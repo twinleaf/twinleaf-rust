@@ -29,8 +29,10 @@ pub trait Filter {
 /// Corner of the filter, as a fraction of the output Nyquist frequency.
 pub const CORNER: f32 = 0.8;
 
-/// Float columns one sample carries at most, which bounds what a ring gathers
-/// for a filter; the widest stream any board declares carries six.
+/// Float columns one filtered sample carries at most, which bounds what a
+/// ring gathers for a filter; the widest filtered stream any board declares
+/// carries six. An unfiltered stream ([`None`]) is not gathered and may be as
+/// wide as a packet allows.
 pub const MAX_COLUMNS: usize = 8;
 
 /// Cascaded second order sections.
