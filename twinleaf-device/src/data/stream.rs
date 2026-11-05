@@ -77,22 +77,24 @@ pub struct DataStream<const N: usize> {
 
 impl<const N: usize> DataStream<N> {
     /// A stopped stream decimating through `filter`, `None` if its sample does
-    /// not fit a packet or it has more than [`MAX_COLUMNS`] float columns.
+    /// not fit a packet or it has more than [`MAX_COLUMNS`] float columns for
+    /// a filter to hold; an unfiltered stream has no such limit.
     pub fn new(
         id: StreamId,
         def: &'static StreamDef,
         filter: &'static mut dyn Filter,
         params: Params,
     ) -> Option<Self> {
-        ((1..=MAX_SAMPLE_BYTES).contains(&def.sample_size()) && def.float_columns() <= MAX_COLUMNS)
-            .then(|| Self {
-                id,
-                def,
-                segments: Segments::new(params),
-                publisher: Publisher::new(),
-                filter,
-                tuned: None,
-            })
+        let fits = (1..=MAX_SAMPLE_BYTES).contains(&def.sample_size());
+        let filterable = def.float_columns() <= MAX_COLUMNS || filter.kind() == FilterType::NONE;
+        (fits && filterable).then(|| Self {
+            id,
+            def,
+            segments: Segments::new(params),
+            publisher: Publisher::new(),
+            filter,
+            tuned: None,
+        })
     }
 
     /// Send a packet once it holds `bytes` of samples rather than when full.
@@ -275,13 +277,14 @@ impl<const N: usize> Streams for [DataStream<N>] {
 }
 
 /// Filter a sample's float columns into `buf`, and hand back what to publish.
+/// An unfiltered stream's sample passes as it came, however wide.
 fn filtered<'a>(
     filter: &mut dyn Filter,
     def: &StreamDef,
     sample: &'a [u8],
     buf: &'a mut [u8; MAX_SAMPLE_BYTES],
 ) -> &'a [u8] {
-    if sample.len() != def.sample_size() {
+    if sample.len() != def.sample_size() || filter.kind() == FilterType::NONE {
         return sample;
     }
     buf[..sample.len()].copy_from_slice(sample);
@@ -811,6 +814,27 @@ mod tests {
     }
 
     #[test]
+    fn an_unfiltered_stream_may_be_wider_than_a_filter_holds() {
+        let mut stream =
+            DataStream::<4>::new(StreamId::new(1), &WIDE, unfiltered(), params(10)).unwrap();
+        let mut sent = Sent::default();
+        stream.start(timeref(), &mut sent).unwrap();
+        let sample: Vec<u8> = (0..WIDE.float_columns())
+            .flat_map(|i| (i as f32).to_le_bytes())
+            .collect();
+        stream.push(&sample, &mut sent);
+        stream.flush(&mut sent);
+        let floats = sent.floats();
+        assert_eq!(floats.len(), 1);
+        assert_eq!(
+            floats[0].1,
+            (0..WIDE.float_columns())
+                .map(|i| i as f32)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn a_slice_of_streams_describes_a_device() {
         let mut streams = started();
         streams[0].push(&[0; 16], &mut Sent::default());
@@ -899,6 +923,31 @@ mod tests {
             sent.types(),
             [PacketType::METADATA],
             "a segment with no rows closes too"
+        );
+    }
+
+    /// A start, a rollover, whole seconds and a stop send their segment records without LAST.
+    #[test]
+    fn segment_records_carry_no_last() {
+        let mut streams = streams();
+        let mut sent = Sent::default();
+        streams[0].start(timeref(), &mut sent).unwrap();
+        (0..25).for_each(|_| streams[0].push(&[0; 16], &mut sent));
+        streams[0].rollover(&mut sent);
+        (0..25).for_each(|_| streams[0].push(&[0; 16], &mut sent));
+        streams[0].stop(&mut sent);
+        let flags: Vec<MetadataFlags> = sent
+            .0
+            .iter()
+            .filter_map(|packet| {
+                data::Metadata::parse(PacketView::parse_prefix(packet).ok()?.0.payload)
+            })
+            .map(|(_, flags)| flags)
+            .collect();
+        let (update, periodic) = (MetadataFlags::UPDATE, MetadataFlags::PERIODIC);
+        assert_eq!(
+            flags,
+            [update, periodic, periodic, update, periodic, update]
         );
     }
 }

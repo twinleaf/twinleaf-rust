@@ -1353,7 +1353,7 @@ impl<'c> World<'c> {
             return;
         }
         let mut out = Out::default();
-        if let Some(image) = self.device.tick(self.now, &mut out) {
+        if let Some(image) = self.device.tick(self.now, &(), &mut out) {
             self.stored = Some(image);
             self.device.saved();
         }
