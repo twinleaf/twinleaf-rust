@@ -102,14 +102,15 @@ impl PacketType {
     }
 }
 
-/// The lane a device's packet travels. Each lane keeps its write order, and lanes keep none
-/// between them.
+/// The lane a device's packet travels, control for its state and data for its time series. Each
+/// lane keeps its write order, and lanes keep none between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Lane {
-    /// Announcements, heartbeats and the device record to every port, replies to the port that asked.
+    /// Heartbeats, announcements and the device, stream and column records to every port, replies
+    /// to the port that asked.
     Control,
-    /// Each stream's records and rows.
+    /// Each stream's rows and segment records.
     Data,
     /// Logs.
     Event,
@@ -125,14 +126,10 @@ pub fn lane_of(packet: PacketView<'_>) -> Option<Lane> {
         | PacketType::HEARTBEAT => Some(Lane::Control),
         PacketType::METADATA => {
             match split_metadata(packet.payload).map(|(kind, ..)| kind.into()) {
-                Some(MetadataType::Device) => Some(Lane::Control),
-                Some(
-                    MetadataType::Stream
-                    | MetadataType::Segment
-                    | MetadataType::Column
-                    | MetadataType::Unknown(_),
-                )
-                | None => Some(Lane::Data),
+                Some(MetadataType::Device | MetadataType::Stream | MetadataType::Column) => {
+                    Some(Lane::Control)
+                }
+                Some(MetadataType::Segment | MetadataType::Unknown(_)) | None => Some(Lane::Data),
             }
         }
         PacketType::LEGACY_STREAM => Some(Lane::Data),
@@ -443,8 +440,8 @@ mod tests {
         }
     }
 
-    /// A device record shares control with announcements, replies and heartbeats, every other
-    /// record shares data with rows, and a log travels alone.
+    /// Device, stream and column records share control with announcements, replies and
+    /// heartbeats, a segment record shares data with rows, and a log travels alone.
     #[test]
     fn each_packet_type_has_one_lane() {
         let lane = |ptype: PacketType, payload: &[u8]| {
@@ -460,8 +457,10 @@ mod tests {
             .into_iter()
             .all(|ptype| lane(ptype, &[]) == Some(Lane::Control)));
         assert_eq!(lane(PacketType::HEARTBEAT, &[0; 8]), Some(Lane::Control));
-        assert_eq!(lane(PacketType::METADATA, &[1, 0]), Some(Lane::Control));
-        assert!([2, 3, 4, 9]
+        assert!([1, 2, 4]
+            .into_iter()
+            .all(|kind| lane(PacketType::METADATA, &[kind, 0]) == Some(Lane::Control)));
+        assert!([3, 9]
             .into_iter()
             .all(|kind| lane(PacketType::METADATA, &[kind, 0]) == Some(Lane::Data)));
         assert_eq!(lane(PacketType::stream(1).unwrap(), &[]), Some(Lane::Data));

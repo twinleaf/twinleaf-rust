@@ -66,9 +66,10 @@ impl Queue {
 /// A port: its three lanes, and whether a host holds it open.
 #[derive(Debug)]
 pub struct Port {
-    /// Its announcements, heartbeats and device records, with the replies to what it asked.
+    /// Its announcements, heartbeats and device, stream and column records, with the replies to
+    /// what it asked.
     pub control: Queue,
-    /// Every stream's records and rows.
+    /// Every stream's rows and segment records.
     pub data: Queue,
     /// Logs.
     pub event: Queue,

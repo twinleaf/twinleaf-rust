@@ -205,17 +205,17 @@ impl<'p> Actions<'p> {
 /// [`lane_of`](twinleaf_proto::lane_of) names. A stream sends its data through a [`Sink`] of its
 /// own.
 ///
-/// Control is every port's announcements, heartbeats and device record in one write order, with
-/// each port's own replies merged in so that an announcement written before a reply leaves ahead
-/// of it. A port that falls behind is cut off, with a counted drop and a gap in the sequence, and
+/// Control is every port's announcements, heartbeats and device, stream and column records in one
+/// write order, with each port's own replies merged in so that an announcement written before a
+/// reply leaves ahead of it. A port that falls behind is cut off, with a counted drop and a gap in the sequence, and
 /// resynchronises from a snapshot, so no port delays the device or another port. Events are
 /// logs, in no order against anything. A platform with one port is [`OneLane`].
 pub trait Lanes {
     /// The control lane of the port that asked: its replies.
     fn reply(&mut self, packet: &[u8]);
 
-    /// Every port's control lane: an announcement, a heartbeat or the device record, behind
-    /// every one before it.
+    /// Every port's control lane: an announcement, a heartbeat or a device, stream or column
+    /// record, behind every one before it.
     fn announce(&mut self, packet: &[u8]);
 
     /// Every port's event lane: a log.

@@ -3,7 +3,7 @@
 //!
 //! A device sends each packet on the lane [`lane_of`] names. Each lane keeps its write order and
 //! lanes keep none between them, so each law reads one lane of one route, its control or one
-//! stream's data.
+//! stream's data, and takes from control only the sample size a stream's record fixes for the session.
 //!
 //! A trace is every packet a host exchanged with a tree of devices since it
 //! first heard them, in the order it saw them. A row is a sample packet, and
@@ -282,7 +282,7 @@ struct Row {
     last: u32,
 }
 
-/// What a stream's records and rows have said so far.
+/// What a stream's segment records and rows have said so far, with the sample size its record set.
 #[derive(Default)]
 struct Stream {
     sample_size: Option<NonZeroU16>,
@@ -480,7 +480,14 @@ impl Route {
                     self.control.protocol = record.protocol;
                     None
                 }
-                Metadata::Stream(_) | Metadata::Segment(_) | Metadata::Column(_) => None,
+                Metadata::Stream(record) => {
+                    self.streams
+                        .entry(record.stream_id)
+                        .or_default()
+                        .sample_size = NonZeroU16::new(record.sample_size);
+                    None
+                }
+                Metadata::Segment(_) | Metadata::Column(_) => None,
             },
             PacketType::RPC_REP => {
                 let reply = Reply::parse(packet.payload)?;
@@ -505,14 +512,7 @@ impl Route {
                     .entry(record.stream_id)
                     .or_default()
                     .recorded(record),
-                Metadata::Stream(record) => {
-                    self.streams
-                        .entry(record.stream_id)
-                        .or_default()
-                        .sample_size = NonZeroU16::new(record.sample_size);
-                    None
-                }
-                Metadata::Device(_) | Metadata::Column(_) => None,
+                Metadata::Device(_) | Metadata::Stream(_) | Metadata::Column(_) => None,
             },
             _ => {
                 let samples = Samples::parse(packet.header, packet.payload)?;
