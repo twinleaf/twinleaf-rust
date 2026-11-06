@@ -1,0 +1,38 @@
+# The crate's channels, locks, timers, task spawns and sockets come from
+# `src/seam`, which the shuttle and turmoil tests swap for simulated ones.
+# Only that module may name the primitives it swaps.
+#
+# A blocking wait or lock outside it would stall shuttle's one OS thread, so
+# those are refused too. Tests over real sockets name tokio's and say so.
+disallowed-types = [
+    { path = "flume::Sender", reason = "use crate::chan::Sender" },
+    { path = "flume::Receiver", reason = "use crate::chan::Receiver" },
+    { path = "flume::Selector", reason = "use crate::chan::Selector" },
+    { path = "flume::async::RecvFut", reason = "use crate::chan::RecvFut" },
+    { path = "flume::async::RecvStream", reason = "use crate::chan::RecvStream" },
+    { path = "tokio::sync::Notify", reason = "use crate::chan::Notify" },
+    { path = "tokio::sync::oneshot::Sender", reason = "use crate::chan::oneshot" },
+    { path = "tokio::sync::oneshot::Receiver", reason = "use crate::chan::oneshot" },
+    { path = "tokio_util::task::AbortOnDropHandle", reason = "use crate::chan::AbortOnDropHandle" },
+    { path = "std::sync::Condvar", reason = "a blocking wait stalls shuttle, so wait on a crate::chan channel or Notify" },
+    { path = "std::sync::RwLock", reason = "a blocking lock stalls shuttle, so use a std Mutex through crate::chan::lock" },
+    { path = "tokio_stream::StreamMap", reason = "use crate::chan::StreamMap" },
+    { path = "tokio::net::TcpStream", reason = "use crate::net::TcpStream" },
+    { path = "tokio::net::TcpListener", reason = "use crate::net::TcpListener" },
+]
+disallowed-methods = [
+    { path = "flume::bounded", reason = "use crate::chan::bounded" },
+    { path = "flume::unbounded", reason = "use crate::chan::unbounded" },
+    { path = "tokio::sync::oneshot::channel", reason = "use crate::chan::oneshot::channel" },
+    { path = "tokio::time::sleep_until", reason = "use crate::chan::sleep_until" },
+    { path = "tokio::spawn", reason = "use crate::chan::spawn or a Supervisor" },
+    { path = "tokio::task::spawn", reason = "use crate::chan::spawn or a Supervisor" },
+    { path = "tokio::runtime::Handle::spawn", reason = "use crate::chan::spawn_on or a Supervisor" },
+    { path = "tokio::runtime::Runtime::spawn", reason = "use crate::chan::spawn_on or a Supervisor" },
+    { path = "tokio::task::JoinSet::spawn", reason = "use a Supervisor" },
+    { path = "tokio::task::JoinSet::spawn_on", reason = "use a Supervisor" },
+    { path = "tokio_util::task::TaskTracker::spawn", reason = "use a Supervisor" },
+    { path = "tokio_util::task::TaskTracker::spawn_on", reason = "use a Supervisor" },
+    { path = "std::sync::Mutex::lock", reason = "use crate::chan::lock" },
+    { path = "tokio::net::lookup_host", reason = "use crate::net::lookup_host" },
+]

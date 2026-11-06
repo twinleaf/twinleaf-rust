@@ -1,6 +1,10 @@
+//! The command line of `tio`, parsed by clap into [`TioCli`]. The doc
+//! comments of these types are the `--help` text.
+
 mod capture;
 mod dump;
 mod health;
+mod list;
 mod log;
 mod monitor;
 mod proxy;
@@ -11,18 +15,38 @@ mod upgrade;
 pub use capture::CaptureCli;
 pub use dump::DumpCli;
 pub use health::HealthCli;
+pub use list::ListCli;
 pub use log::{
-    parse_csv_target, CsvTarget, LogCli, LogSubcommands, MetaSubcommands, SplitLevel, SplitPolicy,
+    parse_csv_target, CsvTarget, LogCli, LogCsvCli, LogDumpCli, LogHdfCli, LogInspectCli,
+    LogMetaCli, LogSubcommands, MetaRerouteCli, MetaSubcommands, SplitLevel, SplitPolicy,
     StreamSel,
 };
 pub use monitor::MonitorCli;
 pub use proxy::{MountArg, ProxyCli, ProxySubcommands};
 pub use rpc::{RPCSubcommands, RpcCli};
-pub use simulate::SimulateCli;
+pub use simulate::{SimulateCli, UploadKind};
 pub use upgrade::UpgradeCli;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
+use std::net::Ipv4Addr;
+use std::path::PathBuf;
+use twinleaf::proxy::Listen;
+use twinleaf::DeviceRoute;
+
+pub(crate) fn parse_device_route(s: &str) -> Result<DeviceRoute, String> {
+    s.parse::<DeviceRoute>()
+        .map_err(|_| format!("invalid sensor route: {s:?}"))
+}
+
+pub(crate) fn parse_existing_file(s: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(s);
+    match std::fs::metadata(&p) {
+        Ok(m) if m.is_file() => Ok(p),
+        Ok(_) => Err(format!("not a regular file: {s:?}")),
+        Err(e) => Err(format!("cannot read {s:?}: {e}")),
+    }
+}
 
 pub(crate) fn nonneg_f64(s: &str) -> Result<f64, String> {
     let v: f64 = s
@@ -32,6 +56,34 @@ pub(crate) fn nonneg_f64(s: &str) -> Result<f64, String> {
         Err("must be >= 0".into())
     } else {
         Ok(v)
+    }
+}
+
+/// The interfaces a server listens on, as `--listen` names them.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenOn {
+    /// This machine only, on loopback
+    Loopback,
+    /// Every interface, so other machines can connect too
+    All,
+}
+
+impl ListenOn {
+    /// Returns the IPv4 address a socket binds to listen on these interfaces.
+    pub fn ipv4(self) -> Ipv4Addr {
+        match self {
+            ListenOn::Loopback => Ipv4Addr::LOCALHOST,
+            ListenOn::All => Ipv4Addr::UNSPECIFIED,
+        }
+    }
+}
+
+impl From<ListenOn> for Listen {
+    fn from(listen: ListenOn) -> Listen {
+        match listen {
+            ListenOn::Loopback => Listen::Loopback,
+            ListenOn::All => Listen::AllInterfaces,
+        }
     }
 }
 
@@ -49,12 +101,8 @@ pub struct TioCli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// List connected devices
-    List {
-        /// Include serial ports with unknown VID/PID
-        #[arg(short = 'a', long = "all")]
-        all: bool,
-    },
+    /// Shortcut for `tio proxy list`
+    List(ListCli),
 
     /// Live sensor data display
     Monitor(MonitorCli),
@@ -84,10 +132,6 @@ pub enum Commands {
     /// Run a simulated sine wave Twinleaf device over UDP
     Simulate(SimulateCli),
 
-    /// (deprecated, use `simulate`) Run a simulated sine wave Twinleaf device over UDP
-    #[command(hide = true)]
-    Test(SimulateCli),
-
     /// Generate shell completions for tio
     #[command(long_about = "\
 Generate shell completions for tio.
@@ -109,4 +153,27 @@ Add one of these lines to your shell's config file:
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TioOpts {
+    /// Sensor root address (e.g., `tcp://localhost`, `serial:///dev/ttyUSB0`)
+    #[arg(
+        short = 'r',
+        long = "root",
+        default_value = "auto",
+        value_hint = clap::ValueHint::Url,
+        help = "Sensor root address (auto selects the default or only device)"
+    )]
+    pub root: String,
+
+    /// Sensor path in the sensor tree (e.g., /, /0, /0/1)
+    #[arg(
+        short = 's',
+        long = "sensor",
+        default_value = "/",
+        value_parser = parse_device_route,
+        help = "Sensor path in the sensor tree"
+    )]
+    pub route: DeviceRoute,
 }

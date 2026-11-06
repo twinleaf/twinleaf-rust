@@ -1,0 +1,8 @@
+# The simulated test tiers of `twinleaf`, as `twinleaf/src/seam` says. Each
+# builds into a target directory of its own, so it does not rebuild the
+# normal one.
+[alias]
+test-shuttle = ["test", "--config", "build.rustflags=['--cfg','shuttle']", "--target-dir", "target/shuttle", "-p", "twinleaf", "--lib", "shuttle"]
+clippy-shuttle = ["clippy", "--config", "build.rustflags=['--cfg','shuttle']", "--target-dir", "target/shuttle", "-p", "twinleaf", "--lib", "--tests"]
+test-turmoil = ["test", "--config", "build.rustflags=['--cfg','turmoil','--cfg','tokio_unstable']", "--target-dir", "target/turmoil", "-p", "twinleaf", "--lib", "turmoil"]
+clippy-turmoil = ["clippy", "--config", "build.rustflags=['--cfg','turmoil','--cfg','tokio_unstable']", "--target-dir", "target/turmoil", "-p", "twinleaf", "--lib", "--tests"]

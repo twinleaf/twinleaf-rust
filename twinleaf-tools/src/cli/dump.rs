@@ -1,7 +1,9 @@
+//! The arguments of `tio dump`.
+
 use clap::Args;
 use std::time::Duration;
 
-use crate::TioOpts;
+use super::TioOpts;
 
 #[derive(Args, Debug)]
 pub struct DumpCli {
@@ -16,7 +18,12 @@ pub struct DumpCli {
     #[arg(short = 'm', long = "meta")]
     pub meta: bool,
 
-    /// Routing depth limit (default: unlimited)
+    /// Filter streams/columns using a glob pattern (e.g. "sync", "/0/vector").
+    /// Requires -d.
+    #[arg(short = 'g', long = "glob", requires = "data")]
+    pub glob: Option<String>,
+
+    /// Routing depth limit (unlimited by default)
     #[arg(long = "depth")]
     pub depth: Option<usize>,
 

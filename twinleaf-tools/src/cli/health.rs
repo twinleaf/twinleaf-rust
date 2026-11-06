@@ -1,14 +1,11 @@
-use clap::Parser;
+//! The arguments of `tio health`.
+
+use clap::Args;
 use std::time::Duration;
 
-use super::nonneg_f64;
-use crate::TioOpts;
+use super::{nonneg_f64, TioOpts};
 
-#[derive(Parser, Debug, Clone)]
-#[command(
-    version,
-    about = "Live timing & rate diagnostics for TIO (Twinleaf) devices"
-)]
+#[derive(Args, Debug, Clone)]
 pub struct HealthCli {
     #[command(flatten)]
     pub(crate) tio: TioOpts,

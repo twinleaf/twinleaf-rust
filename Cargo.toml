@@ -2,7 +2,13 @@
 
 members = [
     "twinleaf",
+    "twinleaf-device",
+    "twinleaf-proto",
     "twinleaf-tools",
 ]
 
 resolver = "2"
+
+[profile.mutants]
+inherits = "test"
+debug = "none"

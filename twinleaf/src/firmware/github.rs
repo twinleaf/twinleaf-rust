@@ -1,19 +1,24 @@
-//! GitHub-backed [`FirmwareCatalog`] (enabled by the `firmware-update` feature).
+//! A [`FirmwareCatalog`] backed by GitHub, enabled by the `firmware-update`
+//! feature.
 
 use super::{FirmwareCatalog, FirmwareDate, FirmwareError, FirmwareRelease};
-use std::io::Read;
 
+/// The user agent of every request.
 const HTTP_USER_AGENT: &str = concat!("twinleaf/", env!("CARGO_PKG_VERSION"));
 
 /// A [`FirmwareCatalog`] backed by a public GitHub repository laid out as
 /// `{name}/{revision}/{name}-{revision}-firmware-{YYYY-MM-DD}-{hash}.bin`.
+#[derive(Debug)]
 pub struct GithubCatalog {
+    /// The repository's owner.
     pub owner: String,
+    /// The repository's name.
     pub repo: String,
 }
 
 impl GithubCatalog {
-    /// The official Twinleaf published-firmware repository.
+    /// Returns the catalog of the official Twinleaf published firmware
+    /// repository.
     pub fn twinleaf() -> Self {
         Self {
             owner: "twinleaf".into(),
@@ -22,7 +27,8 @@ impl GithubCatalog {
     }
 }
 
-/// Parse `{name}-{revision}-firmware-{YYYY-MM-DD}-{hash}.bin` into a release.
+/// Parses `{name}-{revision}-firmware-{YYYY-MM-DD}-{hash}.bin` into a
+/// release. Returns `None` if `filename` does not have that form.
 fn parse_release(name: &str, revision: &str, filename: &str, url: &str) -> Option<FirmwareRelease> {
     let stem = filename.strip_suffix(".bin")?;
     let after = stem.split_once("firmware-")?.1; // "2026-03-17-5d1494"
@@ -56,14 +62,14 @@ impl FirmwareCatalog for GithubCatalog {
             self.owner, self.repo, name, revision
         );
 
-        let response = match ureq::get(&api_url)
-            .set("User-Agent", HTTP_USER_AGENT)
-            .set("Accept", "application/vnd.github+json")
+        let mut response = match ureq::get(&api_url)
+            .header("User-Agent", HTTP_USER_AGENT)
+            .header("Accept", "application/vnd.github+json")
             .call()
         {
             Ok(r) => r,
             // A missing folder simply means nothing is published yet.
-            Err(ureq::Error::Status(404, _)) => return Ok(Vec::new()),
+            Err(ureq::Error::StatusCode(404)) => return Ok(Vec::new()),
             Err(e) => {
                 return Err(FirmwareError::Catalog(format!(
                     "listing request failed: {e}"
@@ -72,7 +78,8 @@ impl FirmwareCatalog for GithubCatalog {
         };
 
         let listing: serde_json::Value = response
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| FirmwareError::Catalog(format!("invalid listing response: {e}")))?;
         let entries = listing
             .as_array()
@@ -97,14 +104,14 @@ impl FirmwareCatalog for GithubCatalog {
     }
 
     fn download(&self, release: &FirmwareRelease) -> Result<Vec<u8>, FirmwareError> {
-        let response = ureq::get(&release.url)
-            .set("User-Agent", HTTP_USER_AGENT)
+        let data = ureq::get(&release.url)
+            .header("User-Agent", HTTP_USER_AGENT)
             .call()
-            .map_err(|e| FirmwareError::Catalog(format!("download request failed: {e}")))?;
-        let mut data = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut data)
+            .map_err(|e| FirmwareError::Catalog(format!("download request failed: {e}")))?
+            .into_body()
+            .into_with_config()
+            .limit(64 * 1024 * 1024)
+            .read_to_vec()
             .map_err(|e| FirmwareError::Catalog(format!("download read failed: {e}")))?;
         Ok(data)
     }
@@ -137,16 +144,16 @@ mod tests {
     }
 
     /// Live end-to-end check against the public firmware repo. Network-gated,
-    /// so it is ignored by default; run with `cargo test -- --ignored`.
+    /// so it is ignored by default. Run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
     fn live_list_and_download_asm_r6() {
         let catalog = GithubCatalog::twinleaf();
-        let releases = catalog
-            .list_releases("ASM", "R6")
-            .expect("listing should succeed");
-        assert!(!releases.is_empty(), "expected at least one ASM/R6 release");
-        let latest = super::super::latest_release(releases).unwrap();
+        let installed =
+            super::super::parse_installed("Twinleaf ASM R6 (000000) [2000-01-01/000000]");
+        let report =
+            super::super::check_for_update(installed, &catalog).expect("listing should succeed");
+        let latest = report.latest.expect("expected at least one ASM/R6 release");
         let data = catalog.download(&latest).expect("download should succeed");
         assert!(!data.is_empty());
 

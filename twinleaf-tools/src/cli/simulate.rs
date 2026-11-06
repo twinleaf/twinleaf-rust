@@ -1,9 +1,11 @@
-use clap::Parser;
+//! The arguments of `tio simulate`.
 
-use super::nonneg_f64;
+use clap::{Parser, ValueEnum};
+use twinleaf::DeviceRoute;
+
+use super::{nonneg_f64, parse_device_route, ListenOn};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Simulate a Twinleaf device over UDP")]
 pub struct SimulateCli {
     /// Sample rate in Hz
     #[arg(
@@ -37,4 +39,34 @@ pub struct SimulateCli {
     /// UDP port to listen on
     #[arg(long = "port", default_value = "7855")]
     pub(crate) port: u16,
+
+    /// Interfaces to listen on
+    #[arg(long = "listen", value_enum, default_value_t = ListenOn::All)]
+    pub(crate) listen: ListenOn,
+
+    /// Disable random sample drops (the 'd' key still drops one manually)
+    #[arg(long = "no-drop")]
+    pub(crate) no_drop: bool,
+
+    /// Routes of the simulated devices, comma-separated (e.g. `/,/0,/1,/1/0`). A route left out has no device and answers nothing, like a hub port with nothing plugged in
+    #[arg(
+        long = "layout",
+        value_delimiter = ',',
+        default_value = "/",
+        value_parser = parse_device_route,
+    )]
+    pub(crate) layout: Vec<DeviceRoute>,
+
+    /// The kind of firmware the devices take, as a real device of that kind does
+    #[arg(long = "upload", value_enum, default_value_t = UploadKind::Image)]
+    pub(crate) upload: UploadKind,
+}
+
+/// What kind of firmware image a simulated device takes.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadKind {
+    /// Images in the chunked format tl-chibi firmware takes, whose chunks carry their own envelope
+    Image,
+    /// Signed packages for board `tio-test`, as a device built on twinleaf-device takes
+    Signed,
 }

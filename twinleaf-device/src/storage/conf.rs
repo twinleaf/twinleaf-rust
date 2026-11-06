@@ -1,0 +1,257 @@
+//! The configuration image: what `dev.conf.save` hands the platform to write,
+//! and what `dev.conf.load` or a boot hands back.
+//!
+//! An image is a run of entries, each the name of a setting and the bytes its
+//! RPC replies with, so a firmware may add or drop a setting without migrating
+//! what is already stored. The flash itself is the platform's.
+
+use twinleaf_proto::rpc::RpcError;
+
+use crate::rpc::Reply;
+use crate::rpc::{Changed, Persisted};
+
+/// The bytes a configuration is stored as, in flash the platform sizes.
+pub type Image<const N: usize> = heapless::Vec<u8, N>;
+
+/// One stored setting: the name it was saved under and its value bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Entry<'a> {
+    /// The name of the setting the value belongs to.
+    pub name: &'a [u8],
+    /// The value, as that setting's RPC replies it.
+    pub value: &'a [u8],
+}
+
+/// Append every setting to `image` as its name and the bytes its RPC replies,
+/// taking each as saved.
+pub fn encode<'s, P: Persisted + ?Sized + 's, const N: usize>(
+    settings: impl IntoIterator<Item = &'s mut P>,
+    image: &mut Image<N>,
+) -> Result<(), RpcError> {
+    for setting in settings {
+        let mut value = Reply::new();
+        setting.save(&mut value)?;
+        let name = setting.name().as_bytes();
+        let name_len = u8::try_from(name.len()).map_err(|_| RpcError::Save)?;
+        let value_len = u8::try_from(value.len()).map_err(|_| RpcError::Save)?;
+        for bytes in [&[name_len, value_len][..], name, &value] {
+            image
+                .extend_from_slice(bytes)
+                .map_err(|_| RpcError::NoBufs)?;
+        }
+    }
+    Ok(())
+}
+
+/// Give every setting the value `image` stores under its name, reporting each
+/// that moved as `changed(name, reply)`. A refused value leaves [`RpcError::Load`].
+pub fn load<'s, P: Persisted + ?Sized + 's>(
+    settings: impl IntoIterator<Item = &'s mut P>,
+    image: &[u8],
+    mut changed: impl FnMut(&str, &[u8]),
+) -> Result<(), RpcError> {
+    entries(image).try_for_each(|entry| entry.map(drop))?;
+    let mut outcome = Ok(());
+    for setting in settings {
+        let stored = entries(image)
+            .filter_map(Result::ok)
+            .find(|entry| entry.name == setting.name().as_bytes());
+        let Some(entry) = stored else {
+            continue;
+        };
+        let mut reply = Reply::new();
+        match setting.load(entry.value, &mut reply) {
+            Ok(Changed::Unchanged) => {}
+            Ok(Changed::Changed) => changed(setting.name(), &reply),
+            Err(_) => outcome = Err(RpcError::Load),
+        }
+    }
+    outcome
+}
+
+/// The entries of an image, ending with [`RpcError::Load`] at the first one
+/// that does not fit in what is left.
+pub fn entries(bytes: &[u8]) -> Entries<'_> {
+    Entries { rest: bytes }
+}
+
+/// The iterator [`entries`] returns.
+#[derive(Clone, Debug)]
+pub struct Entries<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for Entries<'a> {
+    type Item = Result<Entry<'a>, RpcError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let split = match self.rest {
+            [] => return None,
+            [name_len, value_len, fields @ ..] => fields
+                .split_at_checked(usize::from(*name_len))
+                .and_then(|(name, rest)| {
+                    let (value, rest) = rest.split_at_checked(usize::from(*value_len))?;
+                    Some((Entry { name, value }, rest))
+                }),
+            [_] => None,
+        };
+        match split {
+            Some((entry, rest)) => {
+                self.rest = rest;
+                Some(Ok(entry))
+            }
+            None => {
+                self.rest = &[];
+                Some(Err(RpcError::Load))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::Setting;
+
+    /// As much flash as the tests give a configuration.
+    const FLASH: usize = 1024;
+
+    fn image(settings: &mut [&mut dyn Persisted]) -> Image<FLASH> {
+        let mut image = Image::new();
+        encode(
+            settings.iter_mut().map(|setting| &mut **setting),
+            &mut image,
+        )
+        .unwrap();
+        image
+    }
+
+    /// An entry as the tests read it back.
+    type Decoded = Result<(Vec<u8>, Vec<u8>), RpcError>;
+
+    fn decoded(bytes: &[u8]) -> Vec<Decoded> {
+        entries(bytes)
+            .map(|entry| entry.map(|entry| (entry.name.to_vec(), entry.value.to_vec())))
+            .collect()
+    }
+
+    #[test]
+    fn an_image_carries_each_name_and_the_bytes_its_rpc_replies() {
+        let mut gain = Setting::new("app.gain", 7u16).persistent();
+        let mut enable = Setting::new("app.enable", true).persistent();
+        let image = image(&mut [&mut gain, &mut enable]);
+
+        assert_eq!(
+            image.as_slice(),
+            [
+                &[8, 2][..],
+                b"app.gain",
+                &7u16.to_le_bytes(),
+                &[10, 1],
+                b"app.enable",
+                &[1]
+            ]
+            .concat()
+        );
+        assert_eq!(
+            decoded(&image),
+            [
+                Ok((b"app.gain".to_vec(), 7u16.to_le_bytes().to_vec())),
+                Ok((b"app.enable".to_vec(), vec![1])),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_image_has_no_entries() {
+        assert_eq!(decoded(&[]), []);
+        assert_eq!(image(&mut []), Image::<FLASH>::new());
+    }
+
+    #[test]
+    fn an_image_that_does_not_add_up_ends_in_a_load_error() {
+        let mut gain = Setting::new("app.gain", 7u16).persistent();
+        let image = image(&mut [&mut gain]);
+
+        for truncated in 1..image.len() {
+            assert_eq!(
+                decoded(&image[..truncated]).last(),
+                Some(&Err(RpcError::Load)),
+                "{truncated} bytes"
+            );
+        }
+        assert_eq!(decoded(&[1]), [Err(RpcError::Load)]);
+    }
+
+    #[test]
+    fn an_image_too_large_for_the_flash_is_refused() {
+        let mut settings: Vec<Setting<u32>> = (0..FLASH / 8)
+            .map(|_| Setting::new("app.wide", 0u32).persistent())
+            .collect();
+        let mut listed: Vec<&mut dyn Persisted> = settings
+            .iter_mut()
+            .map(|setting| setting as &mut dyn Persisted)
+            .collect();
+        let mut image = Image::<FLASH>::new();
+        let listed = listed.iter_mut().map(|setting| &mut **setting);
+        assert_eq!(encode(listed, &mut image), Err(RpcError::NoBufs));
+    }
+
+    #[test]
+    fn a_load_moves_each_setting_the_image_names_and_reports_the_ones_that_moved() {
+        let mut gain = Setting::new("app.gain", 1u8).persistent();
+        let mut rate = Setting::new("app.rate", 5u32).persistent();
+        let stored = image(&mut [&mut gain, &mut Setting::new("app.rate", 7u32).persistent()]);
+        let mut moved = Vec::new();
+        let outcome = load(
+            [&mut gain as &mut dyn Persisted, &mut rate],
+            &stored,
+            |name, reply| moved.push((name.to_owned(), reply.to_vec())),
+        );
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            moved,
+            [("app.rate".to_owned(), 7u32.to_le_bytes().to_vec())]
+        );
+        assert_eq!((gain.get(), rate.get()), (1, 7));
+    }
+
+    #[test]
+    fn a_load_leaves_a_stored_name_no_setting_takes_and_a_value_already_held() {
+        let mut gain = Setting::new("app.gain", 9u8).persistent();
+        let stored = image(&mut [
+            &mut Setting::new("app.old", 3u8).persistent(),
+            &mut Setting::new("app.gain", 9u8).persistent(),
+        ]);
+        let outcome = load([&mut gain as &mut dyn Persisted], &stored, |_, _| {
+            panic!("nothing moves")
+        });
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(gain.get(), 9);
+    }
+
+    #[test]
+    fn a_load_refuses_a_value_the_setting_refuses_and_keeps_the_one_held() {
+        let mut rate = Setting::new("app.rate", 1.0f64)
+            .checked(|value| (value > 0.0).then_some(value).ok_or(RpcError::Invalid))
+            .persistent();
+        let stored = image(&mut [&mut Setting::new("app.rate", -1.0f64).persistent()]);
+        let outcome = load([&mut rate as &mut dyn Persisted], &stored, |_, _| {
+            panic!("nothing moves")
+        });
+        assert_eq!(outcome, Err(RpcError::Load));
+        assert_eq!(rate.get(), 1.0);
+    }
+
+    #[test]
+    fn a_load_refuses_a_malformed_image_before_touching_a_setting() {
+        let mut gain = Setting::new("app.gain", 1u8).persistent();
+        let mut stored = image(&mut [&mut Setting::new("app.gain", 9u8).persistent()]).to_vec();
+        stored.push(3);
+        let outcome = load([&mut gain as &mut dyn Persisted], &stored, |_, _| {
+            panic!("nothing moves")
+        });
+        assert_eq!(outcome, Err(RpcError::Load));
+        assert_eq!(gain.get(), 1);
+    }
+}

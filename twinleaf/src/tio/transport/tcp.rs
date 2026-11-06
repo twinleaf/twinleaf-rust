@@ -1,0 +1,64 @@
+//! The TCP transport.
+//!
+//! Connects the TCP streams that ports drive. TIO packets go on the stream
+//! unchanged. The receiving end splits the stream into packets by the size
+//! each header gives, as its [codec](super::codec::tcp::Codec) does.
+
+use super::task::{ByteStream, Rules};
+use crate::net::TcpStream;
+use std::io;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+/// How long to wait for the handshake. It is one RTO plus slack, as long as
+/// the proxy lets a TCP link stay silent.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The rules of a TCP port's task. A TCP link has no heartbeat, holdoff or
+/// stale data.
+pub(super) const RULES: Rules = Rules::NONE;
+
+/// How long the task of a client the proxy accepted waits for the client to
+/// close.
+pub(super) const CLIENT_HALF_CLOSE: Duration = Duration::from_millis(500);
+
+/// The rules of the task of a client the proxy accepted. The link closes in
+/// stages, so the client reads all the proxy sent before its socket closes.
+pub(super) const CLIENT_RULES: Rules = Rules {
+    half_close: Some(CLIENT_HALF_CLOSE),
+    ..Rules::NONE
+};
+
+/// Connects to the first of `addresses` that answers, trying each in turn
+/// for at most [`CONNECT_TIMEOUT`], and returns the stream. Must be awaited
+/// on a tokio runtime, which the stream belongs to.
+///
+/// # Errors
+///
+/// Returns the error of the last address if none answers.
+pub(super) async fn connect(addresses: &[SocketAddr]) -> io::Result<TcpStream> {
+    let mut failed = io::Error::new(io::ErrorKind::NotFound, "no address to connect to");
+    for &address in addresses {
+        match connect_stream(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => failed = error,
+        }
+    }
+    Err(failed)
+}
+
+/// Connects to `address`, waiting at most [`CONNECT_TIMEOUT`].
+async fn connect_stream(address: SocketAddr) -> io::Result<TcpStream> {
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, crate::net::connect(address))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{address} did not answer within {CONNECT_TIMEOUT:?}"),
+            )
+        })??;
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+impl ByteStream for TcpStream {}

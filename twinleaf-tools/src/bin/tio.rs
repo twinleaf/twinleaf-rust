@@ -1,12 +1,14 @@
+//! The `tio` binary. It parses the command line, installs the logger, and
+//! runs the subcommand asked for.
+
 use clap::{CommandFactory, Parser};
 use twinleaf_tools::tools::{
     capture::run_capture,
     dump::run_dump,
-    health::{run_health, HealthConfig},
-    list::run_list,
+    health::run_health,
     log::run_log,
-    monitor::{run_monitor, MonitorConfig},
-    proxy::run_proxy,
+    monitor::run_monitor,
+    proxy::{run_list, run_proxy},
     rpc::run_rpc,
     simulate::run_simulate,
     upgrade::run_upgrade,
@@ -17,24 +19,14 @@ fn main() -> eyre::Result<()> {
     twinleaf_tools::install_error_handler()?;
     let cli = TioCli::parse();
 
-    // Health, Monitor, and Proxy manage their own logging (TUI / custom filter)
-    if !matches!(
-        cli.command,
-        Commands::Health(_) | Commands::Monitor(_) | Commands::Proxy(_)
-    ) {
-        twinleaf_tools::init_logging();
-    }
+    twinleaf_tools::logging::init(&cli.command);
 
     match cli.command {
-        Commands::List { all } => run_list(all),
+        Commands::List(list_cli) => run_list(list_cli),
         Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),
         Commands::Simulate(simulate_cli) => run_simulate(simulate_cli),
-        Commands::Test(simulate_cli) => {
-            eprintln!("warning: `tio test` is deprecated; use `tio simulate` instead");
-            run_simulate(simulate_cli)
-        }
-        Commands::Monitor(monitor_cli) => run_monitor(MonitorConfig::from(monitor_cli)),
-        Commands::Health(health_cli) => run_health(HealthConfig::from(health_cli)),
+        Commands::Monitor(monitor_cli) => run_monitor(monitor_cli),
+        Commands::Health(health_cli) => run_health(health_cli),
         Commands::Rpc(rpc_cli) => run_rpc(rpc_cli),
         Commands::Capture(capture_cli) => run_capture(capture_cli),
         Commands::Dump(dump_cli) => run_dump(dump_cli),
