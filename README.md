@@ -1,6 +1,6 @@
 # Twinleaf I/O Tools in Rust
 
-This repository contains three Rust crates: a library ([`twinleaf`](https://crates.io/crates/twinleaf)), a set of tools ([`twinleaf-tools`](https://crates.io/crates/twinleaf-tools)) that are useful for working with Twinleaf quantum sensors and accessories, and a Rust protocol implementation ([`twinleaf-proto`](https://crates.io/crates/twinleaf-proto)) of TIO.
+This repository contains four Rust crates: a library ([`twinleaf`](https://crates.io/crates/twinleaf)), a set of tools ([`twinleaf-tools`](https://crates.io/crates/twinleaf-tools)) that are useful for working with Twinleaf quantum sensors and accessories, a Rust protocol implementation ([`twinleaf-proto`](https://crates.io/crates/twinleaf-proto)) of TIO, and the device side of that protocol for firmware ([`twinleaf-device`](https://crates.io/crates/twinleaf-device)).
 
 It is highly recommended to install `twinleaf-tools` when using the `twinleaf` library.
 
@@ -12,8 +12,8 @@ With rust language tools, install the tools using:
 cargo install twinleaf-tools
 ```
 
-It converts logs to HDF5 as installed. `--no-default-features --features
-serial,mdns` leaves HDF5 out.
+HDF5 log conversion is now a default feature. `--no-default-features
+--features serial,mdns` leaves it out.
 
 ## Basic Usage
 

@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `firmware-update` (default): the [GitHub-backed firmware catalog]. Firmware
   queries and flashing are always available without this feature.
 - `mdns`: discovery of networked devices through mDNS/DNS-SD.
-- `hdf5`: HDF5 data export.
+- `hdf5` (default): HDF5 data export.
 - `processing`: signal processing over a column in `data::ops`, a decimator
   for plotting and a Welch spectral estimate.
 

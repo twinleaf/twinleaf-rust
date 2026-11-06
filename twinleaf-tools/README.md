@@ -221,6 +221,10 @@ may need to prepend `autoload -Uz compinit && compinit`.
 cargo install twinleaf-tools
 ```
 
+The default features are `serial`, `mdns`, and `hdf5`, so `tio log hdf` and
+network discovery come with it. `--no-default-features --features serial,mdns`
+leaves HDF5 out.
+
 Cargo reports where the binary is installed and which path to add to your
 environment, if necessary.
 

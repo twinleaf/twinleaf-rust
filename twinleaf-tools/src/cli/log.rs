@@ -37,7 +37,7 @@ pub struct LogCli {
 
 #[derive(Subcommand, Debug)]
 pub enum LogSubcommands {
-    /// Log metadata to a file. See "tio log meta --help" for more options
+    /// Log metadata to a file
     #[command(args_conflicts_with_subcommands = true)]
     Meta(LogMetaCli),
 
