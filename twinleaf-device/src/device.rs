@@ -47,9 +47,6 @@ pub const DEFAULT_BROADCAST_PERIOD: u16 = 5_000;
 /// As much flash as a stored configuration may take.
 pub const IMAGE_MAX: usize = 1024;
 
-/// Why a locked session's call to a privileged entry is refused.
-pub const LOCKED: &str = "privileged: unlock with dev.priv";
-
 /// As big a cell as `dev.priv.password` keeps, NUL and all.
 pub const PASSWORD_MAX: usize = 16;
 
@@ -299,8 +296,6 @@ pub struct Device<S: Group> {
     /// Which boot this is.
     pub session: SessionId,
     table: &'static [RpcSpec],
-    /// `rpc.hash`, fixed for the image.
-    hash: u32,
     /// Whether `dev.priv` has unlocked this session: not persisted, and false
     /// at every boot.
     privileged: bool,
@@ -352,7 +347,6 @@ impl<S: Group> Device<S> {
             identity,
             session,
             table,
-            hash: table::hash(table),
             privileged: false,
             password: Setting::new("dev.priv.password", Text::from(password)).persistent(),
             autostart: Setting::new("dev.autostart", DEFAULT_AUTOSTART).persistent(),
@@ -388,9 +382,9 @@ impl<S: Group> Device<S> {
         self.table
     }
 
-    /// `rpc.hash`, which the table fixes for the image.
+    /// `rpc.hash`, which the table and whether the session is unlocked fix.
     pub fn hash(&self) -> u32 {
-        self.hash
+        table::hash(self.table, self.privileged)
     }
 
     /// The board's own entries, for the tasks that read them.
@@ -537,21 +531,14 @@ impl<S: Group> Device<S> {
             routing,
         };
         let table = self.table;
-        let index = match request.method {
-            Method::ById(id) => Some(usize::from(id.value())).filter(|&i| i < table.len()),
-            Method::ByName(name) => table.iter().position(|spec| spec.name.as_bytes() == name),
+        let mut listed = table::listed(table, self.privileged);
+        let found = match request.method {
+            Method::ById(id) => listed.nth(usize::from(id.value())),
+            Method::ByName(name) => listed.find(|(_, spec)| spec.name.as_bytes() == name),
         };
-        let Some(index) = index else {
+        let Some((index, spec)) = found else {
             return answer(pending, Err(RpcError::NotFound), &mut to(lanes));
         };
-        let spec = &table[index];
-        if spec.access.is_privileged() && !self.privileged {
-            let locked = Refusal {
-                error: RpcError::State,
-                why: LOCKED,
-            };
-            return answer(pending, Err(locked), &mut to(lanes));
-        }
         let args = request.args;
         if spec.method == table::Method::Action && !args.is_empty() {
             return answer(pending, Err(RpcError::ArgsSize), &mut to(lanes));
@@ -627,12 +614,12 @@ impl<S: Group> Device<S> {
                     Err(_) => Err(RpcError::ArgsSize),
                 },
                 Std::Upgrade => return actions.defer(pending, Deferred::Flash(FlashOp::Upgrade)),
-                Std::RpcName => table::name(table, args, &mut reply),
-                Std::RpcId => table::id(table, args, &mut reply),
-                Std::RpcInfo => table::info(table, args, &mut reply),
-                Std::RpcList => table::list(table, args, false, &mut reply),
-                Std::RpcListInfo => table::list(table, args, true, &mut reply),
-                Std::RpcMatch => table::match_name(table, args, &mut reply),
+                Std::RpcName => table::name(table, self.privileged, args, &mut reply),
+                Std::RpcId => table::id(table, self.privileged, args, &mut reply),
+                Std::RpcInfo => table::info(table, self.privileged, args, &mut reply),
+                Std::RpcList => table::list(table, self.privileged, args, false, &mut reply),
+                Std::RpcListInfo => table::list(table, self.privileged, args, true, &mut reply),
+                Std::RpcMatch => table::match_name(table, self.privileged, args, &mut reply),
                 Std::RpcHash => read(&mut reply, args, &self.hash().to_le_bytes()),
                 Std::Autostart => write(
                     &mut self.settings_version,
@@ -1771,8 +1758,8 @@ mod tests {
         );
     }
 
-    /// Ids are positions in the table and are on the wire, so a host that read
-    /// the table once asks by id from then on.
+    /// Ids are on the wire, so a host that read the table once asks by id
+    /// from then on.
     #[test]
     fn answers_a_standard_rpc_by_id() {
         let mut device = harness();
@@ -1867,31 +1854,39 @@ mod tests {
         assert_eq!(device.ask("dev.lifetime", b"0").error(), RpcError::ReadOnly);
     }
 
-    /// The table is fixed for the image, so a locked session lists every
-    /// entry and reads the hash an unlocked one does.
+    /// A locked session lists, matches and hashes only the public entries, and
+    /// an unlock lists the privileged ones after them under a hash of their own.
     #[test]
-    fn every_session_lists_the_whole_table_under_one_hash() {
+    fn a_locked_session_sees_only_the_public_table() {
         let mut device = harness();
-        let hash = table::hash(device.table()).to_le_bytes();
+        let public = table::listed(device.table(), false).count();
+        assert!(public < device.table().len());
+        assert_eq!(device.listed(), public);
+        assert!(!device.listing().contains(&"board.secret".to_string()));
+        assert_eq!(
+            device.ask("rpc.info", b"board.secret").error(),
+            RpcError::Invalid
+        );
+        assert_eq!(device.ask("rpc.match", b"dev.priv").value(), b"dev.priv");
+        let locked = device.ask("rpc.hash", &[]).value().to_vec();
+        assert_eq!(locked, table::hash(device.table(), false).to_le_bytes());
+
+        device.ask("dev.priv", PASSWORD.as_bytes());
         assert_eq!(device.listed(), device.table().len());
-        assert!(device.listing().contains(&"board.secret".to_string()));
-        assert_eq!(device.ask("rpc.hash", &[]).value(), hash);
+        assert!(device.listing()[public..].contains(&"board.secret".to_string()));
         let info = device.ask("rpc.info", b"board.secret").value().to_vec();
         assert_eq!(
             u16::from_le_bytes(info.try_into().unwrap()),
             0x8000 | (4 << 4) | 0x0100 | 0x0200 | 0x2000 | 0x4000,
             "a board's privileged setting says so and is announced"
         );
-
-        device.ask("dev.priv", PASSWORD.as_bytes());
-        assert_eq!(device.listed(), device.table().len());
-        assert_eq!(device.ask("rpc.hash", &[]).value(), hash);
+        assert_ne!(device.ask("rpc.hash", &[]).value(), locked.as_slice());
     }
 
-    /// A locked session is refused a privileged entry with the state error,
-    /// and `dev.priv` itself stays callable.
+    /// A locked session finds no privileged entry by name or by id, and
+    /// `dev.priv` itself stays callable.
     #[test]
-    fn a_locked_session_is_refused_what_needs_privilege() {
+    fn a_locked_session_finds_nothing_that_needs_privilege() {
         let mut device = harness();
         for name in [
             "board.secret",
@@ -1899,17 +1894,15 @@ mod tests {
             "dev.priv.lock",
             "dev.priv.password",
         ] {
-            let refused = device.ask(name, &[]);
-            assert_eq!(refused.error(), RpcError::State, "{name}");
-            let packet = &refused.0[0];
-            let header = Header::parse_prefix(packet).unwrap();
-            let Some(Answer::Error(error)) =
-                Answer::parse(header.ptype, &packet[header.payload_range()])
-            else {
-                panic!("{name} is refused");
-            };
-            assert_eq!(error.message, LOCKED.as_bytes(), "the refusal says why");
+            assert_eq!(device.ask(name, &[]).error(), RpcError::NotFound, "{name}");
         }
+        let past = table::listed(device.table(), false).count() as u16;
+        let asked = asking(
+            Method::ById(twinleaf_proto::RpcMethodId::new(past)),
+            &[],
+            &[],
+        );
+        assert_eq!(device.send(&asked, BOOT).error(), RpcError::NotFound);
         assert_eq!(device.ask("dev.priv", &[]).value(), &[0]);
         assert_eq!(
             device.ask("dev.mcu.model", &[]).value(),
@@ -1937,7 +1930,7 @@ mod tests {
 
         assert_eq!(device.ask("dev.priv.lock", &[]).value(), b"");
         assert_eq!(device.ask("dev.priv", &[]).value(), &[0]);
-        assert_eq!(device.ask("board.secret", &[]).error(), RpcError::State);
+        assert_eq!(device.ask("board.secret", &[]).error(), RpcError::NotFound);
     }
 
     /// An unlocked session writes a privileged setting as it writes any other.

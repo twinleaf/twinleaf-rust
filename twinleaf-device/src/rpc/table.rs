@@ -336,11 +336,22 @@ standard! {
         prop(Kind::Uint(2), Access::RW.union(Access::PERSISTENT)).announced(),
 }
 
+/// The entries a session sees, numbered by their wire id: the public ones in
+/// table order, then the privileged ones once `unlocked`, as libtio numbers them.
+pub fn listed(table: &[RpcSpec], unlocked: bool) -> impl Iterator<Item = (usize, &RpcSpec)> {
+    let entries = table.iter().enumerate();
+    let public = entries
+        .clone()
+        .filter(|(_, spec)| !spec.access.is_privileged());
+    let privileged = entries.filter(move |(_, spec)| unlocked && spec.access.is_privileged());
+    public.chain(privileged)
+}
+
 /// `rpc.hash`: a CRC32 over the name, flags, description, and signature of
-/// every entry, so a host caches the table once per firmware image.
-pub fn hash(table: &[RpcSpec]) -> u32 {
+/// every entry a session sees, so a host caches the locked and unlocked tables apart.
+pub fn hash(table: &[RpcSpec], unlocked: bool) -> u32 {
     let mut digest = CRC32.digest();
-    for spec in table {
+    for (_, spec) in listed(table, unlocked) {
         digest.update(spec.name.as_bytes());
         digest.update(&spec.flags().to_le_bytes());
         digest.update(spec.desc.as_bytes());
@@ -350,36 +361,51 @@ pub fn hash(table: &[RpcSpec]) -> u32 {
 }
 
 /// `rpc.name`: the name of the method at an id.
-pub fn name(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
-    let spec = table.get(index(arg)?).ok_or(RpcError::Invalid)?;
+pub fn name(
+    table: &[RpcSpec],
+    unlocked: bool,
+    arg: &[u8],
+    out: &mut Reply,
+) -> Result<(), RpcError> {
+    let (_, spec) = listed(table, unlocked)
+        .nth(index(arg)?)
+        .ok_or(RpcError::Invalid)?;
     put(out, spec.name.as_bytes())
 }
 
 /// `rpc.id`: the id of the method with a name.
-pub fn id(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
-    let (index, _) = find(table, arg)?;
-    put(out, &(index as u16).to_le_bytes())
+pub fn id(table: &[RpcSpec], unlocked: bool, arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
+    let (id, _) = find(table, unlocked, arg)?;
+    put(out, &(id as u16).to_le_bytes())
 }
 
 /// `rpc.info`: the metadata of the method with a name.
-pub fn info(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
-    let (_, spec) = find(table, arg)?;
+pub fn info(
+    table: &[RpcSpec],
+    unlocked: bool,
+    arg: &[u8],
+    out: &mut Reply,
+) -> Result<(), RpcError> {
+    let (_, spec) = find(table, unlocked, arg)?;
     put(out, &spec.metadata().to_le_bytes())
 }
 
-/// `rpc.list` and `rpc.listinfo`: how many entries the table has with no
+/// `rpc.list` and `rpc.listinfo`: how many entries the session sees with no
 /// argument, or the name of the one at an id, preceded by its metadata for
 /// `rpc.listinfo`.
 pub fn list(
     table: &[RpcSpec],
+    unlocked: bool,
     arg: &[u8],
     with_info: bool,
     out: &mut Reply,
 ) -> Result<(), RpcError> {
     if arg.is_empty() {
-        return put(out, &(table.len() as u16).to_le_bytes());
+        return put(out, &(listed(table, unlocked).count() as u16).to_le_bytes());
     }
-    let spec = table.get(index(arg)?).ok_or(RpcError::Invalid)?;
+    let (_, spec) = listed(table, unlocked)
+        .nth(index(arg)?)
+        .ok_or(RpcError::Invalid)?;
     if with_info {
         put(out, &spec.metadata().to_le_bytes())?;
     }
@@ -403,7 +429,12 @@ pub fn list(
 /// the prefix from the index. An empty tail after it selects index zero. A
 /// tail that is not all decimal digits still cuts the prefix but selects
 /// nothing, so the reply is the completion or count for that prefix.
-pub fn match_name(table: &[RpcSpec], args: &[u8], out: &mut Reply) -> Result<(), RpcError> {
+pub fn match_name(
+    table: &[RpcSpec],
+    unlocked: bool,
+    args: &[u8],
+    out: &mut Reply,
+) -> Result<(), RpcError> {
     if args.is_empty() {
         return Err(RpcError::Invalid);
     }
@@ -411,9 +442,8 @@ pub fn match_name(table: &[RpcSpec], args: &[u8], out: &mut Reply) -> Result<(),
         Some(bar) => (&args[..bar], match_index(&args[bar + 1..])),
         None => (args, None),
     };
-    let mut matches = table
-        .iter()
-        .map(|spec| spec.name)
+    let mut matches = listed(table, unlocked)
+        .map(|(_, spec)| spec.name)
         .filter(|name| name.as_bytes().starts_with(prefix));
 
     if let Some(index) = select {
@@ -453,12 +483,16 @@ fn index(arg: &[u8]) -> Result<usize, RpcError> {
     Ok(usize::from(u16::from_le_bytes(bytes)))
 }
 
-fn find<'t>(table: &'t [RpcSpec], name: &[u8]) -> Result<(usize, &'t RpcSpec), RpcError> {
+fn find<'t>(
+    table: &'t [RpcSpec],
+    unlocked: bool,
+    name: &[u8],
+) -> Result<(usize, &'t RpcSpec), RpcError> {
     if name.is_empty() {
         return Err(RpcError::Invalid);
     }
-    table
-        .iter()
+    listed(table, unlocked)
+        .map(|(_, spec)| spec)
         .enumerate()
         .find(|(_, spec)| spec.name.as_bytes() == name)
         .ok_or(RpcError::Invalid)
@@ -481,8 +515,8 @@ pub fn read(out: &mut Reply, args: &[u8], value: &[u8]) -> Result<(), RpcError> 
 mod tests {
     use super::*;
 
-    /// What [`STANDARD`] hashes to, over every entry.
-    const HASH: u32 = 0x8725_4e8c;
+    /// What [`STANDARD`] hashes to unlocked, its privileged entries last.
+    const HASH: u32 = 0x8259_f2f3;
 
     fn table() -> [RpcSpec; 3] {
         [
@@ -524,24 +558,24 @@ mod tests {
     #[test]
     fn hash_covers_name_flags_desc_signature() {
         let table = table();
-        let base = hash(&table);
-        assert_eq!(base, hash(&table.clone()));
+        let base = hash(&table, true);
+        assert_eq!(base, hash(&table.clone(), true));
 
         let mut renamed = table.clone();
         renamed[0].name = "a.x";
-        assert_ne!(base, hash(&renamed));
+        assert_ne!(base, hash(&renamed, true));
 
         let mut reflagged = table.clone();
         reflagged[1].access = reflagged[1].access | Access::PERSISTENT;
-        assert_ne!(base, hash(&reflagged));
+        assert_ne!(base, hash(&reflagged, true));
 
         let mut redesc = table.clone();
         redesc[0].desc = "described";
-        assert_ne!(base, hash(&redesc));
+        assert_ne!(base, hash(&redesc, true));
 
         let mut resig = table;
         resig[0].signature = "u32";
-        assert_ne!(base, hash(&resig));
+        assert_ne!(base, hash(&resig, true));
     }
 
     #[test]
@@ -552,7 +586,7 @@ mod tests {
             STANDARD.last().unwrap().name,
             "dev.metadata.broadcast.period"
         );
-        assert_eq!(hash(STANDARD), HASH);
+        assert_eq!(hash(STANDARD, true), HASH);
     }
 
     #[test]
@@ -614,7 +648,7 @@ mod tests {
     #[test]
     fn hash_is_the_iso_hdlc_crc_of_the_entries() {
         let table = [RpcSpec::std("a", Access::NONE)];
-        assert_eq!(hash(&table), CRC32.checksum(b"a\x01\0\0\0"));
+        assert_eq!(hash(&table, true), CRC32.checksum(b"a\x01\0\0\0"));
     }
 
     fn answer(call: impl FnOnce(&mut Reply) -> Result<(), RpcError>) -> Result<Vec<u8>, RpcError> {
@@ -627,39 +661,42 @@ mod tests {
         let table = table();
 
         assert_eq!(
-            answer(|out| list(&table, &[], false, out)),
+            answer(|out| list(&table, true, &[], false, out)),
             Ok(3u16.to_le_bytes().to_vec())
         );
 
         assert_eq!(
-            answer(|out| name(&table, &1u16.to_le_bytes(), out)),
+            answer(|out| name(&table, true, &1u16.to_le_bytes(), out)),
             Ok(b"dev.stop".to_vec())
         );
         assert_eq!(
-            answer(|out| name(&table, &3u16.to_le_bytes(), out)),
+            answer(|out| name(&table, true, &3u16.to_le_bytes(), out)),
             Err(RpcError::Invalid)
         );
         assert_eq!(
-            answer(|out| name(&table, &[1], out)),
+            answer(|out| name(&table, true, &[1], out)),
             Err(RpcError::ArgsSize)
         );
 
         assert_eq!(
-            answer(|out| id(&table, b"test.enable", out)),
+            answer(|out| id(&table, true, b"test.enable", out)),
             Ok(2u16.to_le_bytes().to_vec())
         );
-        assert_eq!(answer(|out| id(&table, b"", out)), Err(RpcError::Invalid));
         assert_eq!(
-            answer(|out| id(&table, b"nope", out)),
+            answer(|out| id(&table, true, b"", out)),
+            Err(RpcError::Invalid)
+        );
+        assert_eq!(
+            answer(|out| id(&table, true, b"nope", out)),
             Err(RpcError::Invalid)
         );
 
         assert_eq!(
-            answer(|out| info(&table, b"dev.stop", out)),
+            answer(|out| info(&table, true, b"dev.stop", out)),
             Ok(0x8000u16.to_le_bytes().to_vec())
         );
 
-        let listed = answer(|out| list(&table, &2u16.to_le_bytes(), true, out)).unwrap();
+        let listed = answer(|out| list(&table, true, &2u16.to_le_bytes(), true, out)).unwrap();
         assert_eq!(&listed[..2], &table[2].metadata().to_le_bytes());
         assert_eq!(&listed[2..], b"test.enable");
     }
@@ -686,7 +723,7 @@ mod tests {
 
     fn matched(args: &[u8]) -> Result<Reply, RpcError> {
         let mut out = Reply::new();
-        match_name(&named(), args, &mut out).map(|()| out)
+        match_name(&named(), true, args, &mut out).map(|()| out)
     }
 
     #[test]
