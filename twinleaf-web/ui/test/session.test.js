@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Session, Trace } from '../src/lib/session.svelte.js';
 import { Hub } from '../src/lib/hub.svelte.js';
-import { decodeFrame, signalKey, spectraMessage } from '../src/lib/protocol.js';
+import { decodeFrame, holdMessage, signalKey, spectraMessage } from '../src/lib/protocol.js';
 
 const meta = (id, route = '/', stream = 'sine', column = 'sine') => ({ id, route, stream, column, units: 'V', rate: 100 });
 
@@ -174,10 +174,14 @@ describe('the hub', () => {
     expect(socket.sent.length).toBe(2);
   });
 
-  it('keeps paused views’ points in every session', () => {
-    const { hub } = hubOnFakeSocket();
-    hub.hold(10);
+  it('has the hub hold its history while a view is paused, in every session', () => {
+    const { hub, socket } = hubOnFakeSocket();
+    hub.text({ type: 'hub', id: 'a', seq: 0 });
+    expect(socket.sent).toEqual([]);
+    hub.hold(true);
     hub.text({ type: 'hub', id: 'b', seq: 0 });
-    expect(hub.session.heldFrom).toBe(10);
+    hub.hold(false);
+    expect(socket.sent).toEqual([holdMessage(true), holdMessage(true), holdMessage(false)]);
   });
+
 });

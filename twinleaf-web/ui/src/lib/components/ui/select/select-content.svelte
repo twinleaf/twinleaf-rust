@@ -8,6 +8,8 @@
 		ref = $bindable(null),
 		class: className,
 		sideOffset = 4,
+		// A list opens under its trigger, from the trigger's left edge.
+		align = "start",
 		portalProps,
 		children,
 		preventScroll = true,
@@ -19,6 +21,7 @@
 	<SelectPrimitive.Content
 		bind:ref
 		{sideOffset}
+		{align}
 		{preventScroll}
 		data-slot="select-content"
 		class={cn(

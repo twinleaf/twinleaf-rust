@@ -16,7 +16,7 @@ export const DECIMATIONS = [100, 500, 2000, 5000];
 export const KINDS = [['time', 'Time'], ['spectrum', 'Spectrum']];
 
 /** Plot modes and their names; plot.js says what each draws. */
-export const MODES = [['overlay', 'Overlay'], ['independent', 'Independent y'], ['stacked', 'Stacked']];
+export const MODES = [['overlay', 'Overlay'], ['independent', 'Independent Y'], ['stacked', 'Stacked']];
 
 /** A plot's kind and mode as the page names them, as "Time · Stacked". */
 export const kindLabel = (kind, mode) => `${KINDS.find((k) => k[0] === kind)[1]} · ${MODES.find((m) => m[0] === mode)[1]}`;
@@ -27,7 +27,7 @@ export const ARRANGEMENTS = [
   ['columns', 'Columns'],
   ['grid', 'Grid'],
   ['quadrants', 'Quadrants'],
-  ['focus', 'Focus (one large)'],
+  ['focus', 'One large'],
 ];
 
 /**

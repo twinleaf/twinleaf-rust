@@ -5,9 +5,26 @@
   import { onMount, tick } from 'svelte';
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
+  import * as Popover from '$lib/components/ui/popover/index.js';
+  import RiToLeft from '@lucide/svelte/icons/arrow-left';
+  import RiToRight from '@lucide/svelte/icons/arrow-right';
+  import RiRemoveAxis from '@lucide/svelte/icons/trash-2';
+  import RiFit from '@lucide/svelte/icons/unfold-vertical';
+  import RiFitX from '@lucide/svelte/icons/unfold-horizontal';
+  import { claimMenu, releaseMenu } from './menus.js';
+  import RiShowOnly from '@lucide/svelte/icons/eye';
+  import RiHide from '@lucide/svelte/icons/eye-off';
+  import RiAxis from '@lucide/svelte/icons/arrow-right-left';
+  import RiMove from '@lucide/svelte/icons/square-arrow-out-up-right';
+  import RiTrash from '@lucide/svelte/icons/trash-2';
+  import RiEraser from '@lucide/svelte/icons/eraser';
+  import RiTab from '@lucide/svelte/icons/app-window';
+  import RiKind from '@lucide/svelte/icons/chart-line';
+  import RiLayout from '@lucide/svelte/icons/layers';
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import IconButton from './IconButton.svelte';
   import KindPicker from './KindPicker.svelte';
+  import { keepsKey, plotKeys } from './keys.js';
   import Tip from './Tip.svelte';
   import RiDraggable from '@lucide/svelte/icons/grip-vertical';
   import RiSplitH from '@lucide/svelte/icons/columns-2';
@@ -17,8 +34,12 @@
   import RiClose from '@lucide/svelte/icons/x';
   import RiPause from '@lucide/svelte/icons/pause';
   import RiPlay from '@lucide/svelte/icons/play';
+  import RiAddSignal from '@lucide/svelte/icons/plus';
   import RiLegend from '@lucide/svelte/icons/list';
-  import { PlotView, colorOf, monitorOf } from './plot.js';
+  import RiXCursors from '@lucide/svelte/icons/separator-vertical';
+  import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
+  import RiZoomTo from '@lucide/svelte/icons/zoom-in';
+  import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
   import { DRAG_START, KINDS, MODES, SPANS, kindLabel } from './constants.js';
   import { actionFor, stepIn } from './keymap.js';
   import { chip } from './tabs.js';
@@ -26,7 +47,7 @@
   let {
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
     onFocus, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
-    onTraceDragStart, onTraceDrop, onEmptied,
+    onTraceDragStart, onTraceDrop, onEmptied, otherPlots = [], onMoveSignal,
   } = $props();
 
   const session = $derived(hub.session);
@@ -37,37 +58,94 @@
   };
   const unitsOf = (key) => session.trace(key)?.meta.units ?? '';
   const shownItems = $derived(plot.items.filter((i) => !i[SHADOW]));
+  /** An independent plot's axes, {left, right}, each the signal keys from the plot outward. */
+  const slots = $derived(plot.mode === 'independent' ? axisSlots(drawnItems().map((i) => i.key), plot.axisSides) : null);
+  /** Whether signal `key` has no axis of its own on an independent plot. */
+  const axisless = (key) => !!slots && !slots.left.includes(key) && !slots.right.includes(key);
+  /** Puts signal `key`'s axis on `side`, 'left' or 'right', or hides it with 'none'. */
+  function setSide(key, side) {
+    plot.axisSides = { ...plot.axisSides, [key]: side };
+  }
 
-  // The context menu shows what was right-clicked: a y axis's bounds, the
-  // time axis's window, or the plot's own items.
+  // A right-click shows what it was on: the time axis's window, or the
+  // plot's own items, in a menu; a y axis's settings, which take typing, in
+  // a popover at the pointer, as menus hold no fields.
   let menuOpen = $state(false);
   let region = $state({ kind: 'plot' });
+  let axisOpen = $state(false);
+  let xAxisOpen = $state(false);
+  let readoutOpen = $state(false);
+  let axisAt = $state({ x: 0, y: 0 });
+  let axisAnchor = $state(null);
   let bounds = $state({ lo: '', hi: '' });
   let boundsError = $state('');
   const shown = (v) => String(+v.toPrecision(6));
+  /** The one signal the axis right-clicked scales, which its popover names, or null for a shared axis. */
+  const axisKey = $derived(region.kind === 'y' && region.keys.length === 1 && region.keys[0] !== 'shared' ? region.keys[0] : null);
+  // Each of the plot's menus closes the page's others as it opens.
+  const closeAxis = () => (axisOpen = false), closeMenu = () => (menuOpen = false), closeSignals = () => (signalsOpen = false);
+  const closeXAxis = () => (xAxisOpen = false), closeReadout = () => (readoutOpen = false);
+  const opened = (open, close) => (open ? claimMenu(close) : releaseMenu(close));
+  $effect(() => opened(axisOpen, closeAxis));
+  $effect(() => opened(menuOpen, closeMenu));
+  $effect(() => opened(signalsOpen, closeSignals));
+  $effect(() => opened(xAxisOpen, closeXAxis));
+  $effect(() => opened(readoutOpen, closeReadout));
   function contextAt(e) {
+    // The cursors' readout has a menu of its own.
+    if (e.target.closest?.('.cursor-readout')) return;
     region = pv?.regionAt(e.clientX, e.clientY) ?? { kind: 'plot' };
+    if (region.kind !== 'y' && region.kind !== 'x') return;
+    // The axis's popover, in place of the plot's menu.
+    e.preventDefault();
+    e.stopPropagation();
+    const r = body.getBoundingClientRect();
+    axisAt = { x: e.clientX - r.left, y: e.clientY - r.top };
+    if (region.kind === 'x') {
+      fBoundsError = '';
+      const xd = plot.kind === 'spectrum' ? pv?.xd : null;
+      fBounds = xd ? { lo: shown(xd[0]), hi: shown(xd[1]) } : { lo: '', hi: '' };
+      return void (xAxisOpen = true);
+    }
     boundsError = '';
-    const b = region.kind === 'y' && region.keys.length ? pv.yBounds(region.keys[0]) : null;
+    const b = region.keys.length ? pv.yBounds(region.keys[0]) : null;
     bounds = b ? { lo: shown(b[0]), hi: shown(b[1]) } : { lo: '', hi: '' };
+    axisOpen = true;
   }
-  /** Sets the bounds typed in, and says why it cannot when they do not make a range. */
+  /** Sets the bounds typed in, and says why it cannot when they do not make a range. Returns whether it set them. */
   function applyBounds() {
     const lo = Number(bounds.lo), hi = Number(bounds.hi);
     if (!isFinite(lo) || !isFinite(hi) || bounds.lo.trim() === '' || bounds.hi.trim() === '') boundsError = 'Enter a number in each';
     else if (lo >= hi) boundsError = 'Max must be above min';
-    else if (plot.kind === 'spectrum' && lo <= 0) boundsError = 'A log axis starts above zero';
+    else if (plot.kind === 'spectrum' && plot.yScale !== 'linear' && lo <= 0) boundsError = 'A log axis starts above zero';
     else {
+      boundsError = '';
       pv?.setYBounds(region.keys, lo, hi);
-      menuOpen = false;
+      return true;
     }
+    return false;
   }
+  // A spectrum's frequency range, typed in its x axis's popover.
+  let fBounds = $state({ lo: '', hi: '' });
+  let fBoundsError = $state('');
+  /** Sets the frequencies typed in, and says why it cannot when they do not make a range. Returns whether it set them. */
+  function applyFBounds() {
+    const lo = Number(fBounds.lo), hi = Number(fBounds.hi);
+    if (!isFinite(lo) || !isFinite(hi) || fBounds.lo.trim() === '' || fBounds.hi.trim() === '') fBoundsError = 'Enter a number in each';
+    else if (lo >= hi) fBoundsError = 'Max must be above min';
+    else if (plot.xScale !== 'linear' && lo <= 0) fBoundsError = 'A log axis starts above zero';
+    else {
+      fBoundsError = '';
+      plot.fRange = [lo, hi];
+      return true;
+    }
+    return false;
+  }
+  /** Enter sets the bounds and closes; leaving a field sets them and stays. */
   function boundsKey(e) {
-    // The menu reads keys to move between items; these are the field's own.
-    e.stopPropagation();
-    if (e.key === 'Enter') applyBounds();
-    if (e.key === 'Escape') menuOpen = false;
+    if (e.key === 'Enter' && applyBounds()) axisOpen = false;
   }
+
   const forTargets = (fn) => {
     for (const v of targets()) fn(v);
   };
@@ -100,20 +178,14 @@
     tick().then(() => document.getElementById(`add-${plot.id}-${addActive}`)?.scrollIntoView({ block: 'nearest' }));
   }
 
-  // A click, not a drag, on the plot: with Shift it adds the plot to the
-  // selection or takes it out. The capture sees the press before the header
+  // A click, not a drag, on the plot selects it; with Shift it adds the plot
+  // to the selection or takes it out, and does nothing else: no pan, and no
+  // pick-up from the header. The capture sees the press before the header
   // or the plot takes it for a move or a pan.
   let pressedAt = null;
   function pressed(e) {
     pressedAt = [e.clientX, e.clientY];
     onFocus();
-    // With Shift, a selected plot is picked up from anywhere on it, with the
-    // rest of the selection. A plain drag still pans the selection, and a
-    // Shift-click that does not move still toggles the plot.
-    if (e.shiftKey && selected && e.button === 0 && !e.target.closest('button, input, [role=menuitem]')) {
-      e.stopPropagation();
-      onStartMove(e);
-    }
   }
   function clicked(e) {
     if (!pressedAt || Math.hypot(e.clientX - pressedAt[0], e.clientY - pressedAt[1]) >= DRAG_START) return;
@@ -168,10 +240,10 @@
 
   // Whether the plot's view streams, for its play and pause button.
   let streaming = $state(true);
-  /** Pauses the plot and the plots linked to it, or streams them again from where they are. */
+  /** Pauses the plot and the plots linked to it, or has them follow live again. */
   function playPause() {
     const perf = performance.now();
-    forTargets((v) => (view.live ? v.pause(perf) : v.resume(perf)));
+    forTargets((v) => (view.live ? v.pause(perf) : v.follow()));
   }
 
   onMount(() => {
@@ -186,9 +258,11 @@
       plotId: plot.id,
       renderer,
       onFocus,
-      config: () => ({ kind: plot.kind, mode: plot.mode, keys: plot.items.filter((i) => !i[SHADOW]).map((i) => i.key) }),
+      onFrequencies: (lo, hi) => (plot.fRange = [lo, hi]),
+      config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null }),
     });
     registry.add(pv);
+    plotKeys.set(plot.id, plotAction);
     const sizing = new ResizeObserver(([entry]) => {
       const { width, height } = entry.contentRect;
       size = { width, height };
@@ -201,19 +275,59 @@
       unwatch();
       sizing.disconnect();
       registry.delete(pv);
+      if (plotKeys.get(plot.id) === plotAction) plotKeys.delete(plot.id);
     };
   });
 
+  // The chips as they were when one was picked up, to go back to when it is
+  // dropped on this same plot: there it is not a move.
+  let dragOrigin = $state.raw(null);
+  /**
+   * The signals the plot draws and gives axes to: while one of its chips is
+   * being dragged, those it had when the drag began, so a chip picked up
+   * keeps its trace and axis until it lands elsewhere.
+   */
+  const drawnItems = () => (dragOrigin ?? plot.items).filter((i) => !i[SHADOW] && !i.hidden);
+  // A chip being dragged is the drag library's shadow in the row it is over,
+  // drawn as the chip faded and outlined at the place it would land, the
+  // other chips trading places with it as the pointer crosses them. In its
+  // own row the shadow takes the chip's own room, so the row keeps its width
+  // and only its order changes. While the pointer is anywhere else, a shadow
+  // of the row's own stands where the chip was, so the row keeps its chips in
+  // place until the chip lands on another plot. That one has an id of its
+  // own, so the chip coming back gets a new element, not the one the library
+  // hid. Where the library adds its shadow beside that one, the row keeps the
+  // library's.
+  const HOME = 'home:'; // the id prefix of that shadow
   function consider(e) {
-    if (e.detail.info.trigger === TRIGGERS.DRAG_STARTED) onTraceDragStart?.();
-    plot.items = e.detail.items;
+    const { trigger, id } = e.detail.info;
+    if (trigger === TRIGGERS.DRAG_STARTED) {
+      dragOrigin = [...plot.items];
+      onTraceDragStart?.();
+    }
+    const items = e.detail.items;
+    const shadows = items.filter((i) => i[SHADOW]);
+    const shadow = shadows.find((i) => !i.id.startsWith(HOME)) ?? shadows[0];
+    if (!shadow && dragOrigin) plot.items = dragOrigin.map((i) => (i.id === id ? { ...i, id: HOME + i.id, [SHADOW]: true } : i));
+    else plot.items = items.filter((i) => !i[SHADOW] || i === shadow);
   }
+  /** Whether chip `id` was this plot's own when the drag began. */
+  const ownChip = (id) => !!dragOrigin?.some((i) => i.id === id);
   function finalize(e) {
     // A chip dropped on a plot's edge lands in no zone and returns here, then
-    // goes to the new plot beside that edge.
-    let items = e.detail.items;
-    const dropped = items.find((i) => i.id === e.detail.info.id && !i[SHADOW]);
+    // goes to the new plot beside that edge. A shadow left in the row is the
+    // place of a chip that landed elsewhere.
+    let items = e.detail.items.filter((i) => !i[SHADOW]);
+    const dropped = items.find((i) => i.id === e.detail.info.id);
     const docked = dropped && onTraceDrop?.(dropped.key);
+    const origin = dragOrigin;
+    dragOrigin = null;
+    // Back on this plot, by its body or one of its axes, the chips stay as they were.
+    if (returned || docked?.plotId === plot.id) {
+      returned = false;
+      plot.items = origin ?? items;
+      return;
+    }
     if (docked) items = items.filter((i) => i !== dropped);
     // A chip from the signal list keeps the list's id until it gets its own here.
     else if (dropped?.id.startsWith('pal:')) items = items.map((i) => (i === dropped ? chip(i.key) : i));
@@ -221,26 +335,40 @@
     plot.items = items.filter((i) => !seen.has(i.key) && seen.add(i.key));
     // A plot whose last signal was dragged away, to another plot or a new
     // one, closes. One emptied with × stays, to be filled again.
+    // Checked once every zone has heard the drop, as this plot's own body may yet take it back.
     const movedOut = docked || e.detail.info.trigger === TRIGGERS.DROPPED_INTO_ANOTHER;
-    if (movedOut && !plot.items.length) onEmptied?.();
+    if (movedOut) queueMicrotask(() => !plot.items.length && onEmptied?.());
   }
   // The plot body is a drop target of its own, which shows nothing: a signal
   // dropped there joins the header's chips, or a new plot when on an edge.
   let bodyItems = $state([]);
+  // A chip of this plot's own came back to it, for the header's finalize,
+  // which the drag library sends after the body's, to put the chips back.
+  let returned = false;
   function bodyConsider(e) {
     bodyItems = e.detail.items;
   }
   function bodyFinalize(e) {
-    const keys = e.detail.items.filter((i) => !i[SHADOW]).map((i) => i.key);
+    const dropped = e.detail.items.filter((i) => !i[SHADOW]);
     bodyItems = [];
-    for (const key of keys) {
-      if (onTraceDrop?.(key)) continue;
-      addSignal(key);
+    for (const item of dropped) {
+      const docked = onTraceDrop?.(item.key);
+      if (ownChip(item.id) && (!docked || docked.plotId === plot.id)) returned = true;
+      else if (!docked) addSignal(item.key);
     }
   }
   function remove(id) {
     plot.items = plot.items.filter((i) => i.id !== id);
   }
+  // A signal the plot keeps but does not draw, as a legend hides a series.
+  let menuChip = $state(null); // the signal a right-click on its chip opened the menu for
+  const toggleHidden = (key) => (plot.items = plot.items.map((i) => (i.key === key ? { ...i, hidden: !i.hidden } : i)));
+  // Whether a spectrum draws the signal's noise floor line, which its chip's eye turns on and off.
+  const toggleFloor = (key) => (plot.items = plot.items.map((i) => (i.key === key ? { ...i, floorHidden: !i.floorHidden } : i)));
+  /** The units of what the plot shows of signal `key`: a spectrum's are per √Hz. */
+  const unitsShown = (key) => unitsOf(key) && (plot.kind === 'spectrum' ? `${unitsOf(key)}/√Hz` : unitsOf(key));
+  const showOnly = (key) => (plot.items = plot.items.map((i) => ({ ...i, hidden: i.key !== key })));
+  const showAll = () => (plot.items = plot.items.map((i) => ({ ...i, hidden: false })));
   /** Whether `e` happened on the header itself or the empty part of its chips. */
   const empty = (e) => e.target === e.currentTarget || e.target.classList?.contains('trace-zone');
 
@@ -267,10 +395,22 @@
   let zoneFocused = $state(false);
   let addFromKeys = false;
   /** Opens the add-a-signal menu under the plot's signals. */
-  function openAdd() {
-    const r = zone.getBoundingClientRect();
-    addFromKeys = true;
-    zone.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.left + 8, clientY: r.bottom }));
+  /**
+   * Opens the add-signal menu under `below`, the signals' row by default, as
+   * a right-click on the row does. From the keys, closing it gives focus back
+   * to the plot.
+   */
+  function openAdd(below = zone, fromKeys = true) {
+    const r = below.getBoundingClientRect();
+    addFromKeys = fromKeys;
+    zone.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.left + 4, clientY: r.bottom }));
+  }
+  let addInput = $state(null);
+  /** Removes every signal and keeps the menu open on its filter, as adding one does, to add others. */
+  function removeAll(e) {
+    e.preventDefault();
+    plot.items = [];
+    tick().then(() => addInput?.focus());
   }
   /** Gives focus back to the plot when a menu opened from the keys closes. */
   function signalsClosed(open) {
@@ -279,12 +419,60 @@
     queueMicrotask(() => card?.focus());
   }
   const PAN = 0.1, ZOOM = 1.25;
-  /** What inside a plot keeps its own keys: fields, menus and buttons. */
-  const OWN_KEYS = 'input, textarea, select, button, [contenteditable], [role=listbox], [role=menu], [role=combobox], [role=dialog]';
+
+  /** Where a legend sits before it is dragged: the top right corner. */
+  const LEGEND_AT = { x: 1, y: 0 };
+  /** Where the cursors' readout sits before it is dragged: the top left corner. */
+  const READOUT_AT = { x: 0, y: 0 };
+  /** The space between the legend and the plot's edge, in px, as plot.css keeps it. */
+  const LEGEND_INSET = 4;
+  /** How near, in px, a dragged legend or readout comes to an edge or the middle before it snaps there. */
+  const LEGEND_SNAP = 12;
+  /**
+   * Drags the legend or the cursors' readout within the plot, keeping where
+   * it sits in `plot[place]`. That is a share of the room around it, 0 to
+   * 1 across and down, so it stays in its place, a corner or between, as the
+   * plot resizes. Across and down, it snaps to either edge and the middle:
+   * the nine places of a corner, an edge's middle or the centre.
+   */
+  function dragOverlay(e, place) {
+    // Its drag is its own, not the plot's pan.
+    e.stopPropagation();
+    if (e.button !== 0 || e.target.closest('.x')) return;
+    e.preventDefault();
+    // A menu opened on it stays where it opened, so picking it up closes that.
+    readoutOpen = false;
+    menuOpen = false;
+    const box = body.getBoundingClientRect(), own = e.currentTarget.getBoundingClientRect();
+    const [dx, dy] = [e.clientX - own.left, e.clientY - own.top];
+    const share = (offset, room) => {
+      if (room <= 0) return 0;
+      const at = Math.min(1, Math.max(0, offset / room));
+      return [0, 0.5, 1].find((a) => Math.abs(a - at) * room < LEGEND_SNAP) ?? at;
+    };
+    const move = (ev) => {
+      plot[place] = {
+        x: share(ev.clientX - dx - box.left - LEGEND_INSET, box.width - 2 * LEGEND_INSET - own.width),
+        y: share(ev.clientY - dy - box.top - LEGEND_INSET, box.height - 2 * LEGEND_INSET - own.height),
+      };
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
+  /** Keys pressed on the plot, its drawing and signals included. What keeps its own keys, as keys.js says, keeps them. */
   function plotKey(e) {
-    // Keys anywhere on the plot, its drawing and its signals included; a
-    // field, menu or button inside it keeps its own.
-    if (e.target !== card && e.target !== zone && e.target.closest?.(OWN_KEYS)) return;
+    const inside = e.target !== card && e.target !== zone;
+    // On a control in the header, the arrows move between the controls (focus.js).
+    if (inside && e.key.startsWith('Arrow')) return;
+    if (inside && keepsKey(e)) return;
+    plotAction(e);
+  }
+  /** Acts on the plot by key `e`, wherever it was pressed: the page sends this plot the keys while it is highlighted. */
+  function plotAction(e) {
     const perf = performance.now(), time = plot.kind === 'time';
     const back = e.key === 'ArrowLeft' || e.key === 'ArrowDown';
     const act = {
@@ -308,6 +496,8 @@
   /** The keys of the plot's signals while they have focus; the rest go on to the plot. */
   function signalsKey(e) {
     if (e.target !== zone) return;
+    // A key shows the signal the arrows are on, however the row got focus.
+    zoneFocused = true;
     const action = actionFor('signals', e);
     if (action === 'move') {
       active = stepIn(e, active, plot.items.length);
@@ -326,7 +516,7 @@
 
 <div
   class:monitor
-  class="plot-card flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border bg-transparent {selected ? 'selected border-primary' : focused ? 'border-ring/60' : 'border-border'}"
+  class="plot-card flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border bg-transparent {selected ? 'selected border-primary' : 'border-border'}"
   bind:this={card}
   onpointerdowncapture={pressed}
   onclick={clicked}
@@ -334,17 +524,19 @@
   onkeydown={plotKey}
   role="group"
   tabindex="0"
+  data-focus="plot"
+  data-focus-arrows
   aria-label={description}
 >
   <!-- The header picks the plot up from anywhere empty, as a title bar does. -->
   <div
     class="plot-head flex h-7 shrink-0 cursor-grab items-center gap-1.5 border-b bg-card px-1.5"
     ondblclick={(e) => empty(e) && onMaximize()}
-    onpointerdown={(e) => empty(e) && onStartMove(e)}
+    onpointerdown={(e) => !e.shiftKey && empty(e) && onStartMove(e)}
     role="toolbar"
     tabindex="-1"
   >
-    <IconButton icon={RiDraggable} label="Drag onto a plot's edge to dock, its middle to swap, or a tab to move" class="grip cursor-grab touch-none text-muted-foreground" tabindex={-1} onpointerdown={onStartMove} />
+    <IconButton icon={RiDraggable} label="Drag onto a plot's edge to dock, its middle to swap, or a tab to move" class="grip cursor-grab touch-none text-muted-foreground" tabindex={-1} data-focus-skip onpointerdown={onStartMove} />
     <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} />
     <!-- The plot's signals, each with its value at the hover, or its newest
          while live. Right-clicking them adds or removes signals. -->
@@ -356,35 +548,79 @@
             bind:this={zone}
             class="trace-zone"
             role="listbox"
+            data-focus="signals"
+            data-focus-own
             aria-label="Signals in this plot"
             aria-activedescendant={zoneFocused && plot.items[active] ? `chip-${plot.items[active].id}` : undefined}
             use:overflowEdges
-            use:dndzone={{ items: plot.items, type: 'trace', flipDurationMs: 0, dropTargetStyle: {}, dropTargetClasses: [], delayTouchStart: true, zoneTabIndex: -1, zoneItemTabIndex: -1, autoAriaDisabled: true }}
+            use:dndzone={{ items: plot.items, type: 'trace', flipDurationMs: 0, dropTargetStyle: {}, dropTargetClasses: [], delayTouchStart: true, zoneTabIndex: -1, zoneItemTabIndex: -1, autoAriaDisabled: true, useCursorForDetection: true, morphDisabled: true }}
             onconsider={consider}
             onfinalize={finalize}
-            oncontextmenucapture={() => ((signalFilter = ''), (addActive = 0))}
+            oncontextmenucapture={(e) => ((signalFilter = ''), (addActive = 0), (menuChip = e.target.closest?.('.trace-chip')?.dataset.key ?? null))}
             onkeydowncapture={signalsKey}
-            onfocus={() => (zoneFocused = true)}
+            onfocus={(e) => (zoneFocused = e.currentTarget.matches(':focus-visible'))}
             onblur={() => (zoneFocused = false)}
           >
             {#each plot.items as item, i (item.id)}
               {@const r = legend.rows[item.key]}
-              <div id="chip-{item.id}" class="trace-chip" class:ghost={item[SHADOW]} class:active={zoneFocused && i === active} role="option" aria-selected={zoneFocused && i === active} style="--c:{colorFor(item.key)}" title={r?.info}>
+              <div id="chip-{item.id}" data-key={item.key} class:hidden-signal={item.hidden} class="trace-chip" class:ghost={item[SHADOW]} class:active={zoneFocused && i === active} class:unscaled={axisless(item.key)} role="option" aria-selected={zoneFocused && i === active} style="--c:{colorFor(item.key)}" title={axisless(item.key) ? 'No axis of its own: drag it beside the plot\'s left or right edge to give it one' : r?.info}>
                 <i></i>
                 <span class="name">{item.key}</span>
-                {#if unitsOf(item.key)}<span class="units">{unitsOf(item.key)}</span>{/if}
-                <!-- Always there, and as wide as the longest value, so a value that comes and goes on hover never moves the header. -->
-                <span class="val">{r?.value ?? ''}</span>
-                <Tip text="Remove from this plot" keys={['Delete']}>
-                  {#snippet children(tip)}<button {...tip} class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>{/snippet}
-                </Tip>
+                {#if unitsShown(item.key)}<span class="units">{unitsShown(item.key)}</span>{/if}
+                {#if plot.kind === 'spectrum'}
+                  <!-- A spectrum's chip shows its white noise floor, always,
+                       the hover's values being in the legend and the tip; its
+                       eye turns the floor's line on the plot on and off. -->
+                  <span class="val floor" title={r?.floor === '—' ? 'No flat noise floor in this spectrum yet' : `White noise floor: ${r?.floor ?? ''} ${unitsShown(item.key)}`}>
+                    <button class="eye" tabindex="-1" aria-pressed={!item.floorHidden} aria-label="{item.floorHidden ? 'Show' : 'Hide'} the noise floor of {item.key}" onclick={() => toggleFloor(item.key)}>
+                      {#if item.floorHidden}<RiHide />{:else}<RiShowOnly />{/if}
+                    </button>{r?.floor ?? ''}
+                  </span>
+                {:else}
+                  <!-- Always there, and as wide as the longest value, so a value that comes and goes on hover never moves the header. -->
+                  <span class="val">{r?.value ?? ''}</span>
+                {/if}
+                <button class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>
               </div>
             {/each}
             {#if !plot.items.length}<span class="trace-empty">Drop signals here, or right-click to add</span>{/if}
           </div>
         {/snippet}
       </ContextMenu.Trigger>
-      <ContextMenu.Content class="w-64">
+      <ContextMenu.Content class={menuChip ? 'menu-icons' : 'w-64'}>
+        {#if menuChip}
+          {@const item = plot.items.find((i) => i.key === menuChip)}
+          {@const side = slots ? (slots.left.includes(menuChip) ? 'left' : slots.right.includes(menuChip) ? 'right' : 'none') : null}
+          <!-- A signal's own menu: what it shows, how it looks, where it goes. -->
+          <ContextMenu.Item onSelect={() => showOnly(menuChip)}><RiShowOnly class="menu-icon" />Show only this</ContextMenu.Item>
+          {#if plot.items.some((i) => i.hidden)}
+            <ContextMenu.Item onSelect={showAll}><RiShowOnly class="menu-icon" />Show all</ContextMenu.Item>
+          {/if}
+          <ContextMenu.Item onSelect={() => toggleHidden(menuChip)}>{#if item?.hidden}<RiShowOnly class="menu-icon" />Show{:else}<RiHide class="menu-icon" />Hide{/if}</ContextMenu.Item>
+          <ContextMenu.Separator />
+          {#if side}
+            <ContextMenu.Sub>
+              <ContextMenu.SubTrigger><RiAxis class="menu-icon" />Axis</ContextMenu.SubTrigger>
+              <ContextMenu.SubContent>
+                <ContextMenu.RadioGroup value={side} onValueChange={(v) => setSide(menuChip, v)}>
+                  <ContextMenu.RadioItem value="left">Left</ContextMenu.RadioItem>
+                  <ContextMenu.RadioItem value="right">Right</ContextMenu.RadioItem>
+                  <ContextMenu.RadioItem value="none">None</ContextMenu.RadioItem>
+                </ContextMenu.RadioGroup>
+              </ContextMenu.SubContent>
+            </ContextMenu.Sub>
+          {/if}
+          <ContextMenu.Sub>
+            <ContextMenu.SubTrigger><RiMove class="menu-icon" />Move to</ContextMenu.SubTrigger>
+            <ContextMenu.SubContent class="max-w-72">
+              <ContextMenu.Item onSelect={() => onMoveSignal?.(menuChip, null)}>New plot</ContextMenu.Item>
+              {#if otherPlots.length}<ContextMenu.Separator />{/if}
+              {#each otherPlots as p (p.id)}<ContextMenu.Item onSelect={() => onMoveSignal?.(menuChip, p.id)}><span class="truncate">{p.label}</span></ContextMenu.Item>{/each}
+            </ContextMenu.SubContent>
+          </ContextMenu.Sub>
+          <ContextMenu.Separator />
+          <ContextMenu.Item variant="destructive" onSelect={() => item && remove(item.id)}><RiTrash class="menu-icon" />Remove<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+        {:else}
         <div class="add-filter">
           <!-- svelte-ignore a11y_autofocus -->
           <input
@@ -396,6 +632,7 @@
             aria-expanded="true"
             aria-controls="add-{plot.id}"
             aria-activedescendant="add-{plot.id}-{addActive}"
+            bind:this={addInput}
             bind:value={signalFilter}
             oninput={() => (addActive = 0)}
             onkeydown={filterKey}
@@ -427,14 +664,16 @@
         </ScrollArea>
         {#if plot.items.length}
           <ContextMenu.Separator />
-          <ContextMenu.Item variant="destructive" onSelect={() => (plot.items = [])}>Remove every signal</ContextMenu.Item>
+          <ContextMenu.Item variant="destructive" onSelect={removeAll}>Remove every signal</ContextMenu.Item>
+        {/if}
         {/if}
       </ContextMenu.Content>
     </ContextMenu.Root>
+    <IconButton icon={RiAddSignal} label="Add a signal" keys={['A']} class="add-signal" tabindex={-1} onclick={(e) => openAdd(e.currentTarget, false)} />
     <div class="plot-actions flex shrink-0 items-center">
       <IconButton
         icon={RiLegend}
-        label={plot.legend ? 'Unpin the legend' : 'Pin the legend in the corner'}
+        label={plot.legend ? 'Hide the legend' : 'Show the legend in the plot'}
         keys={['L']}
         class={plot.legend ? 'text-primary' : ''}
         aria-pressed={!!plot.legend}
@@ -443,7 +682,7 @@
       />
       <IconButton
         icon={streaming ? RiPause : RiPlay}
-        label={streaming ? 'Pause' : 'Stream from here'}
+        label={streaming ? 'Pause' : 'Follow live'}
         keys={['Space']}
         class={streaming ? '' : 'text-primary'}
         tabindex={-1}
@@ -456,63 +695,201 @@
     </div>
   </div>
 
-  <!-- The placed cursors: where each is, and every signal's value at it. -->
-  {#if legend.cursors}
-    {@const c = legend.cursors}
-    <!-- A scope's cursor readout: where A and B are, then each signal there. -->
-    <div class="cursor-readout">
-      <table>
-        <thead>
-          <tr>
-            <th></th>
-            <th class="a">A</th>
-            <th class="b">B</th>
-            <th>Δ = B − A</th>
-            {#if c.rate}<th></th>{/if}
-          </tr>
-        </thead>
-        <tbody>
-          <tr class="position">
-            <th><var>{c.x}</var></th>
-            <td>{c.a}</td>
-            <td>{c.b}</td>
-            <td>{c.d}</td>
-            {#if c.rate}<td class="rate"><span>1/Δ<var>t</var></span> {c.rate}</td>{/if}
-          </tr>
-          {#each shownItems as item (item.id)}
-            {@const r = legend.rows[item.key]}
-            <tr>
-              <th style="--c:{colorFor(item.key)}"><i></i>{item.key}</th>
-              <td>{r?.a ?? '—'}</td>
-              <td>{r?.b ?? '—'}</td>
-              <td>{r?.d ?? '—'}</td>
-              {#if c.rate}<td></td>{/if}
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
-  {/if}
+  <!-- The x axis's settings, as a y axis's: a time axis's window and
+       stream, a frequency axis's scale, and its cursors. -->
+  <Popover.Root bind:open={xAxisOpen}>
+    <Popover.Content customAnchor={axisAnchor} side="top" align="start" class="axis-pop w-auto gap-0 p-1.5">
+      <div class="axis-head">
+        {plot.kind === 'time' ? 'Time' : 'Frequency'}<span class="units">{plot.kind === 'time' ? 's' : 'Hz'}</span>
+        {#if plot.kind === 'time'}
+          <span class="axis-tools">
+            <Tip text={view.live ? 'Pause' : 'Follow live'} keys={['Space']}>
+              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={view.live ? 'Pause' : 'Follow live'} onclick={() => forTargets((v) => (view.live ? v.pause(performance.now()) : v.follow()))}>{#if view.live}<RiPause />{:else}<RiPlay />{/if}</button>{/snippet}
+            </Tip>
+          </span>
+        {/if}
+      </div>
+      {#if plot.kind === 'time'}
+        <div class="axis-row" role="group" aria-label="Window, in seconds">
+          <span>Window</span>
+          <div class="seg">
+            {#each SPANS as s}<button class:on={view.span === s} aria-pressed={view.span === s} onclick={() => forTargets((v) => ((v.span = s), v.notify()))}>{s}</button>{/each}
+          </div>
+          <span class="unit">s</span>
+        </div>
+      {:else}
+        <!-- The range as a phrase, low to high, in Hz, with the fit to every bin beside it. -->
+        <div class="axis-range" role="group" aria-label="Frequency range">
+          <input aria-label="Lowest frequency shown" type="text" inputmode="decimal" bind:value={fBounds.lo} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
+          <span>to</span>
+          <input aria-label="Highest frequency shown" type="text" inputmode="decimal" bind:value={fBounds.hi} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
+          <Tip text="Every frequency">
+            {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Show every frequency" onclick={() => ((plot.fRange = null), (xAxisOpen = false))}><RiFitX /></button>{/snippet}
+          </Tip>
+        </div>
+        {#if fBoundsError}<div class="axis-error">{fBoundsError}</div>{/if}
+        <div class="axis-row" role="group" aria-label="Frequency scale">
+          <span>Scale</span>
+          <div class="seg">
+            <button class:on={plot.xScale !== 'linear'} aria-pressed={plot.xScale !== 'linear'} onclick={() => (plot.xScale = 'log')}>Log</button>
+            <button class:on={plot.xScale === 'linear'} aria-pressed={plot.xScale === 'linear'} onclick={() => (plot.xScale = 'linear')}>Linear</button>
+          </div>
+        </div>
+      {/if}
+      <div class="axis-row" role="group" aria-label="X cursors">
+        <span>Cursors</span>
+        <Tip text="Add X1 and X2">
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" onclick={() => (pv?.addXCursors(), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
+        </Tip>
+        <Tip text="Zoom to X1–X2" keys={['Ctrl', 'drag']}>
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Zoom to the X cursors" onclick={() => (pv?.zoomToCursors(), (xAxisOpen = false))}><RiZoomTo /></button>{/snippet}
+        </Tip>
+        <Tip text="Clear the X cursors">
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear the X cursors" onclick={() => (pv?.clearXCursors(), (xAxisOpen = false))}><RiEraser /></button>{/snippet}
+        </Tip>
+      </div>
+    </Popover.Content>
+  </Popover.Root>
 
+  <!-- A y axis's settings: the signal it scales, its bounds and a fit. -->
+  <Popover.Root bind:open={axisOpen}>
+    <Popover.Content customAnchor={axisAnchor} side="right" align="start" class="axis-pop w-auto gap-0 p-1.5">
+      <div class="axis-head">
+        {#if axisKey}<i style="--c: {colorFor(axisKey)}"></i>{axisKey}{#if unitsOf(axisKey)}<span class="units">{unitsOf(axisKey)}</span>{/if}{:else}Y axis{/if}
+        {#if axisKey && plot.mode === 'independent'}
+          {@const other = region.side === 'left' ? 'right' : 'left'}
+          <span class="axis-tools">
+            <Tip text="Move this axis to the {other}">
+              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Move this axis to the {other}" onclick={() => (setSide(axisKey, other), (axisOpen = false))}>{#if other === 'left'}<RiToLeft />{:else}<RiToRight />{/if}</button>{/snippet}
+            </Tip>
+            <Tip text="Remove this axis; the signal keeps its own scale">
+              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Remove this axis" onclick={() => (setSide(axisKey, 'none'), (axisOpen = false))}><RiRemoveAxis /></button>{/snippet}
+            </Tip>
+          </span>
+        {/if}
+      </div>
+      <!-- The range as a phrase, low to high, with the fit beside it. -->
+      <div class="axis-range" role="group" aria-label="Y axis range">
+        <input aria-label="Lowest value shown" type="text" inputmode="decimal" bind:value={bounds.lo} onkeydown={boundsKey} onblur={applyBounds} />
+        <span>to</span>
+        <input aria-label="Highest value shown" type="text" inputmode="decimal" bind:value={bounds.hi} onkeydown={boundsKey} onblur={applyBounds} />
+        <Tip text="Fit to the data" keys={['double-click']}>
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Fit to the data" onclick={() => (pv?.fit(region.keys), (axisOpen = false))}><RiFit /></button>{/snippet}
+        </Tip>
+      </div>
+      {#if plot.kind === 'spectrum'}
+        <div class="axis-row" role="group" aria-label="Density scale">
+          <span>Scale</span>
+          <div class="seg">
+            <button class:on={plot.yScale !== 'linear'} aria-pressed={plot.yScale !== 'linear'} onclick={() => (plot.yScale = 'log')}>Log</button>
+            <button class:on={plot.yScale === 'linear'} aria-pressed={plot.yScale === 'linear'} onclick={() => (plot.yScale = 'linear')}>Linear</button>
+          </div>
+        </div>
+      {/if}
+      <!-- This axis's Y cursors, which a pull up off the x axis also draws out. -->
+      <div class="axis-row" role="group" aria-label="Y cursors">
+        <span>Cursors</span>
+        <Tip text="Add Y1 and Y2 on this axis">
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (pv?.addYCursors(region.keys?.[0]), (axisOpen = false))}><RiYCursors /></button>{/snippet}
+        </Tip>
+        <Tip text="Clear this axis's cursors">
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (pv?.clearYCursors(region.keys?.[0]), (axisOpen = false))}><RiEraser /></button>{/snippet}
+        </Tip>
+      </div>
+      {#if boundsError}<div class="axis-error">{boundsError}</div>{/if}
+    </Popover.Content>
+  </Popover.Root>
   <ContextMenu.Root bind:open={menuOpen}>
     <ContextMenu.Trigger>
       {#snippet child({ props })}
         <div {...props} class="plot-body" bind:this={body} oncontextmenucapture={contextAt}>
           <canvas bind:this={overlay}></canvas>
-          <!-- The pinned legend: each signal and its value, one short row
-               apiece in the corner, no taller than part of the plot. -->
+          <div class="axis-anchor" bind:this={axisAnchor} style="left: {axisAt.x}px; top: {axisAt.y}px"></div>
+          <!-- The legend: each signal and its value, one short row apiece,
+               no taller than part of the plot, where it was dragged to. -->
           {#if plot.legend && plot.items.length}
-            <div class="pinned-legend" role="list" aria-label="Legend">
+            {@const at = plot.legendAt ?? LEGEND_AT}
+            <div class="pinned-legend" data-focus-skip role="list" aria-label="Legend: drag to move" style="--x: {at.x}; --y: {at.y}" onpointerdown={(e) => dragOverlay(e, 'legendAt')}>
               {#each shownItems as item (item.id)}
                 <div class="row" role="listitem" style="--c:{colorFor(item.key)}" title={item.key}>
-                  <i></i><span class="name">{item.key}</span><span class="val">{legend.rows[item.key]?.value ?? ''}</span><span class="units">{unitsOf(item.key)}</span>
+                  <i></i><span class="name">{item.key}</span><span class="val">{legend.rows[item.key]?.value ?? ''}</span><span class="units">{unitsShown(item.key)}</span>
+                  <Tip text="Remove from this plot" keys={['Delete']}>
+                    {#snippet children(tip)}<button {...tip} class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>{/snippet}
+                  </Tip>
                 </div>
               {/each}
             </div>
           {/if}
+          <!-- The cursors' readout, a scope's: where X1 and X2 are, then each
+               signal there; then each y axis's Y1 and Y2. Column 1 is X1 or
+               Y1, 2 is X2 or Y2. It floats in the plot where it was dragged
+               to, as the legend does, taking none of the plot's height, and
+               its menu zooms to them or clears them. -->
+          {#if legend.cursors}
+            {@const c = legend.cursors}
+            {@const extra = !!c.x?.rate || c.ys.some((y) => y.ratio)}
+            {@const at = plot.readoutAt ?? READOUT_AT}
+            <div class="readout-layer" oncontextmenu={(e) => e.stopPropagation()}>
+              <ContextMenu.Root bind:open={readoutOpen}>
+                <ContextMenu.Trigger>
+                  {#snippet child({ props })}
+                    <div {...props} class="cursor-readout" data-focus-skip role="group" aria-label="Cursor readout: drag to move" style="--x: {at.x}; --y: {at.y}" onpointerdowncapture={(e) => dragOverlay(e, 'readoutAt')}>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th></th>
+                            <th class="a">1</th>
+                            <th class="b">2</th>
+                            <th>Δ = 2 − 1</th>
+                            {#if extra}<th></th>{/if}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {#if c.x}
+                            <tr class="position">
+                              <th>X <var>{c.x.v}</var></th>
+                              <td>{c.x.a}</td>
+                              <td>{c.x.b}</td>
+                              <td>{c.x.d}</td>
+                              {#if extra}<td class="rate">{#if c.x.rate}<span>1/Δ<var>t</var></span> {c.x.rate}{/if}</td>{/if}
+                            </tr>
+                            {#each shownItems as item (item.id)}
+                              {@const r = legend.rows[item.key]}
+                              <tr>
+                                <th style="--c:{colorFor(item.key)}"><i></i>{item.key}</th>
+                                <td>{r?.a ?? '—'}</td>
+                                <td>{r?.b ?? '—'}</td>
+                                <td>{r?.d ?? '—'}</td>
+                                {#if extra}<td></td>{/if}
+                              </tr>
+                            {/each}
+                          {/if}
+                          {#each c.ys as y (y.key)}
+                            <tr class="position">
+                              <th style={y.color ? `--c:${y.color}` : ''}>Y {#if y.color}<i></i>{/if}{y.name}</th>
+                              <td>{y.a}</td>
+                              <td>{y.b}</td>
+                              <td>{y.d}</td>
+                              {#if extra}<td class="rate">{y.ratio}</td>{/if}
+                            </tr>
+                          {/each}
+                        </tbody>
+                      </table>
+                    </div>
+                  {/snippet}
+                </ContextMenu.Trigger>
+                <ContextMenu.Content class="menu-icons">
+                  {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2</ContextMenu.Item><ContextMenu.Separator />{/if}
+                  {#if c.x}<ContextMenu.Item onSelect={() => pv?.clearXCursors()}><RiXCursors class="menu-icon" />Clear X cursors</ContextMenu.Item>{/if}
+                  {#if c.ys.length}<ContextMenu.Item onSelect={() => c.ys.forEach((y) => pv?.clearYCursors(y.key))}><RiYCursors class="menu-icon" />Clear Y cursors</ContextMenu.Item>{/if}
+                  <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors<ContextMenu.Shortcut><kbd>Esc</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+                </ContextMenu.Content>
+              </ContextMenu.Root>
+            </div>
+          {/if}
           <div
             class="legend-zone"
-            use:dndzone={{ items: bodyItems, type: 'trace', flipDurationMs: 0, dropTargetStyle: {}, dropTargetClasses: [], dropAnimationDisabled: true, zoneTabIndex: -1, zoneItemTabIndex: -1 }}
+            use:dndzone={{ items: bodyItems, type: 'trace', flipDurationMs: 0, dropTargetStyle: {}, dropTargetClasses: [], dropAnimationDisabled: true, morphDisabled: true, zoneTabIndex: -1, zoneItemTabIndex: -1 }}
             onconsider={bodyConsider}
             onfinalize={bodyFinalize}
           >
@@ -521,55 +898,41 @@
         </div>
       {/snippet}
     </ContextMenu.Trigger>
-    <ContextMenu.Content class="w-56">
-      {#if region.kind === 'y'}
-        <!-- A y axis: its bounds, typed in, in the units the axis shows. -->
-        <ContextMenu.Label>Y axis{region.keys.length === 1 && plot.mode !== 'overlay' ? ` · ${region.keys[0]}` : ''}</ContextMenu.Label>
-        <div class="bounds" role="group" aria-label="Y axis bounds">
-          <label>Max <input type="text" inputmode="decimal" bind:value={bounds.hi} onkeydown={boundsKey} /></label>
-          <label>Min <input type="text" inputmode="decimal" bind:value={bounds.lo} onkeydown={boundsKey} /></label>
-          {#if boundsError}<span class="error">{boundsError}</span>{/if}
-        </div>
-        <ContextMenu.Item onSelect={applyBounds}>Set bounds<ContextMenu.Shortcut>Enter</ContextMenu.Shortcut></ContextMenu.Item>
-        <ContextMenu.Item onSelect={() => pv?.fit(region.keys)}>Fit to data<ContextMenu.Shortcut>double-click</ContextMenu.Shortcut></ContextMenu.Item>
-      {:else if region.kind === 'x' && plot.kind === 'time'}
-        <!-- The time axis: the window, and following the stream. -->
-        <ContextMenu.Label>Time axis</ContextMenu.Label>
-        {#if view.live}
-          <ContextMenu.Item onSelect={() => forTargets((v) => v.pause(performance.now()))}>Pause<ContextMenu.Shortcut>Space</ContextMenu.Shortcut></ContextMenu.Item>
-        {:else}
-          <ContextMenu.Item onSelect={() => forTargets((v) => v.resume(performance.now()))}>Stream from here<ContextMenu.Shortcut>Space</ContextMenu.Shortcut></ContextMenu.Item>
-        {/if}
-        {#if !view.atNewest}<ContextMenu.Item onSelect={() => forTargets((v) => v.follow())}>Follow live</ContextMenu.Item>{/if}
-        <ContextMenu.Item onSelect={onClearCursors}>Clear cursors<ContextMenu.Shortcut>Esc</ContextMenu.Shortcut></ContextMenu.Item>
-        <ContextMenu.Separator />
-        <ContextMenu.Label>Window</ContextMenu.Label>
-        <ContextMenu.RadioGroup value={String(view.span)} onValueChange={(s) => forTargets((v) => ((v.span = +s), v.notify()))}>
-          {#each SPANS as s}<ContextMenu.RadioItem value={String(s)}>{s} s</ContextMenu.RadioItem>{/each}
-        </ContextMenu.RadioGroup>
-      {:else}
-      <ContextMenu.Item onSelect={() => onSplit('row')}>Split right</ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => onSplit('col')}>Split down</ContextMenu.Item>
-      <ContextMenu.Item onSelect={onMaximize}>{maximized ? 'Restore' : 'Maximize'}</ContextMenu.Item>
-      <ContextMenu.Item onSelect={onClearCursors}>Clear cursors<ContextMenu.Shortcut>Esc</ContextMenu.Shortcut></ContextMenu.Item>
+    <ContextMenu.Content class="menu-icons">
+      <!-- Three groups, as dense menus keep them: where the plot is, what it
+           shows, and closing it, each a key away. -->
+      <ContextMenu.Item onSelect={() => onSplit('row')}><RiSplitH class="menu-icon" />Split right<ContextMenu.Shortcut><kbd>|</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => onSplit('col')}><RiSplitV class="menu-icon" />Split down<ContextMenu.Shortcut><kbd>_</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Item onSelect={onMaximize}>{#if maximized}<RiFullscreenExit class="menu-icon" />Restore{:else}<RiFullscreen class="menu-icon" />Maximize{/if}<ContextMenu.Shortcut><kbd>F</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Sub>
-        <ContextMenu.SubTrigger disabled={!otherTabs.length}>Move to tab</ContextMenu.SubTrigger>
+        <ContextMenu.SubTrigger disabled={!otherTabs.length}><RiTab class="menu-icon" />Move to tab</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
           {#each otherTabs as t (t.id)}<ContextMenu.Item onSelect={() => onMoveToTab(t.id)}>{t.name}</ContextMenu.Item>{/each}
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
       <ContextMenu.Separator />
-      <ContextMenu.Label>Kind</ContextMenu.Label>
-      <ContextMenu.RadioGroup value={plot.kind} onValueChange={(v) => (plot.kind = v)}>
-        {#each KINDS as [kind, kl]}<ContextMenu.RadioItem value={kind}>{kl}</ContextMenu.RadioItem>{/each}
-      </ContextMenu.RadioGroup>
-      <ContextMenu.Label>Layout</ContextMenu.Label>
-      <ContextMenu.RadioGroup value={plot.mode} onValueChange={(v) => (plot.mode = v)}>
-        {#each MODES as [mode, ml]}<ContextMenu.RadioItem value={mode}>{ml}</ContextMenu.RadioItem>{/each}
-      </ContextMenu.RadioGroup>
+      <ContextMenu.Sub>
+        <ContextMenu.SubTrigger><RiKind class="menu-icon" />Kind</ContextMenu.SubTrigger>
+        <ContextMenu.SubContent>
+          <ContextMenu.RadioGroup value={plot.kind} onValueChange={(v) => (plot.kind = v)}>
+            {#each KINDS as [kind, kl]}<ContextMenu.RadioItem value={kind}>{kl}</ContextMenu.RadioItem>{/each}
+          </ContextMenu.RadioGroup>
+        </ContextMenu.SubContent>
+      </ContextMenu.Sub>
+      <ContextMenu.Sub>
+        <ContextMenu.SubTrigger><RiLayout class="menu-icon" />Layout</ContextMenu.SubTrigger>
+        <ContextMenu.SubContent>
+          <ContextMenu.RadioGroup value={plot.mode} onValueChange={(v) => (plot.mode = v)}>
+            {#each MODES as [mode, ml]}<ContextMenu.RadioItem value={mode}>{ml}</ContextMenu.RadioItem>{/each}
+          </ContextMenu.RadioGroup>
+        </ContextMenu.SubContent>
+      </ContextMenu.Sub>
+      <!-- Cursors are dragged out of the axes; these place a pair in view. -->
+      <ContextMenu.Item onSelect={() => pv?.addXCursors()}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => pv?.addYCursors(region.keys?.[0])}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
+      <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors<ContextMenu.Shortcut><kbd>Esc</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Separator />
-      <ContextMenu.Item variant="destructive" onSelect={onRemove}>Close plot</ContextMenu.Item>
-      {/if}
+      <ContextMenu.Item variant="destructive" onSelect={onRemove}><RiClose class="menu-icon" />Close plot<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
     </ContextMenu.Content>
   </ContextMenu.Root>
 </div>

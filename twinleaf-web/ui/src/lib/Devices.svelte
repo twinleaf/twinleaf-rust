@@ -22,7 +22,7 @@
     <div role="list" aria-label="Devices">
       {#each devices as d (d.route)}
         <label class="device" role="listitem" title="{d.serial ?? ''} {d.firmware ?? ''}">
-          <Checkbox checked={!unchecked.has(d.route)} onCheckedChange={(on) => (on ? unchecked.delete(d.route) : unchecked.add(d.route))} />
+          <Checkbox aria-label="Show {d.route} in the panels" checked={!unchecked.has(d.route)} onCheckedChange={(on) => (on ? unchecked.delete(d.route) : unchecked.add(d.route))} />
           <i class="presence {d.presence}" aria-label={d.presence}></i>
           <span class="route">{d.route}</span>
           <span class="name">{d.name ?? '…'}</span>

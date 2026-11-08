@@ -337,6 +337,7 @@ impl Hub {
         let stream = batch.stream_key();
         let schema = batch.schema();
         let rate = batch.metadata().rate_hz();
+        let epoch = batch.metadata().segment().epoch().to_string();
         for (index, column) in schema.columns().enumerate() {
             use twinleaf::proto::data::DataType;
             if !matches!(column.data_type(), DataType::F64 | DataType::F32) {
@@ -353,6 +354,7 @@ impl Hub {
                 column: column.name().to_string(),
                 units: column.units().to_string(),
                 rate,
+                epoch: epoch.clone(),
             };
             let window = ((rate * 8.0) as usize).clamp(256, WELCH_WINDOW);
             let decimation = Fpcs::new(ratio_for(rate, self.points_per_second), HISTORY_SECONDS);

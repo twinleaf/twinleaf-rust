@@ -87,6 +87,8 @@ export function decodeFrame(buf) {
 
 /** The page's message naming the trace ids it shows as spectra. */
 export const spectraMessage = (ids) => JSON.stringify({ type: 'spectra', traces: ids });
+/** Whether the page holds a plot paused, so the hub holds its history as it was then. */
+export const holdMessage = (on) => JSON.stringify({ type: 'hold', on });
 
 /** Sends one /api request and returns its reply, or throws the server's refusal as an Error. */
 async function request(path, { query, body } = {}) {

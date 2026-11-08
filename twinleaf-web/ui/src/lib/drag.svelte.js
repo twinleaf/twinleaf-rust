@@ -6,8 +6,8 @@
 // plot, cells along the layout's outer edge. A cell shows only where a drop
 // could go, and the one under the pointer is the target, named beside it.
 
-import { dock, dockNode, dockOuter, leaf, plotIds, presets, removeAll, restrict, swap } from './layout.js';
-import { newPlot } from './tabs.js';
+import { dock, dockNode, dockOuter, holderDir, leaf, leafSize, placeEdge, plotIds, presets, removeAll, restrict } from './layout.js';
+import { chip, newPlot } from './tabs.js';
 import { DRAG_START } from './constants.js';
 
 /** The smallest plot a split may leave, in px. */
@@ -16,13 +16,19 @@ const MIN_PLOT = { w: 160, h: 100 };
 const CELL = 34, STEP = 42, OUTER_INSET = 24;
 const SIDES = { left: [-1, 0], right: [1, 0], top: [0, -1], bottom: [0, 1] };
 /**
- * What is moved keeps its size: docked beside a plot, it takes as much of
- * that plot's width or height as it had, within SHARE.
+ * What is moved takes the size it last had that way: docked beside a plot,
+ * the width it had when it last stood beside one, and docked above or below,
+ * the height it had when it last stood above or below one, each kept as a
+ * share of the whole layout (as VS Code keeps its panel's size per
+ * position). With none, it takes half of the plot it docks by. Either way,
+ * within SHARE of that plot.
  */
 const SHARE = [0.2, 0.8];
 /** The share of the layout a signal dropped on an outer cell opens its plot with. */
 const OUTER_SHARE = 1 / 3;
 const LANDED_MS = 700;
+/** The empty background a box selection starts on, besides what listens for it: a dock, a panel's body, a list's own space below its items. */
+const EMPTY = '.dock, .dock-side, .dock-body, .palette, [data-slot=scroll-area-viewport]';
 
 const isColumn = (edge) => edge === 'left' || edge === 'right';
 const roomFor = (r, edge) => (isColumn(edge) ? r.width / 2 >= MIN_PLOT.w : r.height / 2 >= MIN_PLOT.h);
@@ -81,10 +87,17 @@ export class Drags {
   drop = $state(null);
   /** The compass cells shown. */
   compass = $state(null);
+  /** Where a plot being moved would land, {x, y, w, h, outer} in client px, drawn over the plots. */
+  preview = $state(null);
   /** The selection box, {x, y, w, h} in client px. */
   marquee = $state(null);
   /** Plots that just landed, flashed so the eye finds them. */
   landed = $state(null);
+  /**
+   * Which side's axes a signal dropped at (x, y) on plot `plotId` would
+   * join, as {side, rect}, or null: set by the page, which has the plots.
+   */
+  axisDropAt = null;
   /** Where the last signal drag ended, {plotId, edge}, read as its drop lands. */
   traceDrop = null;
   traceDragging = false;
@@ -103,10 +116,12 @@ export class Drags {
   /**
    * A drag that starts on empty background draws a box and selects every
    * plot it touches. Shift adds to the selection. A click there clears it
-   * and the plot clicked last.
+   * and the plot clicked last. Empty background is the element listening,
+   * or one of EMPTY: a dock below its panels, a panel's body, or a list
+   * below its last item.
    */
   startMarquee(e) {
-    if (e.button !== 0 || e.target !== e.currentTarget) return;
+    if (e.button !== 0 || (e.target !== e.currentTarget && !e.target.matches?.(EMPTY))) return;
     const ws = this.ws;
     const base = e.shiftKey ? [...ws.selected] : [];
     const [x0, y0] = [e.clientX, e.clientY];
@@ -140,11 +155,13 @@ export class Drags {
    * Picks plot `plotId` up by its header or grip once the pointer moves a
    * few pixels, so a click or double-click there stays one.
    *
-   * While it is held, the tab shows the layout a drop would leave. The
-   * target is read against the plots as they were laid out when it was
-   * picked up, so the plots moving under the pointer do not move it. A
+   * While it is held, the layout stays as it is, and a box over it shows
+   * where the plot would land; the layout changes once, on the drop. A
    * selected plot carries the whole selection, which docks beside another
-   * plot or moves to another tab, and swaps with nothing. Dropped on an
+   * plot or moves to another tab. Dropped on a plot's middle, what is moved
+   * takes its place, as in a list: before it when it came from after it in
+   * reading order, after it otherwise, along the split that holds it, and
+   * that plot moves along beside it. Dropped on an
    * outer cell, what is moved becomes a row or column across the layout. A
    * group that lands in a column stacks, and one in a row lines up, in the
    * order it read.
@@ -156,7 +173,7 @@ export class Drags {
     const [x0, y0] = [e.clientX, e.clientY];
     const group = new Set(ws.selected.has(plotId) && ws.selected.size > 1 ? ws.selected : [plotId]);
     let lifted = null; // {original, rects, tiles, size} once picked up
-    let shown = null; // the target the tab shows
+    let shown = null; // the target the preview shows
     const targetAt = (x, y) => {
       const under = document.elementsFromPoint(x, y).find((el) => !el.closest('.move-ghost, .compass'));
       const tabEl = under?.closest('[data-tab]');
@@ -170,34 +187,57 @@ export class Drags {
       const { cells, hit } = compassAt(x, y, {
         plotId: over?.id,
         r: over?.r,
-        middle: group.size === 1 && 'Swap places',
+        middle: 'Take its place',
         side: (edge) => `Dock ${edge}`,
         tiles: lifted.tiles,
         outer: (edge) => `New ${isColumn(edge) ? 'column' : 'row'} at ${edge}`,
       });
       this.compass = cells;
       if (!hit) return null;
-      return hit.outer ? { outer: true, edge: hit.edge, label: hit.label } : { plotId: hit.plotId, edge: hit.edge, label: hit.label };
+      if (hit.outer) return { outer: true, edge: hit.edge, label: hit.label };
+      // Taking a plot's place is docking on the edge a list's reorder would
+      // pick, along the split that held it before anything moved.
+      if (hit.edge === 'center') {
+        const order = plotIds(lifted.original);
+        const first = order.find((id) => group.has(id));
+        const before = order.indexOf(first) > order.indexOf(hit.plotId);
+        return { plotId: hit.plotId, edge: placeEdge(lifted.original, hit.plotId, before), label: hit.label };
+      }
+      return { plotId: hit.plotId, edge: hit.edge, label: hit.label };
     };
-    const show = (target) => {
-      const same = (a, b) => a?.plotId === b?.plotId && a?.edge === b?.edge && a?.tabId === b?.tabId && a?.outer === b?.outer;
-      if (same(target, shown)) return;
-      shown = target;
-      const { original, tiles, size } = lifted;
-      const across = (edge) => (isColumn(edge) ? 'w' : 'h');
+    const across = (edge) => (isColumn(edge) ? 'width' : 'height');
+    const shareOf = (edge, room) => {
+      const dim = across(edge), remembered = lifted.size[dim === 'width' ? 'w' : 'h'];
+      return clampShare(remembered === undefined ? 0.5 : (remembered * lifted.tiles[dim]) / room[dim]);
+    };
+    /** The part of box `r` along its `edge`, `share` of it deep. */
+    const part = (r, edge, share) => {
+      const w = isColumn(edge) ? r.width * share : r.width, h = isColumn(edge) ? r.height : r.height * share;
+      return { x: edge === 'right' ? r.right - w : r.left, y: edge === 'bottom' ? r.bottom - h : r.top, w, h };
+    };
+    /** Where `target` would put what is moved, as a box over the plots, or null. */
+    /**
+     * The size plot `id` will have once what is moved is out of the layout,
+     * which a dock beside it shares: taking a plot out of a split gives its
+     * neighbour its room, so measuring the neighbour as it is now would give
+     * what is moved more than it had, a little more at every move.
+     */
+    const roomOf = (id) => leafSize(removeAll(lifted.original, group), id, lifted.tiles.width, lifted.tiles.height) ?? lifted.rects.get(id);
+    const previewOf = (target) => {
+      if (!target || target.tabId) return null;
+      if (target.outer) return { ...part(lifted.tiles, target.edge, shareOf(target.edge, lifted.tiles)), outer: true };
+      // Drawn over the plot as it is now, at the size the dock will give.
+      const r = lifted.rects.get(target.plotId), room = roomOf(target.plotId), dim = across(target.edge);
+      return part(r, target.edge, Math.min(0.95, (shareOf(target.edge, room) * room[dim]) / r[dim]));
+    };
+    /** The layout `target` leaves. */
+    const layoutFor = (target) => {
+      const { original, tiles } = lifted;
       const rest = removeAll(original, group);
       const order = plotIds(restrict(original, group));
-      const moved = !target?.edge || group.size === 1 ? restrict(original, group) : isColumn(target.edge) ? presets.rows(order) : presets.columns(order);
-      if (!target || target.tabId) ws.tab.layout = original;
-      else if (target.outer) {
-        const total = across(target.edge) === 'w' ? tiles.width : tiles.height;
-        ws.tab.layout = dockOuter(rest, moved, target.edge, clampShare(size[across(target.edge)] / total));
-      } else if (target.edge === 'center') ws.tab.layout = swap(original, plotId, target.plotId);
-      else {
-        const r = lifted.rects.get(target.plotId);
-        const room = across(target.edge) === 'w' ? r.width : r.height;
-        ws.tab.layout = dockNode(rest, moved, target.plotId, target.edge, clampShare(size[across(target.edge)] / room));
-      }
+      const moved = group.size === 1 ? restrict(original, group) : isColumn(target.edge) ? presets.rows(order) : presets.columns(order);
+      if (target.outer) return dockOuter(rest, moved, target.edge, shareOf(target.edge, tiles));
+      return dockNode(rest, moved, target.plotId, target.edge, shareOf(target.edge, roomOf(target.plotId)));
     };
     follow(
       (ev) => {
@@ -205,31 +245,37 @@ export class Drags {
           if (Math.hypot(ev.clientX - x0, ev.clientY - y0) < DRAG_START) return;
           const leaves = [...document.querySelectorAll('.leaf[data-plot]')];
           const rects = new Map(leaves.map((el) => [el.dataset.plot, el.getBoundingClientRect()]));
-          const own = [...group].map((id) => rects.get(id)).filter(Boolean);
-          // One plot keeps its size; a group that fits a slot keeps the size of its largest plot.
-          const size =
-            group.size > 1
-              ? { w: Math.max(...own.map((r) => r.width)), h: Math.max(...own.map((r) => r.height)) }
-              : { w: own[0]?.width ?? 0, h: own[0]?.height ?? 0 };
-          lifted = { original: ws.tab.layout, rects, size, tiles: document.querySelector('.tiles').getBoundingClientRect() };
+          const tiles = document.querySelector('.tiles').getBoundingClientRect();
+          // A plot remembers the width it has beside another, or the height
+          // it has above or below one, as a share of the layout. A group
+          // remembers nothing and takes half.
+          let size = {};
+          const plot = ws.plots[plotId], r = rects.get(plotId);
+          if (group.size === 1 && plot && r) {
+            const dir = holderDir(ws.tab.layout, plotId);
+            if (dir === 'row') plot.dockSize = { ...plot.dockSize, w: r.width / tiles.width };
+            if (dir === 'col') plot.dockSize = { ...plot.dockSize, h: r.height / tiles.height };
+            size = plot.dockSize ?? {};
+          }
+          lifted = { original: ws.tab.layout, rects, size, tiles };
           ws.maximized = null;
         }
-        const target = targetAt(ev.clientX, ev.clientY);
-        this.moving = { plotId, group, x: ev.clientX, y: ev.clientY, target };
-        show(target);
+        shown = targetAt(ev.clientX, ev.clientY);
+        this.moving = { plotId, group, x: ev.clientX, y: ev.clientY, target: shown };
+        this.preview = previewOf(shown);
       },
       (ev) => {
         this.compass = null;
-        if (!lifted) return;
-        // The layout shown is the one kept, but for a move to another tab, and
-        // a cancelled drag puts everything back.
-        if (ev.type === 'pointercancel') ws.tab.layout = lifted.original;
-        else if (shown?.tabId) {
-          ws.tab.layout = lifted.original;
+        this.preview = null;
+        this.moving = null;
+        if (!lifted || !shown || ev.type === 'pointercancel') return;
+        if (shown.tabId) {
           for (const id of group) ws.movePlotToTab(id, shown.tabId);
           ws.selected.clear();
-        } else if (shown) this.flash(group);
-        this.moving = null;
+        } else {
+          ws.tab.layout = layoutFor(shown);
+          this.flash(group);
+        }
       },
     );
   }
@@ -255,6 +301,15 @@ export class Drags {
       const plotId = el?.dataset.plot;
       const tiles = document.querySelector('.tiles')?.getBoundingClientRect();
       const onTiles = tiles && x >= tiles.left && x < tiles.right && y >= tiles.top && y < tiles.bottom;
+      // Beside an independent plot's edge, the signal joins that side's axes.
+      const axis = plotId && under.closest('.plot-body') ? this.axisDropAt?.(plotId, x, y) : null;
+      if (axis) {
+        this.compass = null;
+        this.drop = { plotId, edge: 'axis', side: axis.side };
+        this.preview = { ...axis.rect, label: `${axis.side === 'left' ? 'Left' : 'Right'} axis` };
+        return;
+      }
+      this.preview = null;
       if (!this.ws.layout || !onTiles || (plotId && !under.closest('.plot-body'))) {
         this.compass = null;
         this.drop = plotId ? { plotId, edge: 'add' } : onTiles && !this.ws.layout ? { outer: true } : null;
@@ -279,21 +334,33 @@ export class Drags {
       this.traceDrop = this.drop?.edge === 'add' ? null : this.drop;
       this.drop = null;
       this.compass = null;
+      this.preview = null;
       this.traceDragging = false;
     });
   }
 
   /**
    * Opens a plot with `key` where the last signal drag ended, beside a
-   * plot's edge or along the layout's, if it ended on one, and says whether
-   * it did. The layout changes after the caller's drop handler returns,
+   * plot's edge or along the layout's, or gives it an axis on an independent
+   * plot's side, if it ended on one. Returns {plotId} of the plot it went
+   * to, or false. The layout changes after the caller's drop handler returns,
    * since the change replaces the plot that is handling the drop.
    */
   dockTrace(key) {
     if (!this.traceDrop) return false;
-    const { plotId, edge } = this.traceDrop;
+    const { plotId, edge, side } = this.traceDrop;
     this.traceDrop = null;
     const ws = this.ws;
+    // Beside an independent plot's edge: the signal joins that plot, its axis on that side.
+    if (edge === 'axis') {
+      queueMicrotask(() => {
+        const p = ws.plots[plotId];
+        if (!p) return;
+        if (!p.items.some((i) => i.key === key)) p.items.push(chip(key));
+        p.axisSides = { ...p.axisSides, [key]: side };
+      });
+      return { plotId };
+    }
     queueMicrotask(() => {
       const p = newPlot(ws.plots[plotId]?.kind ?? 'time', 'overlay', [key]);
       ws.tab.plots[p.id] = p;

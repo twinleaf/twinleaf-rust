@@ -4,7 +4,7 @@
   import * as Command from '$lib/components/ui/command/index.js';
   import { ARRANGEMENTS } from './constants.js';
 
-  /** `act` holds the page's actions: addToFocused(key), newPlot(keys), followLive(), clearCursors(), exportTabs(), importTabs(). */
+  /** `act` holds the page's actions: toggleDock(side), dockShown(side), addToFocused(key), newPlot(keys), followLive(), clearCursors(), exportTabs(), importTabs(). */
   let { open = $bindable(false), session, ws, act } = $props();
 
   /** Closes the palette, then runs `fn`. */
@@ -35,6 +35,11 @@
       {/each}
       <Command.Item onSelect={() => run(() => ws.addTab())}>New layout tab</Command.Item>
       <Command.Item onSelect={() => run(() => ws.duplicateTab(ws.tab))}>Duplicate this tab</Command.Item>
+    </Command.Group>
+    <Command.Group heading="Docks">
+      {#each ['left', 'right'] as side}
+        <Command.Item value={`dock ${side}`} onSelect={() => run(() => act.toggleDock(side))}>{act.dockShown(side) ? 'Hide' : 'Show'} the {side} dock</Command.Item>
+      {/each}
     </Command.Group>
     <Command.Group heading="Arrange">
       {#each ARRANGEMENTS as [name, label]}

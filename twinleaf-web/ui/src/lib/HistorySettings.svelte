@@ -1,8 +1,8 @@
 <script>
-  // The raw history the hub keeps, as one sentence: keep a span of each
-  // stream's own time, or so much memory across every stream, whichever
-  // comes first. The caption names the limit that comes first at the
-  // streams' current rate.
+  // The raw history the hub keeps: a span of each stream's own time, or so
+  // much memory across every stream, whichever comes first, as two rows of
+  // a label and its control (plot.css, .set-grid). The caption names the
+  // limit that comes first at the streams' current rate.
   //
   // The waterline is the memory held of the budget, and its tick is where
   // the span of time would fill it. A tick inside the bar means time comes
@@ -32,39 +32,50 @@
       : `No stream is adding data. Holding ${bytesText(memory.bytes)}.`,
   );
 
+  /** The limit that comes first at the current rate, whose value shows bright: `time`, `memory` or none. */
+  const binding = $derived(tick >= 1 ? 'memory' : tick > 0 ? 'time' : null);
+
   const setBudget = (i) => api.setHistory(memory.maxAge, HISTORY_BUDGETS[i]);
 </script>
 
 <div class="history-set">
-  <div class="history-line">
-    <span>Keep</span>
+  <div class="set-grid">
+    <span>Time limit</span>
     <Select.Root type="single" value={String(memory.maxAge)} onValueChange={(v) => api.setHistory(+v, memory.budget)}>
-      <Select.Trigger size="sm" class="w-[4.75rem] px-2 py-0 text-xs data-[size=sm]:h-6" aria-label="Time limit">{spanText(memory.maxAge)}</Select.Trigger>
+      <Select.Trigger size="sm" class="w-full text-xs {binding === 'time' ? 'text-foreground' : 'text-muted-foreground'}" aria-label="Time limit">{spanText(memory.maxAge)}</Select.Trigger>
       <Select.Content>
         {#each HISTORY_SPANS as s}<Select.Item value={String(s)} label={spanText(s)} />{/each}
       </Select.Content>
     </Select.Root>
-    <span>or</span>
+    <span>Memory limit</span>
     <div class="stepper" role="group" aria-label="Memory limit">
       <button aria-label="Less memory" disabled={step === 0} onclick={() => setBudget(step - 1)}><RiMinus /></button>
-      <span>{bytesText(memory.budget)}</span>
+      <span class:muted={binding !== 'memory'}>{bytesText(memory.budget)}</span>
       <button aria-label="More memory" disabled={step === HISTORY_BUDGETS.length - 1} onclick={() => setBudget(step + 1)}><RiPlus /></button>
     </div>
   </div>
-  <div class="waterline" role="meter" aria-label="Memory held" aria-valuenow={memory.bytes} aria-valuemin={0} aria-valuemax={memory.budget}>
-    <div class="fill" style="width: {held * 100}%"></div>
-    {#if tick > 0 && tick < 1}<div class="tick" style="left: {tick * 100}%"></div>{/if}
-  </div>
-  <div class="water-caption">
-    {#if tick >= 1}
-      <span>Whichever first: <b class="short">memory</b>, at {spanText(lasts)}</span>
-    {:else if tick > 0}
-      <span>Whichever first: <b>time</b>, at {bytesEstimate(memory.rate * memory.maxAge)}</span>
-    {:else}
-      <span>Whichever comes first</span>
-    {/if}
-    <Tip text={info}>
-      {#snippet children(tip)}<button {...tip} class="info" aria-label={info}><RiInfo /></button>{/snippet}
-    </Tip>
+  <div class="water">
+    <div class="waterline" role="meter" aria-label="Memory held" aria-valuenow={memory.bytes} aria-valuemin={0} aria-valuemax={memory.budget}>
+      <div class="fill" style="width: {held * 100}%"></div>
+      {#if tick > 0 && tick < 1}<div class="tick" style="left: {tick * 100}%"></div>{/if}
+    </div>
+    <div class="water-notes">
+      <div class="water-caption">
+        {#if tick >= 1}
+          <span>Whichever first: <b class="short">memory</b>, at {spanText(lasts)}</span>
+        {:else if tick > 0}
+          <span>Whichever first: <b>time</b>, at {bytesEstimate(memory.rate * memory.maxAge)}</span>
+        {:else}
+          <span>Whichever comes first</span>
+        {/if}
+        <Tip text={info}>
+          {#snippet children(tip)}<button {...tip} class="info" aria-label={info}><RiInfo /></button>{/snippet}
+        </Tip>
+      </div>
+      {#if memory.held}
+        <!-- What holding the paused plots' capture costs: what the history would have dropped since. -->
+        <div>Paused plots hold {bytesEstimate(memory.held.bytes)} more</div>
+      {/if}
+    </div>
   </div>
 </div>

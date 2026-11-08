@@ -51,12 +51,21 @@ export function dock(root, plotId, targetId, edge) {
   });
 }
 
-/** Swaps the plots shown by two leaves. */
-export function swap(root, p, q) {
-  const tmp = '\0';
-  let t = mapLeaf(root, p, (l) => ({ ...l, plotId: tmp }));
-  t = mapLeaf(t, q, (l) => ({ ...l, plotId: p }));
-  return mapLeaf(t, tmp, (l) => ({ ...l, plotId: q }));
+/** The direction of the split holding the leaf showing `targetId`: null for a leaf alone, undefined when no leaf shows it. */
+export function holderDir(node, targetId, dir = null) {
+  if (node.type === 'leaf') return node.plotId === targetId ? dir : undefined;
+  return holderDir(node.a, targetId, node.dir) ?? holderDir(node.b, targetId, node.dir);
+}
+
+/**
+ * The edge of the leaf showing `targetId` that a plot taking its place
+ * goes on, as a list's reorder places an item: along the split holding the
+ * leaf, before it when `before`, after it otherwise. A leaf alone splits
+ * side by side.
+ */
+export function placeEdge(root, targetId, before) {
+  const row = (holderDir(root, targetId) ?? 'row') === 'row';
+  return row ? (before ? 'left' : 'right') : before ? 'top' : 'bottom';
 }
 
 /** Splits the leaf showing `targetId`, putting `plotId` after it. */
@@ -90,6 +99,19 @@ export const presets = {
   /** One large plot on the left, the rest stacked on the right. */
   focus: (ids) => (ids.length < 2 ? leaf(ids[0]) : split('row', leaf(ids[0]), chain(ids.slice(1).map(leaf), 'col'), 0.6)),
 };
+
+/**
+ * The size {width, height} the leaf showing `plotId` has in a `width` by
+ * `height` area, by its splits' ratios, or null when no leaf shows it.
+ */
+export function leafSize(node, plotId, width, height) {
+  if (!node) return null;
+  if (node.type === 'leaf') return node.plotId === plotId ? { width, height } : null;
+  const row = node.dir === 'row';
+  const [wa, ha] = row ? [width * node.ratio, height] : [width, height * node.ratio];
+  const [wb, hb] = row ? [width - wa, height] : [width, height - ha];
+  return leafSize(node.a, plotId, wa, ha) ?? leafSize(node.b, plotId, wb, hb);
+}
 
 /** The tree with only the leaves showing `ids`, a Set, kept as they are arranged. */
 export const restrict = (node, ids) => keepOnly(node, (id) => ids.has(id));

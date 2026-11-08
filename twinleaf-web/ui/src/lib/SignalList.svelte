@@ -12,6 +12,10 @@
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
   import { colorOf } from './plot.js';
+  import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
+  import { claimMenu, releaseMenu } from './menus.js';
+  import RiAdd from '@lucide/svelte/icons/plus';
+  import RiNewPlot from '@lucide/svelte/icons/square-plus';
   import { actionFor, stepIn } from './keymap.js';
   import { uid } from './tabs.js';
 
@@ -62,9 +66,15 @@
     refresh();
   }
 
+  let menuOpen = $state(false);
+  const closeMenu = () => (menuOpen = false);
+  $effect(() => (menuOpen ? claimMenu(closeMenu) : releaseMenu(closeMenu)));
+  let menuKey = $state(null); // the signal a right-click opened the menu for
   let active = $state(0);
   let focused = $state(false);
   function onkeydown(e) {
+    // A key shows the row the arrows are on, however the list got focus.
+    focused = true;
     const action = actionFor('list', e);
     const key = palette[active]?.key;
     if (action === 'move') active = stepIn(e, active, palette.length);
@@ -75,7 +85,6 @@
     document.getElementById(`pal-${palette[active]?.id}`)?.scrollIntoView({ block: 'nearest' });
   }
   function searchKey(e) {
-    e.stopPropagation();
     if (e.key === 'Escape' && query) {
       query = '';
       e.preventDefault();
@@ -94,24 +103,37 @@
   onfocus={() => (focused = true)}
   onblur={() => (focused = false)}
 />
+<!-- A signal's menu: where it goes. -->
+<ContextMenu.Root bind:open={menuOpen}>
+<ContextMenu.Trigger>
+{#snippet child({ props })}
 <ScrollArea class="palette-scroll">
   <div
+    {...props}
+    oncontextmenucapture={(e) => {
+      menuKey = e.target.closest?.('.chip')?.dataset.key ?? null;
+      if (!menuKey) e.preventDefault(), e.stopPropagation();
+    }}
     class="palette"
     role="listbox"
     tabindex="0"
+    data-focus-own
     aria-label="Signals: Enter adds to the focused plot, Shift+Enter makes a new one"
     aria-activedescendant={focused && palette[active] ? `pal-${palette[active].id}` : undefined}
     use:dndzone={{ items: palette, type: 'trace', flipDurationMs: FLIP_MS, dropFromOthersDisabled: true, dropTargetStyle: {}, delayTouchStart: true, zoneTabIndex: 0, zoneItemTabIndex: -1, autoAriaDisabled: true }}
     onconsider={consider}
     onfinalize={finalize}
     {onkeydown}
-    onfocus={() => (focused = true)}
+    onfocus={(e) => (focused = e.currentTarget.matches(':focus-visible'))}
     onblur={() => (focused = false)}
   >
     {#each palette as item, i (item.id)}
       {@const t = session.trace(item.key)}
-      <button
+      <!-- An option of the list, which takes its keys. -->
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <div
         id="pal-{item.id}"
+        data-key={item.key}
         class="chip"
         class:active={focused && i === active}
         role="option"
@@ -122,8 +144,17 @@
         onclick={() => onAdd(item.key)}
       >
         <i></i><span class="sig-key">{item.key}</span>{#if t?.meta.units}<span class="sig-units">{t.meta.units}</span>{/if}<small>{t?.meta.rate} Hz</small>
-      </button>
+      </div>
     {/each}
   </div>
   {#if !palette.length}<div class="sig-empty">{session.signals.length ? 'No signal matches' : 'No signal yet'}</div>{/if}
 </ScrollArea>
+{/snippet}
+</ContextMenu.Trigger>
+<ContextMenu.Content class="menu-icons">
+  {#if menuKey}
+    <ContextMenu.Item onSelect={() => onAdd(menuKey)}><RiAdd class="menu-icon" />Add to plot<ContextMenu.Shortcut><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+    <ContextMenu.Item onSelect={() => onNewPlot([menuKey])}><RiNewPlot class="menu-icon" />New plot<ContextMenu.Shortcut><kbd>⇧</kbd><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+  {/if}
+</ContextMenu.Content>
+</ContextMenu.Root>

@@ -56,10 +56,10 @@ export class Trace {
 
   /**
    * Appends points, the pen lifted before the first with `breakFirst`, and
-   * drops those older than RETAIN_SECONDS before the newest, but none from
-   * `heldFrom` on.
+   * drops those older than RETAIN_SECONDS before the newest. A paused plot
+   * reads older ones from the hub's history.
    */
-  push(xs, ys, breakFirst, heldFrom = Infinity) {
+  push(xs, ys, breakFirst) {
     if (!xs.length) return;
     this.reserve(xs.length);
     for (let i = 0; i < xs.length; i++) {
@@ -71,7 +71,7 @@ export class Trace {
       this.y[this.end] = ys[i];
       this.end++;
     }
-    const keepFrom = Math.min(this.x[this.end - 1] - RETAIN_SECONDS, heldFrom);
+    const keepFrom = this.x[this.end - 1] - RETAIN_SECONDS;
     while (this.start < this.end && this.x[this.start] < keepFrom) this.start++;
     while (this.breaks.length && this.breaks[0] <= this.absStart) this.breaks.shift();
   }
@@ -214,20 +214,15 @@ export class Session {
   traces = new Map(); // trace id -> Trace
   byKey = new Map(); // signal key -> Trace
   /** Each paused plot's full-resolution windows: plot id -> (Trace -> Detail). */
-  details = new Map();
+  windows = new Map(); // plot id -> {detail, overview}: each a Map, trace -> Detail
   /** How many times every window was dropped, for the page to read them again. */
   detailsDropped = $state(0);
-  detailTokens = new Map(); // plot id -> its newest window request
-  t0 = null; // device time of the first point, where the time axis counts from
+  windowTokens = new Map(); // plot id -> {asked, shown}: the newest request of each layer, and the one drawn
   latest = -Infinity; // device time of the newest point
   offset = null; // device time minus page time, in seconds
-  /** The device time from which no trace drops a point, for paused views. */
-  heldFrom = Infinity;
-
   /** `id` names the hub, null before the socket reached one. */
-  constructor(id = null, { heldFrom = Infinity } = {}) {
+  constructor(id = null) {
     this.id = id;
-    this.heldFrom = heldFrom;
   }
 
   /** The trace of signal `key`, read reactively: a component asks again as traces arrive. */
@@ -270,14 +265,14 @@ export class Session {
       case 'clear':
         // The server re-decimated its history; a fresh copy follows.
         for (const t of this.traces.values()) t.clear();
-        this.details.clear();
+        this.windows.clear();
         this.detailsDropped++;
         return;
       case 'config':
         this.pps = msg.pps;
         return;
       case 'memory':
-        this.memory = { bytes: msg.bytes, budget: msg.budget, seconds: msg.seconds, maxAge: msg.max_age, rate: msg.rate };
+        this.memory = { bytes: msg.bytes, budget: msg.budget, seconds: msg.seconds, maxAge: msg.max_age, rate: msg.rate, held: msg.held ?? null, oldest: msg.oldest ?? {} };
         return;
       case 'routes':
         this.mounts = msg.mounts;
@@ -314,34 +309,52 @@ export class Session {
       const trace = this.traces.get(id);
       if (!trace) return false;
       if (xs.length === 0) continue;
-      if (this.t0 === null) this.t0 = xs[0];
-      trace.push(xs, ys, brk, this.heldFrom);
+      trace.push(xs, ys, brk);
       if (xs[xs.length - 1] > this.latest) this.latest = xs[xs.length - 1];
     }
     return true;
   }
 
-  /** The window of `trace` plot `plotId` last read, if any. */
-  detailOf(plotId, trace) {
-    return this.details.get(plotId)?.get(trace);
+  // A paused plot draws from windows of the hub's history, in two layers:
+  // the overview, its whole captured history at the plot's width, and the
+  // detail, the view and a span either side at full resolution. The overview
+  // covers every time the plot can be moved to, so nothing the hub holds is
+  // ever drawn blank while a detail window is on its way.
+
+  /** The `layer` window, 'detail' or 'overview', of `trace` that plot `plotId` last read, if any. */
+  windowOf(plotId, layer, trace) {
+    return this.windows.get(plotId)?.[layer].get(trace);
   }
 
-  /** Reads [t0, t1] of `traces` at full resolution, about `width` px wide, for the paused plot `plotId`. */
-  async fetchDetail(plotId, traces, t0, t1, width) {
-    const token = (this.detailTokens.get(plotId) ?? 0) + 1;
-    this.detailTokens.set(plotId, token);
+  /**
+   * Reads [t0, t1] of `traces`, about `width` px wide, into plot `plotId`'s
+   * `layer`. A reply replaces what the layer shows unless a later request's
+   * reply already did: none is thrown away for being overtaken by a request
+   * still in flight.
+   */
+  async fetchWindow(plotId, layer, traces, t0, t1, width) {
+    const tokens = this.tokensOf(plotId);
+    const token = ++tokens.asked;
     const replies = await Promise.all(
       traces.map((t) => api.window({ hub: this.id, id: t.meta.id, t0, t1, width }).then((reply) => [t, reply], () => null)),
     );
-    if (token !== this.detailTokens.get(plotId)) return; // a newer request superseded this one
-    let windows = this.details.get(plotId);
-    if (!windows) this.details.set(plotId, (windows = new Map()));
-    for (const got of replies) if (got) windows.set(got[0], new Detail(got[0], got[1]));
+    if (token <= tokens.shown[layer]) return;
+    tokens.shown[layer] = token;
+    let windows = this.windows.get(plotId);
+    if (!windows) this.windows.set(plotId, (windows = { detail: new Map(), overview: new Map() }));
+    for (const got of replies) if (got) windows[layer].set(got[0], new Detail(got[0], got[1]));
   }
 
-  /** Drops the plot's windows, as its view streams again. */
-  clearDetail(plotId) {
-    this.details.delete(plotId);
-    this.detailTokens.set(plotId, (this.detailTokens.get(plotId) ?? 0) + 1);
+  tokensOf(plotId) {
+    let tokens = this.windowTokens.get(plotId);
+    if (!tokens) this.windowTokens.set(plotId, (tokens = { asked: 0, shown: { detail: 0, overview: 0 } }));
+    return tokens;
+  }
+
+  /** Drops the plot's windows, as its view streams again; replies on their way are dropped too. */
+  clearWindows(plotId) {
+    this.windows.delete(plotId);
+    const tokens = this.tokensOf(plotId);
+    tokens.shown = { detail: tokens.asked, overview: tokens.asked };
   }
 }

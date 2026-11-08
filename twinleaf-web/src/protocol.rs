@@ -170,6 +170,10 @@ pub(crate) struct TraceInfo {
     pub(crate) units: String,
     /// Samples per second.
     pub(crate) rate: f64,
+    /// The timescale of the trace's time, as its segment names it: `unix`
+    /// for Unix seconds, `systime` for its source's uptime, `zero` for an
+    /// arbitrary zero, or `invalid`.
+    pub(crate) epoch: String,
 }
 
 /// One device the hub mounted, the subtree `source` of `url` at `prefix`.

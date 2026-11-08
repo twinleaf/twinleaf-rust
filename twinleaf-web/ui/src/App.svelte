@@ -19,9 +19,10 @@
   import { Drags } from './lib/drag.svelte.js';
   import { Renderer } from './lib/gl.js';
   import { plotIds } from './lib/layout.js';
-  import { exportText, importText, loadTabs, newPlot, saveTabs } from './lib/tabs.js';
+  import { chip, exportText, importText, loadTabs, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS, SPANS } from './lib/constants.js';
   import { actionFor } from './lib/keymap.js';
+  import { keepsKey, plotKeys } from './lib/keys.js';
   import { api } from './lib/protocol.js';
   import PlotCard from './lib/PlotCard.svelte';
   import Tile from './lib/Tile.svelte';
@@ -33,6 +34,8 @@
   import SignalList from './lib/SignalList.svelte';
   import TabStrip from './lib/TabStrip.svelte';
   import DragOverlay from './lib/DragOverlay.svelte';
+  import FocusRing from './lib/FocusRing.svelte';
+  import { leave, navigate, remember } from './lib/focus.js';
   import KeysDialog from './lib/KeysDialog.svelte';
   import StatusBar from './lib/StatusBar.svelte';
   import HistorySettings from './lib/HistorySettings.svelte';
@@ -55,12 +58,19 @@
   import RiAdd from '@lucide/svelte/icons/plus';
   import RiGrid from '@lucide/svelte/icons/layout-grid';
   import RiDownload from '@lucide/svelte/icons/download';
+  import RiReset from '@lucide/svelte/icons/rotate-ccw';
+  import RiRows from '@lucide/svelte/icons/rows-3';
+  import RiColumns from '@lucide/svelte/icons/columns-3';
+  import RiGridArrange from '@lucide/svelte/icons/layout-grid';
+  import RiQuadrants from '@lucide/svelte/icons/grid-2x2';
+  import RiFocusArrange from '@lucide/svelte/icons/layout-panel-left';
   import RiUpload from '@lucide/svelte/icons/upload';
 
   const hub = new Hub();
   const ws = new Workspace(loadTabs(localStorage));
   const views = new Views(hub, viewChanged);
   const drags = new Drags(ws, refreshToolbar);
+  drags.axisDropAt = (plotId, x, y) => [...registry].find((pv) => pv.plotId === plotId)?.axisDropAt(x, y) ?? null;
   /** The PlotViews on the page, which the frame loop draws. */
   const registry = new Set();
   /** The time under the pointer, which every time plot marks. */
@@ -82,6 +92,7 @@
   $effect(() => {
     hub.session.detailsDropped;
     untrack(() => {
+      overviewKeys.clear();
       for (const id of ws.allPlotIds()) if (views.get(id)?.live === false) requestDetail(id);
     });
   });
@@ -105,6 +116,16 @@
    */
   const KEEPS_SELECTION =
     '.tiles, button, a, input, textarea, select, label, [role=button], [role=option], [role=tab], [role=menuitem], [role=slider], [role=listbox], [role=grid], [role=combobox], [contenteditable], [data-slot$=-content], .dock-head';
+  /**
+   * The browser's own right-click menu shows only where it has something to
+   * offer: in a field, and over text that is selected. Everywhere else a
+   * right-click opens the page's menu for what is under it, or nothing.
+   */
+  function nativeMenu(e) {
+    if (e.target instanceof Element && e.target.closest('input, textarea, [contenteditable]')) return;
+    if (getSelection()?.toString()) return;
+    e.preventDefault();
+  }
   function pressOnBackground(e) {
     if (e.button !== 0 || e.shiftKey || !(e.target instanceof Element) || e.target.closest(KEEPS_SELECTION)) return;
     if (!ws.selected.size && ws.focusedId === null) return;
@@ -113,61 +134,98 @@
     refreshToolbar();
   }
 
-  /** Shows the chosen views' state in the toolbar, and keeps every paused view's points. */
+  /** Every time plot's view in the tab, which the toolbar's Live button acts on. */
+  const tabViews = () => ws.timeIds().map((id) => views.of(id));
+  /** Each arrangement's picture in the Layout menu. */
+  const ARRANGE_ICONS = { rows: RiRows, columns: RiColumns, grid: RiGridArrange, quadrants: RiQuadrants, focus: RiFocusArrange };
+  /** Shows the views' state in the toolbar, and keeps every paused view's points. */
   function refreshToolbar() {
     const vs = chosen();
-    live = vs.every((v) => v.atNewest);
+    live = tabViews().every((v) => v.live);
     if (vs.length) span = +vs[0].span.toFixed(3);
     // A paused spectrum holds the spectrum it shows, not the points.
-    hub.hold(views.heldFrom((id) => plotAnywhere(id)?.kind !== 'spectrum'));
+    hub.hold(views.anyPaused((id) => plotAnywhere(id)?.kind !== 'spectrum'));
   }
   // Paused, every pan or zoom asks the server for the plot's view at full
-  // resolution, read from its raw buffer. Live, the decimated stream is used.
-  const DETAIL_DEBOUNCE_MS = 120;
-  const detailTimers = new Map();
+  // resolution, read from its raw buffer, which reaches back as far as the
+  // history kept. Live, the decimated stream is used.
+  // A move asks at once, then at most every DETAIL_MS while it goes on, and
+  // once more after it stops, so a drag keeps the detail close behind it.
+  const DETAIL_MS = 100;
+  const detailAsks = new Map(); // plot id -> {last, timer}
+  const overviewKeys = new Map(); // plot id -> what its overview was read for
   function requestDetail(id) {
-    clearTimeout(detailTimers.get(id));
     const v = views.get(id);
-    const session = hub.session;
-    if (!v || v.live) return session.clearDetail(id);
-    const timer = setTimeout(() => {
+    if (!v || v.live) {
+      overviewKeys.delete(id);
+      return hub.session.clearWindows(id);
+    }
+    requestOverview(id, v);
+    let ask = detailAsks.get(id);
+    if (!ask) detailAsks.set(id, (ask = { last: 0, timer: null }));
+    if (ask.timer) return;
+    const run = () => {
+      ask.last = performance.now();
+      ask.timer = null;
       const plot = plotAnywhere(id);
-      if (!plot || plot.kind !== 'time') return;
-      const [x0, x1] = v.range(hub.now(performance.now()));
-      const pad = (x1 - x0) * 0.5;
-      const traces = plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean);
-      session.fetchDetail(id, traces, x0 - pad, x1 + pad, window.innerWidth * 2);
-    }, DETAIL_DEBOUNCE_MS);
-    detailTimers.set(id, timer);
+      if (!plot || plot.kind !== 'time' || views.get(id)?.live !== false) return;
+      const [x0, x1] = views.get(id).range(hub.now(performance.now()));
+      // A span either side, so zooming out a few steps or panning stays covered.
+      const pad = x1 - x0;
+      hub.session.fetchWindow(id, 'detail', tracesOf(plot), x0 - pad, x1 + pad, window.innerWidth * 2);
+    };
+    const wait = DETAIL_MS - (performance.now() - ask.last);
+    if (wait <= 0) run();
+    else ask.timer = setTimeout(run, wait);
+  }
+  const tracesOf = (plot) => plot.items.map((i) => hub.session.byKey.get(i.key)).filter(Boolean);
+  /** Reads paused plot `id`'s whole captured history once, again only when its signals or its pause change. */
+  function requestOverview(id, v) {
+    const plot = plotAnywhere(id);
+    if (!plot || plot.kind !== 'time') return;
+    const traces = tracesOf(plot);
+    const oldest = hub.session.memory?.oldest ?? {};
+    const lo = Math.min(...traces.map((t) => oldest[t.meta.id] ?? Infinity));
+    const hi = v.pausedAt;
+    if (!isFinite(lo) || hi === null) return;
+    const key = `${hi}|${traces.map((t) => t.meta.id).join(',')}`;
+    if (overviewKeys.get(id) === key) return;
+    overviewKeys.set(id, key);
+    hub.session.fetchWindow(id, 'overview', traces, lo, hi, window.innerWidth * 2);
   }
 
-  /** Adds plot `id` to the selection or takes it out, with Shift, or else
-   * clears the selection. A click on a selected plot clears it once the
-   * double-click time has passed, so a double-click still acts on it all. */
-  let deselect;
+  /** A click on plot `id` selects it alone; with Shift it adds the plot to
+   * the selection or takes it out. A click on one of several selected plots
+   * narrows the selection to it once the double-click time has passed, so a
+   * double-click still acts on them all. Esc, or a click on empty space,
+   * clears the selection. */
+  let narrowing;
   const DOUBLE_CLICK_MS = 300;
   function select(id, shift, clicks) {
-    clearTimeout(deselect);
+    clearTimeout(narrowing);
     const selected = ws.selected;
+    const only = () => {
+      selected.clear();
+      selected.add(id);
+      refreshToolbar();
+    };
     if (shift) selected.has(id) ? selected.delete(id) : selected.add(id);
-    else if (!selected.has(id)) selected.clear();
-    else if (clicks === 1) {
-      deselect = setTimeout(() => {
-        selected.clear();
-        refreshToolbar();
-      }, DOUBLE_CLICK_MS);
-    }
+    else if (!selected.has(id)) only();
+    else if (selected.size > 1 && clicks === 1) narrowing = setTimeout(only, DOUBLE_CLICK_MS);
     refreshToolbar();
   }
 
-  // Closing a tab with plots asks first. `closing` shows the dialog, which
-  // clears it as it closes, before its button's click runs, so the button
-  // closes `asked`, which only this sets.
+  // Closing a tab with plots asks first: `closing` is the tab the dialog
+  // asks about, and shows it. The dialog's Close button closes the tab and
+  // the dialog; its Cancel and Esc close the dialog only.
   let closing = $state(null);
-  let asked = null;
   function closeTab(t) {
-    if (plotIds(t.layout).length) closing = asked = t;
+    if (plotIds(t.layout).length) closing = t;
     else ws.closeTab(t);
+  }
+  function confirmClose() {
+    ws.closeTab(closing);
+    closing = null;
   }
 
   // Export and import: a JSON file of tabs, to share layouts.
@@ -240,7 +298,7 @@
   }
   function closePlot(id) {
     ws.closePlot(id);
-    hub.session.clearDetail(id);
+    hub.session.clearWindows(id);
   }
   /** Closes plot `id` from the keys, and gives focus to the plot after it, or else before it. */
   function closeFromKeys(id) {
@@ -309,40 +367,68 @@
   function followLive() {
     for (const vw of chosen()) vw.follow();
   }
-  /** Pauses the chosen plots while they follow live, as Space does, or has them follow live. */
+  /**
+   * The toolbar's Live button: pauses every time plot of the tab while all
+   * follow live, or has them all follow live. Space does the same for the
+   * highlighted plots alone.
+   */
   function toggleLive() {
-    if (!live) return followLive();
     const perf = performance.now();
-    for (const vw of chosen()) vw.pause(perf);
+    for (const vw of tabViews()) live ? vw.pause(perf) : vw.follow();
+    refreshToolbar();
   }
   function setDelay(ms) {
     delayMs = ms;
     views.setDelay(ms / 1000);
   }
-  /** Clears the cursors of `ids`' plots, or of the selection, or of every plot. */
+  /** Clears the cursors of plots `ids`, by default the selection's or every plot's, and says whether any were placed. */
   function clearCursors(ids = ws.selected.size ? [...ws.selected] : plotIds(ws.layout)) {
+    const placed = (c) => c && (c.a !== null || c.b !== null);
+    let had = false;
     for (const id of ids) {
       const vw = views.get(id);
-      if (vw) vw.cursors = { a: null, b: null };
+      if (vw) (had ||= placed(vw.cursors)), (vw.cursors = { a: null, b: null });
     }
-    for (const pv of registry) if (ids.includes(pv.plotId)) pv.specCursors = { a: null, b: null };
+    for (const pv of registry) if (ids.includes(pv.plotId)) had = pv.clearCursors() || had;
+    return had;
   }
-  const act = { addToFocused: (key) => ws.addToFocused(key), newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };
+  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addToFocused: (key) => ws.addToFocused(key), newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };
 
   let paletteOpen = $state(false);
   let keysOpen = $state(false);
-  // Whether focus last moved by the keyboard: a control reached by Tab keeps
-  // its keys, while one the pointer clicked hands Space and Escape to the plots.
-  let keyFocus = false;
+  /** Moves signal `key` from plot `from` to plot `to`, or to a new plot to its right with null. */
+  function moveSignal(from, key, to) {
+    const src = ws.plots[from];
+    if (!src) return;
+    src.items = src.items.filter((i) => i.key !== key);
+    if (to) {
+      const dst = ws.plots[to];
+      if (dst && !dst.items.some((i) => i.key === key)) dst.items.push(chip(key));
+    } else {
+      const p = newPlot(src.kind, 'overlay', [key]);
+      ws.addPlot(p, from, 'row');
+    }
+  }
+
   function onKey(e) {
-    if (e.key === 'Tab') keyFocus = true;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();
       paletteOpen = !paletteOpen;
       return;
     }
-    // What is typed into a field, or a menu or dialog's own keys, stays there.
-    if (e.target.closest?.('input, textarea, select, [contenteditable], [role=combobox][aria-expanded=true], [role=menu], [role=menuitem], [role=dialog], [data-slot=select-content]')) return;
+    // Tab, the arrows, Enter, Escape and F6 move through the page's tree
+    // (focus.js). A plot acts on its own Escape first.
+    if (navigate(e, (n) => n.matches('[data-focus=plot]'))) return;
+    // What is typed into a field, a menu or dialog's own keys, and the keys
+    // that press a button focused from the keyboard stay there (keys.js).
+    if (keepsKey(e)) return;
+    // Ctrl+A outside a field selects every plot of the tab, not the page's text.
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+      e.preventDefault();
+      ws.selected.clear();
+      for (const id of plotIds(ws.layout)) ws.selected.add(id);
+      return refreshToolbar();
+    }
     const action = actionFor('page', e);
     if (action === 'goToPlot') {
       const id = plotIds(ws.layout)[+e.key - 1];
@@ -356,30 +442,30 @@
       e.preventDefault();
       return stepTab(e.key === ']' ? 1 : -1);
     }
-    if (action !== 'pause' && action !== 'escape') return;
-    const control = e.target.closest?.('button, [role=tab], [role=slider]');
-    if (keyFocus && control) return;
-    // A control the pointer clicked lets go of focus, so the key shows no ring on it.
-    if (control) control.blur();
+    if (action !== 'pause' && action !== 'escape') {
+      // Every other key acts on the highlighted plot, wherever focus is.
+      if (!action && !e.defaultPrevented) plotKeys.get(ws.focusedId)?.(e);
+      return;
+    }
     if (action === 'escape') {
       if (ws.maximized) ws.maximized = null;
       else if (ws.selected.size) {
         ws.selected.clear();
         refreshToolbar();
-      } else clearCursors();
+      } else if (!clearCursors()) leave();
       return;
     }
-    // Space pauses the highlighted plots, or streams them again from where they are.
+    // Space pauses the highlighted plots, or has them follow live again.
     e.preventDefault();
     const perf = performance.now(), vs = ws.highlighted().map((id) => views.of(id));
     if (vs.some((v) => v.live)) for (const v of vs) v.pause(perf);
-    else for (const v of vs) v.resume(perf);
+    else for (const v of vs) v.follow();
   }
 </script>
 
 <!-- Nothing on the page drags natively: plots, signals and tabs move by
      pointer, and a native drag would only carry a picture of the page. -->
-<svelte:window onkeydown={onKey} onpointerdowncapture={() => (keyFocus = false)} onpointerdown={pressOnBackground} ondragstart={(e) => e.preventDefault()} />
+<svelte:window onkeydown={onKey} onfocusin={remember} onpointerdown={pressOnBackground} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
 <canvas class="gl-layer" bind:this={glCanvas}></canvas>
 
 {#snippet plotTile(id)}
@@ -415,6 +501,10 @@
         onTraceDragStart={() => drags.traceDragStart()}
         onTraceDrop={(key) => drags.dockTrace(key)}
         onEmptied={() => queueMicrotask(() => closePlot(id))}
+        otherPlots={plotIds(ws.layout)
+          .filter((p) => p !== id)
+          .map((p) => ({ id: p, label: ws.plots[p]?.items.map((i) => i.key).join(', ') || 'Empty plot' }))}
+        onMoveSignal={(key, to) => moveSignal(id, key, to)}
       />
     {/if}
   {/key}
@@ -450,11 +540,11 @@
 <Tooltip.Provider delayDuration={300} ignoreNonKeyboardFocus>
   <div class="app" class:moving={drags.moving}>
     <!-- One row: what acts on the plots, then the page's own settings. -->
-    <header class="top-bar">
+    <header class="top-bar" data-focus="toolbar" tabindex="-1">
       <span class="brand">Twinleaf Hub</span>
       <button class="search" onclick={() => (paletteOpen = true)}><RiSearch />Commands<kbd>Ctrl K</kbd></button>
       <span class="divider"></span>
-      <Tip text={live ? 'Pause the highlighted plots, or every plot' : 'Follow live'} keys={live ? ['Space'] : ['End']}>
+      <Tip text={live ? 'Pause every plot' : 'Every plot follows live'}>
         {#snippet children(tip)}
           <Button {...tip} size="xs" variant={live ? 'outline' : 'default'} onclick={toggleLive}>
             {#if live}<RiPause />Live{:else}<RiPlay />Follow live{/if}
@@ -478,13 +568,15 @@
             </DropdownMenu.Trigger>
           {/snippet}
         </Tip>
-        <DropdownMenu.Content class="w-48">
+        <!-- Each arrangement beside a picture of it, as the plot menus lead with icons. -->
+        <DropdownMenu.Content class="menu-icons w-max" align="end">
           <DropdownMenu.Label>Arrange this tab</DropdownMenu.Label>
           {#each ARRANGEMENTS as [name, label]}
-            <DropdownMenu.Item onSelect={() => ws.arrange(name)}>{label}</DropdownMenu.Item>
+            {@const Icon = ARRANGE_ICONS[name]}
+            <DropdownMenu.Item onSelect={() => ws.arrange(name)}><Icon class="menu-icon" />{label}</DropdownMenu.Item>
           {/each}
           <DropdownMenu.Separator />
-          <DropdownMenu.Item onSelect={() => ws.reset()}>Reset to the default</DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={() => ws.reset()}><RiReset class="menu-icon" />Reset to default</DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Root>
       <DropdownMenu.Root>
@@ -495,9 +587,9 @@
             </DropdownMenu.Trigger>
           {/snippet}
         </Tip>
-        <DropdownMenu.Content class="w-56">
-          <DropdownMenu.Item onSelect={exportTabs}><RiDownload />Export every tab…</DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => importInput.click()}><RiUpload />Import tabs…</DropdownMenu.Item>
+        <DropdownMenu.Content class="menu-icons w-max" align="end">
+          <DropdownMenu.Item onSelect={exportTabs}><RiDownload class="menu-icon" />Export every tab…</DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={() => importInput.click()}><RiUpload class="menu-icon" />Import tabs…</DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Root>
       <input type="file" accept="application/json,.json" hidden bind:this={importInput} onchange={importTabs} />
@@ -510,36 +602,43 @@
             </Popover.Trigger>
           {/snippet}
         </Tip>
-        <Popover.Content class="w-80" align="end">
+        <!-- A grouped form: each section a heading over rows of a label and
+             its control, the labels in one column and the controls in the
+             other (plot.css, .settings-pop). -->
+        <Popover.Content class="w-80 gap-0 p-0" align="end">
           <div class="settings-pop">
-            <div class="title">Display</div>
-            <label class="flex items-center gap-2 text-xs text-muted-foreground">
-              Delay
-              <Slider type="single" value={delayMs} min={0} max={500} step={10} onValueChange={setDelay} class="w-24" />
-              <span class="w-16 tabular-nums text-foreground">{delayMs} ms</span>
-            </label>
-            <label class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-              Decimation
-              <Select.Root type="single" value={String(hub.session.pps)} onValueChange={(v) => api.setPps(+v)}>
-                <Select.Trigger size="sm" class="w-40">{hub.session.pps} pts/s per trace</Select.Trigger>
-                <Select.Content>
-                  {#each DECIMATIONS as p}<Select.Item value={String(p)} label={`${p} pts/s per trace`} />{/each}
-                </Select.Content>
-              </Select.Root>
-            </label>
+            <section aria-labelledby="set-stream">
+              <h3 id="set-stream">Streaming</h3>
+              <div class="set-grid">
+                <span>Delay</span>
+                <div class="set-control">
+                  <Slider type="single" value={delayMs} min={0} max={500} step={10} onValueChange={setDelay} label="Delay" />
+                  <span class="set-value">{delayMs} ms</span>
+                </div>
+                <span>Decimation</span>
+                <Select.Root type="single" value={String(hub.session.pps)} onValueChange={(v) => api.setPps(+v)}>
+                  <Select.Trigger size="sm" class="w-full text-xs" aria-label="Decimation">{hub.session.pps} pts/s per trace</Select.Trigger>
+                  <Select.Content>
+                    {#each DECIMATIONS as p}<Select.Item value={String(p)} label={`${p} pts/s per trace`} />{/each}
+                  </Select.Content>
+                </Select.Root>
+              </div>
+            </section>
             {#if hub.session.memory}
-              <div class="title">History</div>
-              <HistorySettings memory={hub.session.memory} />
+              <section aria-labelledby="set-history">
+                <h3 id="set-history">History</h3>
+                <HistorySettings memory={hub.session.memory} />
+              </section>
             {/if}
-            <div class="title">Renderer</div>
-            <div class="hud">
-              <span><b>{hud.fps.toFixed(0)}</b> fps</span>
-              <span><b>{hud.frameMs.toFixed(2)}</b> ms CPU/frame</span>
-              <span><b>{hud.segments.toLocaleString()}</b> segments</span>
-              <span><b>{hud.drawCalls}</b> draws</span>
-              <span><b>{hud.uploadKBs.toFixed(1)}</b> kB/s to GPU</span>
-              <span><b>{hud.rxKBs.toFixed(0)}</b> kB/s in</span>
-            </div>
+            <section aria-labelledby="set-renderer">
+              <h3 id="set-renderer">Renderer</h3>
+              <dl class="set-grid">
+                <dt>Frames</dt><dd class="set-value">{hud.fps.toFixed(0)} fps · {hud.frameMs.toFixed(2)} ms CPU</dd>
+                <dt>Drawn</dt><dd class="set-value">{hud.segments.toLocaleString()} segments · {hud.drawCalls} calls</dd>
+                <dt>Received</dt><dd class="set-value">{hud.rxKBs.toFixed(0)} kB/s</dd>
+                <dt>To the GPU</dt><dd class="set-value">{hud.uploadKBs.toFixed(1)} kB/s</dd>
+              </dl>
+            </section>
           </div>
         </Popover.Content>
       </Popover.Root>
@@ -558,7 +657,7 @@
       <Resizable.Pane id="tiles" order={2} defaultSize={100 - (docks.shown('left') ? dockSize.left : 0) - (docks.shown('right') ? dockSize.right : 0)} class="flex min-h-0 min-w-0">
         <main class="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5">
           <TabStrip {ws} {drags} onClose={closeTab} />
-          <div class="tiles" class:has-max={ws.maximized} class:drop-target={drags.drop?.outer && !drags.drop.edge}>
+          <div class="tiles" data-focus="plots" tabindex="-1" class:has-max={ws.maximized} class:drop-target={drags.drop?.outer && !drags.drop.edge}>
             {#key ws.activeId}
               {#if ws.layout}
                 <Tile node={ws.layout} leafContent={plotTile} drop={drags.drop} maximized={ws.maximized} lifted={drags.moving?.group} landed={drags.landed} />
@@ -587,6 +686,7 @@
 </Tooltip.Provider>
 
 <DragOverlay {drags} {ws} session={hub.session} />
+<FocusRing />
 <KeysDialog bind:open={keysOpen} />
 <CommandPalette bind:open={paletteOpen} session={hub.session} {ws} {act} />
 
@@ -595,12 +695,13 @@
     <AlertDialog.Header>
       <AlertDialog.Title>Close “{closing?.name}”?</AlertDialog.Title>
       <AlertDialog.Description>
-        Its {plotIds(closing?.layout ?? null).length} plots go with it. Export first if you want to keep the layout.
+        {@const n = plotIds(closing?.layout ?? null).length}
+        {n === 1 ? 'Its plot goes' : `Its ${n} plots go`} with it. Export first if you want to keep the layout.
       </AlertDialog.Description>
     </AlertDialog.Header>
     <AlertDialog.Footer>
       <AlertDialog.Cancel>Keep it</AlertDialog.Cancel>
-      <AlertDialog.Action onclick={() => asked && ws.closeTab(asked)}>Close tab</AlertDialog.Action>
+      <AlertDialog.Action onclick={confirmClose}>Close tab</AlertDialog.Action>
     </AlertDialog.Footer>
   </AlertDialog.Content>
 </AlertDialog.Root>

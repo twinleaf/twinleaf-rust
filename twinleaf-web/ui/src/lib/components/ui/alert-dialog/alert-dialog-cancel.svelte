@@ -7,7 +7,7 @@
 		ref = $bindable(null),
 		class: className,
 		variant = "outline",
-		size = "default",
+		size = "sm",
 		...restProps
 	} = $props();
 </script>

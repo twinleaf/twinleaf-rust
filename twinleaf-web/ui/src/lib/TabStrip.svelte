@@ -54,13 +54,15 @@
   const reorder = (e) => (ws.tabs = e.detail.items);
 </script>
 
-<div class="flex cursor-crosshair flex-wrap items-center gap-1.5" onpointerdown={(e) => drags.startMarquee(e)}>
+<div class="flex cursor-crosshair flex-wrap items-center gap-1.5" role="group" aria-label="Layout tabs" data-focus="tabs" tabindex="-1" onpointerdown={(e) => drags.startMarquee(e)}>
   <div
     class="flex min-h-8 flex-wrap gap-1"
     onpointerdown={(e) => drags.startMarquee(e)}
     role="tablist"
     aria-label="Layouts"
     tabindex="-1"
+    data-focus="tablist"
+    data-focus-own
     use:dndzone={{ items: ws.tabs, type: 'tab', flipDurationMs: FLIP_MS, dropTargetStyle: {}, delayTouchStart: true, zoneTabIndex: -1, zoneItemTabIndex: -1, autoAriaDisabled: true }}
     onconsider={reorder}
     onfinalize={reorder}
@@ -106,8 +108,8 @@
               </div>
             {/snippet}
           </ContextMenu.Trigger>
-          <ContextMenu.Content class="w-44">
-            <ContextMenu.Item onSelect={() => startRename(t.id)}>Rename<ContextMenu.Shortcut>F2</ContextMenu.Shortcut></ContextMenu.Item>
+          <ContextMenu.Content>
+            <ContextMenu.Item onSelect={() => startRename(t.id)}>Rename<ContextMenu.Shortcut><kbd>F2</kbd></ContextMenu.Shortcut></ContextMenu.Item>
             <ContextMenu.Item onSelect={() => ws.duplicateTab(t)}>Duplicate</ContextMenu.Item>
             <ContextMenu.Separator />
             <ContextMenu.Item variant="destructive" onSelect={() => onClose(t)}>Close</ContextMenu.Item>

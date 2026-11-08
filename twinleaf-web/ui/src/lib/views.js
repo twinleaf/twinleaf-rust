@@ -42,14 +42,9 @@ export class Views {
     for (const id of [...this.map.keys()]) if (!ids.has(id)) this.map.delete(id);
   }
 
-  /**
-   * The device time from which the traces must keep every point: the left
-   * edge of the earliest paused view of a plot `keepsPoints` says holds
-   * points, or null when none is paused.
-   */
-  heldFrom(keepsPoints) {
-    let from = null;
-    for (const [id, v] of this.map) if (!v.live && keepsPoints(id)) from = Math.min(from ?? Infinity, v.range(0)[0]);
-    return from;
+  /** Whether a view of a plot `readsHistory` says reads the hub's history is paused. */
+  anyPaused(readsHistory) {
+    for (const [id, v] of this.map) if (!v.live && readsHistory(id)) return true;
+    return false;
   }
 }

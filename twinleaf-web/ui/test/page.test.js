@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { controlOf, mergeRows, writersOf } from '../src/lib/properties.js';
-import { KEYMAP, actionFor } from '../src/lib/keymap.js';
+import { KEYMAP, actionFor, sheet } from '../src/lib/keymap.js';
 import { lanesOf, siRange } from '../src/lib/plot.js';
 import { Views } from '../src/lib/views.js';
 import { bytesEstimate, bytesText, spanText } from '../src/lib/units.js';
@@ -43,6 +43,13 @@ describe('the keymap', () => {
       expect(new Set(actions).size, place.place).toBe(actions.length);
     }
   });
+
+  it('sheets the places of one title as one section, a row per keys', () => {
+    const lists = sheet().find((s) => s.title === 'Lists');
+    expect(lists.rows.find((r) => r.id === 'Delete ').what).toBe('Remove signal, close tab');
+    expect(lists.rows.filter((r) => r.what === 'Move')).toHaveLength(1);
+    expect(sheet().filter((s) => s.title === 'Lists')).toHaveLength(1);
+  });
 });
 
 describe('a plot', () => {
@@ -57,20 +64,20 @@ describe('a plot', () => {
 describe('the views', () => {
   const hub = { now: () => 100 };
 
-  it('go with the plots that leave every tab, so none holds points for them', () => {
+  it('go with the plots that leave every tab, so none is paused for them', () => {
     const views = new Views(hub, () => {});
     views.of('a').pause(0);
     views.of('b');
-    expect(views.heldFrom(() => true)).toBe(100 - 0.15 - 10);
+    expect(views.anyPaused(() => true)).toBe(true);
     views.prune(new Set(['b']));
     expect(views.get('a')).toBeUndefined();
-    expect(views.heldFrom(() => true)).toBeNull();
+    expect(views.anyPaused(() => true)).toBe(false);
   });
 
-  it('hold no points for a paused spectrum', () => {
+  it('a paused spectrum reads no history', () => {
     const views = new Views(hub, () => {});
     views.of('s').pause(0);
-    expect(views.heldFrom((id) => id !== 's')).toBeNull();
+    expect(views.anyPaused((id) => id !== 's')).toBe(false);
   });
 });
 

@@ -191,7 +191,6 @@
     e.stopPropagation();
   }
   function editorKey(e) {
-    e.stopPropagation();
     if (e.key === 'Enter' && current) {
       e.preventDefault();
       write(current, draft.trim());
@@ -262,6 +261,7 @@
   <Table.Root
     class="props-table"
     role="grid"
+    data-focus-own
     tabindex={0}
     aria-label="Properties: arrows move, Enter edits or runs"
     aria-activedescendant={current ? `prop-${active}` : undefined}

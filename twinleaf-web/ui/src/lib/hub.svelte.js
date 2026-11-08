@@ -7,7 +7,7 @@
 // outlive any hub, read the time through `now`.
 
 import { Session } from './session.svelte.js';
-import { decodeFrame, spectraMessage } from './protocol.js';
+import { decodeFrame, holdMessage, spectraMessage } from './protocol.js';
 
 /** How long the page waits before it opens a socket that closed on its own. */
 const RECONNECT_MS = 1000;
@@ -19,21 +19,25 @@ export class Hub {
   connected = $state(false);
   /** Bytes of binary frames received, for the page's rate readout. */
   bytes = 0;
-  /** The device time from which no trace drops a point, as paused views ask. */
-  heldFrom = Infinity;
+  /** Whether the page holds a plot paused, for which the hub keeps a capture of its history. */
+  holding = false;
   /** The number of the last change applied. */
   seq = 0;
   /** The signal keys the page shows as spectra, and the ids last sent for them. */
   spectrumKeys = [];
   sentSpectra = null;
+  /** Whether the hub was last told the page holds a plot paused: a new connection holds nothing. */
+  sentHold = false;
 
   /** Applies one text message: a snapshot's `hub`, a snapshot's state, or a change. */
   text(msg) {
     if (msg.type === 'hub') {
-      this.session = new Session(msg.id, { heldFrom: this.heldFrom });
+      this.session = new Session(msg.id);
       this.connected = true;
       this.seq = msg.seq;
       this.sentSpectra = null;
+      this.sentHold = false;
+      this.sendHold();
       return;
     }
     if (msg.seq !== undefined && !this.next(msg.seq)) return this.resync();
@@ -81,10 +85,26 @@ export class Hub {
     this.sentSpectra = message;
   }
 
-  /** Keeps every point from device time `t` on, or lets traces drop old points again with null. */
-  hold(t) {
-    this.heldFrom = t ?? Infinity;
-    this.session.heldFrom = this.heldFrom;
+  /** Has the hub keep a capture of its history while `on`, as a scope's Stop does, for the page's paused plots. */
+  hold(on) {
+    this.holding = on;
+    this.sendHold();
+  }
+
+  /** Tells the hub whether the page holds a plot paused, when that changed. */
+  sendHold() {
+    const on = this.holding;
+    if (on === this.sentHold || this.ws?.readyState !== WebSocket.OPEN || this.session.id === null) return;
+    this.ws.send(holdMessage(on));
+    this.sentHold = on;
+  }
+
+  /** The seconds of history the hub stores at page time `perfMs`, back to the oldest time it holds of any trace. */
+  historySeconds(perfMs) {
+    const m = this.session.memory;
+    if (!m) return 0;
+    const oldest = Math.min(...Object.values(m.oldest ?? {}));
+    return Math.max(m.seconds, isFinite(oldest) ? this.now(perfMs) - oldest : 0);
   }
 
   /** Device time that page time `perfMs` corresponds to. */

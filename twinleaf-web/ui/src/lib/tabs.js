@@ -2,10 +2,15 @@
 // how tabs are kept in this browser and moved between people as a file.
 //
 // A tab is {id, name, plots, layout}. `plots` maps a plot id to
-// {id, kind, mode, items, legend?}: `kind` is time or spectrum, `mode` one of
-// plot.js's modes, `items` the plot's signals as [{id, key}], each `key` a
-// signal key (protocol.js `signalKey`), and `legend` whether the legend is
-// pinned. `layout` is the split tree of layout.js over the plot ids, or null
+// {id, kind, mode, items, legend?, legendAt?}: `kind` is time or spectrum,
+// `mode` one of plot.js's modes, `items` the plot's signals as [{id, key}],
+// each `key` a signal key (protocol.js `signalKey`), `legend` whether the
+// legend shows in the plot, and `legendAt` where it was dragged, {x, y} each
+// a share of the room around it, 0 to 1, top right when absent. `axisSides`
+// places an independent plot's axes, signal key to 'left', 'right' or
+// 'none' (plot.js axisSlots). `dockSize` is {w, h}, the width it last had
+// beside another plot and the height it last had above or below one, each
+// a share of the layout, which a move docks it at again. `layout` is the split tree of layout.js over the plot ids, or null
 // for an empty tab.
 //
 // The tabs are kept in localStorage under SAVE_KEY as {tabs, activeId}.

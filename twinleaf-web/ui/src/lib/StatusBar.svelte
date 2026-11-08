@@ -20,7 +20,7 @@
   const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 </script>
 
-<footer class="status-bar">
+<footer class="status-bar" data-focus="status" tabindex="-1">
   <span class="item" title={hub.connected ? 'The page reaches the hub' : 'The page lost the hub and tries again each second'}>
     <i class="dot" class:on={hub.connected}></i>{hub.connected ? 'Connected' : 'Reconnecting…'}
   </span>
@@ -46,7 +46,7 @@
           </Popover.Trigger>
         {/snippet}
       </Tip>
-      <Popover.Content class="w-auto p-2" align="start" side="top">
+      <Popover.Content class="w-72 p-3" align="start" side="top">
         <HistorySettings {memory} />
       </Popover.Content>
     </Popover.Root>

@@ -14,6 +14,7 @@
   // library rearranges, and the drop hands them to `docks`. Where the
   // dragged panel would land shows its header alone, and the place is read
   // from the cursor, as the panel dragged is its header too.
+  import { tick } from 'svelte';
   import { flip } from 'svelte/animate';
   import { dragHandleZone, dragHandle, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
@@ -24,6 +25,7 @@
   import RiHideRight from '@lucide/svelte/icons/panel-right-close';
   import RiShowRight from '@lucide/svelte/icons/panel-right-open';
   import { PANELS } from './docks.svelte.js';
+  import { enter, focusNode } from './focus.js';
   import Tip from './Tip.svelte';
 
   /** `docks` is the page's Docks, `side` this dock's, and `content(id)` draws a panel's body. */
@@ -31,6 +33,33 @@
 
   // Panels slide only while one is dragged, so a fold resizes them in place.
   const FLIP_MS = 150;
+  /**
+   * Hides or shows the dock. The dock is drawn anew either way, so focus
+   * that was in it moves to the new one: to its show button once hidden,
+   * into its panels once shown.
+   */
+  function setHidden(hidden) {
+    const had = root?.contains(document.activeElement);
+    docks.hide(side, hidden);
+    if (!had) return;
+    tick().then(() => {
+      const now = document.querySelector(`.dock-side.${side}`);
+      if (!now) return;
+      const show = hidden && now.querySelector('.dock-button');
+      if (show) focusNode(show);
+      else if (!enter(now)) focusNode(now);
+    });
+  }
+  let root = $state(null);
+  /** How far the pointer may move between press and release for a click on a header to fold it, not drag it, in px. */
+  const CLICK_SLOP = 4;
+  let pressedAt = null;
+  /** Folds or unfolds panel `id` when a click on its header was a click, not the end of a drag. */
+  function clickHead(e, id) {
+    const still = pressedAt && Math.hypot(e.clientX - pressedAt.x, e.clientY - pressedAt.y) < CLICK_SLOP;
+    pressedAt = null;
+    if (still && e.button === 0) docks.toggle(id);
+  }
   let items = $state([]);
   let dragging = $state(false);
   const rail = $derived(!docks.shown(side));
@@ -65,7 +94,10 @@
   class:hidden={rail && docks[side].length > 0}
   class:awaiting={rail && docks.dragging}
   title={rail ? (docks[side].length ? `Show the ${side} dock` : 'Drop a panel here') : undefined}
-  onclick={() => rail && docks[side].length && docks.hide(side, false)}
+  data-focus="dock"
+  tabindex="-1"
+  bind:this={root}
+  onclick={() => rail && docks[side].length && setHidden(false)}
 >
   {#if rail}
     {#if docks[side].length}
@@ -76,7 +108,8 @@
   {:else}
     <Tip text="Hide the {side} dock">
       {#snippet children(tip)}
-        <button {...tip} class="dock-button" aria-label="Hide the {side} dock" onclick={(e) => (e.stopPropagation(), docks.hide(side, true))}><HideIcon /></button>
+        <!-- Out of the Tab order, which steps between the panels; the panels' menu and the commands hide the dock too. -->
+        <button {...tip} class="dock-button" aria-label="Hide the {side} dock" data-focus-skip onclick={(e) => (e.stopPropagation(), setHidden(true))}><HideIcon /></button>
       {/snippet}
     </Tip>
   {/if}
@@ -98,28 +131,37 @@
             <header
               {...props}
               class="dock-head"
+              role="button"
               use:dragHandle
-              aria-label="{panel.title}: drag to move, Enter folds, the menu key moves"
+              aria-label="{panel.title}: click or Space folds, Enter goes in, drag to move, the menu key moves"
+              aria-expanded={p.open}
               tabindex="0"
-              ondblclick={() => docks.toggle(p.id)}
-              onkeydown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
+              data-focus="panel"
+              data-focus-key="panel-{p.id}"
+              onpointerdowncapture={(e) => {
+                pressedAt = { x: e.clientX, y: e.clientY };
+                // The drag library keeps a press from focusing the header, so a
+                // press focuses it here, for Enter and Space to act on it next.
+                e.currentTarget.focus({ preventScroll: true });
+              }}
+              onclick={(e) => clickHead(e, p.id)}
+              onkeydowncapture={(e) => {
+                // Space folds or unfolds. Enter goes into the contents, unfolding them first.
+                // Both are the header's own, not the drag library's keyboard drag,
+                // whose listener on the header this capture runs before.
+                const head = e.currentTarget;
+                if (e.key !== ' ' && e.key !== 'Enter') return;
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                if (e.key === ' ') docks.toggle(p.id);
+                else if (p.open) enter(head);
+                else {
                   docks.toggle(p.id);
+                  tick().then(() => enter(head));
                 }
               }}
             >
-              <button
-                class="dock-fold"
-                aria-label="{p.open ? 'Fold' : 'Unfold'} {panel.title}"
-                aria-expanded={p.open}
-                tabindex="-1"
-                onpointerdown={(e) => e.stopPropagation()}
-                onmousedown={(e) => e.stopPropagation()}
-                onclick={() => docks.toggle(p.id)}
-              >
-                <RiChevron />
-              </button>
+              <span class="dock-fold" aria-hidden="true"><RiChevron /></span>
               <span class="dock-title">{panel.title}</span>
               <RiGrip class="dock-grip" aria-hidden="true" />
             </header>
@@ -131,11 +173,12 @@
           <ContextMenu.Item disabled={i === items.length - 1} onSelect={() => docks.step(p.id, 1)}>Move down</ContextMenu.Item>
           <ContextMenu.Item onSelect={() => docks.moveTo(p.id, other, docks[other].length)}>Move to the {other} dock</ContextMenu.Item>
           <ContextMenu.Separator />
+          <ContextMenu.Item onSelect={() => setHidden(true)}>Hide the {side} dock</ContextMenu.Item>
           <ContextMenu.Item onSelect={() => docks.reset()}>Reset every panel</ContextMenu.Item>
         </ContextMenu.Content>
       </ContextMenu.Root>
       {#if p.open && !p[SHADOW]}
-        <div class="dock-body">{@render content(p.id)}</div>
+        <div class="dock-body" data-focus-group="panel-{p.id}">{@render content(p.id)}</div>
       {/if}
     </section>
   {/each}
