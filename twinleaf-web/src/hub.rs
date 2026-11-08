@@ -16,6 +16,7 @@
 //! that takes its place.
 
 use crate::devices::Devices;
+use crate::export::ExportTrace;
 use crate::feed::Feed;
 use crate::protocol::{Frame, Held, Message, MountInfo, Rows, TraceInfo, Window, WindowChunk};
 use crate::wire::{encode, encode_spectra, split_at_breaks, Chunk, Spectrum};
@@ -49,6 +50,15 @@ const MEMORY_EVERY: Duration = Duration::from_secs(1);
 const WELCH_WINDOW: usize = 16384;
 /// The decimation a hub starts with, in points per second per trace.
 const POINTS_PER_SECOND: f64 = 500.0;
+
+/// A trace as the page names it: `stream.column` on the root device, or
+/// `0/stream.column` on the device at route `/0`.
+fn signal_name(info: &TraceInfo) -> String {
+    match info.route.as_str() {
+        "/" | "" => format!("{}.{}", info.stream, info.column),
+        route => format!("{}/{}.{}", &route[1..], info.stream, info.column),
+    }
+}
 
 struct Trace {
     info: TraceInfo,
@@ -198,6 +208,12 @@ impl Live {
     /// them. It blocks while it works.
     pub(crate) fn rows(&self, id: u16, t0: f64, t1: f64, limit: usize) -> Option<Rows> {
         self.hub.lock().unwrap().rows(id, t0, t1, limit)
+    }
+
+    /// Every raw row of traces `ids` within [t0, t1], to export, as
+    /// [`Hub::export`] gathers them. It blocks only while it gathers.
+    pub(crate) fn export(&self, ids: &[u16], t0: f64, t1: f64) -> Vec<ExportTrace> {
+        self.hub.lock().unwrap().export(ids, t0, t1)
     }
 
     /// Whether the hub has ended, so another must take its place.
@@ -698,6 +714,31 @@ impl Hub {
         })
     }
 
+    /// Every raw row of traces `ids` within [t0, t1], from the history held
+    /// for paused plots where the buffer no longer reaches, to export. The
+    /// batches share the history's chunks, so gathering them copies no rows.
+    /// An id of no trace is passed over.
+    fn export(&self, ids: &[u16], t0: f64, t1: f64) -> Vec<ExportTrace> {
+        ids.iter()
+            .filter_map(|&id| {
+                let trace = self.traces.get(id as usize)?;
+                let key = trace.key.stream_key();
+                let batches = self
+                    .spans(&key, t0, t1)
+                    .into_iter()
+                    .flat_map(|(run, rows)| run.rows(rows))
+                    .collect();
+                Some(ExportTrace {
+                    name: signal_name(&trace.info),
+                    units: trace.info.units.clone(),
+                    unix: trace.info.epoch == "unix",
+                    column: trace.key.column_id,
+                    batches,
+                })
+            })
+            .collect()
+    }
+
     /// The raw rows of trace `id` within [t0, t1], decimated to about two
     /// points per pixel only when there are more than that.
     fn window(&self, id: u16, t0: f64, t1: f64, width: usize) -> Option<Window> {
@@ -946,6 +987,26 @@ mod tests {
         assert_eq!(rows.oldest, Some(0.01));
         let over = hub.rows(0, 1.0, 2.0, 100).unwrap();
         assert_eq!((over.count, over.x.len()), (101, 0));
+    }
+
+    #[test]
+    fn an_export_writes_every_raw_row_in_range_as_csv() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        for batch in samples(&mut parser, 0, 1000) {
+            hub.ingest(&batch);
+        }
+        let traces = hub.export(&[0, 99], 1.0, 1.05);
+        // The id of no trace is passed over.
+        assert_eq!(traces.len(), 1);
+        let mut out = Vec::new();
+        crate::export::write_csv(&traces, &mut out).unwrap();
+        let csv = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(lines[0].starts_with("time (Unix s),"));
+        // At 100 Hz, rows 99 to 104 stand at 1.00 to 1.05 s.
+        assert_eq!(lines.len(), 1 + 6);
+        assert_eq!(lines[1], "1,99");
     }
 
     #[test]

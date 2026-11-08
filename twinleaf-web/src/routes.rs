@@ -1,14 +1,17 @@
 //! The page's routes. `/ws` streams what the hub sends, and `/api` calls
-//! RPCs, finds devices and mounts them, changes the decimation and reads a
-//! window of raw rows. What each says is in `protocol`.
+//! RPCs, finds devices and mounts them, changes the decimation, reads a
+//! window of raw rows and exports them to a file. What each says is in
+//! `protocol`.
 
 use crate::hub::Live;
 use crate::protocol::{
-    CallRequest, DiscoverRequest, Done, Frame, HistoryRequest, MountArg, MountRequest, PageMessage,
-    PpsRequest, ReadRequest, Refusal, RowsRequest, WindowRequest,
+    CallRequest, DiscoverRequest, Done, ExportRequest, Frame, HistoryRequest, MountArg,
+    MountRequest, PageMessage, PpsRequest, ReadRequest, Refusal, RowsRequest, WindowRequest,
 };
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
+use axum::http::header;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -30,6 +33,7 @@ pub(crate) fn router() -> Router {
         .route("/api/history", post(set_history))
         .route("/api/window", get(window))
         .route("/api/rows", get(rows))
+        .route("/api/export", get(export))
         .fallback(crate::assets::serve)
         .with_state(Hubs::default())
         .layer(axum::middleware::from_fn(crate::guard::guard))
@@ -285,6 +289,113 @@ async fn rows(
     match rows {
         Some(rows) => Ok(Json(rows).into_response()),
         None => Err(Refusal::new(StatusCode::NOT_FOUND, "no such trace")),
+    }
+}
+
+/// The raw rows of traces in a time range, as a file to save: CSV written as
+/// it is sent, or HDF5 written whole to a temporary file first. The hub is
+/// held only while its rows are gathered.
+async fn export(
+    State(hubs): State<Hubs>,
+    Query(args): Query<ExportRequest>,
+) -> Result<Response, Refusal> {
+    let live = hubs.live().await?;
+    if live.id != args.hub {
+        return Err(Refusal::new(StatusCode::CONFLICT, "that hub has retired"));
+    }
+    let ids: Vec<u16> = args
+        .ids
+        .split(',')
+        .map(|id| id.trim().parse())
+        .collect::<Result<_, _>>()
+        .map_err(|_| Refusal::new(StatusCode::BAD_REQUEST, "ids are trace numbers"))?;
+    let (t0, t1) = (args.t0, args.t1);
+    let traces = blocking(move || live.export(&ids, t0, t1)).await?;
+    if traces.is_empty() {
+        return Err(Refusal::new(StatusCode::NOT_FOUND, "no such trace"));
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+    let content_type = match args.format.as_str() {
+        "csv" => {
+            tokio::task::spawn_blocking(move || {
+                let mut out = std::io::BufWriter::with_capacity(EXPORT_CHUNK, Sender(tx));
+                // A page that stops reading ends the export.
+                let _ = crate::export::write_csv(&traces, &mut out);
+            });
+            "text/csv; charset=utf-8"
+        }
+        #[cfg(feature = "hdf5")]
+        "h5" => {
+            let path = std::env::temp_dir().join(format!(
+                "twinleaf-export-{}-{}.h5",
+                std::process::id(),
+                EXPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let written = {
+                let path = path.clone();
+                blocking(move || crate::export::write_hdf5(traces, &path)).await?
+            };
+            if let Err(error) = written {
+                let _ = std::fs::remove_file(&path);
+                return Err(Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, error));
+            }
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut file) = std::fs::File::open(&path) {
+                    let mut out = std::io::BufWriter::with_capacity(EXPORT_CHUNK, Sender(tx));
+                    let _ = std::io::copy(&mut file, &mut out)
+                        .and_then(|_| std::io::Write::flush(&mut out));
+                }
+                let _ = std::fs::remove_file(&path);
+            });
+            "application/x-hdf5"
+        }
+        format => {
+            return Err(Refusal::new(
+                StatusCode::BAD_REQUEST,
+                format!("this proxy cannot export {format}"),
+            ))
+        }
+    };
+    let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<_, std::io::Error>(chunk), rx))
+    }));
+    let name = args.name.replace(['"', '\\', '\r', '\n'], "_");
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// How much of an export goes to the page at once, in bytes.
+const EXPORT_CHUNK: usize = 64 * 1024;
+
+/// Numbers each HDF5 export's temporary file, apart from the others.
+#[cfg(feature = "hdf5")]
+static EXPORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Writes an export to the response a chunk at a time, waiting while the
+/// page catches up. Once the page stops reading, every write fails.
+struct Sender(tokio::sync::mpsc::Sender<Bytes>);
+
+impl std::io::Write for Sender {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .blocking_send(Bytes::copy_from_slice(bytes))
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

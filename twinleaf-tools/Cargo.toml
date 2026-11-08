@@ -18,7 +18,7 @@ self_named_module_files = "deny"
 default = ["serial", "mdns", "hdf5", "web"]
 serial = ["dep:serialport", "twinleaf/serial"]
 mdns = ["twinleaf/mdns", "dep:gethostname", "dep:mdns-sd"]
-hdf5 = ["twinleaf/hdf5"]
+hdf5 = ["twinleaf/hdf5", "twinleaf-web?/hdf5"]
 # The web page of `tio proxy`, at http://localhost:7855.
 web = ["dep:twinleaf-web"]
 

@@ -383,6 +383,19 @@ pub(crate) struct RowsRequest {
     pub(crate) limit: usize,
 }
 
+/// An export of the raw rows of traces `ids`, a comma-separated list,
+/// within [t0, t1], as `csv` or `h5`, in a file named `name`.
+#[derive(Deserialize, Debug)]
+pub(crate) struct ExportRequest {
+    /// The hub the trace ids are of, as [`Message::Hub`] named it.
+    pub(crate) hub: String,
+    pub(crate) ids: String,
+    pub(crate) t0: f64,
+    pub(crate) t1: f64,
+    pub(crate) format: String,
+    pub(crate) name: String,
+}
+
 /// The reply to a [`RowsRequest`]: `count` rows, their times `x` and values
 /// `y`, empty when there are more than the limit, and the oldest time the
 /// history still holds of the trace, from which a reader can tell what of

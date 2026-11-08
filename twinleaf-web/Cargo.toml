@@ -24,6 +24,11 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
+futures-util = { version = "0.3", default-features = false }
+
+[features]
+# Exports the history as HDF5 as well as CSV.
+hdf5 = ["twinleaf/hdf5"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

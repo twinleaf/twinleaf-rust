@@ -42,6 +42,7 @@
   import RiXCursors from '@lucide/svelte/icons/separator-vertical';
   import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
   import RiZoomTo from '@lucide/svelte/icons/zoom-in';
+  import RiExport from '@lucide/svelte/icons/file-down';
   import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, KINDS, MODES, SPANS, kindLabel } from './constants.js';
@@ -53,7 +54,7 @@
   let {
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
     onFocus, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
-    onTraceDragStart, onTraceDrop, onEmptied, otherPlots = [], onMoveSignal, onCopy,
+    onTraceDragStart, onTraceDrop, onEmptied, otherPlots = [], onMoveSignal, onCopy, onExport,
   } = $props();
 
   const session = $derived(hub.session);
@@ -963,7 +964,10 @@
           </ContextMenu.RadioGroup>
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
-      {#if plot.items.length}<ContextMenu.Item onSelect={() => onCopy?.()}><RiCopy class="menu-icon" />Copy data<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>{/if}
+      {#if plot.items.length}
+        <ContextMenu.Item onSelect={() => onCopy?.()}><RiCopy class="menu-icon" />Copy data<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+        <ContextMenu.Item onSelect={() => onExport?.()}><RiExport class="menu-icon" />Export data…</ContextMenu.Item>
+      {/if}
       <!-- Cursors are dragged out of the axes; these place a pair in view. -->
       <ContextMenu.Item onSelect={() => pv?.addXCursors()}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
       <ContextMenu.Item onSelect={() => pv?.addYCursors(region.keys?.[0])}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>

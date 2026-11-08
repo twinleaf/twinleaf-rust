@@ -42,6 +42,8 @@
   import { timeAxis } from './lib/plot.js';
   import { leave, navigate, remember } from './lib/focus.js';
   import KeysDialog from './lib/KeysDialog.svelte';
+  import ExportDialog from './lib/ExportDialog.svelte';
+  import RiExport from '@lucide/svelte/icons/file-down';
   import StatusBar from './lib/StatusBar.svelte';
   import HistorySettings from './lib/HistorySettings.svelte';
   import CommandPalette from './lib/CommandPalette.svelte';
@@ -410,6 +412,21 @@
    * start the history no longer holds is copied, and the notice says what is
    * missing.
    */
+  // The export the dialog offers, or null: plots' signals, the time they
+  // show and the time the history holds of them.
+  let exporting = $state(null);
+  /** Offers to export the signals of plots `ids`. */
+  function openExport(ids) {
+    const session = hub.session, now = hub.now(performance.now());
+    const plots = ids.map((id) => [id, plotAnywhere(id)]).filter(([, p]) => p?.items.length);
+    const traces = [...new Map(plots.flatMap(([, p]) => p.items.map((i) => session.byKey.get(i.key)).filter(Boolean)).map((t) => [t.key, t])).values()];
+    if (!traces.length) return toast('Nothing to export: the plots show no signals');
+    const ranges = plots.filter(([, p]) => p.kind === 'time').map(([id]) => views.of(id).range(now));
+    const shown = ranges.length ? [Math.min(...ranges.map((r) => r[0])), Math.max(...ranges.map((r) => r[1]))] : null;
+    const oldest = Math.min(...traces.map((t) => session.memory?.oldest?.[t.meta.id] ?? Infinity));
+    exporting = { hub: session.id, traces, shown, whole: [isFinite(oldest) ? oldest : now - 600, now] };
+  }
+
   async function copyData(ids) {
     const session = hub.session, now = hub.now(performance.now());
     const plots = ids.map((id) => [id, plotAnywhere(id)]).filter(([, p]) => p?.items.length);
@@ -565,6 +582,7 @@
           .filter((p) => p !== id)
           .map((p) => ({ id: p, label: ws.plots[p]?.items.map((i) => i.key).join(', ') || 'Empty plot' }))}
         onMoveSignal={(key, to) => moveSignal(id, key, to)}
+        onExport={() => openExport(ws.selected.has(id) ? [...ws.selected] : [id])}
         onCopy={() => copyData(ws.selected.has(id) ? [...ws.selected] : [id]).catch((error) => toast(`Could not copy: ${error.message}`))}
       />
     {/if}
@@ -651,6 +669,8 @@
         <DropdownMenu.Content class="menu-icons w-max" align="end">
           <DropdownMenu.Item onSelect={exportTabs}><RiDownload class="menu-icon" />Export every tab…</DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => importInput.click()}><RiUpload class="menu-icon" />Import tabs…</DropdownMenu.Item>
+          <DropdownMenu.Separator />
+          <DropdownMenu.Item onSelect={() => openExport(ws.selected.size ? [...ws.selected] : plotIds(ws.layout))}><RiExport class="menu-icon" />Export data…</DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Root>
       <input type="file" accept="application/json,.json" hidden bind:this={importInput} onchange={importTabs} />
@@ -771,6 +791,7 @@
 <FocusRing />
 <Toasts />
 <KeysDialog bind:open={keysOpen} />
+<ExportDialog bind:what={exporting} />
 <CommandPalette bind:open={paletteOpen} session={hub.session} {ws} {act} />
 
 <AlertDialog.Root open={!!closing} onOpenChange={(o) => !o && (closing = null)}>
