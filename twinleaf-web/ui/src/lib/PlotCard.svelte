@@ -4,10 +4,10 @@
   // PlotView; this is the plot's controls.
   import { onMount, tick } from 'svelte';
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
-  import * as Select from '$lib/components/ui/select/index.js';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import IconButton from './IconButton.svelte';
+  import KindPicker from './KindPicker.svelte';
   import Tip from './Tip.svelte';
   import RiDraggable from '@lucide/svelte/icons/grip-vertical';
   import RiSplitH from '@lucide/svelte/icons/columns-2';
@@ -244,10 +244,6 @@
   /** Whether `e` happened on the header itself or the empty part of its chips. */
   const empty = (e) => e.target === e.currentTarget || e.target.classList?.contains('trace-zone');
 
-  function setKindMode(v) {
-    [plot.kind, plot.mode] = v.split(':');
-  }
-
   // The keyboard. The plot is one stop in the page's Tab order; nothing in
   // it takes a stop of its own. Keys pressed while it has focus act on it,
   // and Enter moves into its signals, where the arrows move between them.
@@ -255,12 +251,10 @@
   let card = $state();
   let zone = $state();
   let kindOpen = $state(false);
-  let kindTrigger = $state(null);
   let kindFromKeys = false;
-  /** Opens the kind menu with focus on its trigger, which takes the menu's keys. */
+  /** Opens the kind picker, which takes the keys until it closes. */
   function openKind() {
     kindFromKeys = true;
-    kindTrigger.focus();
     kindOpen = true;
   }
   /** Gives focus back to the plot when a kind menu opened from the keys closes, after the closing key is done. */
@@ -285,9 +279,12 @@
     queueMicrotask(() => card?.focus());
   }
   const PAN = 0.1, ZOOM = 1.25;
+  /** What inside a plot keeps its own keys: fields, menus and buttons. */
+  const OWN_KEYS = 'input, textarea, select, button, [contenteditable], [role=listbox], [role=menu], [role=combobox], [role=dialog]';
   function plotKey(e) {
-    // Keys on the plot or its signals; a menu or field inside it keeps its own.
-    if (e.target !== card && e.target !== zone) return;
+    // Keys anywhere on the plot, its drawing and its signals included; a
+    // field, menu or button inside it keeps its own.
+    if (e.target !== card && e.target !== zone && e.target.closest?.(OWN_KEYS)) return;
     const perf = performance.now(), time = plot.kind === 'time';
     const back = e.key === 'ArrowLeft' || e.key === 'ArrowDown';
     const act = {
@@ -348,21 +345,7 @@
     tabindex="-1"
   >
     <IconButton icon={RiDraggable} label="Drag onto a plot's edge to dock, its middle to swap, or a tab to move" class="grip cursor-grab touch-none text-muted-foreground" tabindex={-1} onpointerdown={onStartMove} />
-    <Select.Root type="single" value={`${plot.kind}:${plot.mode}`} onValueChange={setKindMode} bind:open={kindOpen} onOpenChange={kindClosed}>
-      <Tip text="Plot kind and layout" keys={['K']}>
-        {#snippet children(tip)}
-          <Select.Trigger {...tip} bind:ref={kindTrigger} size="sm" class="h-6 shrink-0 text-xs" tabindex={-1} aria-label="Plot kind and layout"><span class="truncate">{kindLabel(plot.kind, plot.mode)}</span></Select.Trigger>
-        {/snippet}
-      </Tip>
-      <Select.Content>
-        {#each KINDS as [kind, kl]}
-          <Select.Group>
-            <Select.GroupHeading>{kl}</Select.GroupHeading>
-            {#each MODES as [mode, ml]}<Select.Item value={`${kind}:${mode}`} label={`${kl} · ${ml}`} />{/each}
-          </Select.Group>
-        {/each}
-      </Select.Content>
-    </Select.Root>
+    <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} />
     <!-- The plot's signals, each with its value at the hover, or its newest
          while live. Right-clicking them adds or removes signals. -->
     <ContextMenu.Root bind:open={signalsOpen} onOpenChange={signalsClosed}>
@@ -402,13 +385,12 @@
         {/snippet}
       </ContextMenu.Trigger>
       <ContextMenu.Content class="w-64">
-        <ContextMenu.Label>Add a signal</ContextMenu.Label>
-        <div class="bounds">
+        <div class="add-filter">
           <!-- svelte-ignore a11y_autofocus -->
           <input
-            class="filter"
             type="text"
-            placeholder="Filter"
+            placeholder="Add a signal…"
+            aria-label="Add a signal: type to filter"
             autofocus
             role="combobox"
             aria-expanded="true"

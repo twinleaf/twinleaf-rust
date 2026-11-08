@@ -98,6 +98,21 @@
     requestDetail(id);
     refreshToolbar();
   }
+  /**
+   * A press on the page's empty background, outside the tiles, clears the
+   * selection and the highlighted plot, as the docks' own background does.
+   * A press on anything that takes input, or inside a popup, keeps them.
+   */
+  const KEEPS_SELECTION =
+    '.tiles, button, a, input, textarea, select, label, [role=button], [role=option], [role=tab], [role=menuitem], [role=slider], [role=listbox], [role=grid], [role=combobox], [contenteditable], [data-slot$=-content], .dock-head';
+  function pressOnBackground(e) {
+    if (e.button !== 0 || e.shiftKey || !(e.target instanceof Element) || e.target.closest(KEEPS_SELECTION)) return;
+    if (!ws.selected.size && ws.focusedId === null) return;
+    ws.selected.clear();
+    ws.focusedId = null;
+    refreshToolbar();
+  }
+
   /** Shows the chosen views' state in the toolbar, and keeps every paused view's points. */
   function refreshToolbar() {
     const vs = chosen();
@@ -364,7 +379,7 @@
 
 <!-- Nothing on the page drags natively: plots, signals and tabs move by
      pointer, and a native drag would only carry a picture of the page. -->
-<svelte:window onkeydown={onKey} onpointerdowncapture={() => (keyFocus = false)} ondragstart={(e) => e.preventDefault()} />
+<svelte:window onkeydown={onKey} onpointerdowncapture={() => (keyFocus = false)} onpointerdown={pressOnBackground} ondragstart={(e) => e.preventDefault()} />
 <canvas class="gl-layer" bind:this={glCanvas}></canvas>
 
 {#snippet plotTile(id)}
@@ -430,7 +445,9 @@
   />
 {/snippet}
 
-<Tooltip.Provider delayDuration={300}>
+<!-- A tooltip opens on hover and on keyboard focus, not on the focus a
+     closing popover or menu hands back to its trigger. -->
+<Tooltip.Provider delayDuration={300} ignoreNonKeyboardFocus>
   <div class="app" class:moving={drags.moving}>
     <!-- One row: what acts on the plots, then the page's own settings. -->
     <header class="top-bar">

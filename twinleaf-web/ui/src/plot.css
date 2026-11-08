@@ -155,7 +155,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 }
 @container plot (width < 280px) {
 	.plot-head .grip, .plot-head .maximize { display: none; }
-	.plot-head [data-slot=select-trigger]:not(:focus, [data-state=open]) { width: 0; padding: 0; border: 0; overflow: hidden; }
+	.plot-head .kind-select:not(:focus, [data-state=open]) { width: 0; padding: 0; border: 0; overflow: hidden; }
 }
 
 /* The pinned legend: every signal and its value in one column in the plot's
@@ -250,15 +250,27 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .bounds input { width: 110px; height: 22px; padding: 0 6px; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--foreground); font: 12px var(--font-data); font-variant-numeric: tabular-nums; text-align: right; outline: none; }
 .bounds input:focus-visible { border-color: var(--ring); }
 .bounds .error { color: var(--destructive); font-size: 11px; }
-.bounds input.filter { width: 100%; text-align: left; font-family: var(--font-ui); }
+/* A plot's kind and layout (KindPicker.svelte): ghost dropdowns, like the
+   header's other buttons, with no border or fill until hovered or open.
+   (A tooltip's trigger props replace the select's data-slot, so these go by
+   class.) */
+.plot-head .kind-select { height: 24px; gap: 2px; padding: 0 4px 0 6px; border-color: transparent; background: transparent; }
+.plot-head .kind-select:hover, .plot-head .kind-select[data-state=open] { background: var(--secondary); }
+.kind-select svg:first-child { width: 14px; height: 14px; color: var(--foreground); }
+
+/* The add-signal menu: a filter that names the menu, and rows as dense as
+   the page's other lists, aligned with the filter's text. */
+.add-filter { padding: 2px 2px 4px; }
+.add-filter input { width: 100%; height: 24px; padding: 0 6px; border: 1px solid var(--input); border-radius: min(var(--radius-md), 10px); background: var(--background); color: var(--foreground); font-size: 12px; outline: none; }
+.add-filter input:focus-visible { border-color: var(--ring); }
 .signal-list > [data-slot=scroll-area-viewport] { max-height: 260px; }
-.signal-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 8px 3px 24px; border-radius: var(--radius); font-size: 13px; line-height: 20px; cursor: default; }
+.signal-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 22px; padding: 0 8px; border-radius: var(--radius); font-size: 12px; cursor: default; }
 .signal-row.active { background: var(--accent); color: var(--accent-foreground); }
 .signal-row .rate { color: var(--muted-foreground); font-size: 11px; letter-spacing: 0.04em; }
 .signal-option { display: inline-flex; align-items: center; gap: 6px; font: 12px var(--font-data); }
 .signal-option i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; }
 .signal-option small { color: var(--muted-foreground); }
-.signal-none { padding: 4px 8px 6px 24px; color: var(--muted-foreground); font-size: 12px; }
+.signal-none { padding: 2px 8px 4px; color: var(--muted-foreground); font-size: 12px; }
 
 /* The compass: drop cells over the plot under the pointer, and along the
    layout's edge for a moved plot. Each cell's glyph shows the part of the
