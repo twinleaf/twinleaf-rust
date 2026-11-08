@@ -254,6 +254,20 @@ pub enum Channel {
     Diagnostic,
 }
 
+impl Channel {
+    /// The channel's name in lower case, as `setting`, which a host prints
+    /// and a page reads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Channel::Setting => "setting",
+            Channel::Report => "report",
+            Channel::Protocol => "protocol",
+            Channel::Action => "action",
+            Channel::Diagnostic => "diagnostic",
+        }
+    }
+}
+
 /// Declare the standard table once: the variant [`Std`] answers by, the name
 /// the entry carries, its [`Channel`], and the [`RpcSpec`] constructor that
 /// describes it.
