@@ -10,7 +10,7 @@ use eyre::WrapErr;
 use serde_json::{json, Value};
 use twinleaf::device::rpc::{
     pipelined, CallError, Channel, RpcAccess, RpcDescriptor, RpcMetaExt, RpcMetaFlags, RpcRegistry,
-    RpcValue, RpcValueType, RpcValueTypeExt, Std, STANDARD,
+    RpcValue, RpcValueType, RpcValueTypeExt,
 };
 use twinleaf::device::Device;
 use twinleaf::Connection;
@@ -102,7 +102,7 @@ fn select<'a>(
 /// and so refuses that call.
 fn is_hidden(desc: &RpcDescriptor, unlocked: bool) -> bool {
     let privileged = desc.meta.flags().contains(RpcMetaFlags::PRIVILEGED);
-    channel(desc) == Some(Channel::Protocol) || (privileged && !unlocked)
+    desc.channel() == Some(Channel::Protocol) || (privileged && !unlocked)
 }
 
 /// Returns whether `device` has unlocked privileged access, as a read of
@@ -112,40 +112,6 @@ fn unlocked(device: &Device) -> bool {
     device
         .get::<u8>("dev.priv")
         .map_or(true, |unlocked| unlocked != 0)
-}
-
-/// What `desc` is for, from the standard table when it is a standard entry
-/// and from its metadata otherwise, or `None` where neither says.
-fn channel(desc: &RpcDescriptor) -> Option<Channel> {
-    if let Some(index) = STANDARD.iter().position(|spec| spec.name == desc.full_name) {
-        return Std::at(index).map(Std::channel);
-    }
-    if desc.meta.is_unknown() {
-        return None;
-    }
-    let flags = desc.meta.flags();
-    match (
-        flags.contains(RpcMetaFlags::PRIVILEGED),
-        flags.contains(RpcMetaFlags::ANNOUNCED),
-        desc.meta.access(),
-    ) {
-        (true, _, _) => Some(Channel::Diagnostic),
-        (false, _, RpcAccess::Action) => Some(Channel::Action),
-        (false, true, RpcAccess::ReadWrite) => Some(Channel::Setting),
-        (false, true, RpcAccess::ReadOnly) => Some(Channel::Report),
-        (false, true, RpcAccess::WriteOnly) => None,
-        (false, false, RpcAccess::ReadWrite | RpcAccess::ReadOnly | RpcAccess::WriteOnly) => None,
-    }
-}
-
-fn channel_name(channel: Channel) -> &'static str {
-    match channel {
-        Channel::Setting => "setting",
-        Channel::Report => "report",
-        Channel::Protocol => "protocol",
-        Channel::Action => "action",
-        Channel::Diagnostic => "diagnostic",
-    }
 }
 
 /// The type `desc` declares as `tio rpc list` names it, or `None` for none.
@@ -169,7 +135,7 @@ fn describe(desc: &RpcDescriptor) -> Value {
         "persistent": desc.meta.is_persistent(),
         "announced": flags.contains(RpcMetaFlags::ANNOUNCED),
         "privileged": flags.contains(RpcMetaFlags::PRIVILEGED),
-        "channel": channel(desc).map(channel_name),
+        "channel": desc.channel().map(Channel::name),
     })
 }
 
@@ -218,29 +184,6 @@ struct Reading {
     value: Result<RpcValue, String>,
 }
 
-/// Whether `desc` reads with no argument as a value of the type it declares,
-/// which a capture or an untyped entry does not.
-fn is_readable(desc: &RpcDescriptor) -> bool {
-    matches!(
-        desc.meta.access(),
-        RpcAccess::ReadOnly | RpcAccess::ReadWrite
-    ) && !matches!(desc.meta.kind(), RpcValueType::Raw { .. })
-}
-
-/// Returns `value` with an f32 widened to the f64 of its shortest decimal,
-/// which prints as the f32 does.
-fn shortest(kind: RpcValueType, value: RpcValue) -> RpcValue {
-    match value {
-        RpcValue::F64(x) if kind == (RpcValueType::Float { size: 4 }) => RpcValue::F64(
-            (x as f32)
-                .to_string()
-                .parse()
-                .expect("an f32 prints as a float"),
-        ),
-        value => value,
-    }
-}
-
 /// Reads every readable entry `patterns` select through `device`, pipelined,
 /// followed by a failed reading for each pattern that selected none.
 fn read_selected(
@@ -251,7 +194,7 @@ fn read_selected(
 ) -> Vec<Reading> {
     let readable: Vec<&RpcDescriptor> = select(registry, patterns, all, unlocked(device))
         .into_iter()
-        .filter(|desc| is_readable(desc))
+        .filter(|desc| desc.is_readable())
         .collect();
     let replies = pipelined(
         readable
@@ -263,9 +206,9 @@ fn read_selected(
         name: desc.full_name.clone(),
         kind: type_name(desc),
         value: reply.map_err(|error| error.to_string()).and_then(|bytes| {
-            let kind = desc.meta.kind();
-            kind.decode(&bytes)
-                .map(|value| shortest(kind, value))
+            desc.meta
+                .kind()
+                .decode_shortest(&bytes)
                 .map_err(|error| error.to_string())
         }),
     });
@@ -280,26 +223,11 @@ fn read_selected(
     reads.chain(unmatched).collect()
 }
 
-/// The JSON a value is written as. Bytes are hex, and a float JSON cannot
-/// hold is the text Rust writes it as.
-fn json_value(value: &RpcValue) -> Value {
-    match value {
-        RpcValue::Unit => Value::Null,
-        RpcValue::U64(n) => json!(n),
-        RpcValue::I64(n) => json!(n),
-        RpcValue::F64(x) => serde_json::Number::from_f64(*x)
-            .map_or_else(|| Value::String(x.to_string()), Value::Number),
-        RpcValue::Bool(b) => json!(b),
-        RpcValue::Str(s) => json!(s),
-        RpcValue::Bytes(_) => json!(value.to_string()),
-    }
-}
-
 /// The JSON object `tio rpc get --json` prints for `reading`.
 fn reading_json(reading: &Reading) -> Value {
     match &reading.value {
         Ok(value) => {
-            json!({"name": reading.name, "type": reading.kind, "value": json_value(value)})
+            json!({"name": reading.name, "type": reading.kind, "value": value.to_json()})
         }
         Err(error) => json!({"name": reading.name, "type": reading.kind, "error": error}),
     }
@@ -441,7 +369,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use twinleaf::device::rpc::RpcMeta;
+    use twinleaf::device::rpc::{RpcMeta, STANDARD};
     use twinleaf::proxy::{HostOptions, Layout, Mount, Proxy};
     use twinleaf::DeviceRoute;
 
@@ -528,43 +456,6 @@ mod tests {
     #[test]
     fn a_pattern_that_is_not_a_glob_is_refused() {
         assert!(compile(&["cell**".to_string()]).is_err());
-    }
-
-    #[test]
-    fn a_board_entry_takes_the_channel_its_metadata_says() {
-        let channels: Vec<(String, Option<Channel>)> = registry()
-            .iter()
-            .map(|desc| (desc.full_name.clone(), channel(desc)))
-            .collect();
-        for (name, expected) in [
-            ("therm.enable", Some(Channel::Setting)),
-            ("therm.temp", Some(Channel::Report)),
-            ("diag.adc.raw", Some(Channel::Diagnostic)),
-            ("legacy.value", None),
-            ("dev.systime", Some(Channel::Protocol)),
-            ("dev.reboot", Some(Channel::Action)),
-        ] {
-            assert!(
-                channels.contains(&(name.to_string(), expected)),
-                "{name} is not {expected:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_value_json_cannot_hold_is_a_string() {
-        assert_eq!(json_value(&RpcValue::F64(f64::NAN)), json!("NaN"));
-        assert_eq!(json_value(&RpcValue::F64(f64::INFINITY)), json!("inf"));
-        assert_eq!(json_value(&RpcValue::F64(f64::NEG_INFINITY)), json!("-inf"));
-        assert_eq!(
-            json_value(&RpcValue::Bytes(vec![0x0a, 0xff])),
-            json!("0aff")
-        );
-        let tenth = shortest(
-            RpcValueType::Float { size: 4 },
-            RpcValue::F64(0.1f32.into()),
-        );
-        assert_eq!(json_value(&tenth), json!(0.1));
     }
 
     /// The simulated device, served from a thread and opened through a proxy

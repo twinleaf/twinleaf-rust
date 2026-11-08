@@ -63,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   queries and flashing are always available without this feature.
 - `mdns`: discovery of networked devices through mDNS/DNS-SD.
 - `hdf5` (default): HDF5 data export.
+- `json`: `RpcValue::to_json`, the JSON a host writes an RPC value as.
 - `processing`: signal processing over a column in `data::ops`, a decimator
   for plotting and a Welch spectral estimate.
 

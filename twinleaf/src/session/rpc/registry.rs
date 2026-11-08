@@ -3,10 +3,11 @@
 use super::cache;
 use super::error::CallError;
 use super::reply::{PendingReply, Pipeline};
-use crate::proto::rpc::{RpcError, RpcMeta};
+use crate::proto::rpc::{RpcAccess, RpcError, RpcMeta, RpcMetaFlags, RpcValueType};
 use crate::proto::SessionId;
 use crate::tio::rpc::RpcReply;
 use std::collections::BTreeMap;
+use twinleaf_device::rpc::{Channel, Std, STANDARD};
 
 /// The most `rpc.listinfo` calls in flight at once during a walk.
 const WALK_WINDOW: usize = 16;
@@ -47,6 +48,41 @@ impl RpcDescriptor {
             full_name: name,
             meta: RpcMeta::from_bits(meta),
         }
+    }
+
+    /// What the entry is for, from the standard table when it is a standard
+    /// entry and from its metadata otherwise, or `None` where neither says.
+    pub fn channel(&self) -> Option<Channel> {
+        if let Some(index) = STANDARD.iter().position(|spec| spec.name == self.full_name) {
+            return Std::at(index).map(Std::channel);
+        }
+        if self.meta.is_unknown() {
+            return None;
+        }
+        let flags = self.meta.flags();
+        match (
+            flags.contains(RpcMetaFlags::PRIVILEGED),
+            flags.contains(RpcMetaFlags::ANNOUNCED),
+            self.meta.access(),
+        ) {
+            (true, _, _) => Some(Channel::Diagnostic),
+            (false, _, RpcAccess::Action) => Some(Channel::Action),
+            (false, true, RpcAccess::ReadWrite) => Some(Channel::Setting),
+            (false, true, RpcAccess::ReadOnly) => Some(Channel::Report),
+            (false, true, RpcAccess::WriteOnly) => None,
+            (false, false, RpcAccess::ReadWrite | RpcAccess::ReadOnly | RpcAccess::WriteOnly) => {
+                None
+            }
+        }
+    }
+
+    /// Whether a call with no argument reads a value of the type the entry
+    /// declares, which a capture or an untyped entry does not.
+    pub fn is_readable(&self) -> bool {
+        matches!(
+            self.meta.access(),
+            RpcAccess::ReadOnly | RpcAccess::ReadWrite
+        ) && !matches!(self.meta.kind(), RpcValueType::Raw { .. })
     }
 }
 
@@ -369,5 +405,54 @@ mod tests {
             optional(Err(CallError::Timeout)),
             Err(RpcRegistryError::DeviceRpcError(CallError::Timeout))
         ));
+    }
+
+    /// A board's own entry, typed `kind`, with `flags`.
+    fn entry(name: &str, kind: RpcValueType, flags: &[RpcMetaFlags]) -> RpcDescriptor {
+        let flags = flags
+            .iter()
+            .fold(RpcMetaFlags::default(), |all, flag| all | *flag);
+        RpcDescriptor::from_meta(RpcMeta::typed(kind, flags).bits(), name.to_string())
+    }
+
+    /// A standard entry, as a device lists it.
+    fn standard(name: &str) -> RpcDescriptor {
+        let spec = STANDARD
+            .iter()
+            .find(|spec| spec.name == name)
+            .expect("a standard entry");
+        RpcDescriptor::from_meta(spec.metadata(), name.to_string())
+    }
+
+    #[test]
+    fn an_entry_takes_the_channel_its_metadata_or_the_standard_table_says() {
+        use RpcMetaFlags as F;
+        let f32 = RpcValueType::Float { size: 4 };
+        for (desc, expected) in [
+            (
+                entry(
+                    "therm.enable",
+                    RpcValueType::Bool,
+                    &[F::READABLE, F::WRITABLE, F::ANNOUNCED],
+                ),
+                Some(Channel::Setting),
+            ),
+            (
+                entry("therm.temp", f32, &[F::READABLE, F::ANNOUNCED]),
+                Some(Channel::Report),
+            ),
+            (
+                entry("diag.adc.raw", f32, &[F::READABLE, F::PRIVILEGED]),
+                Some(Channel::Diagnostic),
+            ),
+            (
+                entry("legacy.value", f32, &[F::READABLE, F::WRITABLE]),
+                None,
+            ),
+            (standard("dev.systime"), Some(Channel::Protocol)),
+            (standard("dev.reboot"), Some(Channel::Action)),
+        ] {
+            assert_eq!(desc.channel(), expected, "{}", desc.full_name);
+        }
     }
 }

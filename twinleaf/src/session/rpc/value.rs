@@ -47,6 +47,29 @@ impl std::fmt::Display for RpcValue {
 }
 
 impl RpcValue {
+    /// The value as JSON. Raw bytes are hex. A float JSON cannot hold is the
+    /// string protobuf's JSON mapping spells it as, `"NaN"`, `"Infinity"` or
+    /// `"-Infinity"`, which [`parse`](RpcValueTypeExt::parse) reads back.
+    /// `serde_json` would write each as `null`, which keeps none of them.
+    #[cfg(feature = "json")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::Value;
+        match self {
+            RpcValue::Unit => Value::Null,
+            RpcValue::U64(n) => Value::from(*n),
+            RpcValue::I64(n) => Value::from(*n),
+            RpcValue::F64(x) if x.is_nan() => Value::from("NaN"),
+            RpcValue::F64(x) if x.is_infinite() => {
+                Value::from(if *x > 0.0 { "Infinity" } else { "-Infinity" })
+            }
+            RpcValue::F64(x) => Value::from(*x),
+            RpcValue::Bool(b) => Value::Bool(*b),
+            RpcValue::Str(s) => Value::String(s.clone()),
+            RpcValue::Bytes(_) => Value::String(self.to_string()),
+        }
+    }
+
     /// Formats the value as text for a person to read.
     ///
     /// A string is quoted and followed by its bytes, and any other value,
@@ -59,9 +82,15 @@ impl RpcValue {
     }
 }
 
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::RpcValueType {}
+}
+
 /// Host-side codecs between an RPC's value type and owned [`RpcValue`]s, as
-/// wire bytes and as text.
-pub trait RpcValueTypeExt {
+/// wire bytes and as text. It is sealed, so only [`RpcValueType`]
+/// implements it and a method added to it breaks no other crate.
+pub trait RpcValueTypeExt: sealed::Sealed {
     /// The type names [`from_name`](Self::from_name) reads. They are each
     /// integer and float type as [`RpcMetaExt::type_str`] writes it, and
     /// `string`.
@@ -82,6 +111,15 @@ pub trait RpcValueTypeExt {
     /// Returns an [`RpcValueDecodeError`] if `bytes` is too short for this
     /// type, or if this type has a width this build cannot decode.
     fn decode(self, bytes: &[u8]) -> Result<RpcValue, RpcValueDecodeError>;
+
+    /// Decodes `bytes` as [`decode`](Self::decode) does, with an f32 widened
+    /// to the f64 of its shortest decimal. The value then prints as the f32
+    /// does, and two equal f32s decode to equal values.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`decode`](Self::decode) does.
+    fn decode_shortest(self, bytes: &[u8]) -> Result<RpcValue, RpcValueDecodeError>;
 
     /// Returns the type that one of [`NAMES`](Self::NAMES) names, such as
     /// `u16` or `string`, or `None` for any other name.
@@ -137,6 +175,18 @@ impl RpcValueTypeExt for RpcValueType {
             "string" => RpcValueType::String { max_len: None },
             "bytes" => RpcValueType::Bytes { len: None },
             _ => return None,
+        })
+    }
+
+    fn decode_shortest(self, bytes: &[u8]) -> Result<RpcValue, RpcValueDecodeError> {
+        Ok(match self.decode(bytes)? {
+            RpcValue::F64(x) if self == (RpcValueType::Float { size: 4 }) => RpcValue::F64(
+                (x as f32)
+                    .to_string()
+                    .parse()
+                    .expect("an f32 prints as a float"),
+            ),
+            value => value,
         })
     }
 
@@ -447,6 +497,42 @@ impl RpcMetaExt for RpcMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn a_value_json_cannot_hold_is_a_string() {
+        use serde_json::json;
+        assert_eq!(RpcValue::F64(f64::NAN).to_json(), json!("NaN"));
+        assert_eq!(RpcValue::F64(f64::INFINITY).to_json(), json!("Infinity"));
+        assert_eq!(
+            RpcValue::F64(f64::NEG_INFINITY).to_json(),
+            json!("-Infinity")
+        );
+        assert_eq!(RpcValue::Bytes(vec![0x0a, 0xff]).to_json(), json!("0aff"));
+        let tenth = RpcValueType::Float { size: 4 }
+            .decode_shortest(&0.1f32.to_le_bytes())
+            .unwrap();
+        assert_eq!(tenth.to_json(), json!(0.1));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn a_float_json_cannot_hold_reads_back_as_itself() {
+        for size in [4, 8] {
+            let kind = RpcValueType::Float { size };
+            for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let text = RpcValue::F64(x).to_json();
+                let back = kind.parse(text.as_str().unwrap()).unwrap();
+                let RpcValue::F64(y) = back else {
+                    panic!("{text} reads back as {back:?}");
+                };
+                assert!(
+                    x.is_nan() && y.is_nan() || x == y,
+                    "{text} reads back as {y}"
+                );
+            }
+        }
+    }
 
     const U16: RpcValueType = RpcValueType::Int {
         signed: false,
