@@ -6,14 +6,36 @@ use super::metadata::ColumnKey;
 use super::sample::ColumnArray;
 use std::ops::Range;
 
+/// What a [`ColumnOp`] needs of the rows it is fed between two resets.
+///
+/// A [`Run`] keeps time monotonic but may miss rows. A processor resets a
+/// [`Continuous`](Continuity::Continuous) op at each such gap, so the op
+/// only ever sees an unbroken stretch of samples. It feeds a
+/// [`Monotonic`](Continuity::Monotonic) op across gaps, so the op sees
+/// every retained row of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Continuity {
+    /// No missing rows, so evenly spaced samples, as a filter, a spectral
+    /// estimate or a sample counter needs.
+    Continuous,
+    /// Time that never moves backward, rows possibly missing, as a plot
+    /// decimator, a running extreme or a time-windowed statistic needs.
+    Monotonic,
+}
+
 /// An incremental computation over one column's sample stream, such as
 /// decimation or a Welch periodogram.
 ///
 /// Implementations are stateful. They are fed every sample exactly once, in
-/// order.
+/// order, and never a span that crosses a gap in the run.
 pub trait ColumnOp {
     /// What the operation accumulates and hands back.
     type Output;
+    /// What the op needs of the rows it is fed between resets. The default,
+    /// [`Continuity::Continuous`], resets it at every gap.
+    fn continuity(&self) -> Continuity {
+        Continuity::Continuous
+    }
     /// Discards all state, as at a new run or after the op's parameters
     /// change.
     fn reset(&mut self);
@@ -56,8 +78,10 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
     ///
     /// The op is reset and fed every retained row again after a new run, after
     /// rows it had not seen were evicted, or after
-    /// [`invalidate`](Self::invalidate). A call with no new data feeds
-    /// nothing.
+    /// [`invalidate`](Self::invalidate). A
+    /// [`Continuous`](Continuity::Continuous) op is also reset at each gap in
+    /// the run, and a replay feeds it only the rows after the last one. A call
+    /// with no new data feeds nothing.
     pub fn catch_up(&mut self, buffer: &Buffer) -> &Op::Output {
         let Some(run) = buffer.run(&self.key.stream_key()) else {
             return self.op.output();
@@ -72,22 +96,62 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
         let rows = if needs_replay {
             self.op.reset();
             self.cursor = Some(run.generations());
-            retained.clone()
+            let from = match self.op.continuity() {
+                // Rows before the last gap would be reset away.
+                Continuity::Continuous => run
+                    .boundaries()
+                    .map(|(row, _, _)| row)
+                    .next_back()
+                    .map_or(retained.start, |row| row.max(retained.start)),
+                Continuity::Monotonic => retained.start,
+            };
+            from..retained.end
         } else {
             self.next_row..retained.end
         };
 
-        self.feed(run, rows);
+        self.feed(run, rows, needs_replay);
         self.next_row = retained.end;
         self.op.output()
     }
 
-    /// Feeds `rows` to the op, one contiguous span at a time.
-    fn feed(&mut self, run: &Run, rows: Range<u64>) {
-        for span in run.row_spans(rows) {
-            if let Some(values) = span.column(self.key.column_id) {
-                self.op.update_batch(span.timestamps(), values);
+    /// Feeds `rows` to the op, one contiguous span at a time, splitting
+    /// spans at the run's gaps. A [`Continuous`](Continuity::Continuous) op
+    /// is reset at each gap, except one at the first row when the op was
+    /// `fresh`ly reset.
+    fn feed(&mut self, run: &Run, rows: Range<u64>, fresh: bool) {
+        let continuous = self.op.continuity() == Continuity::Continuous;
+        let gaps: Vec<u64> = run
+            .boundaries()
+            .map(|(row, _, _)| row)
+            .filter(|&row| row >= rows.start && row < rows.end)
+            .collect();
+        let mut gaps = gaps.into_iter().peekable();
+        let mut at = rows.start;
+        for span in run.row_spans(rows.clone()) {
+            let end = at + span.len() as u64;
+            let mut from = 0usize;
+            while let Some(&gap) = gaps.peek().filter(|&&g| g < end) {
+                gaps.next();
+                let split = (gap - at) as usize;
+                if split > from {
+                    self.feed_span(&span.slice(from..split));
+                }
+                if continuous && !(fresh && gap == rows.start) {
+                    self.op.reset();
+                }
+                from = split;
             }
+            if from < span.len() {
+                self.feed_span(&span.slice(from..span.len()));
+            }
+            at = end;
+        }
+    }
+
+    fn feed_span(&mut self, span: &super::sample::SampleBatch) {
+        if let Some(values) = span.column(self.key.column_id) {
+            self.op.update_batch(span.timestamps(), values);
         }
     }
 

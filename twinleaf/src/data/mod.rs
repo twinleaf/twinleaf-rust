@@ -173,7 +173,7 @@ pub use metadata::{
     StreamSchema,
 };
 pub use parser::{PacketOutcome, PacketParser};
-pub use pipeline::{ColumnOp, ColumnProcessor};
+pub use pipeline::{ColumnOp, ColumnProcessor, Continuity};
 pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
 pub(crate) use sample::RowSource;
 pub use sample::{ColumnArray, ColumnData, SampleBatch, SampleRow, ScalarBuffer};

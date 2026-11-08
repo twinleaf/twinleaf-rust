@@ -1,13 +1,18 @@
 //! Bounded retention of the newest samples of every live stream.
 //!
-//! [`Buffer`] keeps one [`Run`] per stream. A run retains its rows as frozen
-//! [`SampleBatch`]es. A [`BatchCoalescer`] merges incoming batches into
-//! chunks, and retention drops the oldest rows by slicing the front chunk.
+//! [`Buffer`] keeps one [`Run`] per stream. A run lasts while the stream's
+//! time stays monotonic and its schema holds. A boundary that keeps time
+//! monotonic, such as lost samples, a rate change or an acquisition restart,
+//! stays inside the run and the run records it. Any other boundary, such as
+//! a new session, a time reference change or time moving backward, starts a
+//! new run. A run retains its rows as frozen [`SampleBatch`]es. A
+//! [`BatchCoalescer`] merges incoming batches into chunks, and retention
+//! drops the oldest rows by slicing the front chunk.
 //! Reads return slices of the retained chunks and copy only the
 //! still-accumulating rows they ask for.
 
 use super::coalesce::BatchCoalescer;
-use super::continuity::Generations;
+use super::continuity::{Boundary, Generations};
 use super::metadata::{StreamKey, StreamMetadataSnapshot};
 use super::sample::SampleBatch;
 use crate::proto::SampleNumber;
@@ -76,15 +81,18 @@ impl Buffer {
         }
     }
 
-    /// Appends `batch`'s rows to its stream's run. A batch with a new
-    /// per-stream generation starts a new run. Empty batches are ignored.
+    /// Appends `batch`'s rows to its stream's run. A batch of the run's
+    /// latest per-stream generation joins the run. So does a batch of a newer
+    /// one whose boundary is monotonic and whose schema is the run's, and the
+    /// run records that boundary. Any other batch starts a new run. Empty
+    /// batches are ignored.
     pub fn process_batch(&mut self, batch: &SampleBatch) {
         if batch.is_empty() {
             return;
         }
         let stream_key = batch.stream_key();
         match self.runs.get_mut(&stream_key) {
-            Some(run) if run.generations.stream == batch.generations().stream => run.append(batch),
+            Some(run) if run.admits(batch) => run.append(batch),
             _ => {
                 self.runs.insert(stream_key, Run::new(batch, self.capacity));
             }
@@ -111,9 +119,18 @@ impl Buffer {
 }
 
 /// The retained rows of one stream's current run, oldest first.
+///
+/// Time never moves backward within a run, so its rows are in time order.
+/// Rows may be missing between them, and [`boundaries`](Run::boundaries)
+/// says where.
 pub struct Run {
-    /// The continuity generations stamped on every batch of this run.
+    /// The continuity generations of the batch that opened this run.
     generations: Generations,
+    /// The continuity generations of the run's newest batch.
+    latest: Generations,
+    /// Each boundary within the run that is not continuous, with the logical
+    /// position and time of the row it precedes, oldest first.
+    boundaries: VecDeque<(u64, f64, Boundary)>,
     /// The newest batch's metadata. Its schema is constant within a run.
     metadata: StreamMetadataSnapshot,
     /// Completed chunks in row order. The coalescer holds the rows after them.
@@ -131,6 +148,8 @@ impl std::fmt::Debug for Run {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Run")
             .field("generations", &self.generations)
+            .field("latest", &self.latest)
+            .field("boundaries", &self.boundaries.len())
             .field("rows", &self.rows)
             .field("capacity", &self.capacity)
             .field("next_row", &self.next_row)
@@ -143,6 +162,8 @@ impl Run {
     fn new(batch: &SampleBatch, capacity: usize) -> Run {
         let mut run = Run {
             generations: batch.generations(),
+            latest: batch.generations(),
+            boundaries: VecDeque::new(),
             metadata: batch.metadata().clone(),
             chunks: VecDeque::new(),
             coalescer: BatchCoalescer::new(Some((capacity / 16).clamp(256, 65_536))),
@@ -155,11 +176,32 @@ impl Run {
         run
     }
 
+    /// Whether `batch` continues this run, as a batch of the run's latest
+    /// generation does, and one whose boundary keeps time monotonic and whose
+    /// schema is the run's.
+    fn admits(&self, batch: &SampleBatch) -> bool {
+        if batch.generations().stream == self.latest.stream {
+            return true;
+        }
+        batch
+            .boundary()
+            .is_some_and(|b| b.is_monotonic() && !b.is_initial())
+            && batch.schema() == self.metadata.schema()
+    }
+
     fn append(&mut self, batch: &SampleBatch) {
         debug_assert!(
             batch.schema() == self.metadata.schema(),
-            "the parser guarantees a constant schema within a run"
+            "a run admits only batches of its schema"
         );
+        if self.rows > 0 || !self.chunks.is_empty() || self.coalescer.buffered_len() > 0 {
+            if let Some(boundary) = batch.boundary().filter(|b| !b.is_continuous()) {
+                let time = batch.timestamps()[0];
+                self.boundaries
+                    .push_back((self.next_row, time, boundary.clone()));
+            }
+        }
+        self.latest = batch.generations();
         self.coalescer.push(batch);
         self.take_completed_chunks();
 
@@ -197,6 +239,14 @@ impl Run {
             }
             self.rows -= dropped;
             excess -= dropped;
+        }
+        let start = self.retained_rows().start;
+        while self
+            .boundaries
+            .front()
+            .is_some_and(|&(row, _, _)| row < start)
+        {
+            self.boundaries.pop_front();
         }
     }
 
@@ -245,9 +295,72 @@ impl Run {
         Some(chunk.slice(chunk.len() - 1..chunk.len()))
     }
 
-    /// Returns the continuity generations stamped on every batch of this run.
+    /// Returns the continuity generations of the batch that opened this run.
+    /// They identify the run, as a new run opens with newer ones. Batches that
+    /// joined the run across a monotonic boundary carry newer ones, as
+    /// [`latest_generations`](Self::latest_generations) returns.
     pub fn generations(&self) -> Generations {
         self.generations
+    }
+
+    /// Returns the continuity generations of the run's newest batch.
+    pub fn latest_generations(&self) -> Generations {
+        self.latest
+    }
+
+    /// Returns each retained boundary within the run that is not continuous,
+    /// oldest first, as the logical position and the time of the row after
+    /// it, and the boundary. Every one keeps time monotonic. Most are lost
+    /// samples, others a rate change or an acquisition restart.
+    pub fn boundaries(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (u64, f64, &Boundary)> + ExactSizeIterator + '_ {
+        self.boundaries
+            .iter()
+            .map(|(row, time, b)| (*row, *time, b))
+    }
+
+    /// Returns the retained rows within `rows`, a range of logical positions,
+    /// as contiguous batches in row order. Rows outside the retained ones are
+    /// left out. Only the newest rows, those not yet frozen into a chunk, are
+    /// copied.
+    pub fn rows(&self, rows: Range<u64>) -> Vec<SampleBatch> {
+        self.row_spans(rows)
+    }
+
+    /// Returns the logical positions of the retained rows whose time lies in
+    /// `start..=end`, in seconds after the segment's epoch, as
+    /// [`SampleBatch::timestamps`] reports them. Time never moves backward
+    /// within a run, so the rows are one range. It is empty when no retained
+    /// row lies in the window.
+    pub fn rows_between(&self, start: f64, end: f64) -> Range<u64> {
+        let first = self.first_row_at_or_after(start, false);
+        let last = self.first_row_at_or_after(end, true);
+        first..last.max(first)
+    }
+
+    /// The logical position of the first retained row whose time is at least
+    /// `time`, or after it when `strictly`, or the end of the retained rows.
+    fn first_row_at_or_after(&self, time: f64, strictly: bool) -> u64 {
+        let before = |t: f64| if strictly { t <= time } else { t < time };
+        let mut row = self.retained_rows().start;
+        for chunk in &self.chunks {
+            let stamps = chunk.timestamps();
+            if stamps.last().is_some_and(|&t| before(t)) {
+                row += stamps.len() as u64;
+                continue;
+            }
+            return row + stamps.partition_point(|&t| before(t)) as u64;
+        }
+        let buffered = self.coalescer.buffered_len();
+        if buffered > 0 {
+            let tail = self
+                .coalescer
+                .buffered_rows(0..buffered)
+                .expect("a nonempty buffered tail");
+            row += tail.timestamps().partition_point(|&t| before(t)) as u64;
+        }
+        row
     }
 
     /// Returns when this run last received a batch through
@@ -284,8 +397,9 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::continuity::{BoundaryClass, Change, Loss};
     use crate::data::metadata::{ColumnKey, DeviceRecord, SegmentRecord};
-    use crate::data::pipeline::{ColumnOp, ColumnProcessor};
+    use crate::data::pipeline::{ColumnOp, ColumnProcessor, Continuity};
     use crate::data::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
     use crate::data::tests::fixtures;
     use crate::proto::data as wire;
@@ -383,6 +497,33 @@ mod tests {
             buffer.process_batch(&batch);
         }
 
+        /// Push `samples` as one batch of a single float column whose values
+        /// are the sample numbers, opening with `boundary`.
+        fn push_floats_after(
+            &self,
+            buffer: &mut Buffer,
+            stream_generation: u32,
+            samples: Range<u32>,
+            boundary: Boundary,
+        ) {
+            let mut builder = SampleBatchBuilder::new(
+                BatchContext {
+                    metadata: self.metadata.clone(),
+                    boundary: Some(boundary),
+                    generations: Generations {
+                        stream: stream_generation,
+                        device: 0,
+                        global: 0,
+                    },
+                },
+                samples.len(),
+            );
+            for n in samples {
+                builder.push_row(SampleNumber::new(n), [ColumnData::F64(f64::from(n))]);
+            }
+            buffer.process_batch(&builder.finish());
+        }
+
         /// Push `samples` as one batch of a single float column whose values are
         /// the sample numbers.
         fn push_floats(&self, buffer: &mut Buffer, stream_generation: u32, samples: Range<u32>) {
@@ -453,6 +594,182 @@ mod tests {
         samples
             .map(|n| (f64::from(n) + 1.0, f64::from(n)))
             .collect()
+    }
+
+    /// `samples` lost, as the parser reports when the device or link dropped them.
+    fn loss(samples: u64) -> Boundary {
+        Boundary {
+            change: None,
+            loss: Some(Loss {
+                samples,
+                expected: None,
+                dropped_batches: 0,
+            }),
+        }
+    }
+
+    /// Collect, fed across gaps.
+    #[derive(Default)]
+    struct CollectAcross(Collect);
+
+    impl ColumnOp for CollectAcross {
+        type Output = Vec<(f64, f64)>;
+        fn continuity(&self) -> Continuity {
+            Continuity::Monotonic
+        }
+        fn reset(&mut self) {
+            self.0.reset();
+        }
+        fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray) {
+            self.0.update_batch(timestamps, values);
+        }
+        fn output(&self) -> &Self::Output {
+            self.0.output()
+        }
+    }
+
+    #[test]
+    fn a_run_continues_across_lost_samples_and_records_the_gap() {
+        let mut buffer = Buffer::new(1024);
+        let fx = test_fixture(&[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..10);
+        // The device lost samples 10..15, and the parser bumped the generation.
+        fx.push_floats_after(&mut buffer, 2, 15..20, loss(5));
+        // A receiver's queue dropped 20..22, which bumps no generation.
+        fx.push_floats_after(&mut buffer, 2, 22..25, loss(2));
+
+        let run = buffer.run(&fx.stream_key).expect("one run");
+        assert_eq!(run.retained_rows(), 0..18, "both gaps stay inside the run");
+        assert_eq!(run.generations().stream, 1, "the run keeps its identity");
+        assert_eq!(run.latest_generations().stream, 2);
+        let gaps: Vec<_> = run
+            .boundaries()
+            .map(|(row, time, b)| (row, time, b.class()))
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                (10, 16.0, BoundaryClass::DataLoss),
+                (15, 23.0, BoundaryClass::DataLoss)
+            ],
+            "each gap at the row after it, with that row's time"
+        );
+    }
+
+    #[test]
+    fn a_boundary_that_turns_time_back_starts_a_new_run() {
+        let mut buffer = Buffer::new(1024);
+        let fx = test_fixture(&[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..10);
+        let initial = Boundary {
+            change: Some(Change::Initial),
+            loss: None,
+        };
+        fx.push_floats_after(&mut buffer, 2, 0..4, initial);
+
+        let run = buffer.run(&fx.stream_key).expect("the new run");
+        assert_eq!(run.retained_rows(), 0..4);
+        assert_eq!(run.generations().stream, 2);
+        assert_eq!(
+            run.boundaries().len(),
+            0,
+            "a run's opening boundary is not inside it"
+        );
+    }
+
+    #[test]
+    fn evicted_gaps_are_forgotten() {
+        let mut buffer = Buffer::new(8);
+        let fx = test_fixture(&[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..4);
+        fx.push_floats_after(&mut buffer, 2, 10..14, loss(6));
+        assert_eq!(buffer.run(&fx.stream_key).unwrap().boundaries().len(), 1);
+        fx.push_floats(&mut buffer, 2, 14..20);
+
+        let run = buffer.run(&fx.stream_key).unwrap();
+        assert_eq!(run.retained_rows(), 6..14);
+        assert_eq!(
+            run.boundaries().len(),
+            0,
+            "the gap fell before the oldest retained row"
+        );
+    }
+
+    #[test]
+    fn rows_between_finds_a_time_window_across_chunks_and_the_tail() {
+        let mut buffer = Buffer::new(4096);
+        let fx = test_fixture(&[DataType::F64]);
+        // Chunks of 300 rows, 300 rows and a buffered tail of 50, as above.
+        for start in (0..650).step_by(100) {
+            fx.push_floats(&mut buffer, 1, start..(start + 100).min(650));
+        }
+        let run = buffer.run(&fx.stream_key).unwrap();
+        // Row n has time n + 1.
+        assert_eq!(
+            run.rows_between(100.0, 200.0),
+            99..200,
+            "inclusive at both ends"
+        );
+        assert_eq!(
+            run.rows_between(299.5, 301.5),
+            299..301,
+            "across a chunk edge"
+        );
+        assert_eq!(
+            run.rows_between(640.0, 1e9),
+            639..650,
+            "into the buffered tail"
+        );
+        assert_eq!(run.rows_between(-5.0, 0.5), 0..0, "before the first row");
+        assert_eq!(
+            run.rows_between(700.0, 800.0),
+            650..650,
+            "after the last row"
+        );
+
+        let window: Vec<f64> = run
+            .rows(run.rows_between(298.0, 302.0))
+            .iter()
+            .flat_map(|batch| batch.timestamps().to_vec())
+            .collect();
+        assert_eq!(window, vec![298.0, 299.0, 300.0, 301.0, 302.0]);
+    }
+
+    #[test]
+    fn a_continuous_op_starts_over_at_each_gap_and_a_monotonic_op_feeds_across() {
+        let mut buffer = Buffer::new(1024);
+        let fx = test_fixture(&[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..10);
+        fx.push_floats_after(&mut buffer, 2, 15..20, loss(5));
+
+        let mut continuous = ColumnProcessor::new(fx.column_keys[0], Collect::default());
+        let mut monotonic = ColumnProcessor::new(fx.column_keys[0], CollectAcross::default());
+        assert_eq!(
+            continuous.catch_up(&buffer),
+            &expected(15..20),
+            "a replay starts at the last gap"
+        );
+        assert_eq!(continuous.op().resets, 1, "only the replay's own reset");
+        let mut both = expected(0..10);
+        both.extend(expected(15..20));
+        assert_eq!(monotonic.catch_up(&buffer), &both);
+        assert_eq!(
+            monotonic.op().0.spans,
+            vec![10, 5],
+            "no span crosses the gap"
+        );
+
+        // New rows open with another gap: the continuous op starts over at it.
+        fx.push_floats_after(&mut buffer, 3, 25..28, loss(5));
+        assert_eq!(continuous.catch_up(&buffer), &expected(25..28));
+        assert_eq!(continuous.op().resets, 2);
+        both.extend(expected(25..28));
+        assert_eq!(monotonic.catch_up(&buffer), &both);
+        assert_eq!(
+            monotonic.op().0.resets,
+            1,
+            "a monotonic op is never reset at a gap"
+        );
     }
 
     #[test]

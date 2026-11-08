@@ -5,7 +5,7 @@
 //! Yang, and Chua, "FPCS", IEEE TVCG 2025. This is adapted from
 //! <https://github.com/tmichela/fpcs> (MIT), `src/fpcs/fpcs_pure.py`.
 
-use crate::data::{ColumnArray, ColumnOp};
+use crate::data::{ColumnArray, ColumnOp, Continuity};
 
 /// A streaming FPCS decimator over one column. It keeps each window's
 /// extremes, and a plot of its output still shows the signal's peaks.
@@ -195,6 +195,12 @@ impl Fpcs {
 
 impl ColumnOp for Fpcs {
     type Output = Vec<(f64, f64)>;
+
+    /// A plot shows the gaps between the runs of samples it draws, so the
+    /// decimator keeps its output across them.
+    fn continuity(&self) -> Continuity {
+        Continuity::Monotonic
+    }
 
     fn reset(&mut self) {
         self.out.clear();
