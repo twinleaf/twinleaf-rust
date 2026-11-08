@@ -33,8 +33,8 @@
     const name = exportName(format);
     what = null;
     saveExport({ hub, ids: traces.map((t) => t.meta.id), t0, t1 }, format, name).then(
-      (saved) => saved && toast(`Saved ${saved.name}${saved.bytes === null ? '' : `, ${bytesText(saved.bytes)}`}`),
-      (error) => toast(`Could not export: ${error.message}`),
+      (saved) => saved && toast.success(`Saved ${saved.name}${saved.bytes === null ? '' : `, ${bytesText(saved.bytes)}`}`),
+      (error) => toast.error(`Could not export: ${error.message}`),
     );
   }
 </script>

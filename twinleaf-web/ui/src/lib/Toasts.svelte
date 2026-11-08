@@ -1,15 +1,7 @@
 <script>
-  // The page's notices (toast.svelte.js), stacked above the status bar.
-  import { dismiss, toasts } from './toast.svelte.js';
+  // The page's notices (toast.svelte.js), at the foot of the page above the
+  // status bar, in the page's theme.
+  import { Toaster } from '$lib/components/ui/sonner/index.js';
 </script>
 
-<div class="toasts" role="status" aria-live="polite">
-  {#each toasts as t (t.id)}
-    <div class="toast">
-      <span>{t.text}</span>
-      {#each t.actions as a}
-        <button onclick={() => (a.run(), dismiss(t.id))}>{a.label}</button>
-      {/each}
-    </div>
-  {/each}
-</div>
+<Toaster position="bottom-center" offset={36} />

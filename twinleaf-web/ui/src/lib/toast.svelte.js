@@ -1,20 +1,18 @@
-// Short notices at the foot of the page, for what an action did or why it
-// could not: each a line of text and up to two buttons, gone after a while
-// or when one is pressed.
+// The page's notices, for what an action did or why it could not: Sonner's
+// toasts (components/ui/sonner), each at its level, with a button where an
+// action offers one. Toasts.svelte shows them.
 
-const SHOW_MS = 6000;
-let next = 0;
+import { toast as sonner } from 'svelte-sonner';
 
-export const toasts = $state([]);
+/** Sonner's options for `actions` [{label, run}]: a button for the first. */
+const options = (actions) => (actions[0] ? { action: { label: actions[0].label, onClick: actions[0].run } } : {});
 
-/** Shows `text`, with `actions` [{label, run}] as buttons, for SHOW_MS, or until one is pressed. */
-export function toast(text, actions = []) {
-  const id = next++;
-  toasts.push({ id, text, actions });
-  setTimeout(() => dismiss(id), SHOW_MS);
-}
-
-export function dismiss(id) {
-  const i = toasts.findIndex((t) => t.id === id);
-  if (i >= 0) toasts.splice(i, 1);
-}
+/**
+ * Shows `text` as a plain notice, with `actions` as a button; or, by its
+ * method, as a success, a warning or an error.
+ */
+export const toast = Object.assign((text, actions = []) => sonner(text, options(actions)), {
+  success: (text, actions = []) => sonner.success(text, options(actions)),
+  warning: (text, actions = []) => sonner.warning(text, options(actions)),
+  error: (text, actions = []) => sonner.error(text, options(actions)),
+});

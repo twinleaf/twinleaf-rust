@@ -144,8 +144,8 @@
     for (const y of c.ys) rows.push([`Y ${y.name}`, y.a, y.b, y.d, y.ratio]);
     const blocks = [{ title: `Cursors · ${plot.items.map((i) => i.key).join(', ')}`, header: ['', '1', '2', 'Δ = 2 − 1', ''], rows }];
     writeTables(blocks).then(
-      () => toast('Copied the cursor readout'),
-      (error) => toast(`Could not copy: ${error.message}`),
+      () => toast.success('Copied the cursor readout'),
+      (error) => toast.error(`Could not copy: ${error.message}`),
     );
   }
   /** Sets the bounds typed in, and says why it cannot when they do not make a range. Returns whether it set them. */

@@ -434,7 +434,7 @@
     const session = hub.session, now = hub.now(performance.now());
     const plots = ids.map((id) => [id, plotAnywhere(id)]).filter(([, p]) => p?.items.length);
     const traces = [...new Map(plots.flatMap(([, p]) => p.items.map((i) => session.byKey.get(i.key)).filter(Boolean)).map((t) => [t.key, t])).values()];
-    if (!traces.length) return toast('Nothing to export: the plots show no signals');
+    if (!traces.length) return toast.warning('Nothing to export: the plots show no signals');
     const ranges = plots.filter(([, p]) => p.kind === 'time').map(([id]) => views.of(id).range(now));
     const shown = ranges.length ? [Math.min(...ranges.map((r) => r[0])), Math.max(...ranges.map((r) => r[1]))] : null;
     const oldest = Math.min(...traces.map((t) => session.memory?.oldest?.[t.meta.id] ?? Infinity));
@@ -470,7 +470,7 @@
   async function copyData(ids) {
     const session = hub.session, now = hub.now(performance.now());
     const plots = ids.map((id) => [id, plotAnywhere(id)]).filter(([, p]) => p?.items.length);
-    if (!plots.length) return toast('Nothing to copy: the plots show no signals');
+    if (!plots.length) return toast.warning('Nothing to copy: the plots show no signals');
     const blocks = [];
     let total = 0, lost = 0;
     for (const [id, plot] of plots) {
@@ -500,11 +500,11 @@
       blocks.push({ title: `${traces.map((t) => t.key).join(', ')} · ${time.readout(t0)} – ${time.readout(t1)}`, ...table });
     }
     if (total > MAX_COPY_ROWS)
-      return toast(`${total.toLocaleString()} rows is more than a paste holds well (${MAX_COPY_ROWS.toLocaleString()}); narrow the window, or export it`);
+      return toast.warning(`${total.toLocaleString()} rows is more than a paste holds well (${MAX_COPY_ROWS.toLocaleString()}); narrow the window, or export it`);
     const rows = blocks.reduce((n, b) => n + b.rows.length, 0);
     await writeTables(blocks);
     const missing = lost ? `; the first ${lost.toFixed(1)} s of the window are no longer in history` : '';
-    toast(`Copied ${rows.toLocaleString()} rows of ${blocks.length} plot${blocks.length === 1 ? '' : 's'}${missing}`);
+    toast.success(`Copied ${rows.toLocaleString()} rows of ${blocks.length} plot${blocks.length === 1 ? '' : 's'}${missing}`);
   }
 
   /** Moves signal `key` from plot `from` to plot `to`, or to a new plot to its right with null. */
@@ -537,7 +537,7 @@
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'c' && !String(window.getSelection() ?? '')) {
       e.preventDefault();
       const ids = ws.highlighted().length ? ws.highlighted() : ws.timeIds();
-      return void copyData(ids).catch((error) => toast(`Could not copy: ${error.message}`));
+      return void copyData(ids).catch((error) => toast.error(`Could not copy: ${error.message}`));
     }
     // Ctrl+A outside a field selects every plot of the tab, not the page's text.
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
@@ -624,7 +624,7 @@
         onMoveSignal={(key, to) => moveSignal(id, key, to)}
         onCheckCopy={() => copyCheck(ws.selected.has(id) ? [...ws.selected] : [id])}
         onExport={() => openExport(ws.selected.has(id) ? [...ws.selected] : [id])}
-        onCopy={() => copyData(ws.selected.has(id) ? [...ws.selected] : [id]).catch((error) => toast(`Could not copy: ${error.message}`))}
+        onCopy={() => copyData(ws.selected.has(id) ? [...ws.selected] : [id]).catch((error) => toast.error(`Could not copy: ${error.message}`))}
       />
     {/if}
   {/key}
