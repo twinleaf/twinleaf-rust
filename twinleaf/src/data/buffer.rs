@@ -8,6 +8,15 @@
 //! new run. A run retains its rows as frozen [`SampleBatch`]es. A
 //! [`BatchCoalescer`] merges incoming batches into chunks, and retention
 //! drops the oldest rows by slicing the front chunk.
+//!
+//! A buffer may also keep each stream to a span of time, by the stream's
+//! own clock, so rows older than its newest by more than that go.
+//!
+//! A buffer may also hold a budget of bytes across every stream. Each chunk
+//! records when its first row arrived, by a count of the batches the buffer
+//! has processed, and over the budget the chunk that arrived first goes
+//! first. Arrival, not sample time, orders them, as streams of different
+//! devices may run on clocks that disagree.
 //! Reads return slices of the retained chunks and copy only the
 //! still-accumulating rows they ask for.
 
@@ -19,11 +28,16 @@ use crate::proto::SampleNumber;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ops::Range;
+/// The most bytes a chunk holds, so eviction under a budget frees memory in
+/// small steps.
+const CHUNK_BYTES: usize = 256 * 1024;
 #[cfg(feature = "host")]
 use std::time::Instant;
 
 /// The newest samples of every stream that has delivered data, each capped at
-/// `capacity` rows.
+/// `capacity` rows and, given a maximum age, that span of its own time, and
+/// all of them, given a budget, at that many bytes. Each limit holds at once,
+/// so the tightest decides.
 ///
 /// # Examples
 ///
@@ -70,6 +84,13 @@ use std::time::Instant;
 #[derive(Debug)]
 pub struct Buffer {
     capacity: usize,
+    /// The bytes every run may hold together, or `None` for no such limit.
+    budget: Option<usize>,
+    /// The span of its own time each run keeps, in seconds, or `None`.
+    max_age: Option<f64>,
+    /// How many batches the buffer has processed, which is the arrival number
+    /// of the newest.
+    arrivals: u64,
     runs: HashMap<StreamKey, Run>,
 }
 
@@ -78,7 +99,73 @@ impl Buffer {
     pub fn new(capacity: usize) -> Buffer {
         Buffer {
             capacity,
+            budget: None,
+            max_age: None,
+            arrivals: 0,
             runs: HashMap::new(),
+        }
+    }
+
+    /// Creates a buffer whose streams hold at most `budget` bytes together.
+    /// Over it, the oldest chunk by arrival goes first, from whichever stream
+    /// holds it, so every stream keeps about the same span of history.
+    pub fn with_budget(budget: usize) -> Buffer {
+        Buffer {
+            budget: Some(budget),
+            ..Buffer::new(usize::MAX)
+        }
+    }
+
+    /// Sets the bytes the streams may hold together, or lifts the limit with
+    /// `None`, and drops the oldest chunks at once to meet it.
+    pub fn set_budget(&mut self, budget: Option<usize>) {
+        self.budget = budget;
+        self.trim_to_budget();
+    }
+
+    /// Keeps each stream to rows no older than its newest by more than
+    /// `seconds`, by the stream's own clock, or lifts the limit with `None`.
+    /// Older rows go at once.
+    pub fn set_max_age(&mut self, seconds: Option<f64>) {
+        self.max_age = seconds;
+        for run in self.runs.values_mut() {
+            run.max_age = seconds;
+            let newest = run.last_timestamp();
+            run.evict(newest);
+        }
+    }
+
+    /// Returns the span of its own time each stream keeps, if limited.
+    pub fn max_age(&self) -> Option<f64> {
+        self.max_age
+    }
+
+    /// Returns the bytes the streams may hold together, if limited.
+    pub fn budget(&self) -> Option<usize> {
+        self.budget
+    }
+
+    /// Returns the bytes the streams hold, each retained row's time, sample
+    /// number and columns counted at their native widths.
+    pub fn bytes(&self) -> usize {
+        self.runs.values().map(Run::bytes).sum()
+    }
+
+    /// Drops the chunk that arrived first, run by run, while the streams hold
+    /// more than the budget. The rows still accumulating in each run stay,
+    /// so a budget smaller than those is held to them.
+    fn trim_to_budget(&mut self) {
+        let Some(budget) = self.budget else { return };
+        while self.bytes() > budget {
+            let oldest = self
+                .runs
+                .iter()
+                .filter_map(|(key, run)| Some((run.front_arrival()?, *key)))
+                .min();
+            let Some((_, key)) = oldest else { break };
+            if let Some(run) = self.runs.get_mut(&key) {
+                run.drop_front_chunk();
+            }
         }
     }
 
@@ -91,13 +178,16 @@ impl Buffer {
         if batch.is_empty() {
             return;
         }
+        self.arrivals += 1;
         let stream_key = batch.stream_key();
         match self.runs.get_mut(&stream_key) {
-            Some(run) if run.admits(batch) => run.append(batch),
+            Some(run) if run.admits(batch) => run.append(batch, self.arrivals),
             _ => {
-                self.runs.insert(stream_key, Run::new(batch, self.capacity));
+                let run = Run::new(batch, self.capacity, self.max_age, self.arrivals);
+                self.runs.insert(stream_key, run);
             }
         }
+        self.trim_to_budget();
     }
 
     /// Returns the stream's current run, or `None` if it has delivered no data.
@@ -136,12 +226,20 @@ pub struct Run {
     metadata: StreamMetadataSnapshot,
     /// Completed chunks in row order. The coalescer holds the rows after them.
     chunks: VecDeque<SampleBatch>,
+    /// The arrival number of each chunk's first row, chunk by chunk.
+    arrived: VecDeque<u64>,
+    /// The arrival number of the first row the coalescer holds.
+    tail_arrived: u64,
     coalescer: BatchCoalescer,
     /// Exclusive logical position of the next row appended to this run.
     next_row: u64,
     /// Retained rows, the tail included.
     rows: usize,
     capacity: usize,
+    /// The span of its own time the run keeps, in seconds.
+    max_age: Option<f64>,
+    /// The bytes of one row, its time, sample number and columns together.
+    row_bytes: usize,
     #[cfg(feature = "host")]
     last_seen: Instant,
 }
@@ -160,21 +258,30 @@ impl std::fmt::Debug for Run {
 }
 
 impl Run {
-    fn new(batch: &SampleBatch, capacity: usize) -> Run {
+    fn new(batch: &SampleBatch, capacity: usize, max_age: Option<f64>, arrival: u64) -> Run {
+        let columns: usize = batch.schema().columns().map(|c| c.data_type().size()).sum();
+        let row_bytes = size_of::<f64>() + size_of::<SampleNumber>() + columns;
+        let target = (capacity / 16)
+            .clamp(256, 65_536)
+            .min((CHUNK_BYTES / row_bytes).max(256));
         let mut run = Run {
             generations: batch.generations(),
             latest: batch.generations(),
             boundaries: VecDeque::new(),
             metadata: batch.metadata().clone(),
             chunks: VecDeque::new(),
-            coalescer: BatchCoalescer::new(Some((capacity / 16).clamp(256, 65_536))),
+            arrived: VecDeque::new(),
+            tail_arrived: arrival,
+            coalescer: BatchCoalescer::new(Some(target)),
             next_row: 0,
             rows: 0,
             capacity,
+            max_age,
+            row_bytes,
             #[cfg(feature = "host")]
             last_seen: Instant::now(),
         };
-        run.append(batch);
+        run.append(batch, arrival);
         run
     }
 
@@ -191,7 +298,8 @@ impl Run {
             && batch.schema() == self.metadata.schema()
     }
 
-    fn append(&mut self, batch: &SampleBatch) {
+    /// Appends `batch`, which arrived as the buffer's batch `arrival`.
+    fn append(&mut self, batch: &SampleBatch, arrival: u64) {
         debug_assert!(
             batch.schema() == self.metadata.schema(),
             "a run admits only batches of its schema"
@@ -204,8 +312,11 @@ impl Run {
             }
         }
         self.latest = batch.generations();
+        if self.coalescer.buffered_len() == 0 {
+            self.tail_arrived = arrival;
+        }
         self.coalescer.push(batch);
-        self.take_completed_chunks();
+        self.take_completed_chunks(arrival);
 
         self.metadata = batch.metadata().clone();
         self.next_row += batch.len() as u64;
@@ -214,37 +325,73 @@ impl Run {
         {
             self.last_seen = Instant::now();
         }
-        self.evict();
+        self.evict(batch.timestamps().last().copied());
     }
 
-    fn take_completed_chunks(&mut self) {
+    /// Moves the coalescer's completed chunks to the run. The first began
+    /// with the tail's first row, and any after it with batch `arrival`.
+    fn take_completed_chunks(&mut self, arrival: u64) {
         while let Some(chunk) = self.coalescer.next_completed_batch() {
             self.chunks.push_back(chunk);
+            self.arrived.push_back(self.tail_arrived);
+            self.tail_arrived = arrival;
         }
     }
 
-    /// Drops the oldest rows until at most `capacity` remain. A cut that falls
-    /// inside the front chunk slices it.
-    fn evict(&mut self) {
-        let Some(mut excess) = self.rows.checked_sub(self.capacity) else {
-            return;
+    /// Drops the oldest rows until at most `capacity` remain and, given a
+    /// maximum age, every row older than `newest` by more than it. A cut
+    /// that falls inside the front chunk slices it.
+    fn evict(&mut self, newest: Option<f64>) {
+        let over_capacity = self.rows.saturating_sub(self.capacity);
+        let too_old = match (self.max_age, newest) {
+            (Some(age), Some(newest)) => {
+                let keep_from = self.first_row_at_or_after(newest - age, false);
+                (keep_from - self.retained_rows().start) as usize
+            }
+            _ => 0,
         };
+        let mut excess = over_capacity.max(too_old);
+        if excess == 0 {
+            return;
+        }
         if self.rows - self.coalescer.buffered_len() < excess {
             // The rows to drop reach into the tail, so freeze it first.
             self.coalescer.finish_buffered_batch();
-            self.take_completed_chunks();
+            self.take_completed_chunks(self.tail_arrived);
         }
         while excess > 0 {
             let front = self.chunks.front_mut().expect("chunks cover the excess");
             let dropped = excess.min(front.len());
             if dropped == front.len() {
                 self.chunks.pop_front();
+                self.arrived.pop_front();
             } else {
                 *front = front.slice(dropped..front.len());
             }
             self.rows -= dropped;
             excess -= dropped;
         }
+        self.forget_dropped_boundaries();
+    }
+
+    /// Drops the oldest completed chunk, if any. The rows still
+    /// accumulating are never dropped this way.
+    fn drop_front_chunk(&mut self) {
+        let Some(chunk) = self.chunks.pop_front() else {
+            return;
+        };
+        self.arrived.pop_front();
+        self.rows -= chunk.len();
+        self.forget_dropped_boundaries();
+    }
+
+    /// The arrival number of the oldest completed chunk's first row.
+    fn front_arrival(&self) -> Option<u64> {
+        self.arrived.front().copied()
+    }
+
+    /// Forgets the boundaries before the first retained row.
+    fn forget_dropped_boundaries(&mut self) {
         let start = self.retained_rows().start;
         while self
             .boundaries
@@ -399,6 +546,17 @@ impl Run {
     pub fn retained_rows(&self) -> Range<u64> {
         self.next_row - self.rows as u64..self.next_row
     }
+
+    /// Returns the bytes of one row, its time, sample number and columns
+    /// together at their native widths.
+    pub fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    /// Returns the bytes the retained rows hold.
+    pub fn bytes(&self) -> usize {
+        self.rows * self.row_bytes
+    }
 }
 
 #[cfg(test)]
@@ -544,8 +702,12 @@ mod tests {
     /// One stream sampled at 1 Hz from time zero, so a row's timestamp is its
     /// sample number plus one.
     fn test_fixture(column_types: &[DataType]) -> Fixture {
+        stream_fixture(1, column_types)
+    }
+
+    /// Stream `stream_id` of the root device, as `test_fixture` makes stream 1.
+    fn stream_fixture(stream_id: u8, column_types: &[DataType]) -> Fixture {
         let route = DeviceRoute::root();
-        let stream_id = 1;
 
         let names: Vec<_> = (0..column_types.len())
             .map(|index| {
@@ -1057,5 +1219,100 @@ mod tests {
         fx.push_floats(&mut buffer, 1, 0..0);
         assert!(buffer.run(&fx.stream_key).is_none());
         assert_eq!(buffer.stream_keys().count(), 0);
+    }
+
+    /// The bytes of a row of one f64 column, and the rows of a full chunk of them.
+    const ROW: usize = 8 + 4 + 8;
+    const CHUNK: u32 = (CHUNK_BYTES / ROW) as u32;
+
+    /// Pushes `chunks` batches of a full chunk each, which the coalescer
+    /// completes one chunk apiece, numbered on from `first`.
+    fn push_chunks(fx: &Fixture, buffer: &mut Buffer, first: u32, chunks: u32) {
+        for chunk in 0..chunks {
+            let start = first + chunk * CHUNK;
+            fx.push_floats(buffer, 0, start..start + CHUNK);
+        }
+    }
+
+    #[test]
+    fn a_row_is_its_time_sample_number_and_columns() {
+        let fx = test_fixture(&[DataType::F64, DataType::F32]);
+        let mut buffer = Buffer::new(usize::MAX);
+        fx.push_rows(
+            &mut buffer,
+            0,
+            &[(0, vec![ColumnData::F64(1.0), ColumnData::F32(2.0)])],
+        );
+        let run = buffer.run(&fx.stream_key).expect("a run");
+        assert_eq!(run.row_bytes(), 8 + 4 + 8 + 4);
+        assert_eq!(buffer.bytes(), run.row_bytes());
+    }
+
+    #[test]
+    fn over_the_budget_the_chunk_that_arrived_first_goes() {
+        let (a, b) = (
+            stream_fixture(1, &[DataType::F64]),
+            stream_fixture(2, &[DataType::F64]),
+        );
+        let budget = (5 * CHUNK as usize + CHUNK as usize / 2) * ROW;
+        let mut buffer = Buffer::with_budget(budget);
+        push_chunks(&a, &mut buffer, 0, 4);
+        push_chunks(&b, &mut buffer, 0, 4);
+        // Stream a's rows arrived first, so its oldest chunks went, though
+        // its samples are no older than b's.
+        let all = 0..4 * u64::from(CHUNK);
+        assert_eq!(
+            buffer.run(&a.stream_key).unwrap().retained_rows(),
+            3 * u64::from(CHUNK)..all.end
+        );
+        assert_eq!(buffer.run(&b.stream_key).unwrap().retained_rows(), all);
+        assert!(buffer.bytes() <= budget);
+    }
+
+    #[test]
+    fn a_lower_budget_drops_the_oldest_at_once() {
+        let fx = test_fixture(&[DataType::F64]);
+        let mut buffer = Buffer::new(usize::MAX);
+        let c = u64::from(CHUNK);
+        push_chunks(&fx, &mut buffer, 0, 4);
+        buffer.set_budget(Some(2 * CHUNK as usize * ROW));
+        assert_eq!(
+            buffer.run(&fx.stream_key).unwrap().retained_rows(),
+            2 * c..4 * c
+        );
+        buffer.set_budget(None);
+        push_chunks(&fx, &mut buffer, 4 * CHUNK, 2);
+        assert_eq!(
+            buffer.run(&fx.stream_key).unwrap().retained_rows(),
+            2 * c..6 * c
+        );
+    }
+
+    #[test]
+    fn the_rows_still_accumulating_outlast_any_budget() {
+        let fx = test_fixture(&[DataType::F64]);
+        let mut buffer = Buffer::with_budget(0);
+        fx.push_floats(&mut buffer, 0, 0..100);
+        let run = buffer.run(&fx.stream_key).unwrap();
+        assert_eq!(run.retained_rows(), 0..100);
+        assert_eq!(buffer.bytes(), 100 * run.row_bytes());
+    }
+
+    #[test]
+    fn a_maximum_age_keeps_each_stream_to_a_span_of_its_own_time() {
+        // At 1 Hz from time zero, a row's time is its sample number plus one.
+        let fx = test_fixture(&[DataType::F64]);
+        let mut buffer = Buffer::new(usize::MAX);
+        buffer.set_max_age(Some(100.0));
+        fx.push_floats(&mut buffer, 0, 0..300);
+        assert_eq!(
+            buffer.run(&fx.stream_key).unwrap().retained_rows(),
+            199..300
+        );
+        buffer.set_max_age(Some(50.0));
+        assert_eq!(
+            buffer.run(&fx.stream_key).unwrap().retained_rows(),
+            249..300
+        );
     }
 }
