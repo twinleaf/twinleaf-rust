@@ -554,6 +554,7 @@ impl SampleBatch {
 
     /// Returns this batch with `boundary` in place of its own, and the same
     /// rows, metadata and generations.
+    #[cfg(feature = "host")]
     pub(crate) fn with_boundary(mut self, boundary: Option<Boundary>) -> SampleBatch {
         self.context.boundary = boundary;
         self

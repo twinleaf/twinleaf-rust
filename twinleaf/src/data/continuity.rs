@@ -265,6 +265,7 @@ impl Change {
     /// told of two at once learns what the parser tells of both at once. A
     /// restart ranks below a backward step in time, which it does not stand
     /// for, and above the rollover it stands for.
+    #[cfg(feature = "host")]
     pub(crate) fn rank(&self) -> u8 {
         match self {
             Change::Initial => 7,

@@ -1,6 +1,6 @@
 //! Seekable and indexed access to immutable TIO log files.
 //!
-//! [`LogFile`] maps a log and iterates its packets. [`LogFile::scan`] builds a
+//! [`LogFile`] holds a log's bytes and iterates its packets. [`LogFile::scan`] builds a
 //! [`LogIndex`], which summarizes the log and decodes it in batches.
 
 use super::continuity::{Boundary, BoundaryClass};
@@ -11,20 +11,26 @@ use super::state::{DataError, ScannedRows};
 use crate::proto::data as wire;
 use crate::tio::{self, Packet};
 use bytes::{Buf, Bytes};
+#[cfg(feature = "host")]
 use memmap2::Mmap;
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(feature = "host")]
 use std::fs::File;
+#[cfg(feature = "host")]
 use std::io;
 use std::ops::Range;
+#[cfg(feature = "host")]
 use std::path::Path;
 
 const INDEX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const PROGRESS_BYTES: usize = 1024 * 1024;
 
-/// An immutable, memory-mapped TIO log.
+/// An immutable TIO log, memory-mapped by [`LogFile::open`] or read from
+/// bytes by [`LogFile::from_bytes`].
 ///
-/// Packet payloads share the mapping and copy no bytes. The file must not be
-/// modified or truncated while the log, its index, or its packets are alive.
+/// Packet payloads share the log's bytes and copy none. A mapped file must
+/// not be modified or truncated while the log, its index, or its packets are
+/// alive.
 /// Each call to [`LogFile::packets`] creates an independent packet iterator.
 ///
 /// # Examples
@@ -442,12 +448,19 @@ fn decode_chunk(
 }
 
 impl LogFile {
+    /// Reads a log from its bytes, as a dropped file in a browser gives them.
+    pub fn from_bytes(data: impl Into<Bytes>) -> Self {
+        Self { data: data.into() }
+    }
+
     /// Memory-maps the log at `path`. The file must stay unmodified while the
     /// log, its index, or its packets are alive.
     ///
     /// # Errors
     ///
     /// Returns the I/O error if the file cannot be opened or mapped.
+    #[cfg(feature = "host")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "host")))]
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = File::open(path)?;
         // SAFETY: callers must keep log files immutable while the mapping is
