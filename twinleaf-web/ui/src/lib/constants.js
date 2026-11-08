@@ -3,6 +3,12 @@
 /** The time windows a time plot offers, in seconds. */
 export const SPANS = [0.1, 0.5, 1, 2, 5, 10, 30, 60];
 
+/** The spans of raw history the settings offer, in seconds of each stream. */
+export const HISTORY_SPANS = [60, 300, 600, 1800, 3600, 4 * 3600, 86400];
+
+/** The memory the settings offer the raw history, in bytes across every stream. */
+export const HISTORY_BUDGETS = [0.25, 0.5, 1, 2, 4, 8, 16, 32].map((gb) => gb * 1e9);
+
 /** The decimations the settings offer, in points per second per trace. */
 export const DECIMATIONS = [100, 500, 2000, 5000];
 

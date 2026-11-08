@@ -75,8 +75,9 @@ snapshot:
 2. **Changes**, each numbered `seq` one more than the last (`feed.rs`):
    points frames (every 16 ms), one spectra frame per round (every 100 ms),
    `trace` for a new column, device messages, `memory` when what the buffer
-   holds changed (checked each second), and on a decimation change `clear`,
-   the history again and `config`.
+   holds or may hold changed (checked each second: `bytes` of `budget`, the
+   `seconds` held of `max_age`, and the bytes per second `rate`), and on a
+   decimation change `clear`, the history again and `config`.
 3. **Gaps** go back through 1: a change numbered other than the next, or a
    frame naming a trace the session does not have, makes the page close its
    socket and open another (`Hub.resync`). A retired hub closes the socket.
@@ -105,6 +106,7 @@ an Error. What a device made of a call is data in the reply, not a refusal.
 | `GET /api/discover` | a 3 s scan for devices, mDNS optional |
 | `POST /api/mount` | opens devices in place of the hub's |
 | `POST /api/pps` | the decimation every page shares |
+| `POST /api/history` | the raw history the hub keeps: `{seconds, bytes}`, a span of each stream's time and a budget across every stream |
 | `GET /api/window` | raw rows of one trace of a named hub, for a paused plot |
 
 ## The page (`twinleaf-web/ui/src`)
@@ -135,8 +137,10 @@ canvas and its WebGL layer.
 ### A sample, to a pixel
 
 1. The proxy delivers a `SampleBatch` to the hub's connection. The hub's
-   thread puts it in the `Buffer` (60 s of raw rows per stream) and makes a
-   trace of each new float column (`Hub::register`, id = its index).
+   thread puts it in the `Buffer` of raw rows (10 min of each stream in at
+   most 1 GB at first, as `/api/history` sets; past the budget the chunk
+   that arrived first goes) and makes a trace of each new float column
+   (`Hub::register`, id = its index).
 2. Every 16 ms, `Hub::flush` catches each trace's `Fpcs` decimator up (the
    decimation is `pps` points per second per trace, 500 at first), splits
    the new points where samples were lost, and sends one points frame.

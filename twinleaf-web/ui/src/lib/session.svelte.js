@@ -208,7 +208,7 @@ export class Session {
   mounts = $state.raw(null);
   /** The decimation, in points per second per trace. */
   pps = $state(0);
-  /** What the hub's buffer holds, {bytes, capacity, seconds}, or null before it says. */
+  /** The hub's raw history, {bytes, budget, seconds, maxAge, rate}, or null before it says. */
   memory = $state.raw(null);
 
   traces = new Map(); // trace id -> Trace
@@ -277,7 +277,7 @@ export class Session {
         this.pps = msg.pps;
         return;
       case 'memory':
-        this.memory = { bytes: msg.bytes, capacity: msg.capacity, seconds: msg.seconds };
+        this.memory = { bytes: msg.bytes, budget: msg.budget, seconds: msg.seconds, maxAge: msg.max_age, rate: msg.rate };
         return;
       case 'routes':
         this.mounts = msg.mounts;

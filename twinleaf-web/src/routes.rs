@@ -4,8 +4,8 @@
 
 use crate::hub::Live;
 use crate::protocol::{
-    CallRequest, DiscoverRequest, Done, Frame, MountArg, MountRequest, PageMessage, PpsRequest,
-    ReadRequest, Refusal, WindowRequest,
+    CallRequest, DiscoverRequest, Done, Frame, HistoryRequest, MountArg, MountRequest, PageMessage,
+    PpsRequest, ReadRequest, Refusal, WindowRequest,
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
@@ -27,6 +27,7 @@ pub(crate) fn router() -> Router {
         .route("/api/discover", get(discover))
         .route("/api/mount", post(mount))
         .route("/api/pps", post(set_pps))
+        .route("/api/history", post(set_history))
         .route("/api/window", get(window))
         .fallback(crate::assets::serve)
         .with_state(Hubs::default())
@@ -232,6 +233,22 @@ async fn set_pps(
     let pps = args.pps.clamp(10.0, 100_000.0);
     blocking(move || live.set_points_per_second(pps)).await?;
     Ok(Json(PpsRequest { pps }).into_response())
+}
+
+/// The raw history a page may ask for: from 10 s to a day of each stream,
+/// in 16 MB to 64 GB.
+const HISTORY_SECONDS: (f64, f64) = (10.0, 86_400.0);
+const HISTORY_BYTES: (u64, u64) = (16_000_000, 64_000_000_000);
+
+async fn set_history(
+    State(hubs): State<Hubs>,
+    Json(args): Json<HistoryRequest>,
+) -> Result<Response, Refusal> {
+    let live = hubs.live().await?;
+    let seconds = args.seconds.clamp(HISTORY_SECONDS.0, HISTORY_SECONDS.1);
+    let bytes = args.bytes.clamp(HISTORY_BYTES.0, HISTORY_BYTES.1);
+    blocking(move || live.set_history(seconds, bytes as usize)).await?;
+    Ok(Json(HistoryRequest { seconds, bytes }).into_response())
 }
 
 /// Reads a window of one trace of the hub the page names. A page still on a

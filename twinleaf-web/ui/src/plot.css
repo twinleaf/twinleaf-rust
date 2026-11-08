@@ -92,8 +92,30 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .status-bar .warn svg, .status-bar .keys svg { width: 12px; height: 12px; }
 .status-bar .meter { display: inline-block; width: 48px; height: 4px; border-radius: 2px; background: var(--secondary); overflow: hidden; }
 .status-bar .meter span { display: block; height: 100%; background: var(--primary); }
-.status-bar .keys { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
-.status-bar .keys:hover { color: var(--foreground); background: var(--secondary); }
+.status-bar .keys, .status-bar .history { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.status-bar .keys:hover, .status-bar .history:hover { color: var(--foreground); background: var(--secondary); }
+/* The raw history's settings (HistorySettings.svelte): one sentence of two
+   inline controls, a waterline of the memory held with a tick where the
+   span of time would fill it, and a caption naming the limit that comes
+   first. Sized to its content on a 4 px scale. */
+.history-set { display: flex; flex-direction: column; font-size: 12px; }
+.history-line { display: flex; align-items: center; gap: 6px; height: 24px; color: var(--muted-foreground); white-space: nowrap; }
+/* The stepper matches the select beside it: height, border and corners. */
+.stepper { display: flex; align-items: center; height: 24px; border: 1px solid var(--input); border-radius: min(var(--radius-md), 10px); background: color-mix(in oklch, var(--input) 30%, transparent); overflow: hidden; }
+.stepper button { display: grid; place-items: center; width: 22px; height: 100%; padding: 0; border: 0; background: none; color: var(--muted-foreground); cursor: pointer; }
+.stepper button:hover:not(:disabled) { background: var(--secondary); color: var(--foreground); }
+.stepper button:disabled { opacity: 0.35; cursor: default; }
+.stepper button svg { width: 12px; height: 12px; }
+.stepper span { min-width: 56px; padding: 0 4px; border-inline: 1px solid var(--input); text-align: center; font-variant-numeric: tabular-nums; color: var(--foreground); line-height: 22px; }
+.waterline { position: relative; height: 4px; margin-top: 8px; border-radius: 2px; background: var(--secondary); overflow: hidden; }
+.waterline .fill { height: 100%; background: var(--primary); transition: width 0.3s; }
+.waterline .tick { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--foreground); opacity: 0.6; }
+.water-caption { display: flex; align-items: center; justify-content: space-between; height: 16px; margin-top: 4px; color: var(--muted-foreground); font-size: 11px; font-variant-numeric: tabular-nums; }
+.water-caption b { color: var(--foreground); font-weight: 600; }
+.water-caption .info { display: grid; place-items: center; width: 16px; height: 16px; padding: 0; border: 0; background: none; color: var(--muted-foreground); cursor: help; }
+.water-caption .info:hover { color: var(--foreground); }
+.water-caption .info svg { width: 12px; height: 12px; }
+.water-caption .short { color: var(--cursor-a); }
 .status-bar kbd { font: 10px var(--font-data); padding: 0 3px; border: 1px solid var(--border); border-radius: 3px; }
 .action-grid { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px; }
 .props-empty { padding: 4px; color: var(--muted-foreground); font-size: 12px; }

@@ -118,6 +118,8 @@ export const api = {
   mount: (mounts) => request('/api/mount', { body: { mounts } }),
   /** Sets the decimation every page shares. Replies {pps} as the server clamped it. */
   setPps: (pps) => request('/api/pps', { body: { pps } }),
+  /** Keeps `seconds` of each stream's raw history, in at most `bytes` across every stream. */
+  setHistory: (seconds, bytes) => request('/api/history', { body: { seconds, bytes: Math.round(bytes) } }),
   /**
    * Reads trace `id` of hub `hub` between t0 and t1, decimated to about
    * `width` px. Replies {t0, t1, ratio, chunks: [{x, y}]}, `ratio` raw rows per point.

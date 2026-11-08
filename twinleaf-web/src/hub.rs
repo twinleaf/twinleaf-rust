@@ -27,14 +27,15 @@ use tokio::sync::{broadcast, watch};
 use twinleaf::data::ops::{Fpcs, Welch};
 use twinleaf::data::{Buffer, ColumnArray, ColumnKey, ColumnOp, ColumnProcessor, Run};
 use twinleaf::proxy::Layout;
-use twinleaf::{
-    ColumnId, Connection, DeviceRoute, DeviceTree, RecvError, SampleBatch, SampleNumber,
-};
+use twinleaf::{ColumnId, Connection, DeviceRoute, DeviceTree, RecvError, SampleBatch};
 
-/// How much history the hub keeps, raw in the buffer and decimated.
-const HISTORY_SECONDS: f64 = 60.0;
-/// Raw rows the buffer keeps per stream, 60 s of a 5 kHz stream.
-const BUFFER_ROWS: usize = 5000 * 60;
+/// How much decimated history the hub keeps for the live view, as the page
+/// does.
+const HISTORY_SECONDS: f64 = 120.0;
+/// The raw history the hub starts with: this span of each stream's time, and
+/// at most this many bytes across every stream.
+const RAW_SECONDS: f64 = 600.0;
+const RAW_BYTES: usize = 1_000_000_000;
 /// How often pending points go out.
 const FLUSH: Duration = Duration::from_millis(16);
 /// How often spectra are recomputed.
@@ -67,8 +68,8 @@ pub(crate) struct Hub {
     /// The traces each page shows as spectra, by trace id, by page. Only
     /// these are estimated.
     spectra_shown: HashMap<u64, BTreeSet<u16>>,
-    /// The bytes, capacity and whole seconds the last `memory` message said.
-    memory_sent: Option<(u64, u64, i64)>,
+    /// What the last `memory` message said, rounded as the page shows it.
+    memory_sent: Option<(u64, u64, i64, i64, i64)>,
     feed: Arc<Feed>,
 }
 
@@ -160,6 +161,12 @@ impl Live {
             id: self.next_page.fetch_add(1, Ordering::Relaxed),
             live: self.clone(),
         }
+    }
+
+    /// Sets the raw history the hub keeps: `seconds` of each stream's time,
+    /// in at most `bytes` across every stream.
+    pub(crate) fn set_history(&self, seconds: f64, bytes: usize) {
+        self.hub.lock().unwrap().set_history(seconds, bytes);
     }
 
     /// Changes the decimation every page shares, re-decimating the history.
@@ -275,7 +282,11 @@ fn gap_times(run: Option<&Run>) -> Vec<f64> {
 impl Hub {
     fn new() -> Hub {
         Hub {
-            buffer: Buffer::new(BUFFER_ROWS),
+            buffer: {
+                let mut buffer = Buffer::with_budget(RAW_BYTES);
+                buffer.set_max_age(Some(RAW_SECONDS));
+                buffer
+            },
             traces: Vec::new(),
             by_key: HashMap::new(),
             points_per_second: POINTS_PER_SECOND,
@@ -441,24 +452,15 @@ impl Hub {
         frames
     }
 
-    /// What the buffer holds, as a `memory` message. A row is its time,
-    /// its sample number and its columns.
+    /// What the buffer holds and may hold, as a `memory` message.
     fn memory(&self) -> Message {
-        let (mut bytes, mut capacity, mut seconds) = (0, 0, f64::INFINITY);
+        let (mut rate, mut seconds) = (0.0, f64::INFINITY);
         for key in self.buffer.stream_keys() {
             let Some(run) = self.buffer.run(key) else {
                 continue;
             };
-            let columns: usize = run
-                .metadata()
-                .schema()
-                .columns()
-                .map(|c| c.data_type().size())
-                .sum();
-            let row = (size_of::<f64>() + size_of::<SampleNumber>() + columns) as u64;
+            rate += run.row_bytes() as f64 * run.metadata().rate_hz();
             let rows = run.retained_rows();
-            bytes += (rows.end - rows.start) * row;
-            capacity += BUFFER_ROWS as u64 * row;
             let first = run
                 .rows(rows.start..rows.start + 1)
                 .first()
@@ -467,12 +469,22 @@ impl Hub {
                 seconds = seconds.min(last - first);
             }
         }
-        let seconds = if seconds.is_finite() { seconds } else { 0.0 };
         Message::Memory {
-            bytes,
-            capacity,
-            seconds,
+            bytes: self.buffer.bytes() as u64,
+            budget: self.buffer.budget().unwrap_or(0) as u64,
+            seconds: if seconds.is_finite() { seconds } else { 0.0 },
+            max_age: self.buffer.max_age().unwrap_or(0.0),
+            rate,
         }
+    }
+
+    /// Sets the raw history the buffer keeps, dropping what no longer fits
+    /// at once, and tells every page.
+    fn set_history(&mut self, seconds: f64, bytes: usize) {
+        self.buffer.set_max_age(Some(seconds));
+        self.buffer.set_budget(Some(bytes));
+        self.memory_sent = None;
+        self.send_memory();
     }
 
     /// Tells every page what the buffer holds, when that changed.
@@ -480,13 +492,21 @@ impl Hub {
         let message = self.memory();
         let Message::Memory {
             bytes,
-            capacity,
+            budget,
             seconds,
+            max_age,
+            rate,
         } = &message
         else {
             unreachable!()
         };
-        let shown = (*bytes, *capacity, seconds.round() as i64);
+        let shown = (
+            *bytes,
+            *budget,
+            seconds.round() as i64,
+            max_age.round() as i64,
+            rate.round() as i64,
+        );
         if self.memory_sent != Some(shown) {
             self.memory_sent = Some(shown);
             self.feed.message(&message);

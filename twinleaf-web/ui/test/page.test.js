@@ -3,6 +3,7 @@ import { controlOf, mergeRows, writersOf } from '../src/lib/properties.js';
 import { KEYMAP, actionFor } from '../src/lib/keymap.js';
 import { lanesOf, siRange } from '../src/lib/plot.js';
 import { Views } from '../src/lib/views.js';
+import { bytesEstimate, bytesText, spanText } from '../src/lib/units.js';
 
 const rpc = (name, type, access, channel = 'setting') => ({ name, type, access, channel, readable: access.includes('read'), persistent: false });
 
@@ -78,5 +79,15 @@ describe('a range of values', () => {
     expect(siRange(-2.438, 0.4413, 'V')).toBe('-2.438 … 0.4413 V');
     expect(siRange(-0.0012, 0.0031, 'V')).toBe('-1.200 … 3.100 mV');
     expect(siRange(-1, 2, 'arb')).toBe('-1.000 … 2.000');
+  });
+});
+
+describe('sizes and spans', () => {
+  it('reads as people write them', () => {
+    expect(bytesText(740e3)).toBe('740 kB');
+    expect(bytesText(12.4e6)).toBe('12.4 MB');
+    expect(bytesText(1.5e9)).toBe('1.50 GB');
+    expect([bytesEstimate(126.4e6), bytesEstimate(2.34e9), bytesEstimate(0)]).toEqual(['~130 MB', '~2.3 GB', '~0 kB']);
+    expect([spanText(45), spanText(720), spanText(3.5 * 3600), spanText(2 * 86400), spanText(Infinity)]).toEqual(['45 s', '12 min', '3.5 h', '2 days', 'forever']);
   });
 });

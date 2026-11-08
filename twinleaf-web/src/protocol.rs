@@ -77,13 +77,16 @@ pub(crate) enum Message {
     Clear,
     /// The decimation, in points per second per trace.
     Config { pps: f64 },
-    /// What the hub's buffer holds: `bytes` of raw rows, of the `capacity`
-    /// it holds once every stream is full, and `seconds` of history in the
-    /// stream that keeps the least.
+    /// What the hub's buffer of raw rows holds and may hold: `bytes` of the
+    /// `budget`, and `seconds` of history in the stream that keeps the
+    /// least, of the `max_age` each keeps at most. `rate` is the bytes per
+    /// second the streams add, so the budget lasts `budget / rate` seconds.
     Memory {
         bytes: u64,
-        capacity: u64,
+        budget: u64,
         seconds: f64,
+        max_age: f64,
+        rate: f64,
     },
     /// The devices there are, by route, and the devices the hub mounted, or
     /// `None` for the proxy's default.
@@ -326,6 +329,14 @@ pub(crate) struct MountArg {
 #[derive(Deserialize, Serialize, Debug)]
 pub(crate) struct PpsRequest {
     pub(crate) pps: f64,
+}
+
+/// `POST /api/history`. Sets how much raw history the hub keeps: at most
+/// `seconds` of each stream's own time, and `bytes` across every stream.
+#[derive(Deserialize, Serialize, Debug)]
+pub(crate) struct HistoryRequest {
+    pub(crate) seconds: f64,
+    pub(crate) bytes: u64,
 }
 
 /// `GET /api/window`. Reads the raw rows of one trace between two times.

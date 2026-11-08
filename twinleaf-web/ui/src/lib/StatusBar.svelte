@@ -5,6 +5,9 @@
   import RiKeys from '@lucide/svelte/icons/keyboard';
   import RiWarn from '@lucide/svelte/icons/triangle-alert';
   import Tip from './Tip.svelte';
+  import HistorySettings from './HistorySettings.svelte';
+  import * as Popover from '$lib/components/ui/popover/index.js';
+  import { bytesText as bytes, spanText as span } from './units.js';
 
   /** `hub` is the page's Hub, `hud` the frame stats, and `onKeys` opens the keys. */
   let { hub, hud, onKeys } = $props();
@@ -13,10 +16,7 @@
   const devices = $derived([...session.devices.values()]);
   const lost = $derived(devices.filter((d) => d.presence === 'lost'));
   const memory = $derived(session.memory);
-  const full = $derived(memory?.capacity ? Math.min(1, memory.bytes / memory.capacity) : 0);
-
-  const bytes = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.round(n / 1e3)} kB`);
-  const span = (s) => (s >= 120 ? `${Math.round(s / 60)} min` : `${Math.round(s)} s`);
+  const full = $derived(memory?.budget ? Math.min(1, memory.bytes / memory.budget) : 0);
   const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 </script>
 
@@ -32,14 +32,24 @@
   </span>
   <span class="item">{plural(session.signals.length, 'signal')} · {hud.rxKBs.toFixed(0)} kB/s</span>
   {#if memory}
-    <span
-      class="item"
-      title="The hub holds {bytes(memory.bytes)} of raw rows, of {bytes(memory.capacity)} once every stream is full. The stream that keeps the least holds {span(memory.seconds)}."
-    >
-      History {span(memory.seconds)}
-      <span class="meter" aria-hidden="true"><span style="width: {full * 100}%"></span></span>
-      {bytes(memory.bytes)}
-    </span>
+    <Popover.Root>
+      <Tip text="Raw history: {bytes(memory.bytes)} of {bytes(memory.budget)}, at most {span(memory.maxAge)} of each stream">
+        {#snippet children(tip)}
+          <Popover.Trigger {...tip}>
+            {#snippet child({ props })}
+              <button {...props} class="item history">
+                History {span(memory.seconds)}
+                <span class="meter" aria-hidden="true"><span style="width: {full * 100}%"></span></span>
+                {bytes(memory.bytes)}
+              </button>
+            {/snippet}
+          </Popover.Trigger>
+        {/snippet}
+      </Tip>
+      <Popover.Content class="w-auto p-2" align="start" side="top">
+        <HistorySettings {memory} />
+      </Popover.Content>
+    </Popover.Root>
   {/if}
   <span class="spacer"></span>
   <span class="item" title="GPU: {hud.gpu || 'unknown'}">{hud.fps.toFixed(0)} fps</span>

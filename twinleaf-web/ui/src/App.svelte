@@ -35,6 +35,7 @@
   import DragOverlay from './lib/DragOverlay.svelte';
   import KeysDialog from './lib/KeysDialog.svelte';
   import StatusBar from './lib/StatusBar.svelte';
+  import HistorySettings from './lib/HistorySettings.svelte';
   import CommandPalette from './lib/CommandPalette.svelte';
   import IconButton from './lib/IconButton.svelte';
   import Tip from './lib/Tip.svelte';
@@ -509,6 +510,10 @@
                 </Select.Content>
               </Select.Root>
             </label>
+            {#if hub.session.memory}
+              <div class="title">History</div>
+              <HistorySettings memory={hub.session.memory} />
+            {/if}
             <div class="title">Renderer</div>
             <div class="hud">
               <span><b>{hud.fps.toFixed(0)}</b> fps</span>
