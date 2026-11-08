@@ -1,0 +1,343 @@
+/* What Tailwind classes do not cover: the shared WebGL layer, tiling, chips and tabs. */
+html, body { height: 100%; margin: 0; background: var(--background); color: var(--foreground); }
+.gl-layer { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 0; }
+.app { position: relative; z-index: 1; display: flex; flex-direction: column; height: 100vh; }
+.app.moving, .app.moving * { cursor: grabbing !important; user-select: none; }
+/* The sidebar and the tiles, two PaneForge panes, the sidebar's edge between them. */
+.layout { flex: 1 1 0; min-height: 0; height: auto; padding: 8px 12px; }
+
+/* Scrollbars: thin, in the theme's colours, over a clear track. */
+* { scrollbar-width: thin; scrollbar-color: color-mix(in oklch, var(--muted-foreground) 40%, transparent) transparent; }
+
+/* Tiling: a split's panes are PaneForge panes; a leaf holds one plot. */
+.tiles { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; }
+.leaf { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
+.tiles.has-max .leaf:not(.max) { visibility: hidden; }
+.tiles.has-max .leaf.max { position: absolute; inset: 0; z-index: 5; }
+.drop-hint { position: absolute; pointer-events: none; z-index: 6; background: color-mix(in oklch, var(--primary) 12%, transparent); border: 1px solid var(--primary); }
+.drop-hint.left { left: 0; top: 0; bottom: 0; width: 50%; }
+.drop-hint.right { right: 0; top: 0; bottom: 0; width: 50%; }
+.drop-hint.top { left: 0; right: 0; top: 0; height: 50%; }
+.drop-hint.bottom { left: 0; right: 0; bottom: 0; height: 50%; }
+.drop-hint.center { inset: 22%; }
+/* The signal joins the plot under the pointer. */
+.drop-hint.add { inset: 0; background: color-mix(in oklch, var(--primary) 5%, transparent); border-color: color-mix(in oklch, var(--primary) 60%, transparent); }
+/* The plot being moved, shown where a drop would leave it. */
+.leaf.lifted::after { content: ""; position: absolute; inset: 0; z-index: 5; pointer-events: none; background: color-mix(in oklch, var(--primary) 6%, transparent); outline: 1px solid var(--primary); outline-offset: -1px; }
+/* The plot being moved, as a small panel under the pointer. */
+.move-ghost { position: fixed; z-index: 50; pointer-events: none; width: 220px; overflow: hidden; background: var(--card); border: 1px solid var(--primary); border-radius: var(--radius); box-shadow: 0 12px 32px rgb(0 0 0 / 0.5); font-size: 12px; }
+.move-ghost .ghost-head { padding: 4px 8px; background: var(--secondary); border-bottom: 1px solid var(--border); color: var(--foreground); }
+.move-ghost .ghost-body { display: flex; flex-direction: column; gap: 2px; min-height: 44px; padding: 6px 8px; font: 11px/16px var(--font-data); color: var(--muted-foreground); }
+.move-ghost .ghost-body i { display: inline-block; width: 10px; height: 3px; margin-right: 6px; vertical-align: middle; background: var(--c); border-radius: 2px; }
+.move-ghost .ghost-action { padding: 3px 8px; border-top: 1px solid var(--border); color: var(--primary); font-size: 11px; }
+/* A signal being dragged, as a compact tag, and a tab as itself, lifted.
+   The drag library copies the original's computed styles onto it inline,
+   so these must win. */
+#dnd-action-dragged-el:not(:has(.tab)):not(.dock-panel) { display: inline-flex !important; align-items: center !important; gap: 6px !important; width: auto !important; height: auto !important; padding: 1px 8px !important; font: 11px/18px var(--font-data) !important; white-space: nowrap !important; color: var(--foreground) !important; background: var(--popover) !important; border: 1px solid var(--primary) !important; border-radius: var(--radius) !important; box-shadow: 0 6px 16px rgb(0 0 0 / 0.45) !important; }
+#dnd-action-dragged-el .x { display: none !important; }
+#dnd-action-dragged-el .tab { box-shadow: 0 6px 16px rgb(0 0 0 / 0.45); }
+.tab-slot { display: flex; }
+#dnd-action-dragged-el.dock-panel { height: 28px !important; overflow: hidden !important; padding: 0 6px !important; background: var(--popover) !important; border: 1px solid var(--primary) !important; border-radius: var(--radius) !important; box-shadow: 0 6px 16px rgb(0 0 0 / 0.45) !important; }
+
+/* The docks beside the tiles, and their panels (Dock.svelte). An empty
+   dock is a rail along the edge, wide enough to drop on while a panel is
+   dragged. */
+.docked { flex: 1 1 0; min-height: 0; display: flex; }
+.docked.narrow { flex-direction: column; }
+.docked > .layout { flex: 1; min-width: 0; }
+.dock-side { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.dock { display: flex; flex-direction: column; gap: 4px; min-height: 0; flex: 1; overflow-y: auto; scrollbar-width: thin; }
+.dock-side.rail { flex: none; width: 8px; margin: 8px 0; overflow: hidden; border-radius: var(--radius); transition: width 0.15s, height 0.15s; }
+.dock-side.rail.hidden { width: 26px; cursor: pointer; border: 1px solid var(--border); background: var(--card); }
+.dock-side.rail.hidden:hover { border-color: var(--ring); }
+.docked.narrow .dock-side.rail { width: auto; height: 8px; margin: 0 12px; }
+.docked.narrow .dock-side.rail.hidden { height: 26px; }
+.dock-side.rail.awaiting { width: 56px; border: 1px dashed var(--primary); background: color-mix(in oklch, var(--primary) 8%, transparent); }
+.docked.narrow .dock-side.rail.awaiting { width: auto; height: 48px; }
+.dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: 2px; border-radius: var(--radius); }
+/* Hide sits at the top right of a dock, in its first header's row; Show
+   heads a hidden dock's rail. */
+.dock-button { position: absolute; top: 3px; right: 2px; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
+.dock-button:hover { background: var(--secondary); color: var(--foreground); }
+.dock-button svg { width: 14px; height: 14px; }
+.dock-side.rail .dock-button { right: 2px; }
+.dock > .dock-panel:first-child .dock-head { padding-right: 26px; }
+.dock-panel { display: flex; flex-direction: column; min-height: 0; flex: none; }
+.dock-panel.open.shrinks { flex: 0 1 auto; min-height: 72px; }
+.dock-panel.open:not(.shrinks) { flex: none; }
+.dock-panel + .dock-panel { border-top: 1px solid var(--border); padding-top: 4px; }
+.dock-panel.shadow { flex: none; height: 28px; min-height: 0; opacity: 0.6; border: 1px dashed var(--primary); border-radius: var(--radius); }
+.dock-head { display: flex; align-items: center; gap: 4px; height: 26px; flex: none; padding: 0 2px; border-radius: var(--radius); cursor: grab; user-select: none; outline: none; color: var(--muted-foreground); font: 600 12px var(--font-ui); }
+.dock-head:hover { color: var(--foreground); }
+.dock-head:focus-visible { outline: 1px solid var(--ring); }
+.dock-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dock-head .dock-grip { width: 14px; height: 14px; flex: none; opacity: 0; transition: opacity 0.1s; }
+.dock-head:hover .dock-grip, .dock-head:focus-visible .dock-grip { opacity: 0.7; }
+.dock-fold { display: grid; place-items: center; width: 16px; height: 16px; flex: none; padding: 0; border: 0; border-radius: 3px; background: none; color: inherit; cursor: pointer; }
+.dock-fold:hover { background: var(--secondary); }
+.dock-fold svg { width: 12px; height: 12px; transition: transform 0.15s; }
+.dock-panel.open .dock-fold svg { transform: rotate(90deg); }
+.dock-body { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; padding: 2px 2px 4px; overflow: hidden; }
+/* A key in a tooltip (Tip.svelte). */
+[data-slot=tooltip-content] kbd { padding: 0 4px; border-radius: 3px; font: 10px var(--font-data); background: color-mix(in oklch, var(--background) 25%, transparent); }
+
+/* The status bar along the page's foot (StatusBar.svelte). */
+.status-bar { display: flex; align-items: center; gap: 4px; height: 24px; flex: none; padding: 0 12px 2px; color: var(--muted-foreground); font-size: 11px; white-space: nowrap; overflow: hidden; }
+.status-bar .item { display: inline-flex; align-items: center; gap: 5px; padding: 0 6px; height: 20px; border-radius: 4px; }
+.status-bar .item + .item { border-left: 1px solid var(--border); border-radius: 0; }
+.status-bar .spacer { flex: 1; }
+.status-bar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--destructive); }
+.status-bar .dot.on { background: var(--primary); }
+.status-bar .warn { display: inline-flex; align-items: center; gap: 3px; color: var(--cursor-a); }
+.status-bar .warn svg, .status-bar .keys svg { width: 12px; height: 12px; }
+.status-bar .meter { display: inline-block; width: 48px; height: 4px; border-radius: 2px; background: var(--secondary); overflow: hidden; }
+.status-bar .meter span { display: block; height: 100%; background: var(--primary); }
+.status-bar .keys { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.status-bar .keys:hover { color: var(--foreground); background: var(--secondary); }
+.status-bar kbd { font: 10px var(--font-data); padding: 0 3px; border: 1px solid var(--border); border-radius: 3px; }
+.action-grid { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px; }
+.props-empty { padding: 4px; color: var(--muted-foreground); font-size: 12px; }
+
+/* The plot area is see-through: the WebGL layer behind draws it. */
+.plot-body { position: relative; flex: 1; min-height: 60px; background: transparent; }
+/* The plot takes focus for its context menu. The card's border shows focus and
+   selection, so the browser's ring, clipped to a bar under the header, is off. */
+.plot-body:focus, .plot-body:focus-visible { outline: none; }
+.plot-body canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+
+/* The plot body is a drop target for signals; it lets the pointer through to the plot. */
+.legend-zone { position: absolute; inset: 0; pointer-events: none; }
+.legend-zone .body-ghost { position: absolute; width: 1px; height: 1px; visibility: hidden; }
+/* An edge hint means the signal opens a new plot, so the plot itself is not the target. */
+
+/* The plot's signals, in its header, each with its value. The header is one
+   row at every size: signals past its end scroll sideways under a fade,
+   and the pinned legend shows them all at once. */
+.trace-zone { flex: 1; min-width: 0; height: 24px; display: flex; align-items: center; gap: 10px; padding: 0 4px; overflow: auto hidden; scrollbar-width: none; border-radius: calc(var(--radius) - 4px); }
+.trace-zone::-webkit-scrollbar { display: none; }
+.trace-zone.more-right { mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent); }
+.trace-zone.more-left { mask-image: linear-gradient(to left, #000 calc(100% - 24px), transparent); }
+.trace-zone.more-left.more-right { mask-image: linear-gradient(to right, transparent, #000 24px, #000 calc(100% - 24px), transparent); }
+.trace-empty { color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
+.trace-chip { flex: none; display: inline-flex; align-items: baseline; gap: 5px; height: 20px; font: 11px/20px var(--font-data); white-space: nowrap; color: var(--foreground); cursor: grab; user-select: none; }
+.trace-chip .name { max-width: 18ch; overflow: hidden; text-overflow: ellipsis; }
+/* A narrow plot gives its header to its signals: the kind shortens, then
+   the buttons whose keys and menu items do the same go, then the kind and
+   the grip, the empty header still picking the plot up. The kind's trigger
+   stays in the page at no width, for K to open it. */
+.plot-card { container: plot / inline-size; }
+@container plot (width < 480px) {
+	.plot-head [data-slot=select-trigger] { flex-shrink: 1; min-width: 0; }
+	.plot-head .trace-zone { min-width: 64px; }
+	.plot-head .split { display: none; }
+}
+@container plot (width < 280px) {
+	.plot-head .grip, .plot-head .maximize { display: none; }
+	.plot-head [data-slot=select-trigger]:not(:focus, [data-state=open]) { width: 0; padding: 0; border: 0; overflow: hidden; }
+}
+
+/* The pinned legend: every signal and its value in one column in the plot's
+   corner. It is never taller than part of the plot; past that it scrolls. */
+.pinned-legend { position: absolute; top: 4px; right: 4px; z-index: 2; max-width: calc(100% - 8px); max-height: max(40%, 36px); overflow: hidden auto; scrollbar-width: thin; padding: 1px 6px; font: 10px/16px var(--font-data); font-variant-numeric: tabular-nums; background: color-mix(in oklch, var(--card) 85%, transparent); backdrop-filter: blur(2px); border: 1px solid var(--border); transition: top 90ms; }
+.pinned-legend .row { display: flex; align-items: center; gap: 5px; height: 16px; white-space: nowrap; }
+.pinned-legend i { flex: none; width: 8px; height: 3px; background: var(--c); }
+.pinned-legend .name { max-width: 16ch; overflow: hidden; text-overflow: ellipsis; color: var(--foreground); }
+.pinned-legend .val { margin-left: auto; min-width: 8ch; text-align: right; color: var(--c); }
+.pinned-legend .units { color: var(--muted-foreground); }
+.trace-chip i { align-self: center; width: 10px; height: 3px; background: var(--c); border-radius: 2px; flex: none; }
+.trace-chip .units { color: var(--muted-foreground); }
+/* A fixed slot, as wide as the longest value the chip formats, -0.0012345
+   or -1.2346e+5, so values changing or appearing never reflow the header. */
+.trace-chip .val { flex: none; width: 10ch; overflow: hidden; text-align: right; font-variant-numeric: tabular-nums; color: var(--c); }
+.trace-chip .x { opacity: 0; border: 0; background: none; padding: 0 2px; color: var(--muted-foreground); font-size: 13px; line-height: 1; cursor: pointer; }
+.trace-chip:hover .x, .trace-chip .x:focus-visible { opacity: 1; }
+.trace-chip .x:hover { color: var(--destructive); }
+.trace-chip.ghost { opacity: 0.4; }
+@media (hover: none) { .trace-chip .x { opacity: 1; } }
+
+/* The placed cursors, under the header while there are any, as a scope's
+   readout: a framed table of where A and B are and each signal there. */
+.cursor-readout { padding: 4px 8px 6px; border-bottom: 1px solid var(--border); background: var(--card); overflow-x: auto; }
+.cursor-readout table { border-collapse: collapse; font: 11px/18px var(--font-data); font-variant-numeric: tabular-nums; white-space: nowrap; border: 1px solid var(--border); border-radius: var(--radius); background: var(--plot-bg); }
+.cursor-readout th, .cursor-readout td { padding: 0 10px; }
+.cursor-readout thead th { font: 500 11px/20px var(--font-ui); color: var(--muted-foreground); text-align: right; border-bottom: 1px solid var(--border); }
+.cursor-readout thead th.a { color: var(--cursor-a); }
+.cursor-readout thead th.b { color: var(--cursor-b); }
+.cursor-readout td { text-align: right; color: var(--foreground); }
+.cursor-readout tbody th { text-align: left; font-weight: 400; color: var(--foreground); }
+.cursor-readout tbody th i { display: inline-block; width: 10px; height: 3px; margin-right: 6px; vertical-align: middle; background: var(--c); border-radius: 2px; }
+.cursor-readout tr.position td, .cursor-readout tr.position th { border-bottom: 1px solid var(--border); }
+.cursor-readout var { font: italic 13px/18px "Times New Roman", "STIX Two Text", Georgia, serif; color: var(--foreground); }
+.cursor-readout .rate { color: var(--muted-foreground); }
+.cursor-readout .rate span { margin-right: 6px; font-family: var(--font-ui); }
+
+/* Signal chips in the sidebar, dragged with svelte-dnd-action. */
+.palette-scroll { flex: 1; min-height: 40px; }
+.palette { display: flex; flex-direction: column; gap: 6px; outline: none; }
+.chips { flex: 1; display: flex; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; gap: 4px; min-height: 26px; min-width: 60px; padding: 1px 4px; border: 1px dashed transparent; border-radius: var(--radius); align-items: center; }
+.chips:empty::before { content: 'drop signals here'; color: var(--muted-foreground); font-size: 12px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: var(--radius); background: var(--secondary); border: 1px solid var(--border); color: var(--foreground); font: 12px var(--font-data); white-space: nowrap; cursor: grab; user-select: none; }
+.chip i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; flex: none; }
+.chip small { color: var(--muted-foreground); margin-left: auto; }
+.chip .x { border: 0; background: none; padding: 0 0 0 2px; color: var(--muted-foreground); font-size: 14px; line-height: 1; cursor: pointer; }
+.chip .x:hover { color: var(--foreground); }
+.chip.ghost { opacity: 0.4; border-style: dashed; }
+.drop-target { border-color: var(--primary) !important; background: color-mix(in oklch, var(--primary) 8%, transparent); }
+.palette .chip { padding: 5px 8px; font-size: 13px; }
+.palette .sig-key { overflow: hidden; text-overflow: ellipsis; }
+.palette .sig-units { color: var(--muted-foreground); font-size: 11px; }
+.sig-empty { padding: 8px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
+.tiles.drop-target { border: 1px dashed var(--primary); border-radius: var(--radius); }
+
+/* Layout tabs. */
+.tab { display: inline-flex; align-items: center; gap: 4px; height: 30px; padding: 0 2px 0 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); color: var(--muted-foreground); font-size: 13px; cursor: pointer; user-select: none; }
+.tab.active { color: var(--foreground); background: var(--secondary); box-shadow: inset 0 -2px 0 var(--primary); }
+.tab:focus-visible { outline: 1px solid var(--ring); outline-offset: 1px; }
+
+/* Keyboard focus. A plot shows it with its border; a list keeps focus on
+   itself and outlines the item the arrows are on. */
+.plot-card:focus, .trace-zone:focus, .palette:focus { outline: none; }
+.trace-chip.active, .chip.active { outline: 1px solid var(--ring); outline-offset: 1px; border-radius: var(--radius); }
+
+/* The keys list. */
+/* As many columns as the window has room for, each section kept whole. */
+.keys { columns: 3 16rem; column-gap: 32px; font-size: 12px; }
+.keys section { break-inside: avoid; padding-bottom: 14px; }
+.keys h3 { margin-bottom: 4px; font-weight: 600; font-size: 12px; color: var(--muted-foreground); }
+.keys .row { display: flex; gap: 10px; padding: 2px 0; }
+.keys .row > span:first-child { flex: none; width: 7.5rem; white-space: nowrap; }
+.keys kbd { display: inline-block; min-width: 18px; margin-right: 3px; padding: 0 4px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: var(--radius); background: var(--secondary); font: 11px/16px var(--font-data); text-align: center; }
+.tab.target { border-color: var(--primary); background: color-mix(in oklch, var(--primary) 15%, transparent); }
+
+@media (max-width: 760px) {
+  .app { height: auto; min-height: 100vh; }
+  .palette { flex-direction: row; flex-wrap: wrap; }
+  .tiles { min-height: 80vh; }
+}
+
+/* A selected plot: its header carries the accent, as a selected window's
+   title bar does, so a group reads at a glance. */
+.plot-card.selected [role="toolbar"] { background: color-mix(in oklch, var(--primary) 14%, var(--card)); }
+
+/* The box a drag on the background draws to select plots. */
+.marquee { position: fixed; z-index: 40; pointer-events: none; border: 1px solid var(--primary); background: color-mix(in oklch, var(--primary) 10%, transparent); }
+
+/* Typed bounds in a y axis's context menu. */
+.bounds { display: grid; gap: 4px; padding: 2px 8px 6px 24px; font-size: 12px; color: var(--muted-foreground); }
+.bounds label { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.bounds input { width: 110px; height: 22px; padding: 0 6px; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--foreground); font: 12px var(--font-data); font-variant-numeric: tabular-nums; text-align: right; outline: none; }
+.bounds input:focus-visible { border-color: var(--ring); }
+.bounds .error { color: var(--destructive); font-size: 11px; }
+.bounds input.filter { width: 100%; text-align: left; font-family: var(--font-ui); }
+.signal-list > [data-slot=scroll-area-viewport] { max-height: 260px; }
+.signal-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 8px 3px 24px; border-radius: var(--radius); font-size: 13px; line-height: 20px; cursor: default; }
+.signal-row.active { background: var(--accent); color: var(--accent-foreground); }
+.signal-row .rate { color: var(--muted-foreground); font-size: 11px; letter-spacing: 0.04em; }
+.signal-option { display: inline-flex; align-items: center; gap: 6px; font: 12px var(--font-data); }
+.signal-option i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; }
+.signal-option small { color: var(--muted-foreground); }
+.signal-none { padding: 4px 8px 6px 24px; color: var(--muted-foreground); font-size: 12px; }
+
+/* The compass: drop cells over the plot under the pointer, and along the
+   layout's edge for a moved plot. Each cell's glyph shows the part of the
+   space a drop there takes. */
+.compass { position: fixed; inset: 0; z-index: 45; pointer-events: none; }
+.compass-cell { position: fixed; width: 34px; height: 34px; margin: -17px 0 0 -17px; border: 1px solid color-mix(in oklch, var(--foreground) 35%, transparent); border-radius: var(--radius); background: color-mix(in oklch, var(--popover) 88%, transparent); box-shadow: 0 4px 12px rgb(0 0 0 / 0.45); }
+.compass-cell::after { content: ""; position: absolute; inset: 5px; border-radius: 2px; background: color-mix(in oklch, var(--foreground) 45%, transparent); }
+.compass-cell.left::after { right: 50%; }
+.compass-cell.right::after { left: 50%; }
+.compass-cell.top::after { bottom: 50%; }
+.compass-cell.bottom::after { top: 50%; }
+.compass-cell.outer { border-style: dashed; }
+.compass-cell.outer.left::after, .compass-cell.outer.right::after { inset: 5px; width: 6px; }
+.compass-cell.outer.right::after { left: auto; }
+.compass-cell.outer.top::after, .compass-cell.outer.bottom::after { inset: 5px; height: 6px; }
+.compass-cell.outer.bottom::after { top: auto; }
+.compass-cell.active { border-color: var(--primary); background: color-mix(in oklch, var(--primary) 22%, var(--popover)); }
+.compass-cell.active::after { background: var(--primary); }
+.compass-label { position: fixed; transform: translate(-50%, -50%); padding: 2px 8px; border-radius: var(--radius); background: var(--popover); color: var(--foreground); border: 1px solid var(--primary); font-size: 12px; white-space: nowrap; box-shadow: 0 4px 12px rgb(0 0 0 / 0.45); }
+
+/* A plot that just landed, flashed for a moment so the eye finds it. */
+.leaf.landed::after { content: ""; position: absolute; inset: 0; z-index: 5; pointer-events: none; outline: 2px solid var(--primary); outline-offset: -2px; animation: landed 700ms ease-out forwards; }
+@keyframes landed { from { background: color-mix(in oklch, var(--primary) 18%, transparent); opacity: 1; } to { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .leaf.landed::after { animation: none; opacity: 0; } }
+
+/* The devices, and their RPCs with a column per checked device. */
+.devices { display: flex; flex-direction: column; gap: 8px; min-height: 0; flex: 1; font-size: 12px; }
+.device-list { flex: none; }
+.device-list > [data-slot=scroll-area-viewport] { max-height: 30vh; }
+.device-list [role=list] { display: flex; flex-direction: column; gap: 1px; }
+.device { display: grid; grid-template-columns: auto auto auto 1fr auto; align-items: center; gap: 6px; padding: 2px 4px; border-radius: var(--radius); cursor: default; font-family: var(--font-data); }
+.device:hover { background: var(--accent); }
+.device .route { color: var(--muted-foreground); }
+.device .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.device .serial { color: var(--muted-foreground); font-size: 11px; }
+.presence { width: 7px; height: 7px; border-radius: 50%; background: var(--muted-foreground); }
+.presence.alive { background: var(--primary); }
+.presence.connecting { background: var(--cursor-a); }
+.presence.lost { background: var(--destructive); }
+.devices .empty { color: var(--muted-foreground); padding: 4px; }
+.props-head { display: flex; align-items: baseline; gap: 8px; border-top: 1px solid var(--border); padding-top: 8px; flex: none; }
+.props-head .title { font-weight: 600; font-size: 13px; }
+.props-head .cols { color: var(--muted-foreground); font-family: var(--font-data); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.props { flex: 1; min-height: 0; font-family: var(--font-data); font-size: 12px; }
+.props [data-slot=table-container] { overflow-x: visible; }
+.props-table { outline: none; table-layout: fixed; }
+.props-table th:first-child { width: 50%; }
+.props-table td { overflow: hidden; text-overflow: ellipsis; }
+.props-table th, .props-table td { height: auto; padding: 2px 4px; }
+.props-table th { position: sticky; top: 0; background: var(--card); color: var(--muted-foreground); font-size: 11px; z-index: 1; }
+.props-table tr { border-bottom: 0; }
+.props-table:focus tr[data-state=selected] { outline: 1px solid var(--ring); outline-offset: -1px; }
+.props-table tr[data-state=selected] { background: color-mix(in oklch, var(--primary) 8%, transparent); }
+.props-table .cell { font-variant-numeric: tabular-nums; }
+.props-table .cell.ok { color: var(--primary); }
+.props-table .cell.busy, .props-table .cell.skipped { opacity: 0.6; }
+.props-table .cell.error, .props-table .cell.refused { color: var(--destructive); }
+.props-table .absent { color: var(--muted-foreground); }
+.props-table tr.group-row td { padding: 6px 4px 2px; color: var(--muted-foreground); font: 600 11px var(--font-ui); }
+.props-table tr.group-row:hover { background: transparent; }
+.mark { margin-left: 4px; font-weight: 600; color: var(--cursor-a); }
+.mark.warn { color: var(--cursor-a); }
+.mark.bad { color: var(--destructive); }
+.write-bar { display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding-top: 6px; flex: none; font-size: 12px; }
+.write-bar .wname { font-family: var(--font-data); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
+.write-bar .wvalue { flex: 1; min-width: 60px; font-family: var(--font-data); }
+.write-bar .reach { color: var(--muted-foreground); }
+
+/* The device picker. */
+.picker { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.picker .now, .picker .notice { color: var(--muted-foreground); font-size: 12px; }
+.picker .notice.bad { color: var(--destructive); }
+.picker .bar { display: flex; align-items: center; gap: 8px; }
+.picker .found > [data-slot=scroll-area-viewport] { max-height: 50vh; }
+.picker .found [role=list] { display: flex; flex-direction: column; gap: 1px; }
+.picker .row { display: grid; grid-template-columns: auto 4.5rem minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 3px 4px; border-radius: var(--radius); font-family: var(--font-data); }
+.picker .row:hover { background: var(--accent); }
+.picker .row.sub { padding-left: 24px; }
+.picker .iface { color: var(--muted-foreground); font-size: 11px; }
+.picker .url { color: var(--muted-foreground); font-size: 11px; }
+
+/* The top bar, one row. */
+.top-bar { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--card); flex: none; }
+.top-bar .brand { font-weight: 600; font-size: 13px; margin-right: auto; }
+.top-bar .search { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius); color: var(--muted-foreground); font-size: 12px; }
+.top-bar .search :global(svg), .top-bar .search svg { width: 13px; height: 13px; }
+.top-bar .search kbd { font: 11px var(--font-data); color: var(--muted-foreground); }
+.top-bar .divider { width: 1px; height: 16px; background: var(--border); }
+.settings-pop { display: flex; flex-direction: column; gap: 10px; font-size: 12px; }
+.settings-pop .title { font-weight: 600; }
+.settings-pop .hud { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; font-family: var(--font-data); color: var(--muted-foreground); }
+.settings-pop .hud b { color: var(--primary); font-weight: 600; }
+
+/* A monitor: a plot too small for its header. The lines fill it, and the
+   header's one row shows over the top of the plot on hover or focus, with a
+   pinned legend moved down out from under it. */
+.plot-card { position: relative; }
+.plot-card.monitor .plot-head {
+	position: absolute; inset: 0 0 auto 0; z-index: 3;
+	background: color-mix(in oklch, var(--card) 88%, transparent); backdrop-filter: blur(2px);
+	opacity: 0; pointer-events: none; transition: opacity 90ms;
+}
+.plot-card.monitor:is(:hover, :focus-visible, :has(:focus-visible, [data-state=open])) .plot-head { opacity: 1; pointer-events: auto; }
+.plot-card.monitor:is(:hover, :focus-visible, :has(:focus-visible, [data-state=open])) .pinned-legend { top: 32px; }
