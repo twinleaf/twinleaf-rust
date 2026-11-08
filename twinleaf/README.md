@@ -58,6 +58,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Cargo features
 
+- `host` (default): connections, the proxy, firmware, and memory-mapped log
+  files, everything that runs tasks or reaches the operating system. Without
+  it the crate is the packet codec and the `data` layer, which build for
+  `wasm32-unknown-unknown`; a log is then read with `LogFile::from_bytes`.
+  `serial`, `firmware-update`, `mdns` and `json` turn it on.
 - `serial` (default): serial connections and serial-device discovery.
 - `firmware-update` (default): the [GitHub-backed firmware catalog]. Firmware
   queries and flashing are always available without this feature.

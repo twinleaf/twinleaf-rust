@@ -24,6 +24,7 @@ macro_rules! define_decoders {
             /// # Panics
             ///
             /// Panics if `data` is shorter than the type's size.
+            #[cfg(feature = "host")]
             pub(crate) fn from_le_bytes(data: &[u8], data_type: wire::DataType) -> ColumnData {
                 match data_type {
                     $(

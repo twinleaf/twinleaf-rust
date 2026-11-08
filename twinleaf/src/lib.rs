@@ -15,6 +15,12 @@
 //! | [`proxy`] | each device link, shared among its clients | [`Connection`] and its views |
 //! | [`device`] | the app's API, whose runtime alone starts a proxy | |
 //! | [`firmware`] | firmware queries and updates through a [`Device`] | |
+//!
+//! The `host` feature, on by default, holds every layer that runs tasks or
+//! reaches the operating system. These are `seam`, `rt`, the transports of
+//! [`tio`], `session`, [`proxy`], [`device`], [`firmware`], and
+//! [`LogFile::open`](data::LogFile::open). Without it the crate is the
+//! packet codec and the data layer, which build for `wasm32-unknown-unknown`.
 #![deny(missing_docs)]
 #![warn(
     missing_debug_implementations,
@@ -27,23 +33,32 @@
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod data;
+#[cfg(feature = "host")]
 pub mod device;
+#[cfg(feature = "host")]
 pub mod firmware;
+#[cfg(feature = "host")]
 pub mod proxy;
+#[cfg(feature = "host")]
 mod rt;
+#[cfg(feature = "host")]
 mod seam;
+#[cfg(feature = "host")]
 mod session;
 pub mod tio;
 
+#[cfg(feature = "host")]
 use seam::{chan, net};
 
 /// The wire protocol, shared with device firmware.
 pub use twinleaf_proto as proto;
 
 #[doc(no_inline)]
+#[cfg(feature = "host")]
 pub use flume;
 
 pub use data::{SampleBatch, SampleRow};
+#[cfg(feature = "host")]
 pub use device::{Connection, Device, DeviceTree, Receiver, RecvError};
 #[doc(no_inline)]
 pub use proto::{ColumnId, DeviceRoute, SampleNumber, SegmentId, SessionId, StreamId};

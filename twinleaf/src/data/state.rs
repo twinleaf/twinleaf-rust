@@ -1108,6 +1108,7 @@ impl ParseState {
         self.device(route)?.metadata_snapshot()
     }
 
+    #[cfg(feature = "host")]
     pub(super) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
         self.device(route).map(|device| device.metadata_revision)
     }

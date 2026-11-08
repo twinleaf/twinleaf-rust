@@ -175,6 +175,7 @@ pub use metadata::{
 pub use parser::{PacketOutcome, PacketParser};
 pub use pipeline::{ColumnOp, ColumnProcessor, Continuity};
 pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
+#[cfg(feature = "host")]
 pub(crate) use sample::RowSource;
 pub use sample::{ColumnArray, ColumnData, SampleBatch, SampleRow, ScalarBuffer};
 pub use state::{DataError, StreamDataError};

@@ -254,6 +254,7 @@ impl PacketParser {
     /// it again, as a disconnect does for its subtree. Each stream keeps its
     /// last rows, so the rows after report what was lost, or a new session,
     /// against them, as [`PacketOutcome::Reset`] says.
+    #[cfg(feature = "host")]
     pub(crate) fn relearn_route(&mut self, route: DeviceRoute) {
         self.flush();
         self.state.relearn(|device| *device == route);
@@ -289,12 +290,14 @@ impl PacketParser {
 
     /// Returns the route's current metadata revision without building a
     /// snapshot.
+    #[cfg(feature = "host")]
     pub(crate) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
         self.state.metadata_revision(route)
     }
 
     /// Returns the route's complete metadata and its revision, or `None` if
     /// the revision is still `seen` or the metadata is incomplete.
+    #[cfg(feature = "host")]
     pub(crate) fn revised_metadata(
         &self,
         route: DeviceRoute,

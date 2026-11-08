@@ -19,6 +19,7 @@ use crate::proto::SampleNumber;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ops::Range;
+#[cfg(feature = "host")]
 use std::time::Instant;
 
 /// The newest samples of every stream that has delivered data, each capped at
@@ -141,6 +142,7 @@ pub struct Run {
     /// Retained rows, the tail included.
     rows: usize,
     capacity: usize,
+    #[cfg(feature = "host")]
     last_seen: Instant,
 }
 
@@ -153,7 +155,6 @@ impl std::fmt::Debug for Run {
             .field("rows", &self.rows)
             .field("capacity", &self.capacity)
             .field("next_row", &self.next_row)
-            .field("last_seen", &self.last_seen)
             .finish_non_exhaustive()
     }
 }
@@ -170,6 +171,7 @@ impl Run {
             next_row: 0,
             rows: 0,
             capacity,
+            #[cfg(feature = "host")]
             last_seen: Instant::now(),
         };
         run.append(batch);
@@ -208,7 +210,10 @@ impl Run {
         self.metadata = batch.metadata().clone();
         self.next_row += batch.len() as u64;
         self.rows += batch.len();
-        self.last_seen = Instant::now();
+        #[cfg(feature = "host")]
+        {
+            self.last_seen = Instant::now();
+        }
         self.evict();
     }
 
@@ -365,6 +370,8 @@ impl Run {
 
     /// Returns when this run last received a batch through
     /// [`Buffer::process_batch`].
+    #[cfg(feature = "host")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "host")))]
     pub fn last_seen(&self) -> Instant {
         self.last_seen
     }
