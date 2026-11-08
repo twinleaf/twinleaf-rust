@@ -39,3 +39,34 @@ pub(crate) use real::{chan, net};
 pub(crate) use shuttle::{chan, net};
 #[cfg(all(test, turmoil))]
 pub(crate) use turmoil::{chan, net};
+
+/// The socket a proxy hands a [`Foreign`] handler, with nothing read from it.
+pub type ForeignStream = tokio::net::TcpStream;
+
+/// What a proxy does with a connection that does not speak its protocol,
+/// such as a browser's request, given the socket and the peer's address.
+///
+/// The handler is called on the proxy's runtime and must not block it. The
+/// proxy keeps nothing of the connection after the call.
+#[derive(Clone)]
+pub struct Foreign(std::sync::Arc<dyn Fn(ForeignStream, std::net::SocketAddr) + Send + Sync>);
+
+impl Foreign {
+    /// Wraps `serve` as a handler.
+    pub fn new(
+        serve: impl Fn(ForeignStream, std::net::SocketAddr) + Send + Sync + 'static,
+    ) -> Foreign {
+        Foreign(std::sync::Arc::new(serve))
+    }
+
+    /// Hands `stream`, from `peer`, to the handler.
+    pub(crate) fn serve(&self, stream: ForeignStream, peer: std::net::SocketAddr) {
+        (self.0)(stream, peer);
+    }
+}
+
+impl std::fmt::Debug for Foreign {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Foreign")
+    }
+}

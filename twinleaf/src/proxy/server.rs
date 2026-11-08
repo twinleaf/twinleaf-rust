@@ -8,7 +8,7 @@ use super::table::{Notice, Shared, TableChange};
 use super::worker;
 use super::{answers_async, endpoint_at, ClientInfo, HostOptions, Listen, IDLE, LEAVE_TIMEOUT};
 use crate::chan::oneshot;
-use crate::net::{Listeners, TcpStream};
+use crate::net::{self, Listeners, TcpStream};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::session::{
     call_at, decode, encode, older_build, Introduction, Layout, HELLO, HELLO_TIMEOUT,
@@ -29,6 +29,11 @@ use tokio_util::task::JoinMap;
 /// How long the server waits after an accept fails before it accepts again.
 // An accept that fails for want of file descriptors fails again at once.
 const ACCEPT_RETRY: Duration = Duration::from_millis(20);
+
+/// How long a proxy with a [`Foreign`](super::Foreign) handler waits for a
+/// connection's first byte before it closes the connection. A client sends
+/// `proxy.hello` as soon as it connects.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A running proxy. Dropping it stops it, and the drop blocks until the
 /// proxy has stopped, as [`shutdown`](Proxy::shutdown) does, for at most
@@ -316,10 +321,11 @@ impl Server {
                 biased;
                 notice = self.notices.recv() => match notice {
                     Some(Notice::Update { id, update, done }) => self.update(id, update, done),
+                    Some(Notice::Speaks { stream, peer }) => self.serve(stream, peer),
                     Some(Notice::Stop) | None => break,
                 },
                 accepted = self.listeners.accept(), if accepting => match accepted {
-                    Ok((stream, peer)) => self.serve(stream, peer),
+                    Ok((stream, peer)) => self.accept(stream, peer),
                     Err(error) => {
                         log::warn!("Error accepting client: {error}");
                         self.retry_at = Some(Instant::now() + ACCEPT_RETRY);
@@ -393,6 +399,44 @@ impl Server {
     fn publish(&self) {
         self.table
             .send_replace(self.clients.values().cloned().collect());
+    }
+
+    /// Serves the connection from `peer` as a client, or, with a
+    /// [`Foreign`](super::Foreign) handler, first learns in a task of its
+    /// own what the connection speaks.
+    fn accept(&mut self, stream: TcpStream, peer: SocketAddr) {
+        match self.shared.options.foreign.clone() {
+            None => self.serve(stream, peer),
+            Some(foreign) => {
+                let server = self.shared.server.clone();
+                let task = format_args!("first byte of {peer}");
+                self.shared.tasks.spawn(task, async move {
+                    let mut stream = stream;
+                    match timeout(FIRST_BYTE_TIMEOUT, net::peek_first(&mut stream)).await {
+                        Ok(Ok(Some(first))) if b"CDGHOPT".contains(&first) => {
+                            match net::into_foreign(stream) {
+                                Some(stream) => foreign.serve(stream, peer),
+                                None => {
+                                    log::debug!("Closing {peer}, which speaks another protocol")
+                                }
+                            }
+                        }
+                        Ok(Ok(Some(_))) => {
+                            if let Some(server) = server.upgrade() {
+                                let _ = server.send(Notice::Speaks { stream, peer });
+                            }
+                        }
+                        Ok(Ok(None)) => log::debug!("{peer} closed before sending anything"),
+                        Ok(Err(error)) => log::debug!("Reading from {peer} failed: {error}"),
+                        Err(_elapsed) => {
+                            log::debug!(
+                                "Closing {peer}, which sent nothing in {FIRST_BYTE_TIMEOUT:?}"
+                            )
+                        }
+                    }
+                });
+            }
+        }
     }
 
     /// Adds the client at `peer` connected on `stream` to the table, and

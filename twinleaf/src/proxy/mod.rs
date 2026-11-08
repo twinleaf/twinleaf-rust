@@ -197,6 +197,22 @@
 //! need permission for the local network and for serial devices. Where an
 //! app's network is isolated from the host, its proxy serves only that app.
 //!
+//! # Other protocols on the port
+//!
+//! A proxy hosted with a [`Foreign`] handler in [`HostOptions::foreign`]
+//! shares its port with another protocol, as `tio proxy` shares it with the
+//! web page of `twinleaf-web`. Each client of the proxy speaks first, with
+//! `proxy.hello`, so the proxy reads the first byte of each connection,
+//! leaving it in the socket. A byte that begins an HTTP method, one of
+//! `C D G H O P T`, hands the connection to the handler. No packet type a
+//! client sends is one of those bytes. Any other byte makes the connection a
+//! client as before. A connection that closes, or sends nothing for two
+//! seconds, `FIRST_BYTE_TIMEOUT`, is closed. Each connection waits for its
+//! first byte in a task of its own, so a quiet one holds up no other.
+//!
+//! A proxy without a handler reads no byte first and serves every
+//! connection as a client.
+//!
 //! # Logging
 //!
 //! The proxy logs through the `log` crate. Each device's events are logged
@@ -213,6 +229,7 @@ mod server;
 mod table;
 mod worker;
 
+pub use crate::seam::{Foreign, ForeignStream};
 pub use crate::session::{Layout, Mount};
 pub(crate) use server::host;
 pub use server::Proxy;
@@ -345,12 +362,17 @@ pub struct HostOptions {
     pub reconnect_timeout: Option<Duration>,
     /// The traffic to log.
     pub dump: DumpFlags,
+    /// What serves the connections that do not speak the packet protocol,
+    /// or `None` to serve every connection as a client. See
+    /// [Other protocols on the port](self#other-protocols-on-the-port).
+    pub foreign: Option<Foreign>,
 }
 
 /// The options a tool hosts the machine's proxy with. The proxy listens on
 /// loopback at the default port and runs until it is shut down. No client
 /// may stop it, it has no default layout, and its name is this executable's.
-/// It reconnects forever and logs no traffic.
+/// It reconnects forever, logs no traffic, and serves every connection as a
+/// client.
 impl Default for HostOptions {
     fn default() -> Self {
         HostOptions {
@@ -362,6 +384,7 @@ impl Default for HostOptions {
             name: executable_name(),
             reconnect_timeout: None,
             dump: DumpFlags::default(),
+            foreign: None,
         }
     }
 }
