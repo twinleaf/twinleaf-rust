@@ -43,6 +43,7 @@
   import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
   import RiZoomTo from '@lucide/svelte/icons/zoom-in';
   import RiExport from '@lucide/svelte/icons/file-down';
+  import RiWarn from '@lucide/svelte/icons/triangle-exclamation-point';
   import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, KINDS, MODES, SPANS, kindLabel } from './constants.js';
@@ -54,7 +55,7 @@
   let {
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
     onFocus, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
-    onTraceDragStart, onTraceDrop, onEmptied, otherPlots = [], onMoveSignal, onCopy, onExport,
+    onTraceDragStart, onTraceDrop, onEmptied, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
   } = $props();
 
   const session = $derived(hub.session);
@@ -95,6 +96,15 @@
   const opened = (open, close) => (open ? claimMenu(close) : releaseMenu(close));
   $effect(() => opened(axisOpen, closeAxis));
   $effect(() => opened(menuOpen, closeMenu));
+  // What a copy of the plot would hold, asked of the hub as its menu opens.
+  let copyCheck = $state(null);
+  $effect(() => {
+    if (!menuOpen || !plot.items.length) return void (copyCheck = null);
+    let current = true;
+    copyCheck = { state: 'ok', text: 'Counting rows…' };
+    onCheckCopy?.().then((check) => current && (copyCheck = check), () => current && (copyCheck = null));
+    return () => (current = false);
+  });
   $effect(() => opened(signalsOpen, closeSignals));
   $effect(() => opened(xAxisOpen, closeXAxis));
   $effect(() => opened(readoutOpen, closeReadout));
@@ -936,18 +946,30 @@
       {/snippet}
     </ContextMenu.Trigger>
     <ContextMenu.Content class="menu-icons">
-      <!-- Three groups, as dense menus keep them: where the plot is, what it
-           shows, and closing it, each a key away. -->
-      <ContextMenu.Item onSelect={() => onSplit('row')}><RiSplitH class="menu-icon" />Split right<ContextMenu.Shortcut><kbd>|</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => onSplit('col')}><RiSplitV class="menu-icon" />Split down<ContextMenu.Shortcut><kbd>_</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-      <ContextMenu.Item onSelect={onMaximize}>{#if maximized}<RiFullscreenExit class="menu-icon" />Restore{:else}<RiFullscreen class="menu-icon" />Maximize{/if}<ContextMenu.Shortcut><kbd>F</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-      <ContextMenu.Sub>
-        <ContextMenu.SubTrigger disabled={!otherTabs.length}><RiTab class="menu-icon" />Move to tab</ContextMenu.SubTrigger>
-        <ContextMenu.SubContent>
-          {#each otherTabs as t (t.id)}<ContextMenu.Item onSelect={() => onMoveToTab(t.id)}>{t.name}</ContextMenu.Item>{/each}
-        </ContextMenu.SubContent>
-      </ContextMenu.Sub>
+      <!-- Four groups, each under its name, the most asked for first: the
+           plot's data, its cursors, how it shows its signals, and where it
+           is; then closing it. Copy data says first when a copy would hold
+           too much or come back short, from the hub's count of the rows. -->
+      {#if plot.items.length}
+        <ContextMenu.Label class="menu-group">Data</ContextMenu.Label>
+        <ContextMenu.Item disabled={copyCheck?.state === 'too-many'} onSelect={() => onCopy?.()}>
+          <RiCopy class="menu-icon" />
+          <span class="menu-two">
+            Copy data
+            {#if copyCheck?.text}<small class:warn={copyCheck.state !== 'ok'}>{#if copyCheck.state !== 'ok'}<RiWarn />{/if}{copyCheck.text}</small>{/if}
+          </span>
+          <ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut>
+        </ContextMenu.Item>
+        <ContextMenu.Item onSelect={() => onExport?.()}><RiExport class="menu-icon" />Export data…</ContextMenu.Item>
+        <ContextMenu.Separator />
+      {/if}
+      <ContextMenu.Label class="menu-group">Cursors</ContextMenu.Label>
+      <!-- Cursors are dragged out of the axes; these place a pair in view. -->
+      <ContextMenu.Item onSelect={() => pv?.addXCursors()}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => pv?.addYCursors(region.keys?.[0])}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
+      <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors<ContextMenu.Shortcut><kbd>Esc</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Separator />
+      <ContextMenu.Label class="menu-group">Show</ContextMenu.Label>
       <ContextMenu.Sub>
         <ContextMenu.SubTrigger><RiKind class="menu-icon" />Kind</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
@@ -964,14 +986,17 @@
           </ContextMenu.RadioGroup>
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
-      {#if plot.items.length}
-        <ContextMenu.Item onSelect={() => onCopy?.()}><RiCopy class="menu-icon" />Copy data<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-        <ContextMenu.Item onSelect={() => onExport?.()}><RiExport class="menu-icon" />Export data…</ContextMenu.Item>
-      {/if}
-      <!-- Cursors are dragged out of the axes; these place a pair in view. -->
-      <ContextMenu.Item onSelect={() => pv?.addXCursors()}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => pv?.addYCursors(region.keys?.[0])}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
-      <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors<ContextMenu.Shortcut><kbd>Esc</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Separator />
+      <ContextMenu.Label class="menu-group">Arrange</ContextMenu.Label>
+      <ContextMenu.Item onSelect={() => onSplit('row')}><RiSplitH class="menu-icon" />Split right<ContextMenu.Shortcut><kbd>|</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => onSplit('col')}><RiSplitV class="menu-icon" />Split down<ContextMenu.Shortcut><kbd>_</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Item onSelect={onMaximize}>{#if maximized}<RiFullscreenExit class="menu-icon" />Restore{:else}<RiFullscreen class="menu-icon" />Maximize{/if}<ContextMenu.Shortcut><kbd>F</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Sub>
+        <ContextMenu.SubTrigger disabled={!otherTabs.length}><RiTab class="menu-icon" />Move to tab</ContextMenu.SubTrigger>
+        <ContextMenu.SubContent>
+          {#each otherTabs as t (t.id)}<ContextMenu.Item onSelect={() => onMoveToTab(t.id)}>{t.name}</ContextMenu.Item>{/each}
+        </ContextMenu.SubContent>
+      </ContextMenu.Sub>
       <ContextMenu.Separator />
       <ContextMenu.Item variant="destructive" onSelect={onRemove}><RiClose class="menu-icon" />Close plot<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
     </ContextMenu.Content>

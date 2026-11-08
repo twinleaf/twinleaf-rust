@@ -222,6 +222,13 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
    them: the icon takes the room a check mark would, muted beside its label. */
 .menu-icons :is([data-slot^=context-menu-item], [data-slot=context-menu-sub-trigger], [data-slot^=dropdown-menu-item], [data-slot$=-menu-label]) { padding-left: 8px; white-space: nowrap; }
 .menu-icon { color: var(--muted-foreground); }
+/* A menu's group names, small and muted over their items. */
+.menu-icons [data-slot=context-menu-label].menu-group { padding: 6px 8px 2px; font-size: 11px; font-weight: 500; color: var(--muted-foreground); }
+/* An item with a second line under its name, as Copy data's count. */
+.menu-two { display: flex; flex-direction: column; line-height: 18px; }
+.menu-two small { display: flex; align-items: center; gap: 4px; font-size: 11px; line-height: 14px; color: var(--muted-foreground); }
+.menu-two small.warn { color: var(--warning, #d97706); }
+.menu-two small svg { width: 12px; height: 12px; }
 /* A menu row's current value, before its submenu's arrow. */
 .menu-value { margin-left: auto; padding-left: 16px; color: var(--muted-foreground); font-size: 12px; }
 .menu-value i { display: inline-block; width: 12px; height: 3px; border-radius: 2px; vertical-align: middle; background: var(--c); }

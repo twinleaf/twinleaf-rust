@@ -441,6 +441,32 @@
     exporting = { hub: session.id, traces, shown, whole: [isFinite(oldest) ? oldest : now - 600, now] };
   }
 
+  /**
+   * What Ctrl+C on plots `ids` would copy, from the hub's count of the rows,
+   * as {state, text}: 'ok', 'too-many' past what a paste holds, or
+   * 'partial' when history no longer holds the window's start.
+   */
+  async function copyCheck(ids) {
+    const session = hub.session, now = hub.now(performance.now());
+    let total = 0, lost = 0;
+    for (const id of ids) {
+      const plot = plotAnywhere(id);
+      if (!plot?.items.length) continue;
+      if (plot.kind === 'spectrum') {
+        total += Math.max(0, ...plot.items.map((i) => session.byKey.get(i.key)?.spectrum?.f.length ?? 0));
+        continue;
+      }
+      const [t0, t1] = views.of(id).range(now);
+      const traces = plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean);
+      const replies = await Promise.all(traces.map((t) => api.rows({ hub: session.id, id: t.meta.id, t0, t1, limit: 0 })));
+      total += replies.reduce((n, r) => n + r.count, 0);
+      replies.forEach((r, i) => (lost = Math.max(lost, lostSeconds(t0, r.oldest, traces[i].meta.rate))));
+    }
+    if (total > MAX_COPY_ROWS) return { state: 'too-many', text: `${total.toLocaleString()} rows, more than a paste holds: export instead` };
+    if (lost) return { state: 'partial', text: `The first ${lost.toFixed(1)} s are no longer in history` };
+    return { state: 'ok', text: `${total.toLocaleString()} rows` };
+  }
+
   async function copyData(ids) {
     const session = hub.session, now = hub.now(performance.now());
     const plots = ids.map((id) => [id, plotAnywhere(id)]).filter(([, p]) => p?.items.length);
@@ -596,6 +622,7 @@
           .filter((p) => p !== id)
           .map((p) => ({ id: p, label: ws.plots[p]?.items.map((i) => i.key).join(', ') || 'Empty plot' }))}
         onMoveSignal={(key, to) => moveSignal(id, key, to)}
+        onCheckCopy={() => copyCheck(ws.selected.has(id) ? [...ws.selected] : [id])}
         onExport={() => openExport(ws.selected.has(id) ? [...ws.selected] : [id])}
         onCopy={() => copyData(ws.selected.has(id) ? [...ws.selected] : [id]).catch((error) => toast(`Could not copy: ${error.message}`))}
       />
