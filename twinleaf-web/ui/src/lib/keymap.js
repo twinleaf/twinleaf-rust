@@ -26,6 +26,7 @@ export const KEYMAP = [
       { show: ['[', ']'], keys: ['[', ']'], action: 'stepTab', what: 'Previous, next tab' },
       { show: ['Space'], keys: [' '], action: 'pause', what: 'Pause, or follow live' },
       { show: ['Ctrl', 'A'], what: 'Select every plot' },
+      { show: ['Ctrl', 'C'], what: 'Copy data' },
       { show: ['Ctrl', 'K'], what: 'Commands' },
       { show: ['?'], keys: ['?'], action: 'help', what: 'This sheet' },
     ],
@@ -109,7 +110,7 @@ export const KEYMAP = [
       { show: ['Drag'], on: 'line or tag', what: 'Move' },
       { show: ['Drag'], on: 'off its lane', what: 'Remove' },
       { show: ['Esc'], what: 'Clear' },
-      { show: ['Right-click'], on: 'readout', what: 'Clear' },
+      { show: ['Right-click'], on: 'readout', what: 'Copy, clear' },
     ],
   },
 ];

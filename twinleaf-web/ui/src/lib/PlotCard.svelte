@@ -19,6 +19,7 @@
   import RiAxis from '@lucide/svelte/icons/arrow-right-left';
   import RiMove from '@lucide/svelte/icons/square-arrow-out-up-right';
   import RiTrash from '@lucide/svelte/icons/trash-2';
+  import RiCopy from '@lucide/svelte/icons/clipboard-copy';
   import RiEraser from '@lucide/svelte/icons/eraser';
   import RiTab from '@lucide/svelte/icons/app-window';
   import RiKind from '@lucide/svelte/icons/chart-line';
@@ -44,13 +45,15 @@
   import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, KINDS, MODES, SPANS, kindLabel } from './constants.js';
+  import { writeTables } from './copy.js';
+  import { toast } from './toast.svelte.js';
   import { actionFor, stepIn } from './keymap.js';
   import { chip } from './tabs.js';
 
   let {
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
     onFocus, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
-    onTraceDragStart, onTraceDrop, onEmptied, otherPlots = [], onMoveSignal,
+    onTraceDragStart, onTraceDrop, onEmptied, otherPlots = [], onMoveSignal, onCopy,
   } = $props();
 
   const session = $derived(hub.session);
@@ -114,6 +117,25 @@
     const b = region.keys.length ? pv.yBounds(region.keys[0]) : null;
     bounds = b ? { lo: shown(b[0]), hi: shown(b[1]) } : { lo: '', hi: '' };
     axisOpen = true;
+  }
+  /** Puts the cursors' readout on the clipboard, as the table shows it. */
+  function copyReadout() {
+    const c = legend.cursors;
+    if (!c) return;
+    const rows = [];
+    if (c.x) {
+      rows.push([`X ${c.x.v}`, c.x.a, c.x.b, c.x.d, c.x.rate ? `1/Δt ${c.x.rate}` : '']);
+      for (const item of shownItems) {
+        const r = legend.rows[item.key];
+        rows.push([item.key, r?.a ?? '—', r?.b ?? '—', r?.d ?? '—', '']);
+      }
+    }
+    for (const y of c.ys) rows.push([`Y ${y.name}`, y.a, y.b, y.d, y.ratio]);
+    const blocks = [{ title: `Cursors · ${plot.items.map((i) => i.key).join(', ')}`, header: ['', '1', '2', 'Δ = 2 − 1', ''], rows }];
+    writeTables(blocks).then(
+      () => toast('Copied the cursor readout'),
+      (error) => toast(`Could not copy: ${error.message}`),
+    );
   }
   /** Sets the bounds typed in, and says why it cannot when they do not make a range. Returns whether it set them. */
   function applyBounds() {
@@ -836,7 +858,7 @@
                signal there; then each y axis's Y1 and Y2. Column 1 is X1 or
                Y1, 2 is X2 or Y2. It floats in the plot where it was dragged
                to, as the legend does, taking none of the plot's height, and
-               its menu zooms to them or clears them. -->
+               its menu copies it or clears the cursors. -->
           {#if legend.cursors}
             {@const c = legend.cursors}
             {@const extra = !!c.x?.rate || c.ys.some((y) => y.ratio)}
@@ -891,7 +913,9 @@
                   {/snippet}
                 </ContextMenu.Trigger>
                 <ContextMenu.Content class="menu-icons">
-                  {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2</ContextMenu.Item><ContextMenu.Separator />{/if}
+                  <ContextMenu.Item onSelect={copyReadout}><RiCopy class="menu-icon" />Copy table</ContextMenu.Item>
+                  {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2</ContextMenu.Item>{/if}
+                  <ContextMenu.Separator />
                   {#if c.x}<ContextMenu.Item onSelect={() => pv?.clearXCursors()}><RiXCursors class="menu-icon" />Clear X cursors</ContextMenu.Item>{/if}
                   {#if c.ys.length}<ContextMenu.Item onSelect={() => c.ys.forEach((y) => pv?.clearYCursors(y.key))}><RiYCursors class="menu-icon" />Clear Y cursors</ContextMenu.Item>{/if}
                   <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors<ContextMenu.Shortcut><kbd>Esc</kbd></ContextMenu.Shortcut></ContextMenu.Item>
@@ -939,6 +963,7 @@
           </ContextMenu.RadioGroup>
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
+      {#if plot.items.length}<ContextMenu.Item onSelect={() => onCopy?.()}><RiCopy class="menu-icon" />Copy data<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>{/if}
       <!-- Cursors are dragged out of the axes; these place a pair in view. -->
       <ContextMenu.Item onSelect={() => pv?.addXCursors()}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
       <ContextMenu.Item onSelect={() => pv?.addYCursors(region.keys?.[0])}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>

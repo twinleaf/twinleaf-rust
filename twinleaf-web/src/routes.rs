@@ -5,7 +5,7 @@
 use crate::hub::Live;
 use crate::protocol::{
     CallRequest, DiscoverRequest, Done, Frame, HistoryRequest, MountArg, MountRequest, PageMessage,
-    PpsRequest, ReadRequest, Refusal, WindowRequest,
+    PpsRequest, ReadRequest, Refusal, RowsRequest, WindowRequest,
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
@@ -29,6 +29,7 @@ pub(crate) fn router() -> Router {
         .route("/api/pps", post(set_pps))
         .route("/api/history", post(set_history))
         .route("/api/window", get(window))
+        .route("/api/rows", get(rows))
         .fallback(crate::assets::serve)
         .with_state(Hubs::default())
         .layer(axum::middleware::from_fn(crate::guard::guard))
@@ -266,6 +267,23 @@ async fn window(
         blocking(move || live.window(args.id, args.t0, args.t1, args.width.min(8192))).await?;
     match window {
         Some(window) => Ok(Json(window).into_response()),
+        None => Err(Refusal::new(StatusCode::NOT_FOUND, "no such trace")),
+    }
+}
+
+/// Reads every raw row of one trace of the hub the page names in a range, for
+/// copying, or how many there are past the page's limit.
+async fn rows(
+    State(hubs): State<Hubs>,
+    Query(args): Query<RowsRequest>,
+) -> Result<Response, Refusal> {
+    let live = hubs.live().await?;
+    if live.id != args.hub {
+        return Err(Refusal::new(StatusCode::CONFLICT, "that hub has retired"));
+    }
+    let rows = blocking(move || live.rows(args.id, args.t0, args.t1, args.limit)).await?;
+    match rows {
+        Some(rows) => Ok(Json(rows).into_response()),
         None => Err(Refusal::new(StatusCode::NOT_FOUND, "no such trace")),
     }
 }

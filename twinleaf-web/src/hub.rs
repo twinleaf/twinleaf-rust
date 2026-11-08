@@ -17,7 +17,7 @@
 
 use crate::devices::Devices;
 use crate::feed::Feed;
-use crate::protocol::{Frame, Held, Message, MountInfo, TraceInfo, Window, WindowChunk};
+use crate::protocol::{Frame, Held, Message, MountInfo, Rows, TraceInfo, Window, WindowChunk};
 use crate::wire::{encode, encode_spectra, split_at_breaks, Chunk, Spectrum};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
@@ -192,6 +192,12 @@ impl Live {
     /// them. It blocks while it works.
     pub(crate) fn window(&self, id: u16, t0: f64, t1: f64, width: usize) -> Option<Window> {
         self.hub.lock().unwrap().window(id, t0, t1, width)
+    }
+
+    /// Every raw row of trace `id` within [t0, t1], as [`Hub::rows`] reads
+    /// them. It blocks while it works.
+    pub(crate) fn rows(&self, id: u16, t0: f64, t1: f64, limit: usize) -> Option<Rows> {
+        self.hub.lock().unwrap().rows(id, t0, t1, limit)
     }
 
     /// Whether the hub has ended, so another must take its place.
@@ -659,6 +665,39 @@ impl Hub {
         self.feed.message(&Message::Config { pps });
     }
 
+    /// Every raw row of trace `id` within [t0, t1], none decimated, from the
+    /// history held for paused plots where the buffer no longer reaches; or,
+    /// when there are more than `limit`, only how many. With them, the
+    /// oldest time the history still holds of the trace.
+    fn rows(&self, id: u16, t0: f64, t1: f64, limit: usize) -> Option<Rows> {
+        let trace = self.traces.get(id as usize)?;
+        let key = trace.key.stream_key();
+        self.buffer.run(&key)?;
+        let spans = self.spans(&key, t0, t1);
+        let count = spans
+            .iter()
+            .map(|(_, rows)| (rows.end - rows.start) as usize)
+            .sum();
+        let oldest = self.oldest(&key);
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        if count <= limit {
+            for (run, rows) in spans {
+                for batch in run.rows(rows) {
+                    if let Some(values) = batch.column(trace.key.column_id) {
+                        x.extend_from_slice(batch.timestamps());
+                        y.extend(values.to_f64().iter());
+                    }
+                }
+            }
+        }
+        Some(Rows {
+            count,
+            oldest,
+            x,
+            y,
+        })
+    }
+
     /// The raw rows of trace `id` within [t0, t1], decimated to about two
     /// points per pixel only when there are more than that.
     fn window(&self, id: u16, t0: f64, t1: f64, width: usize) -> Option<Window> {
@@ -858,6 +897,28 @@ mod tests {
     }
 
     #[test]
+    fn a_range_across_the_held_history_and_the_buffer_reads_both_once() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        hub.set_history(1e6, 40_000);
+        for batch in samples(&mut parser, 0, 1000) {
+            hub.ingest(&batch);
+        }
+        hub.hold(7, true);
+        for batch in samples(&mut parser, 1000, 3000) {
+            hub.ingest(&batch);
+        }
+        // Rows 0..4000 stand at 0.01..40 s; all of them, each once.
+        let rows = hub.rows(0, 0.0, 40.0, usize::MAX).unwrap();
+        let mut seen = rows.y.clone();
+        seen.dedup();
+        assert_eq!(seen.len(), rows.y.len(), "no row twice");
+        assert_eq!(rows.y.first(), Some(&0.0));
+        assert_eq!(rows.y.last(), Some(&3999.0));
+        assert_eq!(rows.oldest, Some(0.01));
+    }
+
+    #[test]
     fn memory_says_where_each_trace_begins() {
         let mut hub = Hub::new();
         let mut parser = parser();
@@ -868,6 +929,23 @@ mod tests {
             panic!("memory is a memory message")
         };
         assert_eq!(oldest.get(&0), Some(&0.01));
+    }
+
+    #[test]
+    fn rows_are_every_raw_row_in_range_or_their_count_past_the_limit() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        for batch in samples(&mut parser, 0, 1000) {
+            hub.ingest(&batch);
+        }
+        // At 100 Hz, row n stands at (n + 1) / 100 s.
+        let rows = hub.rows(0, 1.0, 2.0, 1000).unwrap();
+        assert_eq!(rows.count, 101);
+        assert_eq!(rows.y.first(), Some(&99.0));
+        assert_eq!(rows.x.len(), 101);
+        assert_eq!(rows.oldest, Some(0.01));
+        let over = hub.rows(0, 1.0, 2.0, 100).unwrap();
+        assert_eq!((over.count, over.x.len()), (101, 0));
     }
 
     #[test]

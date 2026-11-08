@@ -371,6 +371,30 @@ pub(crate) struct WindowRequest {
     pub(crate) width: usize,
 }
 
+/// A request for every raw row of one trace within [t0, t1], as copying
+/// reads them, or only how many there are when more than `limit`.
+#[derive(Deserialize, Debug)]
+pub(crate) struct RowsRequest {
+    /// The hub the trace id is of, as [`Message::Hub`] named it.
+    pub(crate) hub: String,
+    pub(crate) id: u16,
+    pub(crate) t0: f64,
+    pub(crate) t1: f64,
+    pub(crate) limit: usize,
+}
+
+/// The reply to a [`RowsRequest`]: `count` rows, their times `x` and values
+/// `y`, empty when there are more than the limit, and the oldest time the
+/// history still holds of the trace, from which a reader can tell what of
+/// its range is gone.
+#[derive(Serialize, Debug, PartialEq)]
+pub(crate) struct Rows {
+    pub(crate) count: usize,
+    pub(crate) oldest: Option<f64>,
+    pub(crate) x: Vec<f64>,
+    pub(crate) y: Vec<f64>,
+}
+
 /// The reply to a [`WindowRequest`].
 #[derive(Serialize, Debug)]
 pub(crate) struct Window {

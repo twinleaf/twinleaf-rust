@@ -36,6 +36,10 @@
   import TabStrip from './lib/TabStrip.svelte';
   import DragOverlay from './lib/DragOverlay.svelte';
   import FocusRing from './lib/FocusRing.svelte';
+  import Toasts from './lib/Toasts.svelte';
+  import { toast } from './lib/toast.svelte.js';
+  import { MAX_COPY_ROWS, blockTable, lostSeconds, writeTables } from './lib/copy.js';
+  import { timeAxis } from './lib/plot.js';
   import { leave, navigate, remember } from './lib/focus.js';
   import KeysDialog from './lib/KeysDialog.svelte';
   import StatusBar from './lib/StatusBar.svelte';
@@ -398,6 +402,54 @@
 
   let paletteOpen = $state(false);
   let keysOpen = $state(false);
+  /**
+   * Copies the data of plots `ids`, as copy.js lays it out: a time plot's
+   * every raw sample in its visible window, and a spectrum plot's spectra
+   * as it shows them, each signal's density by frequency. Past MAX_COPY_ROWS
+   * it copies nothing and says how many rows that would be; a window whose
+   * start the history no longer holds is copied, and the notice says what is
+   * missing.
+   */
+  async function copyData(ids) {
+    const session = hub.session, now = hub.now(performance.now());
+    const plots = ids.map((id) => [id, plotAnywhere(id)]).filter(([, p]) => p?.items.length);
+    if (!plots.length) return toast('Nothing to copy: the plots show no signals');
+    const blocks = [];
+    let total = 0, lost = 0;
+    for (const [id, plot] of plots) {
+      if (plot.kind === 'spectrum') {
+        const pv = [...registry].find((v) => v.plotId === id);
+        const traces = plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean);
+        const spectra = traces.map((t) => pv?.spectrumOf(t) ?? t.spectrum).map((sp) => sp ?? { f: [], a: [] });
+        const table = blockTable(
+          traces.map((t, i) => ({ key: t.key, units: t.meta.units ? `${t.meta.units}/√Hz` : '/√Hz', x: [...spectra[i].f], y: [...spectra[i].a] })),
+          'frequency (Hz)',
+        );
+        total += table.rows.length;
+        blocks.push({ title: `Spectrum of ${traces.map((t) => t.key).join(', ')}`, ...table });
+        continue;
+      }
+      const [t0, t1] = views.of(id).range(now);
+      const traces = plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean);
+      const replies = await Promise.all(traces.map((t) => api.rows({ hub: session.id, id: t.meta.id, t0, t1, limit: MAX_COPY_ROWS })));
+      total += replies.reduce((n, r) => n + r.count, 0);
+      if (total > MAX_COPY_ROWS) continue;
+      replies.forEach((r, i) => (lost = Math.max(lost, lostSeconds(t0, r.oldest, traces[i].meta.rate))));
+      const time = timeAxis(traces[0].meta.epoch);
+      const table = blockTable(
+        traces.map((t, i) => ({ key: t.key, units: t.meta.units, x: replies[i].x, y: replies[i].y })),
+        traces[0].meta.epoch === 'unix' ? 'time (Unix s)' : 'time (s)',
+      );
+      blocks.push({ title: `${traces.map((t) => t.key).join(', ')} · ${time.readout(t0)} – ${time.readout(t1)}`, ...table });
+    }
+    if (total > MAX_COPY_ROWS)
+      return toast(`${total.toLocaleString()} rows is more than a paste holds well (${MAX_COPY_ROWS.toLocaleString()}); narrow the window, or export it`);
+    const rows = blocks.reduce((n, b) => n + b.rows.length, 0);
+    await writeTables(blocks);
+    const missing = lost ? `; the first ${lost.toFixed(1)} s of the window are no longer in history` : '';
+    toast(`Copied ${rows.toLocaleString()} rows of ${blocks.length} plot${blocks.length === 1 ? '' : 's'}${missing}`);
+  }
+
   /** Moves signal `key` from plot `from` to plot `to`, or to a new plot to its right with null. */
   function moveSignal(from, key, to) {
     const src = ws.plots[from];
@@ -424,6 +476,12 @@
     // What is typed into a field, a menu or dialog's own keys, and the keys
     // that press a button focused from the keyboard stay there (keys.js).
     if (keepsKey(e)) return;
+    // Ctrl+C with no text selected copies the highlighted plots' data.
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'c' && !String(window.getSelection() ?? '')) {
+      e.preventDefault();
+      const ids = ws.highlighted().length ? ws.highlighted() : ws.timeIds();
+      return void copyData(ids).catch((error) => toast(`Could not copy: ${error.message}`));
+    }
     // Ctrl+A outside a field selects every plot of the tab, not the page's text.
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
       e.preventDefault();
@@ -507,6 +565,7 @@
           .filter((p) => p !== id)
           .map((p) => ({ id: p, label: ws.plots[p]?.items.map((i) => i.key).join(', ') || 'Empty plot' }))}
         onMoveSignal={(key, to) => moveSignal(id, key, to)}
+        onCopy={() => copyData(ws.selected.has(id) ? [...ws.selected] : [id]).catch((error) => toast(`Could not copy: ${error.message}`))}
       />
     {/if}
   {/key}
@@ -710,6 +769,7 @@
 
 <DragOverlay {drags} {ws} session={hub.session} />
 <FocusRing />
+<Toasts />
 <KeysDialog bind:open={keysOpen} />
 <CommandPalette bind:open={paletteOpen} session={hub.session} {ws} {act} />
 

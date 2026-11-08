@@ -127,4 +127,10 @@ export const api = {
    * `width` px. Replies {t0, t1, ratio, chunks: [{x, y}]}, `ratio` raw rows per point.
    */
   window: ({ hub, id, t0, t1, width }) => request('/api/window', { query: { hub, id, t0, t1, width: Math.round(width) } }),
+  /**
+   * Reads every raw row of trace `id` of hub `hub` between t0 and t1, or,
+   * past `limit` rows, only how many. Replies {count, oldest, x, y}, `oldest`
+   * the oldest time the history still holds of the trace.
+   */
+  rows: ({ hub, id, t0, t1, limit }) => request('/api/rows', { query: { hub, id, t0, t1, limit } }),
 };

@@ -19,6 +19,7 @@
   import RiAdd from '@lucide/svelte/icons/plus';
   import RiNewPlot from '@lucide/svelte/icons/square-plus';
   import RiPalette from '@lucide/svelte/icons/palette';
+  import RiCopy from '@lucide/svelte/icons/clipboard-copy';
   import { actionFor, stepIn } from './keymap.js';
   import { uid } from './tabs.js';
 
@@ -106,7 +107,7 @@
   onfocus={() => (focused = true)}
   onblur={() => (focused = false)}
 />
-<!-- A signal's menu: where it goes and its colour. -->
+<!-- A signal's menu: where it goes, its colour, its name. -->
 <ContextMenu.Root bind:open={menuOpen}>
 <ContextMenu.Trigger>
 {#snippet child({ props })}
@@ -162,6 +163,8 @@
       <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorOf({ key: menuKey })}"></i></span></ContextMenu.SubTrigger>
       <ContextMenu.SubContent class="p-1.5"><ColorPicker key={menuKey} ondone={() => (menuOpen = false)} /></ContextMenu.SubContent>
     </ContextMenu.Sub>
+    <ContextMenu.Separator />
+    <ContextMenu.Item onSelect={() => navigator.clipboard.writeText(menuKey)}><RiCopy class="menu-icon" />Copy name</ContextMenu.Item>
   {/if}
 </ContextMenu.Content>
 </ContextMenu.Root>
