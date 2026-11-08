@@ -12,10 +12,13 @@
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
   import { colorOf } from './plot.js';
+  import Swatch from './Swatch.svelte';
+  import ColorPicker from './ColorPicker.svelte';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import { claimMenu, releaseMenu } from './menus.js';
   import RiAdd from '@lucide/svelte/icons/plus';
   import RiNewPlot from '@lucide/svelte/icons/square-plus';
+  import RiPalette from '@lucide/svelte/icons/palette';
   import { actionFor, stepIn } from './keymap.js';
   import { uid } from './tabs.js';
 
@@ -103,7 +106,7 @@
   onfocus={() => (focused = true)}
   onblur={() => (focused = false)}
 />
-<!-- A signal's menu: where it goes. -->
+<!-- A signal's menu: where it goes and its colour. -->
 <ContextMenu.Root bind:open={menuOpen}>
 <ContextMenu.Trigger>
 {#snippet child({ props })}
@@ -129,7 +132,7 @@
   >
     {#each palette as item, i (item.id)}
       {@const t = session.trace(item.key)}
-      <!-- An option of the list, which takes its keys. -->
+      <!-- An option of the list, which takes its keys, so it can hold the colour button. -->
       <!-- svelte-ignore a11y_click_events_have_key_events -->
       <div
         id="pal-{item.id}"
@@ -143,7 +146,7 @@
         animate:flip={{ duration: FLIP_MS }}
         onclick={() => onAdd(item.key)}
       >
-        <i></i><span class="sig-key">{item.key}</span>{#if t?.meta.units}<span class="sig-units">{t.meta.units}</span>{/if}<small>{t?.meta.rate} Hz</small>
+        <Swatch key={item.key} /><span class="sig-key">{item.key}</span>{#if t?.meta.units}<span class="sig-units">{t.meta.units}</span>{/if}<small>{t?.meta.rate} Hz</small>
       </div>
     {/each}
   </div>
@@ -155,6 +158,10 @@
   {#if menuKey}
     <ContextMenu.Item onSelect={() => onAdd(menuKey)}><RiAdd class="menu-icon" />Add to plot<ContextMenu.Shortcut><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
     <ContextMenu.Item onSelect={() => onNewPlot([menuKey])}><RiNewPlot class="menu-icon" />New plot<ContextMenu.Shortcut><kbd>⇧</kbd><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+    <ContextMenu.Sub>
+      <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorOf({ key: menuKey })}"></i></span></ContextMenu.SubTrigger>
+      <ContextMenu.SubContent class="p-1.5"><ColorPicker key={menuKey} ondone={() => (menuOpen = false)} /></ContextMenu.SubContent>
+    </ContextMenu.Sub>
   {/if}
 </ContextMenu.Content>
 </ContextMenu.Root>

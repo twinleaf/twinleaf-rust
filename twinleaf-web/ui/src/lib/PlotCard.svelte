@@ -6,6 +6,7 @@
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
+  import ColorPicker from './ColorPicker.svelte';
   import RiToLeft from '@lucide/svelte/icons/arrow-left';
   import RiToRight from '@lucide/svelte/icons/arrow-right';
   import RiRemoveAxis from '@lucide/svelte/icons/trash-2';
@@ -14,6 +15,7 @@
   import { claimMenu, releaseMenu } from './menus.js';
   import RiShowOnly from '@lucide/svelte/icons/eye';
   import RiHide from '@lucide/svelte/icons/eye-off';
+  import RiPalette from '@lucide/svelte/icons/palette';
   import RiAxis from '@lucide/svelte/icons/arrow-right-left';
   import RiMove from '@lucide/svelte/icons/square-arrow-out-up-right';
   import RiTrash from '@lucide/svelte/icons/trash-2';
@@ -40,6 +42,7 @@
   import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
   import RiZoomTo from '@lucide/svelte/icons/zoom-in';
   import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
+  import Swatch from './Swatch.svelte';
   import { DRAG_START, KINDS, MODES, SPANS, kindLabel } from './constants.js';
   import { actionFor, stepIn } from './keymap.js';
   import { chip } from './tabs.js';
@@ -80,7 +83,7 @@
   let bounds = $state({ lo: '', hi: '' });
   let boundsError = $state('');
   const shown = (v) => String(+v.toPrecision(6));
-  /** The one signal the axis right-clicked scales, which its popover names, or null for a shared axis. */
+  /** The one signal the axis right-clicked scales, whose colour its popover sets, or null for a shared axis. */
   const axisKey = $derived(region.kind === 'y' && region.keys.length === 1 && region.keys[0] !== 'shared' ? region.keys[0] : null);
   // Each of the plot's menus closes the page's others as it opens.
   const closeAxis = () => (axisOpen = false), closeMenu = () => (menuOpen = false), closeSignals = () => (signalsOpen = false);
@@ -438,7 +441,7 @@
   function dragOverlay(e, place) {
     // Its drag is its own, not the plot's pan.
     e.stopPropagation();
-    if (e.button !== 0 || e.target.closest('.x')) return;
+    if (e.button !== 0 || e.target.closest('.x, .swatch')) return;
     e.preventDefault();
     // A menu opened on it stays where it opened, so picking it up closes that.
     readoutOpen = false;
@@ -564,7 +567,7 @@
             {#each plot.items as item, i (item.id)}
               {@const r = legend.rows[item.key]}
               <div id="chip-{item.id}" data-key={item.key} class:hidden-signal={item.hidden} class="trace-chip" class:ghost={item[SHADOW]} class:active={zoneFocused && i === active} class:unscaled={axisless(item.key)} role="option" aria-selected={zoneFocused && i === active} style="--c:{colorFor(item.key)}" title={axisless(item.key) ? 'No axis of its own: drag it beside the plot\'s left or right edge to give it one' : r?.info}>
-                <i></i>
+                <Swatch key={item.key} />
                 <span class="name">{item.key}</span>
                 {#if unitsShown(item.key)}<span class="units">{unitsShown(item.key)}</span>{/if}
                 {#if plot.kind === 'spectrum'}
@@ -598,6 +601,10 @@
           {/if}
           <ContextMenu.Item onSelect={() => toggleHidden(menuChip)}>{#if item?.hidden}<RiShowOnly class="menu-icon" />Show{:else}<RiHide class="menu-icon" />Hide{/if}</ContextMenu.Item>
           <ContextMenu.Separator />
+          <ContextMenu.Sub>
+            <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorFor(menuChip)}"></i></span></ContextMenu.SubTrigger>
+            <ContextMenu.SubContent class="p-1.5"><ColorPicker key={menuChip} ondone={() => (signalsOpen = false)} /></ContextMenu.SubContent>
+          </ContextMenu.Sub>
           {#if side}
             <ContextMenu.Sub>
               <ContextMenu.SubTrigger><RiAxis class="menu-icon" />Axis</ContextMenu.SubTrigger>
@@ -751,7 +758,8 @@
     </Popover.Content>
   </Popover.Root>
 
-  <!-- A y axis's settings: the signal it scales, its bounds and a fit. -->
+  <!-- A y axis's settings: the signal it scales, its bounds, a fit, and the
+       signal's colour when the axis is one signal's. -->
   <Popover.Root bind:open={axisOpen}>
     <Popover.Content customAnchor={axisAnchor} side="right" align="start" class="axis-pop w-auto gap-0 p-1.5">
       <div class="axis-head">
@@ -797,6 +805,10 @@
         </Tip>
       </div>
       {#if boundsError}<div class="axis-error">{boundsError}</div>{/if}
+      {#if axisKey}
+        <div class="axis-sep"></div>
+        <ColorPicker key={axisKey} ondone={() => (axisOpen = false)} />
+      {/if}
     </Popover.Content>
   </Popover.Root>
   <ContextMenu.Root bind:open={menuOpen}>
@@ -812,7 +824,7 @@
             <div class="pinned-legend" data-focus-skip role="list" aria-label="Legend: drag to move" style="--x: {at.x}; --y: {at.y}" onpointerdown={(e) => dragOverlay(e, 'legendAt')}>
               {#each shownItems as item (item.id)}
                 <div class="row" role="listitem" style="--c:{colorFor(item.key)}" title={item.key}>
-                  <i></i><span class="name">{item.key}</span><span class="val">{legend.rows[item.key]?.value ?? ''}</span><span class="units">{unitsShown(item.key)}</span>
+                  <Swatch key={item.key} /><span class="name">{item.key}</span><span class="val">{legend.rows[item.key]?.value ?? ''}</span><span class="units">{unitsShown(item.key)}</span>
                   <Tip text="Remove from this plot" keys={['Delete']}>
                     {#snippet children(tip)}<button {...tip} class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>{/snippet}
                   </Tip>

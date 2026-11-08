@@ -10,6 +10,7 @@
 
 import { SvelteMap } from 'svelte/reactivity';
 import { api, signalKey } from './protocol.js';
+import { colors } from './colors.svelte.js';
 
 /** How long a trace keeps its points, in seconds of device time. */
 const RETAIN_SECONDS = 120;
@@ -260,6 +261,7 @@ export class Session {
         this.traces.set(t.meta.id, t);
         this.byKey.set(t.key, t);
         this.signals = [...this.byKey.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+        colors.give(this.signals.map((s) => s.key));
         return;
       }
       case 'clear':

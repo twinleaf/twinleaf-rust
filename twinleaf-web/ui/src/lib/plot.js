@@ -13,6 +13,7 @@
 
 import { scaleLinear, scaleLog, scaleTime } from 'd3-scale';
 import { DRAG_START } from './constants.js';
+import { colors } from './colors.svelte.js';
 import { spanText } from './units.js';
 
 /** A CSS colour as [r, g, b, a] in 0..1, resolved by the browser, so theme tokens work. */
@@ -296,18 +297,20 @@ export function theme() {
   }
   return themed;
 }
-/** The trace's colour, one of eight by its signal key, so a signal keeps its colour from hub to hub. */
-function colorIndex(trace) {
-  if (trace.colorIndex === undefined) {
-    let h = 0;
-    for (let i = 0; i < trace.key.length; i++) h = (h * 31 + trace.key.charCodeAt(i)) | 0;
-    trace.colorIndex = Math.abs(h) % 8;
-  }
-  return trace.colorIndex;
-}
-export const colorOf = (trace) => theme().traces[colorIndex(trace)];
+/** Each picked colour other than the theme's, as GL's rgba. */
+const customRgba = new Map();
+/** The trace's colour, as colors.svelte.js gives it or it was picked. */
+export const colorOf = (trace) => {
+  const c = colors.of(trace.key);
+  return typeof c === 'number' ? theme().traces[c] : c;
+};
 /** The trace's colour as GL's rgba. */
-const rgbaOf = (trace) => theme().tracesRgba[colorIndex(trace)];
+const rgbaOf = (trace) => {
+  const c = colors.of(trace.key);
+  if (typeof c === 'number') return theme().tracesRgba[c];
+  if (!customRgba.has(c)) customRgba.set(c, cssRgba(c));
+  return customRgba.get(c);
+};
 
 export class PlotView {
   /**

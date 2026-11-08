@@ -195,7 +195,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
    plot resizes; --inset-top clears a monitor's header. */
 .pinned-legend { --inset-top: 4px; position: absolute; left: calc(4px + var(--x) * (100% - 8px)); top: calc(var(--inset-top) + var(--y) * (100% - var(--inset-top) - 4px)); transform: translate(calc(var(--x) * -100%), calc(var(--y) * -100%)); z-index: 2; cursor: grab; touch-action: none; max-width: calc(100% - 8px); max-height: max(40%, 36px); overflow: hidden auto; scrollbar-width: thin; padding: 1px 6px; font: 10px/16px var(--font-data); font-variant-numeric: tabular-nums; background: color-mix(in oklch, var(--card) 85%, transparent); backdrop-filter: blur(2px); border: 1px solid var(--border); }
 .pinned-legend .row { display: flex; align-items: center; gap: 5px; height: 16px; white-space: nowrap; }
-.pinned-legend i { flex: none; width: 8px; height: 3px; background: var(--c); }
+.pinned-legend .swatch i { width: 8px; height: 3px; background: var(--c); }
 .pinned-legend .name { max-width: 16ch; overflow: hidden; text-overflow: ellipsis; color: var(--foreground); }
 .pinned-legend .val { margin-left: auto; min-width: 8ch; text-align: right; color: var(--c); }
 .pinned-legend .units { color: var(--muted-foreground); }
@@ -204,7 +204,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .pinned-legend .row:hover .x { opacity: 1; }
 .pinned-legend .x:hover { color: var(--destructive); }
 @media (hover: none) { .pinned-legend .x { opacity: 1; } }
-.trace-chip i { align-self: center; width: 10px; height: 3px; background: var(--c); border-radius: 2px; flex: none; }
+.trace-chip .swatch i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; }
 .trace-chip .units { color: var(--muted-foreground); }
 /* A fixed slot, as wide as the longest value the chip formats, -0.0012345
    or -1.2346e+5, so values changing or appearing never reflow the header. */
@@ -222,6 +222,9 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
    them: the icon takes the room a check mark would, muted beside its label. */
 .menu-icons :is([data-slot^=context-menu-item], [data-slot=context-menu-sub-trigger], [data-slot^=dropdown-menu-item], [data-slot$=-menu-label]) { padding-left: 8px; white-space: nowrap; }
 .menu-icon { color: var(--muted-foreground); }
+/* A menu row's current value, before its submenu's arrow. */
+.menu-value { margin-left: auto; padding-left: 16px; color: var(--muted-foreground); font-size: 12px; }
+.menu-value i { display: inline-block; width: 12px; height: 3px; border-radius: 2px; vertical-align: middle; background: var(--c); }
 /* A chip answers the pointer as a whole, as Material and Fluent chips do;
    a hidden signal's chip stays, dimmed. */
 .trace-chip { padding: 0 4px; border-radius: var(--radius); transition: background-color 120ms; }
@@ -260,7 +263,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .chips { flex: 1; display: flex; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; gap: 4px; min-height: 26px; min-width: 60px; padding: 1px 4px; border: 1px dashed transparent; border-radius: var(--radius); align-items: center; }
 .chips:empty::before { content: 'drop signals here'; color: var(--muted-foreground); font-size: 12px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: var(--radius); background: var(--secondary); border: 1px solid var(--border); color: var(--foreground); font: 12px var(--font-data); white-space: nowrap; cursor: grab; user-select: none; }
-.chip i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; flex: none; }
+.chip i, .chip .swatch i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; flex: none; }
 .chip small { color: var(--muted-foreground); margin-left: auto; }
 .chip .x { border: 0; background: none; padding: 0 0 0 2px; color: var(--muted-foreground); font-size: 14px; line-height: 1; cursor: pointer; }
 .chip .x:hover { color: var(--foreground); }
@@ -306,7 +309,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 
 /* Typed bounds in a y axis's context menu. */
 /* A y axis's popover: a small header naming what it scales, Max and Min in
-   one aligned column, and Fit. */
+   one aligned column, Fit, and the signal's colour. */
 .axis-anchor { position: absolute; width: 0; height: 0; pointer-events: none; }
 .axis-pop { font-size: 12px; }
 .axis-head { display: flex; align-items: center; gap: 6px; padding: 2px 4px 4px; color: var(--muted-foreground); font: 11px var(--font-data); }
@@ -333,9 +336,10 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .axis-row .seg button:first-child { border-left: 0; }
 .axis-row .seg button:hover { color: var(--foreground); }
 .axis-row .seg button.on { background: var(--secondary); color: var(--foreground); }
+.axis-sep { height: 1px; margin: 4px 0; background: var(--border); }
 /* An independent plot's chips: the one whose scale the axis shows has a solid
    line, the rest hollow, as a scope outlines the channels it is not set to. */
-.trace-chip.unscaled i { background: transparent; box-shadow: inset 0 0 0 1px var(--c); height: 5px; }
+.trace-chip.unscaled .swatch i { background: transparent; box-shadow: inset 0 0 0 1px var(--c); height: 5px; }
 /* A plot's kind and layout (KindPicker.svelte): ghost dropdowns, like the
    header's other buttons, with no border or fill until hovered or open.
    (A tooltip's trigger props replace the select's data-slot, so these go by
@@ -353,6 +357,33 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .signal-row.active { background: var(--accent); color: var(--accent-foreground); }
 .signal-row .rate { color: var(--muted-foreground); font-size: 11px; letter-spacing: 0.04em; }
 .signal-option { display: inline-flex; align-items: center; gap: 6px; font: 12px var(--font-data); }
+/* A signal's colour line, which opens the colour picker (Swatch.svelte). */
+.swatch { display: inline-grid; place-items: center; flex: none; align-self: center; margin: -3px; padding: 3px; border: 0; border-radius: 3px; background: none; cursor: pointer; }
+.swatch:hover, .swatch[data-state=open] { background: var(--secondary); }
+/* The colour picker (ColorPicker.svelte): one width for its grid and its
+   custom view, so swapping one for the other never resizes it sideways. */
+.color-picker { display: flex; flex-direction: column; gap: 4px; width: 136px; }
+.picker-auto { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: var(--radius); font-size: 12px; color: var(--foreground); cursor: pointer; }
+.picker-auto:hover { background: var(--secondary); }
+.swatch-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; padding: 3px 4px; }
+.swatch-choice { aspect-ratio: 1; padding: 0; border: 1px solid color-mix(in oklch, var(--foreground) 15%, transparent); border-radius: 4px; background: var(--c); cursor: pointer; }
+.swatch-choice[aria-checked=true] { box-shadow: 0 0 0 2px var(--popover), 0 0 0 3px var(--foreground); }
+.picker-custom, .picker-back { display: flex; align-items: center; gap: 6px; width: 100%; padding: 3px 4px; border: 0; border-radius: var(--radius); background: none; color: var(--foreground); font-size: 12px; text-align: left; cursor: pointer; }
+.picker-custom:hover, .picker-back:hover { background: var(--secondary); }
+.picker-back { color: var(--muted-foreground); }
+.picker-back svg { width: 14px; height: 14px; }
+/* Custom's chip: an eyedropper until a custom colour is picked, then that colour. */
+.picker-custom-chip { display: grid; place-items: center; width: 16px; height: 16px; border: 1px solid color-mix(in oklch, var(--foreground) 15%, transparent); border-radius: 4px; background: var(--c, var(--secondary)); }
+.picker-custom-chip svg { width: 10px; height: 10px; }
+.picker-custom[aria-checked=true] .picker-custom-chip { box-shadow: 0 0 0 2px var(--popover), 0 0 0 3px var(--foreground); }
+.picker-sv { position: relative; height: 96px; margin: 0 4px; border-radius: 4px; cursor: crosshair; touch-action: none; background: linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, hsl(var(--hue) 100% 50%)); }
+.picker-hue { position: relative; height: 10px; margin: 2px 4px; border-radius: 5px; cursor: ew-resize; touch-action: none; background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00); }
+.picker-thumb { position: absolute; width: 12px; height: 12px; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px rgb(0 0 0 / 0.5); transform: translate(-50%, -50%); pointer-events: none; }
+.picker-row { display: flex; gap: 4px; padding: 0 4px 2px; }
+.picker-hex { flex: 1; min-width: 0; height: 24px; padding: 0 6px; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--foreground); font: 12px var(--font-data); }
+.picker-sample { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 1px solid var(--input); border-radius: var(--radius); background: none; color: var(--muted-foreground); cursor: pointer; }
+.picker-sample:hover { background: var(--secondary); color: var(--foreground); }
+.picker-sample svg { width: 13px; height: 13px; }
 .signal-option i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; }
 .signal-option small { color: var(--muted-foreground); }
 .signal-none { padding: 2px 8px 4px; color: var(--muted-foreground); font-size: 12px; }
