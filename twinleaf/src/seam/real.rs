@@ -149,6 +149,19 @@ pub(crate) mod net {
         socket.connect(address).await
     }
 
+    /// Returns the first byte `stream` has received, leaving it to be read,
+    /// or `None` once the peer has closed without sending one.
+    pub(crate) async fn peek_first(stream: &mut TcpStream) -> io::Result<Option<u8>> {
+        let mut first = [0];
+        Ok((stream.peek(&mut first).await? == 1).then_some(first[0]))
+    }
+
+    /// Returns `stream` as the socket a [`Foreign`](crate::seam::Foreign)
+    /// handler takes.
+    pub(crate) fn into_foreign(stream: TcpStream) -> Option<crate::seam::ForeignStream> {
+        Some(stream)
+    }
+
     /// Makes a connect on `socket` give up after the first refusal. Windows
     /// otherwise sends the handshake twice more, so a closed port takes
     /// about 2 s to refuse.

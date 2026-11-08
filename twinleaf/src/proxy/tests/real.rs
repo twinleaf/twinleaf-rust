@@ -982,3 +982,95 @@ fn clients_lists_who_said_hello_and_what_they_opened() {
     }
     assert_eq!(proxy.clients()[0].name.as_deref(), Some("mine"));
 }
+
+/// Returns a handler that sends each connection it is given to the test,
+/// as a blocking socket, and the receiver of those.
+fn foreign_handler() -> (Foreign, std::sync::mpsc::Receiver<TcpStream>) {
+    let (sender, handed) = std::sync::mpsc::channel();
+    let foreign = Foreign::new(move |stream, _peer| {
+        let stream = stream.into_std().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        let _ = sender.send(stream);
+    });
+    (foreign, handed)
+}
+
+/// A proxy with a handler still serves a client, whose first byte is a
+/// packet type, as it serves one without.
+#[test]
+fn a_proxy_with_a_handler_still_serves_a_client() {
+    let (foreign, handed) = foreign_handler();
+    let proxy = Proxy::host(HostOptions {
+        foreign: Some(foreign),
+        ..options()
+    })
+    .unwrap();
+    let client = TestClient::connect(&proxy.endpoint());
+    client.hello(4242, "client");
+    assert!(handed.try_recv().is_err(), "the client went to the handler");
+}
+
+/// An HTTP request goes to the handler, with none of its bytes read.
+#[test]
+fn an_http_request_goes_to_the_handler_whole() {
+    use std::io::{Read, Write};
+    let (foreign, handed) = foreign_handler();
+    let proxy = Proxy::host(HostOptions {
+        foreign: Some(foreign),
+        ..options()
+    })
+    .unwrap();
+    let address = proxy.endpoint().trim_start_matches("tcp://").to_string();
+    let mut browser = TcpStream::connect(address).unwrap();
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    browser.write_all(request).unwrap();
+
+    let mut served = handed
+        .recv_timeout(WAIT)
+        .expect("no connection reached the handler");
+    let mut read = vec![0; request.len()];
+    served.read_exact(&mut read).unwrap();
+    assert_eq!(read, request);
+    assert!(proxy.clients().is_empty(), "the request became a client");
+}
+
+/// A connection that sends nothing is closed after the first byte's wait,
+/// and a client that connects meanwhile is served at once.
+#[test]
+fn a_quiet_connection_is_closed_and_holds_up_no_client() {
+    use std::io::Read;
+    let (foreign, handed) = foreign_handler();
+    let proxy = Proxy::host(HostOptions {
+        foreign: Some(foreign),
+        ..options()
+    })
+    .unwrap();
+    let address = proxy.endpoint().trim_start_matches("tcp://").to_string();
+    let started = Instant::now();
+    let mut quiet = TcpStream::connect(address).unwrap();
+
+    let client = TestClient::connect(&proxy.endpoint());
+    client.hello(4242, "client");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the client waited behind the quiet connection"
+    );
+
+    quiet
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        quiet.read(&mut byte).unwrap(),
+        0,
+        "the quiet connection was not closed"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "it was closed before its wait"
+    );
+    assert!(
+        handed.try_recv().is_err(),
+        "the quiet connection went to the handler"
+    );
+}

@@ -4,8 +4,10 @@
 use super::link::Links;
 use super::HostOptions;
 use crate::chan::oneshot;
+use crate::net::TcpStream;
 use crate::rt::Supervisor;
 use crate::session::{Introduction, Layout};
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use tokio::sync::{mpsc, watch};
 
@@ -18,6 +20,9 @@ pub(super) enum Notice {
         update: TableChange,
         done: oneshot::Sender<()>,
     },
+    /// A connection that sent a first byte of the packet protocol, to serve
+    /// as a client.
+    Speaks { stream: TcpStream, peer: SocketAddr },
     /// A stop of the proxy.
     Stop,
 }
