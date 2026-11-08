@@ -17,15 +17,16 @@
 
 use crate::devices::Devices;
 use crate::feed::Feed;
-use crate::protocol::{Frame, Message, MountInfo, TraceInfo, Window, WindowChunk};
+use crate::protocol::{Frame, Held, Message, MountInfo, TraceInfo, Window, WindowChunk};
 use crate::wire::{encode, encode_spectra, split_at_breaks, Chunk, Spectrum};
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 use twinleaf::data::ops::{Fpcs, Welch};
-use twinleaf::data::{Buffer, ColumnArray, ColumnKey, ColumnOp, ColumnProcessor, Run};
+use twinleaf::data::{Buffer, ColumnArray, ColumnKey, ColumnOp, ColumnProcessor, Run, StreamKey};
 use twinleaf::proxy::Layout;
 use twinleaf::{ColumnId, Connection, DeviceRoute, DeviceTree, RecvError, SampleBatch};
 
@@ -36,6 +37,8 @@ const HISTORY_SECONDS: f64 = 120.0;
 /// at most this many bytes across every stream.
 const RAW_SECONDS: f64 = 600.0;
 const RAW_BYTES: usize = 1_000_000_000;
+/// The share of the history budget the history held for paused plots keeps.
+const HELD_SHARE: f64 = 0.5;
 /// How often pending points go out.
 const FLUSH: Duration = Duration::from_millis(16);
 /// How often spectra are recomputed.
@@ -68,8 +71,18 @@ pub(crate) struct Hub {
     /// The traces each page shows as spectra, by trace id, by page. Only
     /// these are estimated.
     spectra_shown: HashMap<u64, BTreeSet<u16>>,
+    /// The history as it was when the first page that now holds a plot
+    /// paused paused it, which reads of what the buffer no longer reaches
+    /// prefer, and the pages that hold it. Its chunks are the buffer's,
+    /// shared, so it costs memory only as the buffer drops them.
+    held: Option<Buffer>,
+    holders: BTreeSet<u64>,
+    /// The bytes the buffer and the held history may hold together. The held
+    /// history keeps at most HELD_SHARE of it, from its newest rows, and the
+    /// buffer the rest.
+    budget: Option<usize>,
     /// What the last `memory` message said, rounded as the page shows it.
-    memory_sent: Option<(u64, u64, i64, i64, i64)>,
+    memory_sent: Option<(u64, u64, i64, i64, i64, i64)>,
     feed: Arc<Feed>,
 }
 
@@ -229,11 +242,18 @@ impl Page {
     pub(crate) fn show_spectra(&self, traces: BTreeSet<u16>) {
         self.live.hub.lock().unwrap().show_spectra(self.id, traces);
     }
+
+    /// Holds the history as it is now while `on`, for the page's paused
+    /// plots, or lets it go.
+    pub(crate) fn hold(&self, on: bool) {
+        self.live.hub.lock().unwrap().hold(self.id, on);
+    }
 }
 
 impl Drop for Page {
     fn drop(&mut self) {
         self.show_spectra(BTreeSet::new());
+        self.hold(false);
     }
 }
 
@@ -291,6 +311,9 @@ impl Hub {
             by_key: HashMap::new(),
             points_per_second: POINTS_PER_SECOND,
             spectra_shown: HashMap::new(),
+            held: None,
+            holders: BTreeSet::new(),
+            budget: Some(RAW_BYTES),
             memory_sent: None,
             feed: Feed::new(),
         }
@@ -301,6 +324,11 @@ impl Hub {
             return;
         }
         self.buffer.process_batch(batch);
+        // As the buffer drops what the held history keeps, the held history
+        // costs more, and the buffer gets that much less.
+        if self.held.is_some() {
+            self.share_budget();
+        }
         self.register(batch);
     }
 
@@ -452,6 +480,79 @@ impl Hub {
         frames
     }
 
+    /// Holds the history as it is now for page `page` while `on`, or lets
+    /// it go once no page holds it. While held, the buffer goes on keeping
+    /// the newest rows in what of the budget the held history leaves.
+    fn hold(&mut self, page: u64, on: bool) {
+        let was = !self.holders.is_empty();
+        if on {
+            self.holders.insert(page);
+        } else {
+            self.holders.remove(&page);
+        }
+        match (was, !self.holders.is_empty()) {
+            (false, true) => {
+                let mut held = self.buffer.frozen();
+                held.set_budget(self.held_budget());
+                self.held = Some(held);
+            }
+            (true, false) => self.held = None,
+            _ => return,
+        }
+        self.share_budget();
+        self.memory_sent = None;
+        self.send_memory();
+    }
+
+    /// The bytes the held history may keep: HELD_SHARE of the budget.
+    fn held_budget(&self) -> Option<usize> {
+        self.budget.map(|b| (b as f64 * HELD_SHARE) as usize)
+    }
+
+    /// Gives the buffer what of the budget the held history leaves: the bytes
+    /// the held history alone holds, as the chunks both hold are counted once,
+    /// in the buffer.
+    fn share_budget(&mut self) {
+        let held = self
+            .held
+            .as_ref()
+            .map_or(0, |held| held.bytes_not_in(&self.buffer));
+        self.buffer
+            .set_budget(self.budget.map(|b| b.saturating_sub(held)));
+    }
+
+    /// Where the rows of `key` within [t0, t1] are, in time order: the held
+    /// history's up to where the buffer begins, then the buffer's. Each is a
+    /// run and the rows of it to read.
+    fn spans(&self, key: &StreamKey, t0: f64, t1: f64) -> Vec<(&Run, Range<u64>)> {
+        let live = self.buffer.run(key);
+        let live_first = live.and_then(Run::first_timestamp);
+        let mut spans = Vec::new();
+        if let Some(held) = self.held.as_ref().and_then(|h| h.run(key)) {
+            if live_first.is_none_or(|first| first > t0) {
+                // Up to just before the buffer's first row, which the buffer reads.
+                let end = live_first.map_or(t1, |first| t1.min(first - 1e-9));
+                spans.push((held, held.rows_between(t0, end)));
+            }
+        }
+        if let Some(live) = live {
+            spans.push((live, live.rows_between(t0, t1)));
+        }
+        spans.retain(|(_, rows)| rows.start < rows.end);
+        spans
+    }
+
+    /// The oldest time the history holds of `key`, held or not.
+    fn oldest(&self, key: &StreamKey) -> Option<f64> {
+        let held = self
+            .held
+            .as_ref()
+            .and_then(|h| h.run(key))
+            .and_then(Run::first_timestamp);
+        let live = self.buffer.run(key).and_then(Run::first_timestamp);
+        held.into_iter().chain(live).reduce(f64::min)
+    }
+
     /// What the buffer holds and may hold, as a `memory` message.
     fn memory(&self) -> Message {
         let (mut rate, mut seconds) = (0.0, f64::INFINITY);
@@ -469,12 +570,22 @@ impl Hub {
                 seconds = seconds.min(last - first);
             }
         }
+        let held = self.held.as_ref().map(|held| Held {
+            bytes: held.bytes_not_in(&self.buffer) as u64,
+        });
+        let oldest = self
+            .traces
+            .iter()
+            .filter_map(|trace| Some((trace.info.id, self.oldest(&trace.key.stream_key())?)))
+            .collect();
         Message::Memory {
             bytes: self.buffer.bytes() as u64,
-            budget: self.buffer.budget().unwrap_or(0) as u64,
+            budget: self.budget.unwrap_or(0) as u64,
             seconds: if seconds.is_finite() { seconds } else { 0.0 },
             max_age: self.buffer.max_age().unwrap_or(0.0),
             rate,
+            held,
+            oldest,
         }
     }
 
@@ -482,7 +593,12 @@ impl Hub {
     /// at once, and tells every page.
     fn set_history(&mut self, seconds: f64, bytes: usize) {
         self.buffer.set_max_age(Some(seconds));
-        self.buffer.set_budget(Some(bytes));
+        self.budget = Some(bytes);
+        let held_budget = self.held_budget();
+        if let Some(held) = &mut self.held {
+            held.set_budget(held_budget);
+        }
+        self.share_budget();
         self.memory_sent = None;
         self.send_memory();
     }
@@ -496,6 +612,8 @@ impl Hub {
             seconds,
             max_age,
             rate,
+            oldest,
+            ..
         } = &message
         else {
             unreachable!()
@@ -506,6 +624,8 @@ impl Hub {
             seconds.round() as i64,
             max_age.round() as i64,
             rate.round() as i64,
+            // Where each trace's history begins moves as it is dropped.
+            oldest.values().map(|t| t.floor() as i64).min().unwrap_or(0),
         );
         if self.memory_sent != Some(shown) {
             self.memory_sent = Some(shown);
@@ -541,27 +661,36 @@ impl Hub {
     /// points per pixel only when there are more than that.
     fn window(&self, id: u16, t0: f64, t1: f64, width: usize) -> Option<Window> {
         let trace = self.traces.get(id as usize)?;
-        let run = self.buffer.run(&trace.key.stream_key())?;
-        let rows = run.rows_between(t0, t1);
-        // Split the raw rows at the run's gaps.
-        let gaps: Vec<u64> = run.boundaries().map(|(row, _, _)| row).collect();
+        let key = trace.key.stream_key();
+        self.buffer.run(&key)?;
+        // The raw rows, the held history's then the buffer's, split at each
+        // run's gaps.
         let mut segments: Vec<Vec<(f64, f64)>> = vec![Vec::new()];
-        let mut row = rows.start;
-        for batch in run.rows(rows.clone()) {
-            let Some(values) = batch.column(trace.key.column_id) else {
-                row += batch.timestamps().len() as u64;
-                continue;
-            };
-            for (&t, &v) in batch.timestamps().iter().zip(values.to_f64().iter()) {
-                if gaps.binary_search(&row).is_ok() && !segments.last().unwrap().is_empty() {
-                    segments.push(Vec::new());
+        let mut raw: usize = 0;
+        for (run, rows) in self.spans(&key, t0, t1) {
+            raw += (rows.end - rows.start) as usize;
+            // Where the held history ends and the buffer begins may be a hole,
+            // so a new span is a new segment, which the page draws apart.
+            if !segments.last().unwrap().is_empty() {
+                segments.push(Vec::new());
+            }
+            let gaps: Vec<u64> = run.boundaries().map(|(row, _, _)| row).collect();
+            let mut row = rows.start;
+            for batch in run.rows(rows) {
+                let Some(values) = batch.column(trace.key.column_id) else {
+                    row += batch.timestamps().len() as u64;
+                    continue;
+                };
+                for (&t, &v) in batch.timestamps().iter().zip(values.to_f64().iter()) {
+                    if gaps.binary_search(&row).is_ok() && !segments.last().unwrap().is_empty() {
+                        segments.push(Vec::new());
+                    }
+                    segments.last_mut().unwrap().push((t, v));
+                    row += 1;
                 }
-                segments.last_mut().unwrap().push((t, v));
-                row += 1;
             }
         }
         segments.retain(|s| !s.is_empty());
-        let raw = (rows.end - rows.start) as usize;
         let budget = (2 * width).max(64);
         let ratio = raw.div_ceil(budget).max(1);
         let chunks = segments
@@ -694,6 +823,49 @@ mod tests {
             .iter()
             .flat_map(|c| c.points.iter().copied())
             .collect()
+    }
+
+    #[test]
+    fn while_a_page_holds_the_history_a_window_reads_what_the_buffer_dropped() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        // 20 bytes a row: half the budget holds the first 1000 rows.
+        hub.set_history(1e6, 40_000);
+        for batch in samples(&mut parser, 0, 1000) {
+            hub.ingest(&batch);
+        }
+        hub.hold(7, true);
+        for batch in samples(&mut parser, 1000, 3000) {
+            hub.ingest(&batch);
+        }
+        let first = |hub: &Hub| {
+            hub.window(0, 0.0, 1.0, 8192)
+                .and_then(|w| w.chunks.first().map(|c| c.x[0]))
+        };
+        assert!(
+            first(&hub).is_some_and(|t| t <= 0.02),
+            "the held history reaches the start"
+        );
+        hub.hold(7, false);
+        assert_eq!(
+            first(&hub),
+            None,
+            "let go, the buffer alone no longer reaches it"
+        );
+        assert_eq!(hub.buffer.budget(), Some(40_000));
+    }
+
+    #[test]
+    fn memory_says_where_each_trace_begins() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        for batch in samples(&mut parser, 0, 100) {
+            hub.ingest(&batch);
+        }
+        let Message::Memory { oldest, .. } = hub.memory() else {
+            panic!("memory is a memory message")
+        };
+        assert_eq!(oldest.get(&0), Some(&0.01));
     }
 
     #[test]

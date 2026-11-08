@@ -81,12 +81,17 @@ pub(crate) enum Message {
     /// `budget`, and `seconds` of history in the stream that keeps the
     /// least, of the `max_age` each keeps at most. `rate` is the bytes per
     /// second the streams add, so the budget lasts `budget / rate` seconds.
+    /// `held` is the history captured while a page holds a plot paused, and
+    /// `oldest` the oldest time the history holds of each trace, by id,
+    /// captured or not, where a paused plot's history begins.
     Memory {
         bytes: u64,
         budget: u64,
         seconds: f64,
         max_age: f64,
         rate: f64,
+        held: Option<Held>,
+        oldest: BTreeMap<u16, f64>,
     },
     /// The devices there are, by route, and the devices the hub mounted, or
     /// `None` for the proxy's default.
@@ -134,6 +139,14 @@ impl Message {
     }
 }
 
+/// The raw history the hub captured while a page holds a plot paused: the
+/// bytes it holds that the live buffer no longer does, which is what holding
+/// it costs.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Held {
+    pub(crate) bytes: u64,
+}
+
 /// A text frame the page sends on the socket.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -141,6 +154,9 @@ pub(crate) enum PageMessage {
     /// The traces the page shows as spectra, by id, in place of those it
     /// named before.
     Spectra { traces: Vec<u16> },
+    /// Whether the page holds a plot paused, so the hub keeps the history as
+    /// it was at the pause, as a scope's Stop does.
+    Hold { on: bool },
 }
 
 /// A trace as the page names it.

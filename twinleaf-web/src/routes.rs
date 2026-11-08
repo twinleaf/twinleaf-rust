@@ -119,6 +119,7 @@ async fn client(mut socket: WebSocket, live: Arc<Live>) {
                     Ok(PageMessage::Spectra { traces }) => {
                         page.show_spectra(traces.into_iter().collect());
                     }
+                    Ok(PageMessage::Hold { on }) => page.hold(on),
                     Err(error) => log::debug!("A page sent what this server does not read: {error}"),
                 },
                 Some(Ok(_)) => {}
