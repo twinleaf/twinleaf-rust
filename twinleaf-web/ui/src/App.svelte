@@ -24,7 +24,10 @@
   import { actionFor } from './lib/keymap.js';
   import { keepsKey, plotKeys } from './lib/keys.js';
   import { api } from './lib/protocol.js';
-  import { THEMES, TRACE_WIDTHS, prefs } from './lib/prefs.svelte.js';
+  import { THEMES, TRACE_WIDTH, prefs } from './lib/prefs.svelte.js';
+  import RiSun from '@lucide/svelte/icons/sun';
+  import RiMoon from '@lucide/svelte/icons/moon';
+  import RiSystem from '@lucide/svelte/icons/monitor';
   import PlotCard from './lib/PlotCard.svelte';
   import Tile from './lib/Tile.svelte';
   import Devices from './lib/Devices.svelte';
@@ -73,6 +76,8 @@
   import RiQuadrants from '@lucide/svelte/icons/grid-2x2';
   import RiFocusArrange from '@lucide/svelte/icons/layout-panel-left';
   import RiUpload from '@lucide/svelte/icons/upload';
+  import { pressOutsideKeepsFocus } from './lib/menus.js';
+  import RiChevron from '@lucide/svelte/icons/chevron-down';
 
   const hub = new Hub();
   const ws = new Workspace(loadTabs(localStorage));
@@ -144,6 +149,15 @@
 
   /** Every time plot's view in the tab, which the toolbar's Live button acts on. */
   const tabViews = () => ws.timeIds().map((id) => views.of(id));
+  // The top bar's menus and popovers: each opens 2 px below the bar, as a
+  // plot's header menus open below the header (its 24 px buttons sit 5 px
+  // above the 34 px bar's foot), and a press on another's button opens it.
+  const BAR_OFFSET = 7;
+  const layoutMenu = pressOutsideKeepsFocus(), fileMenu = pressOutsideKeepsFocus(), settingsMenu = pressOutsideKeepsFocus(), windowMenu = pressOutsideKeepsFocus();
+  /** The step of SPANS nearest window `s`, by ratio, as a zoom leaves it between them. */
+  const spanStep = (s) => SPANS.reduce((best, x, i) => (Math.abs(Math.log(x / s)) < Math.abs(Math.log(SPANS[best] / s)) ? i : best), 0);
+  /** Each theme's icon. */
+  const THEME_ICONS = { light: RiSun, dark: RiMoon, system: RiSystem };
   /** Each arrangement's picture in the Layout menu. */
   const ARRANGE_ICONS = { rows: RiRows, columns: RiColumns, grid: RiGridArrange, quadrants: RiQuadrants, focus: RiFocusArrange };
   /** Shows the views' state in the toolbar, and keeps every paused view's points. */
@@ -630,14 +644,22 @@
           </Button>
         {/snippet}
       </Tip>
-      <Select.Root type="single" value={String(span)} onValueChange={setSpan}>
+      <!-- The time window: a slider over the spans, a step apiece, each step
+           about a doubling or more, with the span it stands at named. -->
+      <Popover.Root>
         <Tip text="The time window the plots show">
-          {#snippet children(tip)}<Select.Trigger {...tip} size="sm" class="h-6 w-20 text-xs" aria-label="Time window">{span} s</Select.Trigger>{/snippet}
+          {#snippet children(tip)}
+            <Popover.Trigger {...tip}>
+              {#snippet child({ props })}<Button {...props} size="xs" variant="outline" class="window-button" aria-label="Time window">{span} s<RiChevron /></Button>{/snippet}
+            </Popover.Trigger>
+          {/snippet}
         </Tip>
-        <Select.Content>
-          {#each SPANS as s}<Select.Item value={String(s)} label={`${s} s`} />{/each}
-        </Select.Content>
-      </Select.Root>
+        <Popover.Content class="window-pop w-72 gap-0 p-3" align="start" sideOffset={BAR_OFFSET} {...windowMenu}>
+          <div class="window-head"><span>Window</span><span class="set-value">{span} s</span></div>
+          <Slider type="single" value={spanStep(span)} min={0} max={SPANS.length - 1} step={1} onValueChange={(i) => setSpan(SPANS[i])} label="Time window" />
+          <div class="window-ticks" aria-hidden="true">{#each SPANS as s}<span>{s}</span>{/each}</div>
+        </Popover.Content>
+      </Popover.Root>
       <IconButton icon={RiEraser} label="Clear the cursors" keys={['Esc']} onclick={() => clearCursors()} />
       <DropdownMenu.Root>
         <Tip text="Arrange this tab's plots">
@@ -648,7 +670,7 @@
           {/snippet}
         </Tip>
         <!-- Each arrangement beside a picture of it, as the plot menus lead with icons. -->
-        <DropdownMenu.Content class="menu-icons w-max" align="end">
+        <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET} {...layoutMenu}>
           <DropdownMenu.Label>Arrange this tab</DropdownMenu.Label>
           {#each ARRANGEMENTS as [name, label]}
             {@const Icon = ARRANGE_ICONS[name]}
@@ -666,7 +688,7 @@
             </DropdownMenu.Trigger>
           {/snippet}
         </Tip>
-        <DropdownMenu.Content class="menu-icons w-max" align="end">
+        <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET} {...fileMenu}>
           <DropdownMenu.Item onSelect={exportTabs}><RiDownload class="menu-icon" />Export every tab…</DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => importInput.click()}><RiUpload class="menu-icon" />Import tabs…</DropdownMenu.Item>
           <DropdownMenu.Separator />
@@ -686,25 +708,26 @@
         <!-- A grouped form: each section a heading over rows of a label and
              its control, the labels in one column and the controls in the
              other (plot.css, .settings-pop). -->
-        <Popover.Content class="w-80 gap-0 p-0" align="end">
+        <Popover.Content class="w-80 gap-0 p-0" align="end" sideOffset={BAR_OFFSET} {...settingsMenu}>
           <div class="settings-pop">
             <section aria-labelledby="set-display">
               <h3 id="set-display">Display</h3>
               <div class="set-grid">
                 <span>Theme</span>
-                <Select.Root type="single" value={prefs.theme} onValueChange={(v) => prefs.setTheme(v)}>
-                  <Select.Trigger size="sm" class="w-full text-xs" aria-label="Theme">{THEMES.find(([v]) => v === prefs.theme)[1]}</Select.Trigger>
-                  <Select.Content>
-                    {#each THEMES as [value, label]}<Select.Item {value} {label} />{/each}
-                  </Select.Content>
-                </Select.Root>
+                <!-- The theme as the icons every app shows it by: a sun, a moon, a screen for the system's. -->
+                <div class="seg theme-seg justify-self-end" role="radiogroup" aria-label="Theme">
+                  {#each THEMES as [value, label]}
+                    {@const Icon = THEME_ICONS[value]}
+                    <Tip text={label}>
+                      {#snippet children(tip)}<button {...tip} role="radio" aria-checked={prefs.theme === value} aria-label={label} class:on={prefs.theme === value} onclick={() => prefs.setTheme(value)}><Icon /></button>{/snippet}
+                    </Tip>
+                  {/each}
+                </div>
                 <span>Trace width</span>
-                <Select.Root type="single" value={String(prefs.traceWidth)} onValueChange={(v) => prefs.setTraceWidth(+v)}>
-                  <Select.Trigger size="sm" class="w-full text-xs" aria-label="Trace width">{prefs.traceWidth} px</Select.Trigger>
-                  <Select.Content>
-                    {#each TRACE_WIDTHS as px}<Select.Item value={String(px)} label="{px} px" />{/each}
-                  </Select.Content>
-                </Select.Root>
+                <div class="set-control">
+                  <Slider type="single" value={prefs.traceWidth} min={TRACE_WIDTH.min} max={TRACE_WIDTH.max} step={TRACE_WIDTH.step} onValueChange={(px) => prefs.setTraceWidth(px)} label="Trace width" />
+                  <span class="set-value">{prefs.traceWidth} px</span>
+                </div>
                 <label for="set-hints">Shortcut hints</label>
                 <Checkbox id="set-hints" class="justify-self-end" checked={prefs.hints} onCheckedChange={(on) => prefs.setHints(on)} />
               </div>

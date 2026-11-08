@@ -12,7 +12,10 @@
 		align = "start",
 		portalProps,
 		children,
-		preventScroll = true,
+		// The page never scrolls, and the scroll lock blocks every press outside the
+		// menu, so a press on another menu's button only closed this one. Without
+		// it, the press reaches its target, and the page's one-menu rule closes this.
+		preventScroll = false,
 		...restProps
 	} = $props();
 </script>

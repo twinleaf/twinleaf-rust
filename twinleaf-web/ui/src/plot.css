@@ -326,6 +326,17 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .icon-btn svg { width: 14px; height: 14px; }
 .axis-range .icon-btn { border-color: var(--input); }
 /* The axis's cursors: a label, then adding and clearing them. */
+/* The theme's three icons as one strip, the chosen one lit. */
+.theme-seg { display: flex; border: 1px solid var(--input); border-radius: var(--radius); overflow: hidden; }
+.theme-seg button { display: grid; place-items: center; width: 32px; height: 24px; padding: 0; border: 0; border-left: 1px solid var(--input); background: none; color: var(--muted-foreground); cursor: pointer; }
+.theme-seg button:first-child { border-left: 0; }
+.theme-seg button:hover { color: var(--foreground); }
+.theme-seg button.on { background: var(--secondary); color: var(--foreground); }
+.theme-seg svg { width: 14px; height: 14px; }
+/* The time window's button and its slider, the spans named under their steps. */
+.top-bar .window-button { min-width: 64px; justify-content: space-between; font-variant-numeric: tabular-nums; }
+.window-pop .window-head { display: flex; justify-content: space-between; margin-bottom: 12px; font-size: 12px; color: var(--muted-foreground); }
+.window-pop .window-ticks { display: flex; justify-content: space-between; margin-top: 8px; font: 11px/16px var(--font-data); color: var(--muted-foreground); }
 /* The export dialog: its choices as an axis popover's rows, then a note. */
 .export-dialog .axis-row { padding: 0; font-size: 13px; }
 .export-note { margin: 0; color: var(--muted-foreground); font-size: 12px; line-height: 16px; }

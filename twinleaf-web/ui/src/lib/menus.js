@@ -13,3 +13,20 @@ export function claimMenu(close) {
 export function releaseMenu(close) {
   if (closeOpen === close) closeOpen = null;
 }
+
+/**
+ * Props for a menu's or popover's content: a press outside it, which closes
+ * it, leaves focus where the press put it instead of handing it back to the
+ * menu's button, so a press on another menu's button opens that menu at
+ * once. Closing it from the keys still hands focus back.
+ */
+export function pressOutsideKeepsFocus() {
+  let pressed = false;
+  return {
+    onInteractOutside: () => (pressed = true),
+    onCloseAutoFocus: (e) => {
+      if (pressed) e.preventDefault();
+      pressed = false;
+    },
+  };
+}

@@ -9,23 +9,29 @@
 
 const KEY = 'tl-prefs';
 
-/** The themes, as [value, label]. */
+/** The themes, as [value, label], in the order apps show them: light, dark, the system's. */
 export const THEMES = [
-  ['system', 'System'],
   ['light', 'Light'],
   ['dark', 'Dark'],
+  ['system', 'System'],
 ];
 
-/** The widths a trace is drawn at, in CSS px. */
-export const TRACE_WIDTHS = [1, 1.3, 2, 3];
+/** The widths a trace may be drawn at, in CSS px: from `min` to `max` in steps of `step`. */
+export const TRACE_WIDTH = { min: 1, max: 3, step: 0.25 };
+
+/** `px` as a trace width: within TRACE_WIDTH, on one of its steps. */
+export function traceWidthOf(px) {
+  const { min, max, step } = TRACE_WIDTH;
+  return Math.min(max, Math.max(min, min + Math.round((px - min) / step) * step));
+}
 
 export class Prefs {
   /** Whether key caps and shortcut text show in menus, tooltips and the page. */
   hints = $state(true);
   /** 'system', 'light' or 'dark'. */
   theme = $state('system');
-  /** The width the plots draw traces at, one of TRACE_WIDTHS. */
-  traceWidth = $state(1.3);
+  /** The width the plots draw traces at, within TRACE_WIDTH. */
+  traceWidth = $state(1.25);
   /** Whether the page shows dark: the theme's, or with System, the system's. */
   dark = $state(true);
 
@@ -37,7 +43,7 @@ export class Prefs {
       const kept = JSON.parse(storage?.getItem(KEY) ?? '{}');
       if (typeof kept.hints === 'boolean') this.hints = kept.hints;
       if (THEMES.some(([v]) => v === kept.theme)) this.theme = kept.theme;
-      if (TRACE_WIDTHS.includes(kept.traceWidth)) this.traceWidth = kept.traceWidth;
+      if (typeof kept.traceWidth === 'number' && isFinite(kept.traceWidth)) this.traceWidth = traceWidthOf(kept.traceWidth);
     } catch {
       // Unreadable preferences start from the defaults.
     }
@@ -51,7 +57,7 @@ export class Prefs {
   }
 
   setTraceWidth(px) {
-    this.traceWidth = px;
+    this.traceWidth = traceWidthOf(px);
     this.save();
   }
 
