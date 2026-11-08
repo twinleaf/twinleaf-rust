@@ -6,14 +6,90 @@
 
 /* The design's one home. Every colour, font and radius the page and the
    plots use is a token here: the components through Tailwind, and the plot
-   canvas through theme() in lib/plot.js. */
+   canvas through theme() in lib/plot.js. :root holds the light values, and
+   .dark on the page's root, which prefs.svelte.js sets, the dark. */
 :root {
+	color-scheme: light;
 	/* The system's own faces: SF on a Mac, Segoe on Windows. Numbers that
 	   must line up use the data face. */
 	--font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
 	--font-data: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
 
-	/* The plot area, drawn on a canvas. */
+	/* The plot area, drawn on a canvas. A tag is filled with its cursor's
+	   or its trace's colour, and its text is the plot's background. */
+	/* As plotting libraries draw on white: a white plot on a page a shade
+	   darker, a pale grid (ggplot2's grey92), a frame that holds the plot
+	   (grey70) and axis text dark enough to read at a glance (grey30). The
+	   grid is drawn over the traces, so it is a translucent black that shows
+	   as grey92 on white, not an opaque grey that would cut through them. */
+	--plot-bg: oklch(1 0 0);
+	--plot-axis-text: #4d4d4d;
+	--plot-grid: rgb(0 0 0 / 8%);
+	--plot-frame: #b3b3b3;
+	--plot-gap: oklch(0.6 0.19 25 / 55%);
+	--plot-crosshair: oklch(0 0 0 / 35%);
+	--plot-span: oklch(0 0 0 / 4%);
+	--plot-tag-text: oklch(1 0 0);
+	--plot-seek-bg: oklch(0.93 0.005 255);
+	--plot-seek-window: oklch(0 0 0 / 18%);
+	--plot-seek-edge: oklch(0 0 0 / 55%);
+	/* The cursors dark, from Paul Tol's schemes, so white tag text reads on
+	   them; yellow, a dark plot's cursor, all but vanishes on white. */
+	--cursor-a: #882255;
+	--cursor-b: #004488;
+
+	/* The traces, slot for slot the dark theme's hues (colors.svelte.js
+	   names them: cyan, magenta, lime, amber, violet, rose, teal, orange),
+	   so a signal looks like itself in either theme: each the vivid shade
+	   deep enough for white, at least the 3:1 a line needs against the plot. */
+	--trace-1: #0891b2;
+	--trace-2: #db2777;
+	--trace-3: #16a34a;
+	--trace-4: #d97706;
+	--trace-5: #7c3aed;
+	--trace-6: #e11d48;
+	--trace-7: #0d9488;
+	--trace-8: #ea580c;
+
+	/* Neutrals with a little blue in them: white panels on a page a shade
+	   darker. Text is at least 4.5:1 on each of them. */
+	--background: oklch(0.975 0.003 255);
+	--foreground: oklch(0.21 0.012 255);
+	--card: oklch(1 0 0);
+	--card-foreground: oklch(0.21 0.012 255);
+	--popover: oklch(1 0 0);
+	--popover-foreground: oklch(0.21 0.012 255);
+	/* The one accent: live, selected and focused. */
+	--primary: oklch(0.53 0.15 136);
+	--primary-foreground: oklch(0.985 0.01 130);
+	--secondary: oklch(0.945 0.005 255);
+	--secondary-foreground: oklch(0.21 0.012 255);
+	--muted: oklch(0.945 0.005 255);
+	--muted-foreground: oklch(0.49 0.014 255);
+	--accent: oklch(0.93 0.006 255);
+	--accent-foreground: oklch(0.18 0.012 255);
+	--destructive: oklch(0.55 0.21 27);
+	--border: oklch(0 0 0 / 10%);
+	--input: oklch(0 0 0 / 16%);
+	--ring: oklch(0.53 0.15 136 / 80%);
+	--chart-1: var(--trace-1);
+	--chart-2: var(--trace-2);
+	--chart-3: var(--trace-3);
+	--chart-4: var(--trace-4);
+	--chart-5: var(--trace-5);
+	--radius: 0.25rem;
+	--sidebar: oklch(0.965 0.004 255);
+	--sidebar-foreground: oklch(0.25 0.012 255);
+	--sidebar-primary: oklch(0.53 0.15 136);
+	--sidebar-primary-foreground: oklch(0.985 0.01 130);
+	--sidebar-accent: oklch(0.93 0.006 255);
+	--sidebar-accent-foreground: oklch(0.18 0.012 255);
+	--sidebar-border: oklch(0 0 0 / 10%);
+	--sidebar-ring: oklch(0.53 0.15 136 / 80%);
+}
+
+.dark {
+	color-scheme: dark;
 	--plot-bg: oklch(0.15 0.006 255);
 	--plot-axis-text: oklch(0.7 0.012 255);
 	--plot-grid: oklch(1 0 0 / 6%);
@@ -28,7 +104,6 @@
 	--cursor-a: #ffd166;
 	--cursor-b: #06d6a0;
 
-	/* The traces, in the order signals take them. */
 	--trace-1: #4cc9f0;
 	--trace-2: #f72585;
 	--trace-3: #b8f35a;
@@ -37,44 +112,7 @@
 	--trace-6: #fb7185;
 	--trace-7: #2dd4bf;
 	--trace-8: #f97316;
-}
 
-:root {
-	--background: oklch(1 0 0);
-	--foreground: oklch(0.145 0 0);
-	--card: oklch(1 0 0);
-	--card-foreground: oklch(0.145 0 0);
-	--popover: oklch(1 0 0);
-	--popover-foreground: oklch(0.145 0 0);
-	--primary: oklch(0.841 0.238 128.85);
-	--primary-foreground: oklch(0.405 0.101 131.063);
-	--secondary: oklch(0.967 0.001 286.375);
-	--secondary-foreground: oklch(0.21 0.006 285.885);
-	--muted: oklch(0.97 0 0);
-	--muted-foreground: oklch(0.556 0 0);
-	--accent: oklch(0.97 0 0);
-	--accent-foreground: oklch(0.205 0 0);
-	--destructive: oklch(0.577 0.245 27.325);
-	--border: oklch(0.922 0 0);
-	--input: oklch(0.922 0 0);
-	--ring: oklch(0.708 0 0);
-	--chart-1: oklch(0.87 0 0);
-	--chart-2: oklch(0.556 0 0);
-	--chart-3: oklch(0.439 0 0);
-	--chart-4: oklch(0.371 0 0);
-	--chart-5: oklch(0.269 0 0);
-	--radius: 0.25rem;
-	--sidebar: oklch(0.985 0 0);
-	--sidebar-foreground: oklch(0.145 0 0);
-	--sidebar-primary: oklch(0.648 0.2 131.684);
-	--sidebar-primary-foreground: oklch(0.986 0.031 120.757);
-	--sidebar-accent: oklch(0.97 0 0);
-	--sidebar-accent-foreground: oklch(0.205 0 0);
-	--sidebar-border: oklch(0.922 0 0);
-	--sidebar-ring: oklch(0.708 0 0);
-}
-
-.dark {
 	/* Neutrals with a little blue in them, darkest at the plots. The
 	   sidebar sits dimmer than the panels, so the plots lead. */
 	--background: oklch(0.165 0.006 255);
@@ -83,7 +121,6 @@
 	--card-foreground: oklch(0.93 0.005 255);
 	--popover: oklch(0.215 0.008 255);
 	--popover-foreground: oklch(0.93 0.005 255);
-	/* The one accent: live, selected and focused. */
 	--primary: oklch(0.768 0.233 130.85);
 	--primary-foreground: oklch(0.25 0.07 131);
 	--secondary: oklch(0.245 0.008 255);
@@ -96,11 +133,6 @@
 	--border: oklch(1 0 0 / 9%);
 	--input: oklch(1 0 0 / 12%);
 	--ring: oklch(0.768 0.233 130.85 / 75%);
-	--chart-1: var(--trace-1);
-	--chart-2: var(--trace-2);
-	--chart-3: var(--trace-3);
-	--chart-4: var(--trace-4);
-	--chart-5: var(--trace-5);
 	--sidebar: oklch(0.175 0.006 255);
 	--sidebar-foreground: oklch(0.86 0.006 255);
 	--sidebar-primary: oklch(0.768 0.233 130.85);

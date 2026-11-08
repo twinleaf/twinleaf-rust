@@ -14,6 +14,7 @@
 import { scaleLinear, scaleLog, scaleTime } from 'd3-scale';
 import { DRAG_START } from './constants.js';
 import { colors } from './colors.svelte.js';
+import { prefs } from './prefs.svelte.js';
 import { spanText } from './units.js';
 
 /** A CSS colour as [r, g, b, a] in 0..1, resolved by the browser, so theme tokens work. */
@@ -26,7 +27,6 @@ function cssRgba(css) {
   const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
   return [r / 255, g / 255, b / 255, a / 255];
 }
-const LINE_WIDTH = 1.3;
 const LANE_GAP = 6;
 
 /** How many y axes an independent plot shows on each side. */
@@ -255,13 +255,15 @@ export function siRange(lo, hi, unit) {
  * background, also as GL's rgba, the axis text, grid, frame, gap marks,
  * crosshair, the span between cursors, the text on tags, the cursors, the
  * seek strip and the traces, each trace also as GL's rgba. They are kept
- * once every token has a value. A canvas ignores an empty colour and keeps
- * the last one drawn with, so a token the page has not loaded yet is read
- * again on the next frame.
+ * once every token has a value, until the page turns light or dark
+ * (prefs.svelte.js), which a reader in an effect or a template follows. A
+ * canvas ignores an empty colour and keeps the last one drawn with, so a
+ * token the page has not loaded yet is read again on the next frame.
  */
 let themed = null;
 export function theme() {
-  if (!themed) {
+  const dark = prefs.dark;
+  if (themed?.dark !== dark) {
     const style = getComputedStyle(document.documentElement);
     let missing = false;
     const token = (name) => {
@@ -271,6 +273,7 @@ export function theme() {
     };
     const traces = [1, 2, 3, 4, 5, 6, 7, 8].map((i) => token(`--trace-${i}`));
     const read = {
+      dark,
       bg: token('--plot-bg'),
       axisText: token('--plot-axis-text'),
       grid: token('--plot-grid'),
@@ -505,9 +508,9 @@ export class PlotView {
       const [y0, y1] = ranges.get(this.rangeKey(cfg, p.t));
       if (p.src !== p.t) {
         const st = this.renderer.detailBuffer(this.slotOf(p.t), p.src);
-        if (this.renderer.lane(lane, st.base, x0, x1, y0, y1, LINE_WIDTH, rgbaOf(p.t)))
+        if (this.renderer.lane(lane, st.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t)))
           this.renderer.drawDetail(st, p.src, p.a0, p.a1);
-      } else if (this.renderer.lane(lane, ring.base, x0, x1, y0, y1, LINE_WIDTH, rgbaOf(p.t))) {
+      } else if (this.renderer.lane(lane, ring.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t))) {
         this.renderer.drawTrace(p.t, ring, p.a0, p.a1);
       }
     });
@@ -544,7 +547,7 @@ export class PlotView {
     for (const p of plans) {
       const lane = geo.lanes[this.laneOf(cfg, p.index)];
       const [y0, y1] = ranges.get(this.rangeKey(cfg, p.t));
-      if (!this.renderer.lane(lane, 0, lx0, lx1, y0, y1, LINE_WIDTH, rgbaOf(p.t))) continue;
+      if (!this.renderer.lane(lane, 0, lx0, lx1, y0, y1, prefs.traceWidth, rgbaOf(p.t))) continue;
       this.renderer.drawStatic(this.slotOf(p.t, variant), p.s, () => {
         const pts = new Float32Array(p.s.f.length * 2);
         for (let i = 0; i < p.s.f.length; i++) {

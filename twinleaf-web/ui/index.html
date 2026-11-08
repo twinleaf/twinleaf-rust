@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Twinleaf Plot Spike</title>
+    <!-- The theme kept in prefs.svelte.js, set before the first paint so a
+         light page never shows dark first. -->
+    <script>
+      try {
+        const theme = JSON.parse(localStorage.getItem('tl-prefs') ?? '{}').theme;
+        const dark = theme === 'dark' || (theme !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.classList.toggle('dark', dark);
+      } catch {}
+    </script>
   </head>
   <body>
     <div id="app"></div>

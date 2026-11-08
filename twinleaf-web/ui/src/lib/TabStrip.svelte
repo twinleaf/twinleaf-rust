@@ -12,6 +12,7 @@
   import RiAdd from '@lucide/svelte/icons/plus';
   import { plotIds } from './layout.js';
   import { actionFor } from './keymap.js';
+  import { prefs } from './prefs.svelte.js';
 
   /** `onClose(t)` closes tab `t`, asking first when it has plots. */
   let { ws, drags, onClose } = $props();
@@ -100,7 +101,7 @@
                     }}
                   />
                 {:else}
-                  <span title="Double-click to rename">{t.name}</span>
+                  <span title={prefs.hints ? 'Double-click to rename' : undefined}>{t.name}</span>
                   <span class="text-[11px] text-muted-foreground">{plotIds(t.layout).length}</span>
                 {/if}
                 <IconButton icon={RiCopy} label="Duplicate {t.name}" class="size-5" tabindex={-1} onclick={(e) => (e.stopPropagation(), ws.duplicateTab(t))} />

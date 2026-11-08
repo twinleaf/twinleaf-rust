@@ -24,6 +24,7 @@
   import { actionFor } from './lib/keymap.js';
   import { keepsKey, plotKeys } from './lib/keys.js';
   import { api } from './lib/protocol.js';
+  import { THEMES, TRACE_WIDTHS, prefs } from './lib/prefs.svelte.js';
   import PlotCard from './lib/PlotCard.svelte';
   import Tile from './lib/Tile.svelte';
   import Devices from './lib/Devices.svelte';
@@ -45,6 +46,7 @@
   import { Button } from '$lib/components/ui/button/index.js';
   import * as Select from '$lib/components/ui/select/index.js';
   import { Slider } from '$lib/components/ui/slider/index.js';
+  import { Checkbox } from '$lib/components/ui/checkbox/index.js';
   import * as Tooltip from '$lib/components/ui/tooltip/index.js';
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
   import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
@@ -529,7 +531,7 @@
 {#snippet dockHandle(side)}
   <Resizable.Handle
     aria-label="{side === 'left' ? 'Left' : 'Right'} dock width"
-    title="Drag to resize; double-click resets"
+    title={prefs.hints ? 'Drag to resize; double-click resets' : undefined}
     class="mx-[3px] bg-transparent transition-colors after:w-3 hover:bg-primary/60 data-[direction=vertical]:mx-0 data-[direction=vertical]:my-[3px] data-[direction=vertical]:after:h-3"
     ondblclick={() => dockPanes[side]?.resize(DOCK.default)}
   />
@@ -542,7 +544,7 @@
     <!-- One row: what acts on the plots, then the page's own settings. -->
     <header class="top-bar" data-focus="toolbar" tabindex="-1">
       <span class="brand">Twinleaf Hub</span>
-      <button class="search" onclick={() => (paletteOpen = true)}><RiSearch />Commands<kbd>Ctrl K</kbd></button>
+      <button class="search" onclick={() => (paletteOpen = true)}><RiSearch />Commands{#if prefs.hints}<kbd>Ctrl K</kbd>{/if}</button>
       <span class="divider"></span>
       <Tip text={live ? 'Pause every plot' : 'Every plot follows live'}>
         {#snippet children(tip)}
@@ -607,6 +609,27 @@
              other (plot.css, .settings-pop). -->
         <Popover.Content class="w-80 gap-0 p-0" align="end">
           <div class="settings-pop">
+            <section aria-labelledby="set-display">
+              <h3 id="set-display">Display</h3>
+              <div class="set-grid">
+                <span>Theme</span>
+                <Select.Root type="single" value={prefs.theme} onValueChange={(v) => prefs.setTheme(v)}>
+                  <Select.Trigger size="sm" class="w-full text-xs" aria-label="Theme">{THEMES.find(([v]) => v === prefs.theme)[1]}</Select.Trigger>
+                  <Select.Content>
+                    {#each THEMES as [value, label]}<Select.Item {value} {label} />{/each}
+                  </Select.Content>
+                </Select.Root>
+                <span>Trace width</span>
+                <Select.Root type="single" value={String(prefs.traceWidth)} onValueChange={(v) => prefs.setTraceWidth(+v)}>
+                  <Select.Trigger size="sm" class="w-full text-xs" aria-label="Trace width">{prefs.traceWidth} px</Select.Trigger>
+                  <Select.Content>
+                    {#each TRACE_WIDTHS as px}<Select.Item value={String(px)} label="{px} px" />{/each}
+                  </Select.Content>
+                </Select.Root>
+                <label for="set-hints">Shortcut hints</label>
+                <Checkbox id="set-hints" class="justify-self-end" checked={prefs.hints} onCheckedChange={(on) => prefs.setHints(on)} />
+              </div>
+            </section>
             <section aria-labelledby="set-stream">
               <h3 id="set-stream">Streaming</h3>
               <div class="set-grid">
