@@ -16,6 +16,13 @@
   // the entry writable, each encoded by that device's own type, and shows
   // each device's outcome in its cell.
   //
+  // Rows are picked as a sheet's are, to copy: a click picks one, Shift a
+  // run from the last clicked, Ctrl or ⌘ adds or drops one; Shift with the
+  // arrows extends, and Ctrl+A picks every row. Ctrl+C, or Copy in the right-
+  // click menu, copies the picked rows, a property and each device's value
+  // apiece, as a sheet pastes them. A star pins a property to the Favorites
+  // panel, which shows every starred property of the checked devices.
+  //
   // Up to MAX_COLUMNS devices get a column each; more share one column,
   // which shows the value they agree on or how many values they differ in.
   // Each cell reads its own device's value, so one device's change redraws
@@ -33,6 +40,12 @@
   import { api } from './protocol.js';
   import { sameValue } from './session.svelte.js';
   import { controlOf, deviceLabel, mergeRows, writersOf } from './properties.js';
+  import { favorites } from './favorites.svelte.js';
+  import { writeTables } from './copy.js';
+  import { toast } from './toast.svelte.js';
+  import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
+  import RiStar from '@lucide/svelte/icons/star';
+  import RiCopy from '@lucide/svelte/icons/clipboard-copy';
 
   /**
    * `devices`: the checked Devices, a column each, in order. `channels`:
@@ -48,8 +61,10 @@
   /** The most devices that get a column each. */
   const MAX_COLUMNS = 8;
 
-  const rows = $derived(mergeRows(devices, channels));
-  const grouped = $derived(!channels || channels.length > 1);
+  /** Whether this is the Favorites panel, of every starred property. */
+  const starredOnly = $derived(channels?.length === 1 && channels[0] === 'favorite');
+  const rows = $derived(starredOnly ? mergeRows(devices).filter((r) => favorites.has(r.name)) : mergeRows(devices, channels));
+  const grouped = $derived(!channels || channels.length > 1 || starredOnly);
   const buttons = $derived(channels?.length === 1 && channels[0] === 'action');
 
   // Values read on request, each device's outcome of the last call of a
@@ -175,11 +190,60 @@
     }
   }
 
+  // The rows picked to copy, by name, and the row a Shift pick runs from.
+  let picked = $state(new Set());
+  let anchor = 0;
+  /** Picks row `i` as a click with `e`'s keys does: alone, a run from the anchor with Shift, added or dropped with Ctrl or ⌘. */
+  function pick(i, e) {
+    const name = rows[i]?.name;
+    if (!name) return;
+    if (e.shiftKey) {
+      const [a, b] = [Math.min(anchor, i), Math.max(anchor, i)];
+      picked = new Set(rows.slice(a, b + 1).map((r) => r.name));
+    } else if (e.ctrlKey || e.metaKey) {
+      const next = new Set(picked);
+      if (!next.delete(name)) next.add(name);
+      picked = next;
+      anchor = i;
+    } else {
+      picked = new Set([name]);
+      anchor = i;
+    }
+    active = i;
+  }
+  /** Copies the picked rows, or the active one: a header of the devices, then each property and its values, as a sheet pastes them. */
+  function copyRows() {
+    const chosen = rows.filter((r) => picked.has(r.name));
+    const list = chosen.length ? chosen : current ? [current] : [];
+    if (!list.length) return;
+    const each = devices.length <= MAX_COLUMNS;
+    const header = ['Property', ...(each ? devices.map(deviceLabel) : [`${devices.length} devices`])];
+    const body = list.map((r) => [r.name, ...(each ? devices.map((d) => (r.entries.has(d.route) ? show(valueOf(d, r.name)) : '')) : [show(shared(r))])]);
+    writeTables([{ title: '', header, rows: body }]).then(
+      () => toast.success(`Copied ${list.length} propert${list.length === 1 ? 'y' : 'ies'}`),
+      (error) => toast.error(`Could not copy: ${error.message}`),
+    );
+  }
+
   function tableKey(e) {
     const n = rows.length;
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
+      copyRows();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+      picked = new Set(rows.map((r) => r.name));
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     const to = { ArrowDown: active + 1, ArrowUp: active - 1, Home: 0, End: n - 1, PageDown: active + PAGE, PageUp: active - PAGE }[e.key];
     if (to !== undefined) {
-      active = Math.max(0, Math.min(n - 1, to));
+      const i = Math.max(0, Math.min(n - 1, to));
+      // The arrows pick the row they move to; with Shift they pick the run to it.
+      pick(i, { shiftKey: e.shiftKey });
       tick().then(() => document.getElementById(`prop-${active}`)?.scrollIntoView({ block: 'nearest' }));
     } else if (e.key === 'Enter' && current) {
       const control = controlOf(current.rpc);
@@ -204,6 +268,8 @@
 </script>
 
 {#snippet nameCell({ row })}
+  {@const starred = favorites.has(row.name)}
+  <button class="star" class:on={starred} tabindex="-1" aria-pressed={starred} aria-label="{starred ? 'Unpin' : 'Pin'} {row.name} {starred ? 'from' : 'to'} Favorites" title={starred ? 'Unpin from Favorites' : 'Pin to Favorites'} onclick={(e) => (e.stopPropagation(), favorites.toggle(row.name))}><RiStar /></button>
   <span class="pname" title="{row.rpc.type ?? 'no type'} · {row.rpc.access.join('/') || 'action'}{row.rpc.persistent ? ' · persistent' : ''}">
     {row.name}{#if mixed(row)}<b class="mark" title="The devices differ">≠</b>{/if}{#if row.differs}<b class="mark warn" title="The devices declare it differently">!</b>{/if}
   </span>
@@ -232,7 +298,7 @@
 {/snippet}
 
 {#if !rows.length}
-  <div class="props-empty">Nothing here on the checked devices</div>
+  <div class="props-empty">{starredOnly ? 'Star a property to pin it here' : 'Nothing here on the checked devices'}</div>
 {:else if buttons}
   <ScrollArea class="props">
     <div class="action-grid">
@@ -257,6 +323,14 @@
     </div>
   </ScrollArea>
 {:else}
+<ContextMenu.Root>
+<ContextMenu.Trigger>
+{#snippet child({ props })}
+<div {...props} class="props-wrap" oncontextmenucapture={(e) => {
+  // A right-click on a row not picked picks it alone, as a sheet does.
+  const i = Number(e.target.closest?.('tr[id^=prop-]')?.id.slice(5));
+  if (Number.isInteger(i) && !picked.has(rows[i]?.name)) pick(i, {});
+}}>
 <ScrollArea class="props">
   <Table.Root
     class="props-table"
@@ -290,8 +364,9 @@
         <Table.Row
           id="prop-{i}"
           data-state={i === active ? 'selected' : undefined}
-          aria-selected={i === active}
-          onclick={() => ((active = i), tableEl?.focus())}
+          class={picked.has(row.original.name) ? 'picked' : ''}
+          aria-selected={picked.has(row.original.name)}
+          onclick={(e) => (pick(i, e), tableEl?.focus())}
         >
           {#each row.getVisibleCells() as cell (cell.id)}
             <Table.Cell class={cell.column.id === 'name' ? '' : 'text-right'}>
@@ -303,6 +378,16 @@
     </Table.Body>
   </Table.Root>
 </ScrollArea>
+</div>
+{/snippet}
+</ContextMenu.Trigger>
+<ContextMenu.Content class="menu-icons">
+  <ContextMenu.Item onSelect={copyRows}><RiCopy class="menu-icon" />Copy {picked.size > 1 ? `${picked.size} rows` : 'row'}<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+  {#if current}
+    <ContextMenu.Item onSelect={() => favorites.toggle(current.name)}><RiStar class="menu-icon" />{favorites.has(current.name) ? 'Unpin from Favorites' : 'Pin to Favorites'}</ContextMenu.Item>
+  {/if}
+</ContextMenu.Content>
+</ContextMenu.Root>
 
 {#if current && ['action', 'toggle', 'value'].includes(controlOf(current.rpc))}
   {@const control = controlOf(current.rpc)}

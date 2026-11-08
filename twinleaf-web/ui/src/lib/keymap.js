@@ -113,6 +113,19 @@ export const KEYMAP = [
       { show: ['Right-click'], on: 'readout', what: 'Copy, clear' },
     ],
   },
+  {
+    place: 'properties',
+    title: 'Properties',
+    entries: [
+      { show: ['Click'], what: 'Pick a row' },
+      { show: ['Shift', 'Click'], what: 'Pick a run of rows' },
+      { show: ['Ctrl', 'Click'], what: 'Add or drop a row' },
+      { show: ['Shift', '↑', '↓'], what: 'Extend the pick' },
+      { show: ['Ctrl', 'A'], what: 'Pick every row' },
+      { show: ['Ctrl', 'C'], what: 'Copy, as a sheet pastes' },
+      { show: ['☆'], what: 'Pin to Favorites' },
+    ],
+  },
 ];
 
 /**

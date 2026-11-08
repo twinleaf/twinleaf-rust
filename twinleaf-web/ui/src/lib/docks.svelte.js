@@ -24,6 +24,7 @@ export const PANELS = {
   actions: { title: 'Actions', shrinks: false, channels: ['action'] },
   diagnostics: { title: 'Diagnostics', shrinks: true, channels: ['diagnostic'] },
   other: { title: 'Other', shrinks: true, channels: [null] },
+  favorites: { title: 'Favorites', shrinks: true, channels: ['favorite'] },
 };
 
 export const SIDES = ['left', 'right'];
@@ -35,6 +36,7 @@ export const DEFAULT = {
     { id: 'signals', open: true },
   ],
   right: [
+    { id: 'favorites', open: true },
     { id: 'settings', open: true },
     { id: 'reports', open: true },
     { id: 'actions', open: true },

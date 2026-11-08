@@ -24,7 +24,7 @@ describe('the docks', () => {
   it('move a panel to the other side at an index', () => {
     const got = move(normalize(null), 'signals', 'right', 1);
     expect(got.left.map((p) => p.id)).toEqual(['devices']);
-    expect(got.right.map((p) => p.id).slice(0, 3)).toEqual(['settings', 'signals', 'reports']);
+    expect(got.right.map((p) => p.id).slice(0, 3)).toEqual(['favorites', 'signals', 'settings']);
   });
 
   it('keep the arrangement across a reload', () => {

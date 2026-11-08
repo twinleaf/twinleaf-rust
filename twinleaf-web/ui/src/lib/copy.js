@@ -29,9 +29,9 @@ export function blockTable(signals, timeName = 'time (s)') {
   return { header, rows };
 }
 
-/** The blocks [{title, header, rows}] as tab-separated text. */
+/** The blocks [{title, header, rows}] as tab-separated text, a block with no title starting at its header. */
 export function toTsv(blocks) {
-  return blocks.map((b) => [b.title, b.header.join('\t'), ...b.rows.map((r) => r.join('\t'))].join('\n')).join('\n\n') + '\n';
+  return blocks.map((b) => [...(b.title ? [b.title] : []), b.header.join('\t'), ...b.rows.map((r) => r.join('\t'))].join('\n')).join('\n\n') + '\n';
 }
 
 const escape = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -39,7 +39,7 @@ const escape = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').rep
 /** The blocks as HTML tables, each under its title. */
 export function toHtml(blocks) {
   const table = (b) =>
-    `<p><b>${escape(b.title)}</b></p><table><thead><tr>${b.header.map((h) => `<th>${escape(h)}</th>`).join('')}</tr></thead><tbody>${b.rows
+    `${b.title ? `<p><b>${escape(b.title)}</b></p>` : ''}<table><thead><tr>${b.header.map((h) => `<th>${escape(h)}</th>`).join('')}</tr></thead><tbody>${b.rows
       .map((r) => `<tr>${r.map((v) => `<td>${escape(v)}</td>`).join('')}</tr>`)
       .join('')}</tbody></table>`;
   return `<meta charset="utf-8">${blocks.map(table).join('<br>')}`;

@@ -4,7 +4,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 /* The page is controls, not text: nothing but fields and readouts selects,
    so a click or drag never starts the browser's text selection or its menu. */
 .app { position: relative; z-index: 1; display: flex; flex-direction: column; height: 100vh; user-select: none; }
-.app :is(input, textarea, [contenteditable], .props-table td) { user-select: text; }
+.app :is(input, textarea, [contenteditable]) { user-select: text; }
 .app.moving, .app.moving * { cursor: grabbing !important; user-select: none; }
 /* The sidebar and the tiles, two PaneForge panes, the sidebar's edge between them. */
 .layout { flex: 1 1 0; min-height: 0; height: auto; padding: 8px 12px; }
@@ -469,7 +469,14 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .props-table th { position: sticky; top: 0; background: var(--card); color: var(--muted-foreground); font-size: 11px; z-index: 1; }
 .props-table tr { border-bottom: 0; }
 .props-table:focus-visible tr[data-state=selected] { outline: 1px solid var(--ring); outline-offset: -1px; }
-.props-table tr[data-state=selected] { background: color-mix(in oklch, var(--primary) 8%, transparent); }
+.props-table tr.picked { background: color-mix(in oklch, var(--primary) 12%, transparent); }
+.props-wrap { display: contents; }
+/* A property's star: shown on its row's hover, and always once starred. */
+.props-table .star { display: inline-grid; place-items: center; width: 14px; height: 14px; margin-right: 4px; padding: 0; border: 0; background: none; color: var(--muted-foreground); vertical-align: -2px; cursor: pointer; opacity: 0; }
+.props-table .star svg { width: 12px; height: 12px; }
+.props-table tr:hover .star, .props-table .star.on { opacity: 1; }
+.props-table .star.on { color: var(--cursor-a); }
+.props-table .star.on svg { fill: currentColor; }
 .props-table .cell { font-variant-numeric: tabular-nums; }
 .props-table .cell.ok { color: var(--primary); }
 .props-table .cell.busy, .props-table .cell.skipped { opacity: 0.6; }
