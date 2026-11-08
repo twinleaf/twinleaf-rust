@@ -19,6 +19,10 @@
 //! devices may run on clocks that disagree.
 //! Reads return slices of the retained chunks and copy only the
 //! still-accumulating rows they ask for.
+//!
+//! [`Buffer::frozen`] copies a buffer as it is, to read while the buffer goes
+//! on. The copy shares the chunks, which never change, so only the rows still
+//! accumulating are copied.
 
 use super::coalesce::BatchCoalescer;
 use super::continuity::{Boundary, Generations};
@@ -190,6 +194,42 @@ impl Buffer {
         self.trim_to_budget();
     }
 
+    /// A copy of the buffer as it is now, which takes no more batches and
+    /// drops nothing by age. Its runs share this buffer's chunks, and the
+    /// rows still accumulating are copied into a chunk of their own. A
+    /// budget, if given one later, drops its oldest chunks as this buffer's
+    /// does.
+    pub fn frozen(&self) -> Buffer {
+        Buffer {
+            capacity: self.capacity,
+            budget: None,
+            max_age: None,
+            arrivals: self.arrivals,
+            runs: self
+                .runs
+                .iter()
+                .map(|(key, run)| (*key, run.frozen()))
+                .collect(),
+        }
+    }
+
+    /// Returns the bytes of this buffer's completed chunks that `newer`, the
+    /// buffer this one was frozen from, no longer holds, which are those that
+    /// arrived before the oldest chunk `newer` keeps of the same stream. The
+    /// chunks both hold are shared, and count once, in `newer`.
+    pub fn bytes_not_in(&self, newer: &Buffer) -> usize {
+        self.runs
+            .iter()
+            .map(|(key, run)| {
+                let kept_from = newer
+                    .run(key)
+                    .and_then(Run::front_arrival)
+                    .unwrap_or(u64::MAX);
+                run.bytes_arrived_before(kept_from)
+            })
+            .sum()
+    }
+
     /// Returns the stream's current run, or `None` if it has delivered no data.
     pub fn run(&self, stream_key: &StreamKey) -> Option<&Run> {
         self.runs.get(stream_key)
@@ -283,6 +323,40 @@ impl Run {
         };
         run.append(batch, arrival);
         run
+    }
+
+    /// A copy of the run that takes no more rows and drops none by age. It
+    /// shares the run's chunks, and the rows still accumulating become a
+    /// chunk of its own.
+    fn frozen(&self) -> Run {
+        let mut chunks = self.chunks.clone();
+        let mut arrived = self.arrived.clone();
+        let buffered = self.coalescer.buffered_len();
+        if buffered > 0 {
+            chunks.push_back(
+                self.coalescer
+                    .buffered_rows(0..buffered)
+                    .expect("a nonempty buffered tail"),
+            );
+            arrived.push_back(self.tail_arrived);
+        }
+        Run {
+            generations: self.generations,
+            latest: self.latest,
+            boundaries: self.boundaries.clone(),
+            metadata: self.metadata.clone(),
+            chunks,
+            arrived,
+            tail_arrived: self.tail_arrived,
+            coalescer: BatchCoalescer::new(None),
+            next_row: self.next_row,
+            rows: self.rows,
+            capacity: self.capacity,
+            max_age: None,
+            row_bytes: self.row_bytes,
+            #[cfg(feature = "host")]
+            last_seen: self.last_seen,
+        }
     }
 
     /// Whether `batch` continues this run, as a batch of the run's latest
@@ -388,6 +462,17 @@ impl Run {
     /// The arrival number of the oldest completed chunk's first row.
     fn front_arrival(&self) -> Option<u64> {
         self.arrived.front().copied()
+    }
+
+    /// The bytes of the completed chunks whose first row arrived before
+    /// `arrival`.
+    fn bytes_arrived_before(&self, arrival: u64) -> usize {
+        self.chunks
+            .iter()
+            .zip(&self.arrived)
+            .filter(|&(_, &arrived)| arrived < arrival)
+            .map(|(chunk, _)| chunk.len() * self.row_bytes)
+            .sum()
     }
 
     /// Forgets the boundaries before the first retained row.
@@ -527,6 +612,15 @@ impl Run {
     /// run's, and its segment and rate are the newest.
     pub fn metadata(&self) -> &StreamMetadataSnapshot {
         &self.metadata
+    }
+
+    /// Returns the end-of-sample time of the oldest retained row, in seconds
+    /// after the segment's epoch, or `None` if no rows remain.
+    pub fn first_timestamp(&self) -> Option<f64> {
+        let first = self.retained_rows().start;
+        self.row_spans(first..first + 1)
+            .first()
+            .map(|row| row.timestamps()[0])
     }
 
     /// Returns the end-of-sample time of the newest retained row, in seconds
@@ -1285,6 +1379,50 @@ mod tests {
         assert_eq!(
             buffer.run(&fx.stream_key).unwrap().retained_rows(),
             2 * c..6 * c
+        );
+    }
+
+    #[test]
+    fn a_frozen_copy_keeps_what_the_buffer_goes_on_to_drop() {
+        let fx = test_fixture(&[DataType::F64]);
+        let mut buffer = Buffer::with_budget(2 * CHUNK as usize * ROW);
+        push_chunks(&fx, &mut buffer, 0, 2);
+        fx.push_floats(&mut buffer, 2 * CHUNK, 0..10);
+        let had = buffer.run(&fx.stream_key).unwrap().retained_rows();
+        let first = buffer.run(&fx.stream_key).unwrap().first_timestamp();
+        let frozen = buffer.frozen();
+        push_chunks(&fx, &mut buffer, 2 * CHUNK + 10, 3);
+        // The buffer moved on; the copy holds the rows it had, the tail too.
+        let held = frozen.run(&fx.stream_key).unwrap();
+        assert_eq!(held.retained_rows(), had);
+        assert_eq!(held.first_timestamp(), first);
+        assert!(buffer.run(&fx.stream_key).unwrap().retained_rows().start > had.start);
+    }
+
+    #[test]
+    fn a_frozen_copy_costs_only_what_the_buffer_has_dropped_since() {
+        let fx = test_fixture(&[DataType::F64]);
+        let mut buffer = Buffer::with_budget(2 * CHUNK as usize * ROW);
+        push_chunks(&fx, &mut buffer, 0, 2);
+        let frozen = buffer.frozen();
+        // At first every chunk is the buffer's too.
+        assert_eq!(frozen.bytes_not_in(&buffer), 0);
+        push_chunks(&fx, &mut buffer, 2 * CHUNK, 2);
+        // The buffer moved on past both, which the copy alone now holds.
+        assert_eq!(frozen.bytes_not_in(&buffer), 2 * CHUNK as usize * ROW);
+    }
+
+    #[test]
+    fn a_frozen_copy_given_a_budget_drops_its_oldest() {
+        let fx = test_fixture(&[DataType::F64]);
+        let c = u64::from(CHUNK);
+        let mut buffer = Buffer::new(usize::MAX);
+        push_chunks(&fx, &mut buffer, 0, 4);
+        let mut frozen = buffer.frozen();
+        frozen.set_budget(Some(2 * CHUNK as usize * ROW));
+        assert_eq!(
+            frozen.run(&fx.stream_key).unwrap().retained_rows(),
+            2 * c..4 * c
         );
     }
 
