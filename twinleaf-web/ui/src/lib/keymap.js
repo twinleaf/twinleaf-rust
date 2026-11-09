@@ -22,7 +22,7 @@ export const KEYMAP = [
     entries: [
       { show: ['Tab'], what: 'Next; with Shift, back' },
       { show: ['Enter'], what: 'Go in' },
-      { show: ['Esc'], keys: ['Escape'], action: 'escape', what: 'Deselect, or go out a level' },
+      { show: ['Esc'], keys: ['Escape'], action: 'escape', what: 'Restore, deselect, or go out a level' },
       { show: ['F6'], what: 'Next region; with Shift, back' },
       { show: ['1–9'], keys: digits, action: 'goToPlot', what: 'Go to plot' },
       { show: ['[', ']'], keys: ['[', ']'], action: 'stepTab', what: 'Previous, next tab' },

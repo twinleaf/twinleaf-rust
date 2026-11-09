@@ -166,7 +166,10 @@ describe('a key', () => {
               // An empty plot beside each, selected to fill next.
               expect(made.length).toBe(want.length);
               if (want.length) expect([...page.ws.selected].sort()).toEqual([...made].sort());
-            } else if (key === 'f') expect(page.ws.maximized).toEqual(!want.length ? was : was ? null : want);
+            } else if (key === 'f') {
+              // F leaves a maximized view whatever is selected, else maximizes what it acts on.
+              expect(page.ws.maximized).toEqual(was ? null : want.length ? want : null);
+            }
             else if (key === 'k' || key === 'a') expect(acted(), `${key} with ${picked.length} selected`).toEqual(want.length ? [lead] : []);
             else expect([...acted(page, before)].sort(), `${key} with ${picked.length} selected`).toEqual([...want].filter((id) => key !== 'ArrowLeft' || page.ws.plots[id].kind === 'time').sort());
             if (!want.length) expect(page.history.undos.length).toBe(undos);

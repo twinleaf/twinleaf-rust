@@ -3,7 +3,7 @@
 // press on each control of every kind the list names, with any plots
 // selected, clears the selection or keeps it as the list says; a press on a
 // plot's own control selects that plot first; keyboard focus selects; and
-// Escape deselects, leaving a maximized plot as it is.
+// Escape leaves a maximized view first, the selection kept, then deselects.
 import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
@@ -108,25 +108,42 @@ describe('a press', () => {
 });
 
 describe('Escape', () => {
-  it('deselects everything, and leaves a maximized plot as it is', async () => {
-    const page = await mountPage(KEYS, 'columns');
-    try {
-      const [a, b] = plotIds(page.ws.layout);
-      page.ws.maximized = [a];
-      page.ws.selected.add(a);
-      page.ws.selected.add(b);
-      page.ws.selection.point(a);
-      flushSync();
-      document.body.focus();
-      await commands.key('Escape');
-      flushSync();
-      expect(page.ws.selected.size).toBe(0);
-      expect(page.ws.focusedId).toBe(null);
-      expect(page.ws.maximized).toEqual([a]);
-    } finally {
-      page.dispose();
-    }
-  });
+  it('leaves a maximized view first, the selection kept, then deselects, then changes nothing, wherever focus is', async () => {
+    await fc.assert(
+      fc.asyncProperty(fc.option(fc.subarray([0, 1, 2], { minLength: 1 })), fc.subarray([0, 1, 2]), fc.option(fc.nat(2)), async (max, picks, focus) => {
+        const page = await mountPage(KEYS, 'columns');
+        try {
+          const ids = plotIds(page.ws.layout);
+          page.ws.maximized = max && max.map((i) => ids[i]);
+          const shown = page.ws.shownIds();
+          const picked = picks.map((i) => ids[i]).filter((id) => shown.includes(id));
+          page.ws.selection.only(picked);
+          const into = focus !== null && shown.includes(ids[focus]) ? ids[focus] : null;
+          if (into) document.querySelector(`.leaf[data-plot="${into}"] .plot-card`).focus();
+          else document.activeElement?.blur();
+          flushSync();
+          await frames();
+          // What each Escape leaves: the layout restored, the selection kept; then nothing selected.
+          const steps = [];
+          if (max) steps.push({ maximized: null, selected: picked });
+          if (picked.length) steps.push({ maximized: null, selected: [] });
+          steps.push({ maximized: null, selected: [] });
+          for (const want of steps) {
+            await commands.key('Escape');
+            flushSync();
+            expect(page.ws.maximized).toEqual(want.maximized);
+            expect([...page.ws.selected].sort()).toEqual([...want.selected].sort());
+          }
+          // Deselecting lets go of the plot clicked last too.
+          if (picked.length) expect(page.ws.focusedId).toBe(null);
+          expect(page.history.undos.length).toBe(0);
+        } finally {
+          page.dispose();
+        }
+      }),
+      { numRuns: Math.max(20, Math.ceil(fc.readConfigureGlobal().numRuns / 5)), examples: [[[0], [0, 1], null], [[0, 1], [1], 1], [null, [2], 2], [[1], [], null]] },
+    );
+  }, 600_000);
 });
 
 describe('keyboard focus', () => {

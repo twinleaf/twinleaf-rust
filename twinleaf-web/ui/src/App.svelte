@@ -665,6 +665,12 @@
    */
   function plotKey(e) {
     const action = actionFor('plot', e);
+    // F leaves the maximized view whatever is selected, as Escape does.
+    if (action === 'maximize' && ws.maximized) {
+      e.preventDefault();
+      ws.maximized = null;
+      return;
+    }
     const ids = action ? selection.pageTargets(scopeOf(action)) : [];
     if (!ids.length) return;
     const perf = performance.now(), back = e.key === 'ArrowLeft' || e.key === 'ArrowDown';
@@ -672,7 +678,7 @@
     const act = {
       splitRight: () => splitPlots(ids, 'row', true),
       splitDown: () => splitPlots(ids, 'col', true),
-      maximize: () => (ws.maximized = ws.maximized ? null : ids),
+      maximize: () => (ws.maximized = ids),
       close: () => closePlots(ids, true),
       fitY: () => registry.forEach((p) => ids.includes(p.plotId) && p.autoscale()),
       legend: () => {
@@ -707,11 +713,12 @@
       paletteOpen = !paletteOpen;
       return;
     }
-    // Escape, once a menu or a drag has had it, deselects; with nothing
-    // selected it goes out a level. It never clears cursors or restores a
-    // maximized plot.
-    if (e.key === 'Escape' && !e.defaultPrevented && !keepsKey(e) && (ws.selected.size || selection.rows.size)) {
+    // Escape, once a menu or a drag has had it, leaves the maximized view,
+    // the selection kept; then deselects; with nothing selected it goes out
+    // a level. It never clears cursors.
+    if (e.key === 'Escape' && !e.defaultPrevented && !keepsKey(e) && (ws.maximized || ws.selected.size || selection.rows.size)) {
       e.preventDefault();
+      if (ws.maximized) return void (ws.maximized = null);
       return selection.clear();
     }
     // Tab, the arrows, Enter, Escape and F6 move through the page's tree
