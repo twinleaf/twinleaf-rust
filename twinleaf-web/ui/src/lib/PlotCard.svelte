@@ -113,14 +113,41 @@
   const opened = (open, close) => (open ? claimMenu(close) : releaseMenu(close));
   $effect(() => opened(axisOpen, closeAxis));
   $effect(() => opened(menuOpen, closeMenu));
-  // What a copy of the plot would hold, asked of the hub as its menu opens.
+  // What a copy of the plot would hold, asked of the hub at each right-click
+  // that opens or moves the menu, since the window may have changed while it
+  // was shut or open. The right-click sets the placeholder itself, so the
+  // menu's first frame already has its line.
   let copyCheck = $state(null);
+  let copyAsk = $state(0);
+  function recountCopy() {
+    if (plot.items.length) copyCheck = { state: 'ok', text: 'Counting rows…' };
+    copyAsk++;
+  }
+  /** How long the view must rest, while the menu is open, before the count is asked again, in ms. */
+  const RECOUNT_MS = 200;
   $effect(() => {
-    if (!menuOpen || !plot.items.length) return void (copyCheck = null);
-    let current = true;
+    copyAsk;
+    if (!plot.items.length) return void (copyCheck = null);
+    // A closing menu keeps its line while it fades, so it does not change size on the way out.
+    if (!menuOpen) return;
+    let current = true, asked = 0, timer;
+    const ask = () => {
+      const n = ++asked;
+      onCheckCopy?.().then((check) => current && n === asked && (copyCheck = check), () => current && n === asked && (copyCheck = null));
+    };
     copyCheck = { state: 'ok', text: 'Counting rows…' };
-    onCheckCopy?.().then((check) => current && (copyCheck = check), () => current && (copyCheck = null));
-    return () => (current = false);
+    ask();
+    // A wheel over the plot zooms it with the menu still open: the count
+    // follows once the view rests, keeping the last one shown meanwhile.
+    const off = view.onChange(() => {
+      clearTimeout(timer);
+      timer = setTimeout(ask, RECOUNT_MS);
+    });
+    return () => {
+      current = false;
+      clearTimeout(timer);
+      off();
+    };
   });
   $effect(() => opened(signalsOpen, closeSignals));
   $effect(() => opened(xAxisOpen, closeXAxis));
@@ -883,7 +910,7 @@
   <ContextMenu.Root bind:open={menuOpen}>
     <ContextMenu.Trigger>
       {#snippet child({ props })}
-        <div {...props} class="plot-body" bind:this={body} oncontextmenucapture={(e) => (onContext?.(), contextAt(e))}>
+        <div {...props} class="plot-body" bind:this={body} oncontextmenucapture={(e) => (onContext?.(), recountCopy(), contextAt(e))}>
           <canvas bind:this={overlay}></canvas>
           <div class="axis-anchor" bind:this={axisAnchor} style="left: {axisAt.x}px; top: {axisAt.y}px"></div>
           <!-- The legend: each signal and its value, one short row apiece,
