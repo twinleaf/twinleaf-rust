@@ -2,9 +2,12 @@
 // plot wherever focus is.
 //
 // What is typed into a field, and an open menu, list or dialog's own keys,
-// stay there. A button with focus keeps the keys that press it, Enter and
-// Space, however it got focus. Every other key acts on the highlighted plot,
-// so clicking a button in a plot's header, or anywhere else, never takes the
+// stay there. A button keeps the keys that press it, Enter and Space, only
+// when the keyboard moved focus to it. A button focused by a click keeps
+// none, so Space still pauses. The browser's :focus-visible cannot tell
+// them apart here: it turns on for a clicked button at the first key, before
+// the page hears it. Every other key acts on the highlighted plot, so
+// clicking a button in a plot's header, or anywhere else, never takes the
 // plot's keys away: which plot they act on is the page's state, not the
 // browser's focus.
 
@@ -14,12 +17,29 @@ const TYPING = 'input, textarea, select, [contenteditable], [role=combobox][aria
 const PRESSABLE = 'button, a, [role=button], [role=tab], [role=radio], [role=checkbox], [role=switch], [role=slider]';
 const PRESS = ['Enter', ' '];
 
+/** Whether a key was pressed since the last pointer press, so focus arriving now came from the keyboard. */
+let keyboardLast = false;
+/** The elements the keyboard moved focus to, while they keep it. */
+const keyboardFocused = new WeakSet();
+if (typeof window !== 'undefined') {
+  window.addEventListener('keydown', () => (keyboardLast = true), true);
+  window.addEventListener('pointerdown', () => (keyboardLast = false), true);
+  window.addEventListener('focusin', (e) => (keyboardLast ? keyboardFocused.add(e.target) : keyboardFocused.delete(e.target)), true);
+}
+
 /** Whether key event `e` belongs to where it was pressed, rather than to the highlighted plot. */
 export function keepsKey(e) {
   const at = e.target instanceof Element ? e.target : null;
   if (!at) return false;
   if (at.closest(TYPING)) return true;
-  return PRESS.includes(e.key) && !!at.closest(PRESSABLE);
+  if (!PRESS.includes(e.key)) return false;
+  const pressable = at.closest(PRESSABLE);
+  return !!pressable && keyboardFocused.has(pressable);
+}
+
+/** Whether the keyboard moved focus to `el`, rather than a click. */
+export function focusedByKeyboard(el) {
+  return keyboardFocused.has(el);
 }
 
 /** Each plot's key handler, by plot id, which acts on that plot wherever focus is. */

@@ -26,6 +26,7 @@
   import RiShowRight from '@lucide/svelte/icons/panel-right-open';
   import { PANELS } from './docks.svelte.js';
   import { enter, focusNode } from './focus.js';
+  import { focusedByKeyboard } from './keys.js';
   import Tip from './Tip.svelte';
 
   /** `docks` is the page's Docks, `side` this dock's, and `content(id)` draws a panel's body. */
@@ -148,9 +149,12 @@
               onkeydowncapture={(e) => {
                 // Space folds or unfolds. Enter goes into the contents, unfolding them first.
                 // Both are the header's own, not the drag library's keyboard drag,
-                // whose listener on the header this capture runs before.
+                // whose listener on the header this capture runs before. They are
+                // the header's only when the keyboard moved focus to it, as keys.js
+                // has buttons keep them, so after a click Space still pauses the plots.
                 const head = e.currentTarget;
                 if (e.key !== ' ' && e.key !== 'Enter') return;
+                if (!focusedByKeyboard(head)) return;
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 if (e.key === ' ') docks.toggle(p.id);

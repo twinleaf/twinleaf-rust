@@ -3,14 +3,16 @@
   // holds it: above the page, under every popover, menu and tooltip, or,
   // for focus in a popover or dialog, inside it, so whatever opens over
   // that covers the ring as it covers the field. Every part of the page
-  // shows the same ring, and no scrolling box clips it. It
-  // shows where the browser shows focus (:focus-visible): after a key moved
-  // it, and in a field however it came. It goes around what looks like the
+  // shows the same ring, and no scrolling box clips it. It shows after
+  // the keyboard moved focus, and in a field however focus came, as keys.js
+  // tells them apart. A click that only gives focus, as one that deselects
+  // the plots, shows none, nor does a key pressed after it, Space pausing. It goes around what looks like the
   // field: an input with an icon beside it is one box. A menu's or a list's
   // own items show as highlighted instead, as does an item the arrows move
   // to inside a node that keeps its own, or in the list a filter field
   // (a combobox, as the command palette's) chooses from.
   import { onMount } from 'svelte';
+  import { focusedByKeyboard } from './keys.js';
 
   // A selected plot's border already marks it, so a ring around it would
   // only thicken that one plot's border beside the other selected plots'.
@@ -18,6 +20,8 @@
   // does, Shift-click too, which the browser counts as from the keys: the
   // plot is the stop the keys reach, so the drawing shows no ring of its own.
   const NO_RING = '[role=menu], [role=dialog], [role=alertdialog], [data-slot$=-content], [role=menuitem], [role=option], [aria-activedescendant], [role=combobox], [data-slot=command-input], .plot-card.selected, .plot-body';
+  /** What shows a ring however focus came to it: what is typed into. */
+  const FIELD = 'input, textarea, select, [contenteditable]';
   /** What a ring goes around in place of the element with focus inside it. */
   const BOX = '[data-slot=input-group]';
   /** The layers over the page that hold their own ring: a popover's or a dialog's content. */
@@ -28,7 +32,8 @@
   /** The ring's box around the element with focus, kept on the screen, and the layer holding it, or null for none. */
   function ringBox() {
     const el = document.activeElement;
-    if (!el || el === document.body || !el.matches(':focus-visible') || el.matches(NO_RING)) return null;
+    if (!el || el === document.body || el.matches(NO_RING)) return null;
+    if (!el.matches(FIELD) && !focusedByKeyboard(el)) return null;
     const shown = el.closest(BOX) ?? el;
     const r = shown.getBoundingClientRect();
     if (!r.width && !r.height) return null;

@@ -518,6 +518,15 @@
     }
   }
 
+  /**
+   * A button presses on Space's keyup, not its keydown. A Space the page took
+   * for its own, to pause, takes the keyup too, so a button focused by a
+   * click presses nothing.
+   */
+  function onKeyUp(e) {
+    if (e.key === ' ' && !keepsKey(e)) e.preventDefault();
+  }
+
   function onKey(e) {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();
@@ -579,7 +588,7 @@
 
 <!-- Nothing on the page drags natively: plots, signals and tabs move by
      pointer, and a native drag would only carry a picture of the page. -->
-<svelte:window onkeydown={onKey} onfocusin={remember} onpointerdown={pressOnBackground} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
+<svelte:window onkeydown={onKey} onkeyup={onKeyUp} onfocusin={remember} onpointerdown={pressOnBackground} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
 <canvas class="gl-layer" bind:this={glCanvas}></canvas>
 
 {#snippet plotTile(id)}
