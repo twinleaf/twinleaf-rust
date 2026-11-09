@@ -307,8 +307,8 @@
     });
     sizing.observe(card);
     streaming = view.live;
-    windowSpan = view.span;
-    const unwatch = view.onChange(() => ((streaming = view.live), (windowSpan = view.span)));
+    windowSpan = view.window;
+    const unwatch = view.onChange(() => ((streaming = view.live), (windowSpan = view.window)));
     return () => {
       clearInterval(poll);
       unwatch();
@@ -538,7 +538,7 @@
       close: () => onRemove(true),
       fitY: () => pv?.autoscale(),
       legend: () => (plot.legend = !plot.legend),
-      follow: () => forTargets((v) => v.follow()),
+      follow: () => forTargets((v) => v.follow(true)),
       pan: time && (() => forTargets((v) => v.pan((e.shiftKey ? 1 : PAN) * (back ? -1 : 1), perf))),
       zoom: time && (() => forTargets((v) => v.zoom(back ? ZOOM : 1 / ZOOM, v.live ? 1 : 0.5, perf))),
     }[actionFor('plot', e)];

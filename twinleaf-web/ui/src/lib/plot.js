@@ -1712,7 +1712,7 @@ export class PlotView {
       // The time axis seeks; two clicks there do nothing more.
       if (onAxis(e)) return;
       if (this.yAxisAt(e.clientX, e.clientY)) this.autoscale();
-      else for (const v of this.targets()) v.follow();
+      else for (const v of this.targets()) v.follow(true);
     });
   }
 
@@ -1761,6 +1761,9 @@ const AXIS_DROP = 48;
  */
 export class View {
   live = true;
+  /** The seconds a live view shows, which the window setting sets. A paused view keeps it to go back to. */
+  window = 10;
+  /** The seconds the view shows now. While live it is the window. */
   span = 10;
   delay = 0.15;
   right = 0; // device time of the right edge when paused
@@ -1784,7 +1787,9 @@ export class View {
    * holds a moment the live view would scroll away, so it pauses the view.
    * A paused view stays paused however it zooms, so a slip of the wheel
    * never sends a held history off streaming; going live is the history
-   * bar's end, or Follow live.
+   * bar's end, or Follow live. A zoom that leaves the view live sets its
+   * window; one that pauses it, or of a paused view, leaves the window as it
+   * was, for going live again.
    */
   zoom(factor, anchor, perf, edge = LIVE_EDGE) {
     const widest = this.live ? this.liveSeconds() : this.limits ? this.limits[1] - this.limits[0] : Math.max(WINDOW_LIMITS[1], this.hub.historySeconds?.(perf) ?? 0);
@@ -1797,6 +1802,7 @@ export class View {
       this.right = Math.min(this.hub.now(perf) - this.delay, at + (1 - anchor) * span);
     }
     this.span = span;
+    if (this.live) this.window = span;
     this.keepWithin();
     this.notify();
   }
@@ -1814,9 +1820,13 @@ export class View {
     this.right = Math.min(hi, Math.max(lo + this.span, this.right));
   }
 
-  /** Shows a window of `span` seconds, ending where it ends now, within what a paused view captured. */
+  /**
+   * Sets the window to `span` seconds, and shows that much, ending where it
+   * ends now, within what a paused view captured.
+   */
   setSpan(span) {
-    this.span = Math.min(this.live ? this.liveSeconds() : Infinity, Math.max(WINDOW_LIMITS[0], span));
+    this.window = Math.min(this.liveSeconds(), Math.max(WINDOW_LIMITS[0], span));
+    this.span = this.live ? this.window : Math.max(WINDOW_LIMITS[0], span);
     this.keepWithin();
     this.notify();
   }
@@ -1836,11 +1846,9 @@ export class View {
   }
 
   /**
-   * Moves the view by `fraction` of its span, later for a positive one, and
-   * pauses it, within what it captured. A live view is at the newest
-   * samples already, so a pan later leaves it live.
+   * Shows times [t0, t1], paused, within what it captured and the narrowest
+   * span. The window stays as it was, for going live again.
    */
-  /** Shows times [t0, t1], paused, within what it captured and the narrowest span. */
   show(t0, t1, perf) {
     this.pause(perf);
     this.span = Math.max(WINDOW_LIMITS[0], t1 - t0);
@@ -1849,6 +1857,11 @@ export class View {
     this.notify();
   }
 
+  /**
+   * Moves the view by `fraction` of its span, later for a positive one, and
+   * pauses it, within what it captured. A live view is at the newest
+   * samples already, so a pan later leaves it live.
+   */
   pan(fraction, perf) {
     if (this.live && fraction >= 0) return;
     this.pause(perf);
@@ -1857,9 +1870,15 @@ export class View {
     this.notify();
   }
 
-  /** Follows the newest samples again, as unpausing does. The time cursors go: live, they would scroll away. */
-  follow() {
+  /**
+   * Follows the newest samples again. As unpausing, it goes on at the span
+   * it shows, and keeps its window. With `restore`, as a double-click, it
+   * goes back to its window. The time cursors go: live, they would scroll
+   * away.
+   */
+  follow(restore = false) {
     this.live = true;
+    this.span = restore ? this.window : Math.min(this.liveSeconds(), this.span);
     this.pausedAt = null;
     this.cursors = { a: null, b: null };
     this.notify();

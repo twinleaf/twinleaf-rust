@@ -540,11 +540,12 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .focus-ring.in-layer { position: absolute; z-index: 1; }
 
 /* The window slider: a rail on a log scale, a detent and its label at each
-   preset, the thumb, and the exact window typed at its end. The track keeps
-   half a thumb clear at each end, so the thumb and the end labels stay in it. */
+   preset, the thumb, and the exact window typed at its end. The scale sits
+   10 px inside the track at each end, so the end labels and the thumb stay
+   in the track's box, where the page's focus ring goes around it. */
 .window-slider { display: flex; align-items: flex-start; gap: 10px; }
-.window-track { position: relative; width: 200px; height: 30px; margin: 0 8px; cursor: pointer; touch-action: none; border-radius: var(--radius); outline: none; }
-.window-track:focus-visible { box-shadow: 0 0 0 2px var(--ring); }
+.window-track { position: relative; width: 220px; height: 30px; cursor: pointer; touch-action: none; border-radius: var(--radius); outline: none; }
+.window-track .scale { position: absolute; inset: 0 10px; }
 .window-track .rail { position: absolute; top: 7px; left: 0; right: 0; height: 4px; border-radius: 2px; background: var(--secondary); }
 .window-track .fill { position: absolute; top: 0; bottom: 0; left: 0; width: var(--at); border-radius: 2px; background: var(--primary); }
 .window-track .thumb { position: absolute; top: 9px; left: var(--at); width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--primary); background: var(--background); transform: translate(-50%, -50%); }

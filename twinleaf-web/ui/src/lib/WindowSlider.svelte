@@ -9,16 +9,20 @@
   let { value, onchange, widest } = $props();
 
   let track = $state();
+  /** The rail's span inside the track, which positions are fractions of. */
+  let scale = $state();
   // What the field holds while it is typed in, or null.
   let typed = $state(null);
   let dragging = false;
 
   const at = (e) => {
-    const r = track.getBoundingClientRect();
+    const r = scale.getBoundingClientRect();
     return windowFrom((e.clientX - r.left) / r.width, r.width);
   };
   function down(e) {
     if (e.button !== 0) return;
+    // The slider owns the press: it neither starts nor extends a text selection, and it takes focus itself.
+    e.preventDefault();
     dragging = true;
     track.setPointerCapture(e.pointerId);
     track.focus();
@@ -58,9 +62,11 @@
     onpointercancel={() => (dragging = false)}
     onkeydown={key}
   >
-    <span class="rail"><span class="fill"></span></span>
-    {#each SPANS as s}<span class="detent" class:on={s === value} style="--p: {positionOf(s) * 100}%"><i></i>{s}</span>{/each}
-    <span class="thumb"></span>
+    <span class="scale" bind:this={scale}>
+      <span class="rail"><span class="fill"></span></span>
+      {#each SPANS as s}<span class="detent" class:on={s === value} style="--p: {positionOf(s) * 100}%"><i></i>{s}</span>{/each}
+      <span class="thumb"></span>
+    </span>
   </div>
   <label class="window-field">
     <input

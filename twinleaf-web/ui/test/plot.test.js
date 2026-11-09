@@ -325,3 +325,57 @@ describe('the level a plot draws', () => {
     expect(at(ls, 8, 0)).toBe(1);
   });
 });
+
+describe('the window a view goes live at', () => {
+  // A view on a hub whose newest sample is at time 1000, showing 10 s.
+  const view = () => {
+    const v = new View({ now: () => 1000.15 });
+    v.setSpan(10);
+    return v;
+  };
+
+  it('is set by a zoom that leaves the view live', () => {
+    const v = view();
+    v.zoom(2, 1, 0);
+    expect(v.live).toBe(true);
+    expect([v.window, v.span]).toEqual([20, 20]);
+  });
+
+  it('is kept by a zoom that pauses the view, and a double-click goes back to it', () => {
+    const v = view();
+    v.zoom(0.5, 0.5, 0);
+    expect(v.live).toBe(false);
+    expect([v.window, v.span]).toEqual([10, 5]);
+    v.show(990, 991, 0);
+    expect([v.window, v.span]).toEqual([10, 1]);
+    v.follow(true);
+    expect([v.live, v.window, v.span]).toEqual([true, 10, 10]);
+  });
+
+  it('is kept when play carries on live at the span shown, for a double-click after', () => {
+    const v = view();
+    v.zoom(0.5, 0.5, 0);
+    v.follow();
+    expect([v.live, v.window, v.span]).toEqual([true, 10, 5]);
+    v.pause(0);
+    v.follow(true);
+    expect([v.live, v.window, v.span]).toEqual([true, 10, 10]);
+  });
+
+  it('is set by a zoom at the live edge, from the span shown', () => {
+    const v = view();
+    v.zoom(0.5, 0.5, 0);
+    v.follow();
+    v.zoom(2, 1, 0);
+    expect([v.live, v.window, v.span]).toEqual([true, 10, 10]);
+  });
+
+  it('is what the window setting sets, paused or live', () => {
+    const v = view();
+    v.zoom(0.5, 0.5, 0);
+    v.setSpan(30);
+    expect([v.window, v.span]).toEqual([30, 30]);
+    v.follow(true);
+    expect(v.span).toBe(30);
+  });
+});

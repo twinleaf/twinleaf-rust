@@ -164,7 +164,7 @@
   function refreshToolbar() {
     const vs = chosen();
     live = tabViews().every((v) => v.live);
-    if (vs.length) span = +vs[0].span.toFixed(3);
+    if (vs.length) span = +vs[0].window.toFixed(3);
     // A paused spectrum holds the spectrum it shows, not the points.
     hub.hold(views.anyPaused((id) => plotAnywhere(id)?.kind !== 'spectrum'));
   }
@@ -384,7 +384,7 @@
     for (const vw of chosen()) vw.setSpan(v);
   }
   function followLive() {
-    for (const vw of chosen()) vw.follow();
+    for (const vw of chosen()) vw.follow(true);
   }
   /**
    * The toolbar's Live button: pauses every time plot of the tab while all
