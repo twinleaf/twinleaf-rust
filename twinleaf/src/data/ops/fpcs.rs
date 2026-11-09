@@ -72,6 +72,19 @@ impl Fpcs {
         self.ratio = ratio.max(1);
     }
 
+    /// Returns how long output points are kept, in seconds before the newest.
+    pub fn retention_seconds(&self) -> f64 {
+        self.retention_seconds
+    }
+
+    /// Sets how long output points are kept, as [`new`](Self::new) takes it.
+    /// A shorter retention drops the older points with the next samples, and
+    /// a longer one keeps more from then on. Points already dropped do not
+    /// come back.
+    pub fn set_retention_seconds(&mut self, retention_seconds: f64) {
+        self.retention_seconds = retention_seconds;
+    }
+
     /// Emits `p`, unless it is earlier than the last point emitted.
     fn push_out(&mut self, p: (f64, f64)) {
         if self.out.last().is_some_and(|&(t, _)| p.0 < t) {
@@ -186,10 +199,13 @@ impl Fpcs {
         }
     }
 
-    fn push_values(&mut self, times: impl Iterator<Item = f64>, values: impl Iterator<Item = f64>) {
-        for (t, v) in times.zip(values) {
+    /// Consumes the next span of samples, their values already `f64`, as
+    /// [`ColumnOp::update_batch`] does a column's.
+    pub(crate) fn update_f64(&mut self, timestamps: &[f64], values: &[f64]) {
+        for (&t, &v) in timestamps.iter().zip(values) {
             self.add_point(t, v);
         }
+        self.prune_retention();
     }
 }
 
@@ -213,8 +229,7 @@ impl ColumnOp for Fpcs {
     }
 
     fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray) {
-        self.push_values(timestamps.iter().copied(), values.to_f64().iter().copied());
-        self.prune_retention();
+        self.update_f64(timestamps, &values.to_f64());
     }
 
     fn output(&self) -> &Self::Output {
