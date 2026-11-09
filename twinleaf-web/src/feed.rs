@@ -59,14 +59,17 @@ mod tests {
         let (last, mut rx) = feed.subscribe();
         assert_eq!(last, 1);
         feed.binary(|seq| vec![seq as u8]);
-        feed.message(&Message::Config { pps: 5.0 });
+        feed.message(&Message::Config {
+            pps: 5.0,
+            levels: vec![120.0],
+        });
         assert_eq!(*rx.try_recv().unwrap(), Frame::Binary(vec![2]));
         let Frame::Text(text) = &*rx.try_recv().unwrap() else {
             panic!("a message is text")
         };
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(text).unwrap(),
-            serde_json::json!({"type": "config", "seq": 3, "pps": 5.0})
+            serde_json::json!({"type": "config", "seq": 3, "pps": 5.0, "levels": [120.0]})
         );
     }
 }

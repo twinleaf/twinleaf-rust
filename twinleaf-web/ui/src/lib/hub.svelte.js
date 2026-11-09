@@ -8,6 +8,7 @@
 
 import { Session } from './session.svelte.js';
 import { decodeFrame, holdMessage, spectraMessage } from './protocol.js';
+import { WINDOW_LIMITS } from './window.js';
 
 /** How long the page waits before it opens a socket that closed on its own. */
 const RECONNECT_MS = 1000;
@@ -105,6 +106,11 @@ export class Hub {
     if (!m) return 0;
     const oldest = Math.min(...Object.values(m.oldest ?? {}));
     return Math.max(m.seconds, isFinite(oldest) ? this.now(perfMs) - oldest : 0);
+  }
+
+  /** The widest a live window goes, in seconds: what the coarsest level of decimation keeps. */
+  liveSeconds() {
+    return this.session.levels.at(-1) ?? WINDOW_LIMITS[1];
   }
 
   /** Device time that page time `perfMs` corresponds to. */

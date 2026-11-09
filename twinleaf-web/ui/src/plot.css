@@ -192,8 +192,10 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 /* The legend in the plot: every signal and its value in one column. It is
    never taller than part of the plot; past that it scrolls. It sits at --x,
    --y, each a share of the room around it, so the same place holds as the
-   plot resizes; --inset-top clears a monitor's header. */
-.pinned-legend { --inset-top: 4px; position: absolute; left: calc(4px + var(--x) * (100% - 8px)); top: calc(var(--inset-top) + var(--y) * (100% - var(--inset-top) - 4px)); transform: translate(calc(var(--x) * -100%), calc(var(--y) * -100%)); z-index: 2; cursor: grab; touch-action: none; max-width: calc(100% - 8px); max-height: max(40%, 36px); overflow: hidden auto; scrollbar-width: thin; padding: 1px 6px; font: 10px/16px var(--font-data); font-variant-numeric: tabular-nums; background: color-mix(in oklch, var(--card) 85%, transparent); backdrop-filter: blur(2px); border: 1px solid var(--border); }
+   plot resizes. That room is the plot area, as plot.js gives its edges,
+   inset 8px, and 22px at the top, which clears the LIVE tag; --clear-top
+   clears a monitor's header. */
+.pinned-legend { --clear-top: 0px; --room-l: calc(var(--frame-l, 0px) + 8px); --room-t: max(calc(var(--frame-t, 0px) + 22px), var(--clear-top)); --room-r: calc(var(--frame-r, 0px) + 8px); --room-b: calc(var(--frame-b, 0px) + 8px); position: absolute; left: calc(var(--room-l) + var(--x) * (100% - var(--room-l) - var(--room-r))); top: calc(var(--room-t) + var(--y) * (100% - var(--room-t) - var(--room-b))); transform: translate(calc(var(--x) * -100%), calc(var(--y) * -100%)); z-index: 2; cursor: grab; touch-action: none; max-width: calc(100% - var(--room-l) - var(--room-r)); max-height: max(40%, 36px); overflow: hidden auto; scrollbar-width: thin; padding: 1px 6px; font: 10px/16px var(--font-data); font-variant-numeric: tabular-nums; background: color-mix(in oklch, var(--card) 85%, transparent); backdrop-filter: blur(2px); border: 1px solid var(--border); }
 .pinned-legend .row { display: flex; align-items: center; gap: 5px; height: 16px; white-space: nowrap; }
 .pinned-legend .swatch i { width: 8px; height: 3px; background: var(--c); }
 .pinned-legend .name { max-width: 16ch; overflow: hidden; text-overflow: ellipsis; color: var(--foreground); }
@@ -248,8 +250,10 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 
 /* The placed cursors, under the header while there are any, as a scope's
    readout: a framed table of where A and B are and each signal there. */
-/* The cursors' readout, floating in the plot as the legend does, at --x, --y. */
-.readout-layer { display: contents; }
+/* The cursors' readout, floating in the plot as the legend does, at --x, --y.
+   It and the legend each sit in a layer of no box of its own, which keeps
+   their menus from the plot's. */
+.readout-layer, .legend-layer { display: contents; }
 .cursor-readout { position: absolute; left: calc(4px + var(--x) * (100% - 8px)); top: calc(4px + var(--y) * (100% - 8px)); transform: translate(calc(var(--x) * -100%), calc(var(--y) * -100%)); z-index: 2; cursor: grab; touch-action: none; max-width: calc(100% - 8px); max-height: calc(100% - 8px); overflow: auto; scrollbar-width: thin; background: color-mix(in oklch, var(--card) 88%, transparent); backdrop-filter: blur(2px); border: 1px solid var(--border); }
 .cursor-readout table { border-collapse: collapse; font: 10px/16px var(--font-data); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .cursor-readout th, .cursor-readout td { padding: 0 6px; }
@@ -342,8 +346,6 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .theme-seg svg { width: 14px; height: 14px; }
 /* The time window's button and its slider, the spans named under their steps. */
 .top-bar .window-button { min-width: 64px; justify-content: space-between; font-variant-numeric: tabular-nums; }
-.window-pop .window-head { display: flex; justify-content: space-between; margin-bottom: 12px; font-size: 12px; color: var(--muted-foreground); }
-.window-pop .window-ticks { display: flex; justify-content: space-between; margin-top: 8px; font: 11px/16px var(--font-data); color: var(--muted-foreground); }
 /* The export dialog: its choices as an axis popover's rows, then a note. */
 .export-dialog .axis-row { padding: 0; font-size: 13px; }
 .export-note { margin: 0; color: var(--muted-foreground); font-size: 12px; line-height: 16px; }
@@ -528,7 +530,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 }
 @media (prefers-reduced-motion: reduce) { .plot-card .plot-head { transition: none; } }
 .plot-card.monitor:is(:hover, :focus-visible, :has(:focus-visible, [data-state=open])) .plot-head { opacity: 1; pointer-events: auto; }
-.plot-card.monitor:is(:hover, :focus-visible, :has(:focus-visible, [data-state=open])) .pinned-legend { --inset-top: 32px; }
+.plot-card.monitor:is(:hover, :focus-visible, :has(:focus-visible, [data-state=open])) .pinned-legend { --clear-top: 32px; }
 
 /* Focus: one ring, which the page draws above everything (FocusRing.svelte),
    so nothing clips it. Nothing draws a ring of its own. */
@@ -536,3 +538,19 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 /* Above the page and its drag overlays, under popovers, menus and tooltips (z 50); in a popover or dialog, above its content. */
 .focus-ring { position: fixed; z-index: 46; pointer-events: none; border-style: solid; border-color: var(--ring); box-sizing: border-box; }
 .focus-ring.in-layer { position: absolute; z-index: 1; }
+
+/* The window slider: a rail on a log scale, a detent and its label at each
+   preset, the thumb, and the exact window typed at its end. The track keeps
+   half a thumb clear at each end, so the thumb and the end labels stay in it. */
+.window-slider { display: flex; align-items: flex-start; gap: 10px; }
+.window-track { position: relative; width: 200px; height: 30px; margin: 0 8px; cursor: pointer; touch-action: none; border-radius: var(--radius); outline: none; }
+.window-track:focus-visible { box-shadow: 0 0 0 2px var(--ring); }
+.window-track .rail { position: absolute; top: 7px; left: 0; right: 0; height: 4px; border-radius: 2px; background: var(--secondary); }
+.window-track .fill { position: absolute; top: 0; bottom: 0; left: 0; width: var(--at); border-radius: 2px; background: var(--primary); }
+.window-track .thumb { position: absolute; top: 9px; left: var(--at); width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--primary); background: var(--background); transform: translate(-50%, -50%); }
+.window-track .detent { position: absolute; top: 14px; left: var(--p); transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; font: 10px/12px var(--font-data); color: var(--muted-foreground); pointer-events: none; }
+.window-track .detent i { width: 1px; height: 4px; background: currentColor; }
+.window-track .detent.on { color: var(--foreground); }
+.window-field { display: inline-flex; align-items: center; gap: 2px; height: 24px; padding-right: 6px; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--muted-foreground); font: 11px var(--font-data); }
+.window-field:focus-within { border-color: var(--ring); }
+.window-field input { width: 44px; height: 22px; padding: 0 2px 0 6px; border: 0; outline: none; background: none; color: var(--foreground); font: 12px var(--font-data); font-variant-numeric: tabular-nums; text-align: right; }

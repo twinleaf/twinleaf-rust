@@ -12,17 +12,26 @@ import { SvelteMap } from 'svelte/reactivity';
 import { api, signalKey } from './protocol.js';
 import { colors } from './colors.svelte.js';
 
-/** How long a trace keeps its points, in seconds of device time. */
+/** How long a trace keeps its finest points, in seconds of device time, until the hub says. */
 const RETAIN_SECONDS = 120;
+/** How far back, in ms of page time, the clock looks for the batch that arrived least delayed. */
+const CLOCK_WINDOW_MS = 2000;
+/**
+ * How fast the clock moves toward its goal, in seconds a second: the plots
+ * scroll at most this share faster or slower than real time.
+ */
+const CLOCK_SLEW = 0.005;
+/** How far, in seconds, the clock may be from its goal before it is set there at once. */
+const CLOCK_SNAP = 0.5;
 
 /**
- * One trace's points, in device seconds. Points have absolute indices that
- * never change, so a GPU ring buffer can find the ones it has not uploaded.
+ * One line of points, in device seconds, kept for `keep` seconds before the
+ * newest. Points have absolute indices that never change, so a GPU ring
+ * buffer can find the ones it has not uploaded.
  */
-export class Trace {
-  constructor(meta) {
-    this.meta = meta;
-    this.key = signalKey(meta);
+export class Points {
+  constructor(keep = RETAIN_SECONDS) {
+    this.keep = keep;
     this.cap = 4096;
     this.x = new Float64Array(this.cap);
     this.y = new Float32Array(this.cap);
@@ -30,7 +39,6 @@ export class Trace {
     this.end = 0;
     this.shift = 0; // absolute index of local index 0
     this.breaks = []; // absolute indices the pen lifts before, ascending
-    this.spectrum = null; // the newest {f, a, floor}
   }
 
   get length() {
@@ -57,8 +65,8 @@ export class Trace {
 
   /**
    * Appends points, the pen lifted before the first with `breakFirst`, and
-   * drops those older than RETAIN_SECONDS before the newest. A paused plot
-   * reads older ones from the hub's history.
+   * drops those older than `keep` before the newest. A paused plot reads
+   * older ones from the hub's history.
    */
   push(xs, ys, breakFirst) {
     if (!xs.length) return;
@@ -72,7 +80,7 @@ export class Trace {
       this.y[this.end] = ys[i];
       this.end++;
     }
-    const keepFrom = this.x[this.end - 1] - RETAIN_SECONDS;
+    const keepFrom = this.x[this.end - 1] - this.keep;
     while (this.start < this.end && this.x[this.start] < keepFrom) this.start++;
     while (this.breaks.length && this.breaks[0] <= this.absStart) this.breaks.shift();
   }
@@ -110,6 +118,34 @@ export class Trace {
       if (v > hi) hi = v;
     }
     return [lo, hi];
+  }
+}
+
+/**
+ * One trace: its points at each level of the hub's decimation, finest
+ * first, and its newest spectrum. The trace is its own finest level, so what
+ * reads only the newest points reads the trace.
+ */
+export class Trace extends Points {
+  constructor(meta) {
+    super();
+    this.meta = meta;
+    this.key = signalKey(meta);
+    this.levels = [this];
+    this.spectrum = null; // the newest {f, a, floor}
+  }
+
+  /** Level `k`, keeping `keep` seconds, with every finer level made first. */
+  level(k, keep = RETAIN_SECONDS * 4 ** k) {
+    while (this.levels.length <= k) this.levels.push(new Points(RETAIN_SECONDS * 4 ** this.levels.length));
+    this.levels[k].keep = keep;
+    return this.levels[k];
+  }
+
+  /** Drops every point of every level; the next one starts a new line. */
+  clear() {
+    super.clear();
+    for (const level of this.levels.slice(1)) level.clear();
   }
 }
 
@@ -207,8 +243,10 @@ export class Session {
   devices = new SvelteMap();
   /** The devices the hub mounted, [{url, source, prefix}], or null for the proxy's default. */
   mounts = $state.raw(null);
-  /** The decimation, in points per second per trace. */
+  /** The decimation, in points per second per trace of the finest level. */
   pps = $state(0);
+  /** The seconds each level of the decimation keeps, finest first. */
+  levels = $state.raw([]);
   /** The hub's raw history, {bytes, budget, seconds, maxAge, rate}, or null before it says. */
   memory = $state.raw(null);
 
@@ -221,6 +259,8 @@ export class Session {
   windowTokens = new Map(); // plot id -> {asked, shown}: the newest request of each layer, and the one drawn
   latest = -Infinity; // device time of the newest point
   offset = null; // device time minus page time, in seconds
+  arrivals = []; // [page ms, device time minus page time in s] of each batch that moved `latest`, the last CLOCK_WINDOW_MS
+  tickedAt = null; // page ms of the last tick
   /** `id` names the hub, null before the socket reached one. */
   constructor(id = null) {
     this.id = id;
@@ -237,12 +277,22 @@ export class Session {
     return this.offset === null ? this.latest : perfMs / 1000 + this.offset;
   }
 
-  /** Moves the clock toward the newest point, once per frame. */
+  /**
+   * Moves the clock toward its goal, once per frame. The goal is the most
+   * device time any batch of the last CLOCK_WINDOW_MS was ahead of page
+   * time as it arrived: a batch can arrive late but never early, so that
+   * one was least delayed. The clock runs at the page's rate and moves
+   * toward the goal no faster than CLOCK_SLEW, whatever the frame rate, so
+   * the plots scroll evenly however the batches arrive.
+   */
   tick(perfMs) {
-    if (!isFinite(this.latest)) return;
-    const target = this.latest - perfMs / 1000;
-    if (this.offset === null || Math.abs(target - this.offset) > 0.5) this.offset = target;
-    else this.offset += (target - this.offset) * (target > this.offset ? 0.05 : 0.01);
+    if (!this.arrivals.length) return;
+    this.forgetArrivals(perfMs);
+    const goal = Math.max(...this.arrivals.map((a) => a[1]));
+    const dt = this.tickedAt === null ? 0 : Math.max(0, perfMs - this.tickedAt) / 1000;
+    this.tickedAt = perfMs;
+    if (this.offset === null || Math.abs(goal - this.offset) > CLOCK_SNAP) this.offset = goal;
+    else this.offset += Math.max(-CLOCK_SLEW * dt, Math.min(CLOCK_SLEW * dt, goal - this.offset));
   }
 
   /** The device at `route`, made the first time the routes list it. */
@@ -272,6 +322,7 @@ export class Session {
         return;
       case 'config':
         this.pps = msg.pps;
+        this.levels = msg.levels ?? [];
         return;
       case 'memory':
         this.memory = { bytes: msg.bytes, budget: msg.budget, seconds: msg.seconds, maxAge: msg.max_age, rate: msg.rate, held: msg.held ?? null, oldest: msg.oldest ?? {} };
@@ -297,8 +348,9 @@ export class Session {
   /**
    * Applies one decoded binary frame. Returns false when it names a trace
    * this session never heard of, a gap the page fills with a new snapshot.
+   * `perfMs` is the page time it arrived.
    */
-  apply(frame) {
+  apply(frame, perfMs = performance.now()) {
     if (frame.kind === 'spectra') {
       for (const { id, f, a, floor } of frame.spectra) {
         const t = this.traces.get(id);
@@ -307,14 +359,24 @@ export class Session {
       }
       return true;
     }
-    for (const { id, brk, xs, ys } of frame.chunks) {
+    const was = this.latest;
+    for (const { id, level, brk, xs, ys } of frame.chunks) {
       const trace = this.traces.get(id);
       if (!trace) return false;
       if (xs.length === 0) continue;
-      trace.push(xs, ys, brk);
+      trace.level(level, this.levels[level]).push(xs, ys, brk);
       if (xs[xs.length - 1] > this.latest) this.latest = xs[xs.length - 1];
     }
+    if (this.latest > was) {
+      this.arrivals.push([perfMs, this.latest - perfMs / 1000]);
+      this.forgetArrivals(perfMs);
+    }
     return true;
+  }
+
+  /** Drops the arrivals older than CLOCK_WINDOW_MS before `perfMs`, keeping the newest, also while no frame ticks. */
+  forgetArrivals(perfMs) {
+    while (this.arrivals.length > 1 && this.arrivals[0][0] < perfMs - CLOCK_WINDOW_MS) this.arrivals.shift();
   }
 
   // A paused plot draws from windows of the hub's history, in two layers:

@@ -75,8 +75,9 @@ pub(crate) enum Message {
     Trace { trace: TraceInfo },
     /// Every trace's points are dropped. The history follows, decimated anew.
     Clear,
-    /// The decimation, in points per second per trace.
-    Config { pps: f64 },
+    /// The decimation: `pps` points per second per trace in the finest
+    /// level, and the seconds each level keeps, finest first.
+    Config { pps: f64, levels: Vec<f64> },
     /// What the hub's buffer of raw rows holds and may hold: `bytes` of the
     /// `budget`, and `seconds` of history in the stream that keeps the
     /// least, of the `max_age` each keeps at most. `rate` is the bytes per

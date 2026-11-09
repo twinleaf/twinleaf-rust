@@ -9,12 +9,14 @@
 //!
 //! ```text
 //! u16 chunk count, then per chunk:
-//!   u16 trace id, u8 break before the first point, u8 pad, u32 n,
+//!   u16 trace id, u8 break before the first point, u8 level, u32 n,
 //!   n × f64 x (seconds, device time), n × f32 y
 //! ```
 //!
 //! A chunk with its break set starts a new line. The page lifts the pen
-//! before its first point, as at a gap in the samples.
+//! before its first point, as at a gap in the samples. `level` names the
+//! decimation the points are of, 0 the finest, as the hub's `FpcsLevels`
+//! numbers them. Each level of a trace is a line of its own.
 //!
 //! Spectra, kind 2, one per trace estimated in a round:
 //!
@@ -32,6 +34,8 @@ const HEADER: usize = 16;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Chunk {
     pub(crate) id: u16,
+    /// The decimation the points are of, 0 the finest.
+    pub(crate) level: u8,
     /// Whether a gap comes before the first point.
     pub(crate) brk: bool,
     pub(crate) points: Vec<(f64, f32)>,
@@ -59,7 +63,7 @@ pub(crate) fn encode(chunks: &[Chunk], seq: u64) -> Vec<u8> {
     for chunk in chunks {
         buf.extend_from_slice(&chunk.id.to_le_bytes());
         buf.push(chunk.brk as u8);
-        buf.push(0);
+        buf.push(chunk.level);
         buf.extend_from_slice(&(chunk.points.len() as u32).to_le_bytes());
         for &(x, _) in &chunk.points {
             buf.extend_from_slice(&x.to_le_bytes());
@@ -92,10 +96,11 @@ pub(crate) fn encode_spectra(spectra: &[Spectrum], seq: u64) -> Vec<u8> {
     buf
 }
 
-/// Splits time-ordered points into chunks at the gap times in `breaks`,
-/// given the time of the point before the first one.
+/// Splits time-ordered points of level `level` into chunks at the gap times
+/// in `breaks`, given the time of the point before the first one.
 pub(crate) fn split_at_breaks(
     id: u16,
+    level: u8,
     before: f64,
     points: &[(f64, f64)],
     breaks: &[f64],
@@ -111,6 +116,7 @@ pub(crate) fn split_at_breaks(
             if !current.is_empty() {
                 chunks.push(Chunk {
                     id,
+                    level,
                     brk,
                     points: std::mem::take(&mut current),
                 });
@@ -123,6 +129,7 @@ pub(crate) fn split_at_breaks(
     if !current.is_empty() {
         chunks.push(Chunk {
             id,
+            level,
             brk,
             points: current,
         });
@@ -139,7 +146,12 @@ pub(crate) fn decode(frame: &[u8]) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let mut at = HEADER + 2;
     for _ in 0..u16_at(HEADER) {
-        let (id, brk, n) = (u16_at(at), frame[at + 2] == 1, u32_at(at + 4));
+        let (id, brk, level, n) = (
+            u16_at(at),
+            frame[at + 2] == 1,
+            frame[at + 3],
+            u32_at(at + 4),
+        );
         at += 8;
         let points = (0..n)
             .map(|i| {
@@ -153,7 +165,12 @@ pub(crate) fn decode(frame: &[u8]) -> Vec<Chunk> {
             })
             .collect();
         at += n * 12;
-        chunks.push(Chunk { id, brk, points });
+        chunks.push(Chunk {
+            id,
+            level,
+            brk,
+            points,
+        });
     }
     chunks
 }
@@ -165,6 +182,7 @@ mod tests {
     fn chunk(id: u16, brk: bool, points: &[(f64, f32)]) -> Chunk {
         Chunk {
             id,
+            level: 0,
             brk,
             points: points.to_vec(),
         }
@@ -174,7 +192,10 @@ mod tests {
     fn a_frame_decodes_to_its_chunks() {
         let chunks = vec![
             chunk(3, false, &[(1.5, 2.0), (2.5, 3.0)]),
-            chunk(4, true, &[(9.0, -1.0)]),
+            Chunk {
+                level: 3,
+                ..chunk(4, true, &[(9.0, -1.0)])
+            },
         ];
         assert_eq!(decode(&encode(&chunks, 9)), chunks);
     }
@@ -182,7 +203,7 @@ mod tests {
     #[test]
     fn a_gap_between_two_points_starts_a_new_chunk() {
         let points = [(1.0, 10.0), (2.0, 20.0), (5.0, 50.0)];
-        let chunks = split_at_breaks(7, f64::NEG_INFINITY, &points, &[3.0]);
+        let chunks = split_at_breaks(7, 0, f64::NEG_INFINITY, &points, &[3.0]);
         assert_eq!(
             chunks,
             vec![
@@ -194,7 +215,7 @@ mod tests {
 
     #[test]
     fn a_gap_before_the_first_point_of_a_flush_breaks_it() {
-        let chunks = split_at_breaks(7, 2.0, &[(5.0, 50.0)], &[3.0]);
+        let chunks = split_at_breaks(7, 0, 2.0, &[(5.0, 50.0)], &[3.0]);
         assert_eq!(chunks, vec![chunk(7, true, &[(5.0, 50.0)])]);
     }
 

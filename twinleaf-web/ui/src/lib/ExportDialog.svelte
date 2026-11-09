@@ -5,13 +5,15 @@
   import * as Dialog from '$lib/components/ui/dialog/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { FORMATS, exportName, saveExport } from './exportfile.js';
+  import { api } from './protocol.js';
   import { bytesText, spanText } from './units.js';
   import { toast } from './toast.svelte.js';
 
   /**
    * `what` is the export to offer, or null: {hub, traces, shown, whole},
    * `shown` the time [t0, t1] the plots show, null with none of time, and
-   * `whole` the time the history holds of the traces.
+   * `whole` the time the history may hold of the traces, from -Infinity
+   * when the page has not heard where it begins.
    */
   let { what = $bindable(null) } = $props();
 
@@ -19,8 +21,24 @@
   let format = $state('csv');
   const open = $derived(!!what);
   const chosen = $derived(what && (range === 'shown' && what.shown ? what.shown : what.whole));
-  // About how many samples the file holds, at each signal's rate.
-  const samples = $derived(what && chosen ? Math.round(what.traces.reduce((n, t) => n + t.meta.rate * (chosen[1] - chosen[0]), 0)) : 0);
+  // What the file holds, as the hub counts it: {samples, seconds}, the
+  // samples of every signal and the time from the oldest it holds; null
+  // until the hub answers.
+  let counted = $state(null);
+  $effect(() => {
+    counted = null;
+    if (!chosen) return;
+    const [t0, t1] = chosen, { hub, traces } = what;
+    let current = true;
+    Promise.all(traces.map((t) => api.rows({ hub, id: t.meta.id, t0, t1, limit: 0 }))).then(
+      (replies) => {
+        const oldest = Math.min(...replies.map((r) => r.oldest ?? Infinity));
+        if (current) counted = { samples: replies.reduce((n, r) => n + r.count, 0), seconds: Math.max(0, t1 - Math.max(t0, oldest)) };
+      },
+      () => {},
+    );
+    return () => (current = false);
+  });
 
   $effect(() => {
     if (what && !what.shown) range = 'whole';
@@ -63,11 +81,11 @@
       </div>
     </div>
     <p class="export-note">
-      {#if chosen}{spanText(chosen[1] - chosen[0])}, about {samples.toLocaleString()} samples.{/if}
+      {#if !counted}Counting…{:else if counted.samples}{spanText(counted.seconds)}, {counted.samples.toLocaleString()} samples.{:else}No samples in this time.{/if}
       {format === 'csv' ? 'One time column, one column per signal.' : 'One table per stream, every column of it.'}
     </p>
     <Dialog.Footer>
-      <Button size="sm" onclick={save}>Save…</Button>
+      <Button size="sm" disabled={counted?.samples === 0} onclick={save}>Save…</Button>
     </Dialog.Footer>
   </Dialog.Content>
 </Dialog.Root>

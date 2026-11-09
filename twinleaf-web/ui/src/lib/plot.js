@@ -16,6 +16,7 @@ import { DRAG_START } from './constants.js';
 import { colors } from './colors.svelte.js';
 import { prefs } from './prefs.svelte.js';
 import { spanText } from './units.js';
+import { WINDOW_LIMITS, windowText } from './window.js';
 
 /** A CSS colour as [r, g, b, a] in 0..1, resolved by the browser, so theme tokens work. */
 function cssRgba(css) {
@@ -108,6 +109,41 @@ const LIVE_EDGE_BUFFER = 32;
  * pointer reads at once.
  */
 const READ_MS = 250;
+/** How fast the live edge's wash and LIVE line come in and go, as the time constant of their fade, in ms. */
+const LIVE_FADE_MS = { in: 60, out: 100 };
+/** How long a time plot shows its window on the time axis after the window changes, in ms. */
+const WINDOW_SHOWN_MS = 1200;
+const reducedMotion = typeof matchMedia === 'undefined' ? null : matchMedia('(prefers-reduced-motion: reduce)');
+/**
+ * The fewest points a pixel a plot draws a trace with, while a level that
+ * fine exists. A coarser level gives about a quarter as many, and moves a
+ * line by under half a pixel at the switch from this many.
+ */
+export const LEVEL_FLOOR = 4;
+/**
+ * How far past the floor a coarser level must reach before a plot moves to
+ * it, as a factor. A plot then moves back to the finer level only once the
+ * coarser one falls under the floor, so a zoom that rests near a switch
+ * does not flip between the two.
+ */
+export const LEVEL_BAND = 1.25;
+
+/**
+ * The level of `levels`, finest first, that a plot `width` px wide draws
+ * [x0, x1] from, given the level it drew last, `was`: the coarsest with at
+ * least LEVEL_FLOOR points a pixel, held within LEVEL_BAND. A level that
+ * does not reach back to x0, while a coarser one holds points before it,
+ * gives way to the coarser one.
+ */
+export function pickLevel(levels, x0, x1, width, was = 0) {
+  const count = (k) => levels[k].lowerBound(x1) - levels[k].lowerBound(x0);
+  const reaches = (k) => levels[k].length > 0 && levels[k].xAt(levels[k].absStart) <= x0;
+  let k = Math.min(Math.max(was, 0), levels.length - 1);
+  while (k + 1 < levels.length && count(k + 1) >= LEVEL_FLOOR * LEVEL_BAND * width) k++;
+  while (k > 0 && count(k) < LEVEL_FLOOR * width) k--;
+  while (k + 1 < levels.length && !reaches(k) && levels[k + 1].length && levels[k + 1].xAt(levels[k + 1].absStart) < levels[k].xAt(levels[k].absStart)) k++;
+  return k;
+}
 
 /** The trace's point nearest time t, or null outside the points it keeps. */
 function traceAt(t, x) {
@@ -291,6 +327,10 @@ export function theme() {
       seekBg: token('--plot-seek-bg'),
       seekWindow: token('--plot-seek-window'),
       seekEdge: token('--plot-seek-edge'),
+      live: token('--primary'),
+      liveText: token('--primary-foreground'),
+      // The live edge's wash: the plot's foreground, as an rgb triple to give an alpha.
+      wash: dark ? '255 255 255' : '0 0 0',
       traces,
       tracesRgba: traces.map(cssRgba),
     };
@@ -336,6 +376,7 @@ export class PlotView {
     this.tagsPlaced = [];
     this.axisHover = null; // clientX over the x axis, where a drag seeks
     this.phosphor = new Map(); // signal key -> the shares its axis column shows, eased frame to frame
+    this.drawnLevel = new Map(); // trace -> the level of it the plot drew last, see `pickLevel`
     this.gutter = { left: [], right: [] }; // each y axis's width, in px, from the plot outward, fitted to its labels
     this.hover = null; // the pointer over the plot, {x, y} in client px, for the crosshair
     this.hidden = false;
@@ -458,8 +499,22 @@ export class PlotView {
     const traces = this.traces();
     const geo = this.geometry(body, cfg, traces.length);
     this.geo = geo;
+    this.publishFrame(body, geo.plot);
     if (cfg.kind === 'spectrum') this.drawSpectrum(cfg, traces, geo, body);
     else this.drawTime(cfg, traces, geo, body, perf);
+  }
+
+  /**
+   * Sets the plot area's distance from each edge of the body, in px, as
+   * --frame-l, --frame-t, --frame-r and --frame-b on the body, for what
+   * the page places within the plot area, as the legend. Only a change is
+   * written.
+   */
+  publishFrame(body, P) {
+    const edges = [P.x - body.x, P.y - body.y, body.x + body.w - P.x - P.w, body.y + body.h - P.y - P.h].map(Math.round);
+    if (this.frameEdges?.every((v, i) => v === edges[i])) return;
+    this.frameEdges = edges;
+    ['l', 't', 'r', 'b'].forEach((side, i) => this.body.style.setProperty(`--frame-${side}`, `${edges[i]}px`));
   }
 
   /** The lane of the plot's `i`th trace, one of `lanesOf(cfg.mode, n)`. */
@@ -471,16 +526,20 @@ export class PlotView {
     const [x0, x1] = this.view.range(this.hub.now(perf));
     const session = this.hub.session;
     const plans = traces.map((t, index) => {
+      // Live, it draws the level of the live points that suits the window.
       // Paused, it draws from the hub's history: the detail window when it
       // covers the view, else whichever of it, the overview of the whole
-      // capture and the live points covers most, the sharper on a tie.
+      // capture and that level covers most, the sharper on a tie.
+      const level = pickLevel(t.levels, x0, x1, geo.plot.w, this.drawnLevel.get(t));
+      this.drawnLevel.set(t, level);
+      const live = t.levels[level];
       const d = this.view.live ? null : session.windowOf(this.plotId, 'detail', t);
       const o = this.view.live ? null : session.windowOf(this.plotId, 'overview', t);
-      const src = d?.covers(x0, x1) ? d : [d, o, t].filter(Boolean).reduce((best, s) => (spanWithin(s, x0, x1) > spanWithin(best, x0, x1) ? s : best));
+      const src = d?.covers(x0, x1) ? d : [d, o, live].filter(Boolean).reduce((best, s) => (spanWithin(s, x0, x1) > spanWithin(best, x0, x1) ? s : best));
       const a0 = Math.max(src.absStart, src.lowerBound(x0) - 1);
       const a1 = Math.min(src.absEnd, src.lowerBound(x1) + 1);
       const [lo, hi] = a1 > a0 ? src.extent(a0, a1) : [Infinity, -Infinity];
-      return { t, src, a0, a1, lo, hi, index };
+      return { t, src, fromWindow: src !== live, level, a0, a1, lo, hi, index };
     });
     // The history the plot moves through, oldest to newest: from the oldest
     // time the hub holds of its signals to the newest point, or, paused, to
@@ -489,7 +548,7 @@ export class PlotView {
     let lo = Infinity, hi = -Infinity;
     const oldest = this.hub.session.memory?.oldest ?? {};
     for (const t of traces) {
-      if (t.length) [lo, hi] = [Math.min(lo, t.xAt(t.absStart)), Math.max(hi, t.xAt(t.absEnd - 1))];
+      for (const l of t.levels) if (l.length) [lo, hi] = [Math.min(lo, l.xAt(l.absStart)), Math.max(hi, l.xAt(l.absEnd - 1))];
       if (oldest[t.meta.id] !== undefined) lo = Math.min(lo, oldest[t.meta.id]);
     }
     if (!this.view.live && this.view.pausedAt !== null) hi = this.view.pausedAt;
@@ -503,16 +562,16 @@ export class PlotView {
     }
     const ranges = new Map([...ext].map(([k, [lo, hi]]) => [k, this.yRange(k, lo, hi, true)]));
     plans.forEach((p) => {
-      const ring = this.renderer.ring(p.t); // keeps the ring current either way
       const lane = geo.lanes[this.laneOf(cfg, p.index)];
       const [y0, y1] = ranges.get(this.rangeKey(cfg, p.t));
-      if (p.src !== p.t) {
+      if (p.fromWindow) {
         const st = this.renderer.detailBuffer(this.slotOf(p.t), p.src);
         if (this.renderer.lane(lane, st.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t)))
           this.renderer.drawDetail(st, p.src, p.a0, p.a1);
-      } else if (this.renderer.lane(lane, ring.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t))) {
-        this.renderer.drawTrace(p.t, ring, p.a0, p.a1);
+        return;
       }
+      const ring = this.renderer.ring(p.src);
+      if (this.renderer.lane(lane, ring.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t))) this.renderer.drawTrace(p.src, ring, p.a0, p.a1);
     });
     this.drawOverlay(cfg, geo, body, plans, ranges, [x0, x1], false);
   }
@@ -643,6 +702,29 @@ export class PlotView {
     const P = geo.plot;
     const sx = (logX ? scaleLog() : scaleLinear()).domain(xd).range([P.x, P.x + P.w]);
     const time = timeAxis(plans[0]?.t.meta.epoch);
+
+    // The live edge, while the pointer is over it on a live time plot, where
+    // a zoom keeps the plot live: a wash rising toward the newest edge, under
+    // the grid, and a LIVE line on that edge, drawn with the hover, where the
+    // zoom anchors. Both fade in and out.
+    const frameAt = performance.now();
+    const dt = Math.min(100, frameAt - (this.overlayAt ?? frameAt));
+    this.overlayAt = frameAt;
+    const pointer = this.hover;
+    const edgeX = pointer && !spectrum && this.view.live ? P.x + this.liveEdge() * P.w : Infinity;
+    const target = pointer && this.inPlot(pointer.x, pointer.y) && pointer.x >= edgeX ? 1 : 0, was = this.zone ?? 0;
+    this.zone = reducedMotion?.matches ? target : was + (target - was) * (1 - Math.exp(-dt / (target ? LIVE_FADE_MS.in : LIVE_FADE_MS.out)));
+    if (Math.abs(this.zone - target) < 0.01) this.zone = target;
+    if (this.zone > 0) {
+      const from = isFinite(edgeX) ? edgeX : (this.zoneFrom ?? P.x + P.w);
+      this.zoneFrom = from;
+      const g = ctx.createLinearGradient(from, 0, P.x + P.w, 0);
+      g.addColorStop(0, `rgb(${T.wash} / 0)`);
+      g.addColorStop(0.35, `rgb(${T.wash} / ${0.03 * this.zone})`);
+      g.addColorStop(1, `rgb(${T.wash} / ${0.075 * this.zone})`);
+      ctx.fillStyle = g;
+      for (const lane of geo.lanes) ctx.fillRect(from, lane.y, P.x + P.w - from, lane.h);
+    }
     const unlog = (r) => (logY ? [10 ** r[0], 10 ** r[1]] : r);
     const yScale = (range, lane) => (logY ? scaleLog() : scaleLinear()).domain(unlog(range)).range([lane.y + lane.h, lane.y]);
     // A log axis labels its decades only.
@@ -715,8 +797,9 @@ export class PlotView {
     const hy = this.hover?.y ?? null;
     const hoverLane = hy === null ? null : geo.lanes.find((l) => hy >= l.y && hy <= l.y + l.h);
     const overAxis = this.hover ? this.yAxisAt(this.hover.x, hy) : null; // the band the pointer is on
-    // The source whose samples a strip counts: the plot's own when raw, else the live trace.
-    const rawOf = (p) => (p.src === p.t || p.src.ratio === 1 ? p.src : p.t);
+    // The source whose samples a strip counts: the plot's own when it is raw
+    // or a live level, else the live level the plot would draw.
+    const rawOf = (p) => (!p.fromWindow || p.src.ratio === 1 ? p.src : p.t.levels[p.level]);
     const rowsOf = (lane, sy) => [(y) => Math.floor(sy(y) - lane.y), Math.ceil(lane.h)];
     // Leaving the axis lets the columns go, so the next hover fades them in.
     if (!hoverLane || !overAxis || spectrum) this.phosphor.clear();
@@ -866,6 +949,26 @@ export class PlotView {
       }
     }
     if (inView(marks.hover)) vline(marks.hover, T.crosshair);
+    if (this.zone > 0) {
+      const px = P.x + P.w - 1, top = P.y + TAB.h + 2;
+      ctx.save();
+      ctx.globalAlpha = this.zone;
+      ctx.strokeStyle = T.live;
+      ctx.lineWidth = 1.5;
+      for (const lane of geo.lanes) {
+        ctx.beginPath();
+        ctx.moveTo(px, Math.max(lane.y, top));
+        ctx.lineTo(px, lane.y + lane.h);
+        ctx.stroke();
+      }
+      const w = ctx.measureText('LIVE').width + 8;
+      ctx.fillStyle = T.live;
+      ctx.fillRect(P.x + P.w - w, P.y + 1, w, TAB.h);
+      ctx.fillStyle = T.liveText;
+      ctx.textAlign = 'center';
+      ctx.fillText('LIVE', P.x + P.w - w / 2, P.y + 1 + TAB.h / 2 + 4);
+      ctx.restore();
+    }
     // The crosshair's horizontal line, in the lane under the pointer, with the
     // pointer's value tagged on each of that lane's y axes, just inside the
     // plot, clear of a pointer on the axis and of the axis's labels.
@@ -958,7 +1061,7 @@ export class PlotView {
       else if (!spectrum && this.view.live && p.t.length) value = fy(p.t.yAt(p.t.absEnd - 1));
       // Where the points come from: raw samples, or how many raw rows per point.
       let info = `${p.t.meta.rate} Hz`;
-      if (!spectrum) info += p.src !== p.t ? (p.src.ratio === 1 ? ' · raw' : ` · 1:${p.src.ratio}`) : ' · live';
+      if (!spectrum) info += p.fromWindow ? (p.src.ratio === 1 ? ' · raw' : ` · 1:${p.src.ratio}`) : p.level ? ` · live, level ${p.level}` : ' · live';
       // A spectrum's values keep their exponent, its units being per √Hz.
       const fv = spectrum ? fy : (v) => si(v, p.t.meta.units);
       const cell = (pt) => (pt ? fv(pt.y) : '—');
@@ -1006,7 +1109,39 @@ export class PlotView {
       const value = v === undefined ? '' : spectrum ? fy(v) : span ? siRange(span.lo, span.hi, u) : si(v, u);
       this.drawTip(ctx, T, hoverLane, near, value, sx(marks.hover), hy);
     }
+    if (!spectrum) this.drawWindow(ctx, T, P, open, frameAt);
+  }
 
+  /**
+   * A time plot's window, on the time axis's right end: a dot, the primary
+   * colour while live and a grey square while paused, and the seconds shown.
+   * It shows while the pointer is on the time axis, unless the history bar
+   * has the axis, and for WINDOW_SHOWN_MS after the window changes.
+   */
+  drawWindow(ctx, T, P, historyOpen, frameAt) {
+    if (this.shownSpan !== this.view.span) {
+      if (this.shownSpan !== undefined) this.windowUntil = frameAt + WINDOW_SHOWN_MS;
+      this.shownSpan = this.view.span;
+    }
+    if (historyOpen || (this.axisHover === null && !(frameAt < this.windowUntil))) return;
+    const text = `${windowText(this.view.span)} s`, H = 16;
+    const w = ctx.measureText(text).width + 22, x = P.x + P.w - w, y = P.y + P.h + 3;
+    ctx.fillStyle = T.tipBg;
+    ctx.fillRect(x, y, w, H);
+    ctx.strokeStyle = T.tipBorder;
+    ctx.strokeRect(x + 0.5, y + 0.5, w - 1, H - 1);
+    if (this.view.live) {
+      ctx.fillStyle = T.live;
+      ctx.beginPath();
+      ctx.arc(x + 9, y + H / 2, 3, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = T.axisText;
+      ctx.fillRect(x + 6, y + H / 2 - 3, 6, 6);
+    }
+    ctx.fillStyle = T.tipText;
+    ctx.textAlign = 'left';
+    ctx.fillText(text, x + 16, y + 12);
   }
 
   /**
@@ -1620,13 +1755,6 @@ const X_LABEL_GAP = 8;
 const AXIS_DROP = 48;
 
 /**
- * The narrowest a time plot's x range goes, and the widest while live, in
- * seconds: as much as the page keeps of the live stream. Paused, a plot reads
- * the hub's history, and goes as wide as all of it.
- */
-const SPAN = [0.002, 120];
-
-/**
  * One time plot's x range: live, trailing the newest samples by `delay`, or
  * paused at `right`. It reads the time from the hub, so it outlives any one
  * hub's session.
@@ -1659,8 +1787,8 @@ export class View {
    * bar's end, or Follow live.
    */
   zoom(factor, anchor, perf, edge = LIVE_EDGE) {
-    const widest = this.live ? SPAN[1] : this.limits ? this.limits[1] - this.limits[0] : Math.max(SPAN[1], this.hub.historySeconds?.(perf) ?? 0);
-    const span = Math.min(widest, Math.max(SPAN[0], this.span * factor));
+    const widest = this.live ? this.liveSeconds() : this.limits ? this.limits[1] - this.limits[0] : Math.max(WINDOW_LIMITS[1], this.hub.historySeconds?.(perf) ?? 0);
+    const span = Math.min(widest, Math.max(WINDOW_LIMITS[0], this.span * factor));
     if (this.live && factor < 1 && anchor < edge) this.pause(perf);
     if (!this.live) {
       // It stays within what has arrived: zooming out past the newest
@@ -1673,12 +1801,24 @@ export class View {
     this.notify();
   }
 
+  /** The widest the view goes while live, in seconds. */
+  liveSeconds() {
+    return this.hub.liveSeconds?.() ?? WINDOW_LIMITS[1];
+  }
+
   /** Keeps a paused view within its limits, the history its plot captured. */
   keepWithin() {
     if (this.live || !this.limits) return;
     const [lo, hi] = this.limits;
-    this.span = Math.min(this.span, Math.max(SPAN[0], hi - lo));
+    this.span = Math.min(this.span, Math.max(WINDOW_LIMITS[0], hi - lo));
     this.right = Math.min(hi, Math.max(lo + this.span, this.right));
+  }
+
+  /** Shows a window of `span` seconds, ending where it ends now, within what a paused view captured. */
+  setSpan(span) {
+    this.span = Math.min(this.live ? this.liveSeconds() : Infinity, Math.max(WINDOW_LIMITS[0], span));
+    this.keepWithin();
+    this.notify();
   }
 
   /** Whether time cursors hold the view where it is. */
@@ -1703,7 +1843,7 @@ export class View {
   /** Shows times [t0, t1], paused, within what it captured and the narrowest span. */
   show(t0, t1, perf) {
     this.pause(perf);
-    this.span = Math.max(SPAN[0], t1 - t0);
+    this.span = Math.max(WINDOW_LIMITS[0], t1 - t0);
     this.right = t0 + this.span;
     this.keepWithin();
     this.notify();

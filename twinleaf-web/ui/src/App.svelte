@@ -20,7 +20,7 @@
   import { Renderer } from './lib/gl.js';
   import { plotIds } from './lib/layout.js';
   import { chip, exportText, importText, loadTabs, newPlot, saveTabs } from './lib/tabs.js';
-  import { ARRANGEMENTS, DECIMATIONS, SPANS } from './lib/constants.js';
+  import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
   import { actionFor } from './lib/keymap.js';
   import { keepsKey, plotKeys } from './lib/keys.js';
   import { api } from './lib/protocol.js';
@@ -46,6 +46,8 @@
   import { leave, navigate, remember } from './lib/focus.js';
   import KeysDialog from './lib/KeysDialog.svelte';
   import ExportDialog from './lib/ExportDialog.svelte';
+  import WindowSlider from './lib/WindowSlider.svelte';
+  import { windowText } from './lib/window.js';
   import RiExport from '@lucide/svelte/icons/file-down';
   import StatusBar from './lib/StatusBar.svelte';
   import HistorySettings from './lib/HistorySettings.svelte';
@@ -154,8 +156,6 @@
   // above the 34 px bar's foot), and a press on another's button opens it.
   const BAR_OFFSET = 7;
   const layoutMenu = pressOutsideKeepsFocus(), fileMenu = pressOutsideKeepsFocus(), settingsMenu = pressOutsideKeepsFocus(), windowMenu = pressOutsideKeepsFocus();
-  /** The step of SPANS nearest window `s`, by ratio, as a zoom leaves it between them. */
-  const spanStep = (s) => SPANS.reduce((best, x, i) => (Math.abs(Math.log(x / s)) < Math.abs(Math.log(SPANS[best] / s)) ? i : best), 0);
   /** Each theme's icon. */
   const THEME_ICONS = { light: RiSun, dark: RiMoon, system: RiSystem };
   /** Each arrangement's picture in the Layout menu. */
@@ -381,10 +381,7 @@
   });
 
   function setSpan(v) {
-    for (const vw of chosen()) {
-      vw.span = +v;
-      vw.notify();
-    }
+    for (const vw of chosen()) vw.setSpan(v);
   }
   function followLive() {
     for (const vw of chosen()) vw.follow();
@@ -438,7 +435,7 @@
     const ranges = plots.filter(([, p]) => p.kind === 'time').map(([id]) => views.of(id).range(now));
     const shown = ranges.length ? [Math.min(...ranges.map((r) => r[0])), Math.max(...ranges.map((r) => r[1]))] : null;
     const oldest = Math.min(...traces.map((t) => session.memory?.oldest?.[t.meta.id] ?? Infinity));
-    exporting = { hub: session.id, traces, shown, whole: [isFinite(oldest) ? oldest : now - 600, now] };
+    exporting = { hub: session.id, traces, shown, whole: [isFinite(oldest) ? oldest : -Infinity, now] };
   }
 
   /**
@@ -677,14 +674,15 @@
         <Tip text="The time window the plots show">
           {#snippet children(tip)}
             <Popover.Trigger {...tip}>
-              {#snippet child({ props })}<Button {...props} size="xs" variant="outline" class="window-button" aria-label="Time window">{span} s<RiChevron /></Button>{/snippet}
+              {#snippet child({ props })}<Button {...props} size="xs" variant="outline" class="window-button" aria-label="Time window">{windowText(span)} s<RiChevron /></Button>{/snippet}
             </Popover.Trigger>
           {/snippet}
         </Tip>
-        <Popover.Content class="window-pop w-72 gap-0 p-3" align="start" sideOffset={BAR_OFFSET} {...windowMenu}>
-          <div class="window-head"><span>Window</span><span class="set-value">{span} s</span></div>
-          <Slider type="single" value={spanStep(span)} min={0} max={SPANS.length - 1} step={1} onValueChange={(i) => setSpan(SPANS[i])} label="Time window" />
-          <div class="window-ticks" aria-hidden="true">{#each SPANS as s}<span>{s}</span>{/each}</div>
+        <Popover.Content class="axis-pop w-auto gap-0 p-1.5" align="start" sideOffset={BAR_OFFSET} {...windowMenu}>
+          <div class="axis-row">
+            <span>Window</span>
+            <WindowSlider value={span} onchange={setSpan} widest={hub.liveSeconds()} />
+          </div>
         </Popover.Content>
       </Popover.Root>
       <IconButton icon={RiEraser} label="Clear the cursors" keys={['Esc']} onclick={() => clearCursors()} />

@@ -3,7 +3,7 @@
 //! window of raw rows and exports them to a file. What each says is in
 //! `protocol`.
 
-use crate::hub::Live;
+use crate::hub::{Ended, Live};
 use crate::protocol::{
     CallRequest, DiscoverRequest, Done, ExportRequest, Frame, HistoryRequest, MountArg,
     MountRequest, PageMessage, PpsRequest, ReadRequest, Refusal, RowsRequest, WindowRequest,
@@ -102,7 +102,9 @@ async fn client(mut socket: WebSocket, live: Arc<Live>) {
     if live.is_retired() {
         return;
     }
-    let (snapshot, mut rx) = live.snapshot();
+    let Ok((snapshot, mut rx)) = live.snapshot().await else {
+        return;
+    };
     if send_all(&mut socket, &snapshot).await.is_err() {
         return;
     }
@@ -112,8 +114,8 @@ async fn client(mut socket: WebSocket, live: Arc<Live>) {
                 Ok(frame) => if send(&mut socket, &frame).await.is_err() { return },
                 Err(broadcast::error::RecvError::Lagged(frames)) => {
                     log::debug!("A page fell {frames} frames behind and is sent a snapshot");
-                    let snapshot;
-                    (snapshot, rx) = live.snapshot();
+                    let Ok((snapshot, again)) = live.snapshot().await else { return };
+                    rx = again;
                     if send_all(&mut socket, &snapshot).await.is_err() { return }
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
@@ -229,15 +231,14 @@ fn layout_of(mut mounts: Vec<MountArg>) -> Result<Option<Layout>, String> {
     Ok((!mounts.is_empty()).then_some(Layout { mounts }))
 }
 
-/// Changes the decimation, off the runtime's threads, as it re-decimates the
-/// history.
+/// Changes the decimation. The history follows once it is decimated anew.
 async fn set_pps(
     State(hubs): State<Hubs>,
     Json(args): Json<PpsRequest>,
 ) -> Result<Response, Refusal> {
     let live = hubs.live().await?;
     let pps = args.pps.clamp(10.0, 100_000.0);
-    blocking(move || live.set_points_per_second(pps)).await?;
+    live.set_points_per_second(pps).await?;
     Ok(Json(PpsRequest { pps }).into_response())
 }
 
@@ -253,7 +254,7 @@ async fn set_history(
     let live = hubs.live().await?;
     let seconds = args.seconds.clamp(HISTORY_SECONDS.0, HISTORY_SECONDS.1);
     let bytes = args.bytes.clamp(HISTORY_BYTES.0, HISTORY_BYTES.1);
-    blocking(move || live.set_history(seconds, bytes as usize)).await?;
+    live.set_history(seconds, bytes as usize).await?;
     Ok(Json(HistoryRequest { seconds, bytes }).into_response())
 }
 
@@ -267,12 +268,12 @@ async fn window(
     if live.id != args.hub {
         return Err(Refusal::new(StatusCode::CONFLICT, "that hub has retired"));
     }
-    let window =
-        blocking(move || live.window(args.id, args.t0, args.t1, args.width.min(8192))).await?;
-    match window {
-        Some(window) => Ok(Json(window).into_response()),
-        None => Err(Refusal::new(StatusCode::NOT_FOUND, "no such trace")),
-    }
+    let gathered = live
+        .gather(args.id, args.t0, args.t1)
+        .await?
+        .ok_or_else(no_such_trace)?;
+    let window = blocking(move || gathered.window(args.width.min(8192))).await?;
+    Ok(Json(window).into_response())
 }
 
 /// Reads every raw row of one trace of the hub the page names in a range, for
@@ -285,16 +286,17 @@ async fn rows(
     if live.id != args.hub {
         return Err(Refusal::new(StatusCode::CONFLICT, "that hub has retired"));
     }
-    let rows = blocking(move || live.rows(args.id, args.t0, args.t1, args.limit)).await?;
-    match rows {
-        Some(rows) => Ok(Json(rows).into_response()),
-        None => Err(Refusal::new(StatusCode::NOT_FOUND, "no such trace")),
-    }
+    let gathered = live
+        .gather(args.id, args.t0, args.t1)
+        .await?
+        .ok_or_else(no_such_trace)?;
+    let rows = blocking(move || gathered.rows(args.limit)).await?;
+    Ok(Json(rows).into_response())
 }
 
 /// The raw rows of traces in a time range, as a file to save: CSV written as
-/// it is sent, or HDF5 written whole to a temporary file first. The hub is
-/// held only while its rows are gathered.
+/// it is sent, or HDF5 written whole to a temporary file first. The hub's
+/// thread only gathers the rows, and the writing happens off it.
 async fn export(
     State(hubs): State<Hubs>,
     Query(args): Query<ExportRequest>,
@@ -310,7 +312,7 @@ async fn export(
         .collect::<Result<_, _>>()
         .map_err(|_| Refusal::new(StatusCode::BAD_REQUEST, "ids are trace numbers"))?;
     let (t0, t1) = (args.t0, args.t1);
-    let traces = blocking(move || live.export(&ids, t0, t1)).await?;
+    let traces = live.export(ids, t0, t1).await?;
     if traces.is_empty() {
         return Err(Refusal::new(StatusCode::NOT_FOUND, "no such trace"));
     }
@@ -400,6 +402,18 @@ impl std::io::Write for Sender {
 }
 
 /// Runs `work` off the runtime's threads.
+/// The refusal of a request that names a trace the hub does not have.
+fn no_such_trace() -> Refusal {
+    Refusal::new(StatusCode::NOT_FOUND, "no such trace")
+}
+
+/// A hub that ended while it was asked refuses as one that has retired.
+impl From<Ended> for Refusal {
+    fn from(_: Ended) -> Refusal {
+        Refusal::new(StatusCode::CONFLICT, "that hub has retired")
+    }
+}
+
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Refusal> {

@@ -46,11 +46,12 @@
   import RiWarn from '@lucide/svelte/icons/triangle-exclamation-point';
   import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
   import Swatch from './Swatch.svelte';
-  import { DRAG_START, KINDS, MODES, SPANS, kindLabel } from './constants.js';
+  import { DRAG_START, KINDS, MODES, kindLabel } from './constants.js';
   import { writeTables } from './copy.js';
   import { toast } from './toast.svelte.js';
   import { actionFor, stepIn } from './keymap.js';
   import { chip } from './tabs.js';
+  import WindowSlider from './WindowSlider.svelte';
 
   let {
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
@@ -274,8 +275,9 @@
     };
   }
 
-  // Whether the plot's view streams, for its play and pause button.
+  // Whether the plot's view streams, for its play and pause button, and its window, for the time axis's slider.
   let streaming = $state(true);
+  let windowSpan = $state(10);
   /** Pauses the plot and the plots linked to it, or has them follow live again. */
   function playPause() {
     const perf = performance.now();
@@ -305,7 +307,8 @@
     });
     sizing.observe(card);
     streaming = view.live;
-    const unwatch = view.onChange(() => (streaming = view.live));
+    windowSpan = view.span;
+    const unwatch = view.onChange(() => ((streaming = view.live), (windowSpan = view.span)));
     return () => {
       clearInterval(poll);
       unwatch();
@@ -398,6 +401,8 @@
   }
   // A signal the plot keeps but does not draw, as a legend hides a series.
   let menuChip = $state(null); // the signal a right-click on its chip opened the menu for
+  let legendMenuOpen = $state(false);
+  let legendKey = $state(null); // the signal a right-click on its legend row opened the legend's menu for
   const toggleHidden = (key) => (plot.items = plot.items.map((i) => (i.key === key ? { ...i, hidden: !i.hidden } : i)));
   // Whether a spectrum draws the signal's noise floor line, which its chip's eye turns on and off.
   const toggleFloor = (key) => (plot.items = plot.items.map((i) => (i.key === key ? { ...i, floorHidden: !i.floorHidden } : i)));
@@ -460,8 +465,14 @@
   const LEGEND_AT = { x: 1, y: 0 };
   /** Where the cursors' readout sits before it is dragged: the top left corner. */
   const READOUT_AT = { x: 0, y: 0 };
-  /** The space between the legend and the plot's edge, in px, as plot.css keeps it. */
-  const LEGEND_INSET = 4;
+  /** The space between the readout and the plot's edge, in px, as plot.css keeps it. */
+  const READOUT_INSET = 4;
+  /**
+   * The space between the legend and the plot area's edges, in px, as
+   * plot.css keeps it: its top clears the LIVE tag, and a monitor's header
+   * while it shows.
+   */
+  const LEGEND_INSET = { side: 8, top: 22, monitorTop: 32 };
   /** How near, in px, a dragged legend or readout comes to an edge or the middle before it snaps there. */
   const LEGEND_SNAP = 12;
   /**
@@ -478,9 +489,15 @@
     e.preventDefault();
     // A menu opened on it stays where it opened, so picking it up closes that.
     readoutOpen = false;
+    legendMenuOpen = false;
     menuOpen = false;
-    const box = body.getBoundingClientRect(), own = e.currentTarget.getBoundingClientRect();
+    const own = e.currentTarget.getBoundingClientRect();
     const [dx, dy] = [e.clientX - own.left, e.clientY - own.top];
+    // The room it moves in, in client px: the legend's within the plot area, the readout's within the body.
+    const b = body.getBoundingClientRect(), P = pv.geo?.plot;
+    const room = place === 'legendAt' && P
+      ? { l: P.x + LEGEND_INSET.side, t: Math.max(P.y + LEGEND_INSET.top, b.top + (monitor ? LEGEND_INSET.monitorTop : 0)), r: P.x + P.w - LEGEND_INSET.side, b: P.y + P.h - LEGEND_INSET.side }
+      : { l: b.left + READOUT_INSET, t: b.top + READOUT_INSET, r: b.right - READOUT_INSET, b: b.bottom - READOUT_INSET };
     const share = (offset, room) => {
       if (room <= 0) return 0;
       const at = Math.min(1, Math.max(0, offset / room));
@@ -488,8 +505,8 @@
     };
     const move = (ev) => {
       plot[place] = {
-        x: share(ev.clientX - dx - box.left - LEGEND_INSET, box.width - 2 * LEGEND_INSET - own.width),
-        y: share(ev.clientY - dy - box.top - LEGEND_INSET, box.height - 2 * LEGEND_INSET - own.height),
+        x: share(ev.clientX - dx - room.l, room.r - room.l - own.width),
+        y: share(ev.clientY - dy - room.t, room.b - room.t - own.height),
       };
     };
     const up = () => {
@@ -550,6 +567,44 @@
   const description = $derived(`${kindLabel(plot.kind, plot.mode)} plot: ${plot.items.map((i) => i.key).join(', ') || 'no signals'}`);
 </script>
 
+<!-- A signal's own menu, on its chip and on its row of the legend: what
+     it shows, how it looks, where it goes. `close` closes the menu it is in. -->
+{#snippet signalMenu(key, close)}
+  {@const item = plot.items.find((i) => i.key === key)}
+  {@const side = slots ? (slots.left.includes(key) ? 'left' : slots.right.includes(key) ? 'right' : 'none') : null}
+  <ContextMenu.Item onSelect={() => showOnly(key)}><RiShowOnly class="menu-icon" />Show only this</ContextMenu.Item>
+  {#if plot.items.some((i) => i.hidden)}
+    <ContextMenu.Item onSelect={showAll}><RiShowOnly class="menu-icon" />Show all</ContextMenu.Item>
+  {/if}
+  <ContextMenu.Item onSelect={() => toggleHidden(key)}>{#if item?.hidden}<RiShowOnly class="menu-icon" />Show{:else}<RiHide class="menu-icon" />Hide{/if}</ContextMenu.Item>
+  <ContextMenu.Separator />
+  <ContextMenu.Sub>
+    <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorFor(key)}"></i></span></ContextMenu.SubTrigger>
+    <ContextMenu.SubContent class="p-1.5"><ColorPicker {key} ondone={close} /></ContextMenu.SubContent>
+  </ContextMenu.Sub>
+  {#if side}
+    <ContextMenu.Sub>
+      <ContextMenu.SubTrigger><RiAxis class="menu-icon" />Axis</ContextMenu.SubTrigger>
+      <ContextMenu.SubContent>
+        <ContextMenu.RadioGroup value={side} onValueChange={(v) => setSide(key, v)}>
+          <ContextMenu.RadioItem value="left">Left</ContextMenu.RadioItem>
+          <ContextMenu.RadioItem value="right">Right</ContextMenu.RadioItem>
+          <ContextMenu.RadioItem value="none">None</ContextMenu.RadioItem>
+        </ContextMenu.RadioGroup>
+      </ContextMenu.SubContent>
+    </ContextMenu.Sub>
+  {/if}
+  <ContextMenu.Sub>
+    <ContextMenu.SubTrigger><RiMove class="menu-icon" />Move to</ContextMenu.SubTrigger>
+    <ContextMenu.SubContent class="max-w-72">
+      <ContextMenu.Item onSelect={() => onMoveSignal?.(key, null)}>New plot</ContextMenu.Item>
+      {#if otherPlots.length}<ContextMenu.Separator />{/if}
+      {#each otherPlots as p (p.id)}<ContextMenu.Item onSelect={() => onMoveSignal?.(key, p.id)}><span class="truncate">{p.label}</span></ContextMenu.Item>{/each}
+    </ContextMenu.SubContent>
+  </ContextMenu.Sub>
+  <ContextMenu.Separator />
+  <ContextMenu.Item variant="destructive" onSelect={() => item && remove(item.id)}><RiTrash class="menu-icon" />Remove<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+{/snippet}
 <div
   class:monitor
   class="plot-card flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border bg-transparent {selected ? 'selected border-primary' : 'border-border'}"
@@ -575,7 +630,8 @@
     <IconButton icon={RiDraggable} label="Drag onto a plot's edge to dock, its middle to swap, or a tab to move" class="grip cursor-grab touch-none text-muted-foreground" tabindex={-1} data-focus-skip onpointerdown={onStartMove} />
     <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} />
     <!-- The plot's signals, each with its value at the hover, or its newest
-         while live. Right-clicking them adds or removes signals. -->
+         while live, unless the legend shows the values. Right-clicking them
+         adds or removes signals. -->
     <ContextMenu.Root bind:open={signalsOpen} onOpenChange={signalsClosed}>
       <ContextMenu.Trigger>
         {#snippet child({ props })}
@@ -612,8 +668,8 @@
                       {#if item.floorHidden}<RiHide />{:else}<RiShowOnly />{/if}
                     </button>{r?.floor ?? ''}
                   </span>
-                {:else}
-                  <!-- Always there, and as wide as the longest value, so a value that comes and goes on hover never moves the header. -->
+                {:else if !plot.legend}
+                  <!-- Always there, and as wide as the longest value, so a value that comes and goes on hover never moves the header. The legend, when shown, holds the values instead. -->
                   <span class="val">{r?.value ?? ''}</span>
                 {/if}
                 <button class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>
@@ -625,41 +681,7 @@
       </ContextMenu.Trigger>
       <ContextMenu.Content class={menuChip ? 'menu-icons' : 'w-64'}>
         {#if menuChip}
-          {@const item = plot.items.find((i) => i.key === menuChip)}
-          {@const side = slots ? (slots.left.includes(menuChip) ? 'left' : slots.right.includes(menuChip) ? 'right' : 'none') : null}
-          <!-- A signal's own menu: what it shows, how it looks, where it goes. -->
-          <ContextMenu.Item onSelect={() => showOnly(menuChip)}><RiShowOnly class="menu-icon" />Show only this</ContextMenu.Item>
-          {#if plot.items.some((i) => i.hidden)}
-            <ContextMenu.Item onSelect={showAll}><RiShowOnly class="menu-icon" />Show all</ContextMenu.Item>
-          {/if}
-          <ContextMenu.Item onSelect={() => toggleHidden(menuChip)}>{#if item?.hidden}<RiShowOnly class="menu-icon" />Show{:else}<RiHide class="menu-icon" />Hide{/if}</ContextMenu.Item>
-          <ContextMenu.Separator />
-          <ContextMenu.Sub>
-            <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorFor(menuChip)}"></i></span></ContextMenu.SubTrigger>
-            <ContextMenu.SubContent class="p-1.5"><ColorPicker key={menuChip} ondone={() => (signalsOpen = false)} /></ContextMenu.SubContent>
-          </ContextMenu.Sub>
-          {#if side}
-            <ContextMenu.Sub>
-              <ContextMenu.SubTrigger><RiAxis class="menu-icon" />Axis</ContextMenu.SubTrigger>
-              <ContextMenu.SubContent>
-                <ContextMenu.RadioGroup value={side} onValueChange={(v) => setSide(menuChip, v)}>
-                  <ContextMenu.RadioItem value="left">Left</ContextMenu.RadioItem>
-                  <ContextMenu.RadioItem value="right">Right</ContextMenu.RadioItem>
-                  <ContextMenu.RadioItem value="none">None</ContextMenu.RadioItem>
-                </ContextMenu.RadioGroup>
-              </ContextMenu.SubContent>
-            </ContextMenu.Sub>
-          {/if}
-          <ContextMenu.Sub>
-            <ContextMenu.SubTrigger><RiMove class="menu-icon" />Move to</ContextMenu.SubTrigger>
-            <ContextMenu.SubContent class="max-w-72">
-              <ContextMenu.Item onSelect={() => onMoveSignal?.(menuChip, null)}>New plot</ContextMenu.Item>
-              {#if otherPlots.length}<ContextMenu.Separator />{/if}
-              {#each otherPlots as p (p.id)}<ContextMenu.Item onSelect={() => onMoveSignal?.(menuChip, p.id)}><span class="truncate">{p.label}</span></ContextMenu.Item>{/each}
-            </ContextMenu.SubContent>
-          </ContextMenu.Sub>
-          <ContextMenu.Separator />
-          <ContextMenu.Item variant="destructive" onSelect={() => item && remove(item.id)}><RiTrash class="menu-icon" />Remove<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+          {@render signalMenu(menuChip, () => (signalsOpen = false))}
         {:else}
         <div class="add-filter">
           <!-- svelte-ignore a11y_autofocus -->
@@ -750,12 +772,9 @@
         {/if}
       </div>
       {#if plot.kind === 'time'}
-        <div class="axis-row" role="group" aria-label="Window, in seconds">
+        <div class="axis-row">
           <span>Window</span>
-          <div class="seg">
-            {#each SPANS as s}<button class:on={view.span === s} aria-pressed={view.span === s} onclick={() => forTargets((v) => ((v.span = s), v.notify()))}>{s}</button>{/each}
-          </div>
-          <span class="unit">s</span>
+          <WindowSlider value={windowSpan} onchange={(s) => forTargets((v) => v.setSpan(s))} widest={hub.liveSeconds()} />
         </div>
       {:else}
         <!-- The range as a phrase, low to high, in Hz, with the fit to every bin beside it. -->
@@ -851,18 +870,34 @@
           <canvas bind:this={overlay}></canvas>
           <div class="axis-anchor" bind:this={axisAnchor} style="left: {axisAt.x}px; top: {axisAt.y}px"></div>
           <!-- The legend: each signal and its value, one short row apiece,
-               no taller than part of the plot, where it was dragged to. -->
+               no taller than part of the plot, where it was dragged to. A
+               row's menu is its chip's. -->
           {#if plot.legend && plot.items.length}
             {@const at = plot.legendAt ?? LEGEND_AT}
-            <div class="pinned-legend" data-focus-skip role="list" aria-label="Legend: drag to move" style="--x: {at.x}; --y: {at.y}" onpointerdown={(e) => dragOverlay(e, 'legendAt')}>
-              {#each shownItems as item (item.id)}
-                <div class="row" role="listitem" style="--c:{colorFor(item.key)}" title={item.key}>
-                  <Swatch key={item.key} /><span class="name">{item.key}</span><span class="val">{legend.rows[item.key]?.value ?? ''}</span><span class="units">{unitsShown(item.key)}</span>
-                  <Tip text="Remove from this plot" keys={['Delete']}>
-                    {#snippet children(tip)}<button {...tip} class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>{/snippet}
-                  </Tip>
-                </div>
-              {/each}
+            <div class="legend-layer" oncontextmenu={(e) => e.stopPropagation()}>
+              <ContextMenu.Root bind:open={legendMenuOpen}>
+                <ContextMenu.Trigger>
+                  {#snippet child({ props })}
+                    <div {...props} class="pinned-legend" data-focus-skip role="list" aria-label="Legend: drag to move" style="--x: {at.x}; --y: {at.y}" onpointerdowncapture={(e) => dragOverlay(e, 'legendAt')} oncontextmenucapture={(e) => (legendKey = e.target.closest?.('.row')?.dataset.key ?? null)}>
+                      {#each shownItems as item (item.id)}
+                        <div class="row" role="listitem" data-key={item.key} style="--c:{colorFor(item.key)}" title={item.key}>
+                          <Swatch key={item.key} /><span class="name">{item.key}</span><span class="val">{legend.rows[item.key]?.value ?? ''}</span><span class="units">{unitsShown(item.key)}</span>
+                          <Tip text="Remove from this plot" keys={['Delete']}>
+                            {#snippet children(tip)}<button {...tip} class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>{/snippet}
+                          </Tip>
+                        </div>
+                      {/each}
+                    </div>
+                  {/snippet}
+                </ContextMenu.Trigger>
+                <ContextMenu.Content class="menu-icons">
+                  {#if legendKey}
+                    {@render signalMenu(legendKey, () => (legendMenuOpen = false))}
+                  {:else}
+                    <ContextMenu.Item onSelect={() => (plot.legend = false)}><RiLegend class="menu-icon" />Hide the legend<ContextMenu.Shortcut><kbd>L</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+                  {/if}
+                </ContextMenu.Content>
+              </ContextMenu.Root>
             </div>
           {/if}
           <!-- The cursors' readout, a scope's: where X1 and X2 are, then each

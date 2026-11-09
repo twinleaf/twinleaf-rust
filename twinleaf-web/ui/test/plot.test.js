@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { Trace } from '../src/lib/session.svelte.js';
-import { axisSlots, blurred, PlotView, rowCounts, timeAxis, View } from '../src/lib/plot.js';
+import { Points, Trace } from '../src/lib/session.svelte.js';
+import { axisSlots, blurred, pickLevel, PlotView, rowCounts, timeAxis, View } from '../src/lib/plot.js';
 
 const meta = { id: 0, route: '/', stream: 'sine', column: 'sine', units: 'V', rate: 1000 };
 
@@ -287,5 +287,41 @@ describe('View.zoom, paused, at the newest samples', () => {
     v.zoom(4, 0.5, 0);
     expect(v.range(0)[1]).toBeCloseTo(1000);
     expect(v.span).toBe(40);
+  });
+});
+
+describe('the level a plot draws', () => {
+  // Levels 4 apart over 0 to 100 s, level k a point every 10·4^k ms, as
+  // FPCS levels of one signal give about.
+  const levels = (from = [0, 0, 0]) =>
+    from.map((start, k) => {
+      const l = new Points(1e9), dt = 0.01 * 4 ** k;
+      const xs = [];
+      for (let x = start; x <= 100; x += dt) xs.push(x);
+      l.push(xs, xs.map(() => 0), false);
+      return l;
+    });
+  // A plot 100 px wide wants 400 points from a level; the next level up
+  // gives that at 16 s, and 1.25 times it at 20 s.
+  const at = (ls, span, was) => pickLevel(ls, 100 - span, 100, 100, was);
+
+  it('draws the coarsest level with enough points a pixel', () => {
+    const ls = levels();
+    expect(at(ls, 10, 0)).toBe(0);
+    expect(at(ls, 21, 0)).toBe(1);
+    expect(at(ls, 90, 0)).toBe(2);
+  });
+
+  it('holds the level it drew within the band', () => {
+    const ls = levels();
+    expect(at(ls, 18, 0)).toBe(0);
+    expect(at(ls, 18, 1)).toBe(1);
+    expect(at(ls, 15, 1)).toBe(0);
+  });
+
+  it('gives way to a coarser level when the finer one does not reach back', () => {
+    const ls = levels([95, 0, 0]);
+    expect(at(ls, 4, 0)).toBe(0);
+    expect(at(ls, 8, 0)).toBe(1);
   });
 });

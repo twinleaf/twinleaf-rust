@@ -3,9 +3,19 @@
 //!
 //! Every batch goes into one [`Buffer`], which keeps the newest raw rows of
 //! each stream. Each trace, one float column, is a set of
-//! [`ColumnProcessor`]s over that buffer. `Fpcs` decimates it for the live
-//! view, and `Welch` estimates its spectrum. A window read gives the raw rows
-//! between two times, for a paused view zoomed in.
+//! [`ColumnProcessor`]s over that buffer. `FpcsLevels` decimates it for the
+//! live view at several ratios, each LEVEL_FACTOR times the last, none kept
+//! longer than the raw history, and `Welch` estimates its spectrum. Every
+//! level goes to every page, which draws each plot from the level that suits
+//! its span. A window read gives the raw rows between two times, for a
+//! paused view zoomed in.
+//!
+//! The hub lives on a thread of its own, which alone touches it. Batches of
+//! samples and the pages' requests come to it as mail, in the order sent,
+//! and a request's answer goes back on a channel of its own. What takes long
+//! is done elsewhere: a read takes the rows it needs, which share the
+//! buffer's chunks, and copies them off the thread, and a change of
+//! decimation replays a frozen copy of the buffer on a thread of its own.
 //!
 //! A run lasts across lost samples, and [`Run::boundaries`] says where they
 //! fell. The hub splits the points it sends there, so the page lifts the pen.
@@ -23,17 +33,24 @@ use crate::wire::{encode, encode_spectra, split_at_breaks, Chunk, Spectrum};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
-use twinleaf::data::ops::{Fpcs, Welch};
+use twinleaf::data::ops::{Fpcs, FpcsLevels, Welch};
 use twinleaf::data::{Buffer, ColumnArray, ColumnKey, ColumnOp, ColumnProcessor, Run, StreamKey};
 use twinleaf::proxy::Layout;
 use twinleaf::{ColumnId, Connection, DeviceRoute, DeviceTree, RecvError, SampleBatch};
 
-/// How much decimated history the hub keeps for the live view, as the page
-/// does.
+/// How much of the finest decimation the hub keeps for the live view, as
+/// the page does. Each coarser level keeps LEVEL_FACTOR times as much.
 const HISTORY_SECONDS: f64 = 120.0;
+/// How many times longer each level's windows are than the level before.
+const LEVEL_FACTOR: usize = 4;
+/// How many levels of decimation each trace has. The coarsest keeps
+/// HISTORY_SECONDS·LEVEL_FACTOR⁵, about 34 hours, when the raw history is
+/// that long.
+const LEVELS: usize = 6;
 /// The raw history the hub starts with: this span of each stream's time, and
 /// at most this many bytes across every stream.
 const RAW_SECONDS: f64 = 600.0;
@@ -46,6 +63,8 @@ const FLUSH: Duration = Duration::from_millis(16);
 const SPECTRUM_EVERY: Duration = Duration::from_millis(100);
 /// How often the hub says what its buffer holds.
 const MEMORY_EVERY: Duration = Duration::from_secs(1);
+/// How long a job may hold the hub's thread before the log says so.
+const SLOW_JOB: Duration = Duration::from_millis(50);
 /// Samples per Welch estimate, at most.
 const WELCH_WINDOW: usize = 16384;
 /// The decimation a hub starts with, in points per second per trace.
@@ -63,10 +82,10 @@ fn signal_name(info: &TraceInfo) -> String {
 struct Trace {
     info: TraceInfo,
     key: ColumnKey,
-    live: ColumnProcessor<Fpcs>,
+    live: ColumnProcessor<FpcsLevels>,
     spectrum: ColumnProcessor<Welch>,
-    /// Time of the last decimated point sent.
-    last_sent: f64,
+    /// Time of the last point sent of each level.
+    last_sent: Vec<f64>,
     /// The stream generation the last points came from. A new one is a new run.
     generation: Option<u32>,
 }
@@ -94,6 +113,15 @@ pub(crate) struct Hub {
     /// What the last `memory` message said, rounded as the page shows it.
     memory_sent: Option<(u64, u64, i64, i64, i64, i64)>,
     feed: Arc<Feed>,
+    /// The seconds of each stream's time the raw history keeps, which no
+    /// level of the decimation keeps longer.
+    history_seconds: f64,
+    /// The hub's own mailbox, which the replay of a change of decimation
+    /// posts its result to. A hub without one, as in a test, replays at once.
+    mailbox: Option<mpsc::Sender<Mail>>,
+    /// The number of the newest change of decimation, so the replay of an
+    /// older one is dropped.
+    decimation: u64,
 }
 
 /// A hub fed by its connection to the proxy, and the devices that connection
@@ -103,7 +131,8 @@ pub(crate) struct Live {
     /// hears another's snapshot, and a window request names the hub its
     /// trace id is of.
     pub(crate) id: String,
-    hub: Arc<Mutex<Hub>>,
+    /// The hub's thread, which alone holds the hub.
+    mailbox: mpsc::Sender<Mail>,
     pub(crate) devices: Arc<Devices>,
     /// The tree the connection sees, which the page's calls go through.
     pub(crate) tree: DeviceTree,
@@ -126,10 +155,27 @@ impl End {
     }
 }
 
+/// The hub's thread has ended, so it answers nothing more.
+#[derive(Debug)]
+pub(crate) struct Ended;
+
+/// What the hub's thread is sent: the next batch of samples or why they
+/// ended, or a job to run with the hub.
+enum Mail {
+    Samples(Result<SampleBatch, RecvError>),
+    Job(Job),
+}
+
+/// Work for the hub's thread, named for the log when it runs long.
+struct Job {
+    name: &'static str,
+    run: Box<dyn FnOnce(&mut Hub) + Send>,
+}
+
 impl Live {
     /// Opens `layout`, or the proxy's default for `None`, and starts the
-    /// thread that feeds the hub and the watchers of its devices on
-    /// `runtime`. Blocks until the proxy has opened it.
+    /// hub's thread, the thread that takes its samples and the watchers of
+    /// its devices on `runtime`. Blocks until the proxy has opened it.
     pub(crate) fn start(
         layout: Option<&Layout>,
         runtime: &tokio::runtime::Handle,
@@ -139,7 +185,9 @@ impl Live {
             None => Connection::connect()?,
         };
         let tree = connection.tree(DeviceRoute::root());
-        let hub = Hub::new();
+        let (mailbox, mail) = mpsc::channel();
+        let mut hub = Hub::new();
+        hub.mailbox = Some(mailbox.clone());
         let devices = Devices::new(hub.feed.clone());
         let mounts = layout.map(|layout| {
             layout
@@ -153,16 +201,16 @@ impl Live {
                 .collect()
         });
         crate::devices::watch(&connection, mounts, devices.clone(), runtime);
-        let hub = Arc::new(Mutex::new(hub));
         let end = End {
             connection: connection.clone(),
             retired: Arc::new(watch::channel(false).0),
         };
-        let (feeding, ending) = (hub.clone(), end.clone());
+        take_samples(&connection, mailbox.clone())?;
+        let ending = end.clone();
         std::thread::Builder::new()
             .name("twinleaf-web hub".to_string())
             .spawn(move || {
-                feed(&feeding, &ending.connection);
+                run(hub, &mail);
                 ending.retire();
             })?;
         let id = std::time::SystemTime::now()
@@ -170,12 +218,35 @@ impl Live {
             .map_or(0, |since| since.as_nanos() as u64);
         Ok(Live {
             id: id.to_string(),
-            hub,
+            mailbox,
             devices,
             tree,
             next_page: AtomicU64::new(0),
             end,
         })
+    }
+
+    /// Runs `work` with the hub on its thread, after what was sent before it.
+    fn tell(&self, name: &'static str, work: impl FnOnce(&mut Hub) + Send + 'static) {
+        // A hub whose thread has ended drops the job, as it has no use for it.
+        let _ = self.mailbox.send(Mail::Job(Job {
+            name,
+            run: Box::new(work),
+        }));
+    }
+
+    /// Runs `work` with the hub on its thread, after what was sent before it,
+    /// and returns what it gives.
+    async fn ask<T: Send + 'static>(
+        &self,
+        name: &'static str,
+        work: impl FnOnce(&mut Hub) -> T + Send + 'static,
+    ) -> Result<T, Ended> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.tell(name, move |hub| {
+            let _ = reply.send(work(hub));
+        });
+        answer.await.map_err(|_| Ended)
     }
 
     /// A page that connected to this hub, whose spectra go once it does.
@@ -187,33 +258,41 @@ impl Live {
     }
 
     /// Sets the raw history the hub keeps: `seconds` of each stream's time,
-    /// in at most `bytes` across every stream.
-    pub(crate) fn set_history(&self, seconds: f64, bytes: usize) {
-        self.hub.lock().unwrap().set_history(seconds, bytes);
+    /// in at most `bytes` across every stream. No level of the decimation
+    /// keeps more than `seconds` either.
+    pub(crate) async fn set_history(&self, seconds: f64, bytes: usize) -> Result<(), Ended> {
+        self.ask("set history", move |hub| hub.set_history(seconds, bytes))
+            .await
     }
 
-    /// Changes the decimation every page shares, re-decimating the history.
-    /// It blocks while it works.
-    pub(crate) fn set_points_per_second(&self, pps: f64) {
-        self.hub.lock().unwrap().set_points_per_second(pps);
+    /// Changes the decimation every page shares. The history is decimated
+    /// anew off the hub's thread, and goes to every page once it is.
+    pub(crate) async fn set_points_per_second(&self, pps: f64) -> Result<(), Ended> {
+        self.ask("set decimation", move |hub| hub.set_points_per_second(pps))
+            .await
     }
 
-    /// The raw rows of trace `id` within [t0, t1], as [`Hub::window`] reads
-    /// them. It blocks while it works.
-    pub(crate) fn window(&self, id: u16, t0: f64, t1: f64, width: usize) -> Option<Window> {
-        self.hub.lock().unwrap().window(id, t0, t1, width)
-    }
-
-    /// Every raw row of trace `id` within [t0, t1], as [`Hub::rows`] reads
-    /// them. It blocks while it works.
-    pub(crate) fn rows(&self, id: u16, t0: f64, t1: f64, limit: usize) -> Option<Rows> {
-        self.hub.lock().unwrap().rows(id, t0, t1, limit)
+    /// The raw rows of trace `id` within [t0, t1], to read off the hub's
+    /// thread, or `None` for no such trace.
+    pub(crate) async fn gather(
+        &self,
+        id: u16,
+        t0: f64,
+        t1: f64,
+    ) -> Result<Option<Gathered>, Ended> {
+        self.ask("gather", move |hub| hub.gather(id, t0, t1)).await
     }
 
     /// Every raw row of traces `ids` within [t0, t1], to export, as
-    /// [`Hub::export`] gathers them. It blocks only while it gathers.
-    pub(crate) fn export(&self, ids: &[u16], t0: f64, t1: f64) -> Vec<ExportTrace> {
-        self.hub.lock().unwrap().export(ids, t0, t1)
+    /// [`Hub::export`] gathers them.
+    pub(crate) async fn export(
+        &self,
+        ids: Vec<u16>,
+        t0: f64,
+        t1: f64,
+    ) -> Result<Vec<ExportTrace>, Ended> {
+        self.ask("export", move |hub| hub.export(&ids, t0, t1))
+            .await
     }
 
     /// Whether the hub has ended, so another must take its place.
@@ -232,16 +311,19 @@ impl Live {
     }
 
     /// What a page needs to show this hub from scratch, and the receiver of
-    /// everything sent after it. Both are taken under the hub's lock, so no
-    /// point is missed or doubled. The devices' messages each replace the
+    /// everything sent after it. The hub's thread takes both in one job, so
+    /// no point is missed or doubled. The devices' messages each replace the
     /// last of their kind, so one heard twice does no harm, and they are
     /// taken after subscribing.
-    pub(crate) fn snapshot(&self) -> (Vec<Frame>, broadcast::Receiver<Arc<Frame>>) {
-        let (hub, seq, rx) = {
-            let hub = self.hub.lock().unwrap();
-            let (seq, rx) = hub.feed.subscribe();
-            (hub.snapshot(), seq, rx)
-        };
+    pub(crate) async fn snapshot(
+        &self,
+    ) -> Result<(Vec<Frame>, broadcast::Receiver<Arc<Frame>>), Ended> {
+        let (hub, seq, rx) = self
+            .ask("snapshot", |hub| {
+                let (seq, rx) = hub.feed.subscribe();
+                (hub.snapshot(), seq, rx)
+            })
+            .await?;
         let mut frames = vec![Message::Hub {
             id: self.id.clone(),
             seq,
@@ -249,7 +331,7 @@ impl Live {
         .frame()];
         frames.extend(hub);
         frames.extend(self.devices.snapshot());
-        (frames, rx)
+        Ok((frames, rx))
     }
 }
 
@@ -262,13 +344,16 @@ pub(crate) struct Page {
 impl Page {
     /// Shows the page the spectra of `traces`, in place of those it showed.
     pub(crate) fn show_spectra(&self, traces: BTreeSet<u16>) {
-        self.live.hub.lock().unwrap().show_spectra(self.id, traces);
+        let id = self.id;
+        self.live
+            .tell("show spectra", move |hub| hub.show_spectra(id, traces));
     }
 
     /// Holds the history as it is now while `on`, for the page's paused
     /// plots, or lets it go.
     pub(crate) fn hold(&self, on: bool) {
-        self.live.hub.lock().unwrap().hold(self.id, on);
+        let id = self.id;
+        self.live.tell("hold", move |hub| hub.hold(id, on));
     }
 }
 
@@ -279,35 +364,75 @@ impl Drop for Page {
     }
 }
 
-/// Feeds `hub` the samples of `connection` until they end.
-fn feed(hub: &Mutex<Hub>, connection: &Connection) {
+/// Starts the thread that takes each batch of `connection`'s samples as it
+/// comes and posts it to the hub's thread. The connection queues 1024
+/// batches and drops those that come while it is full, so taking them never
+/// waits on the hub. A busy hub delays the samples and loses none.
+fn take_samples(connection: &Connection, mailbox: mpsc::Sender<Mail>) -> std::io::Result<()> {
     let samples = connection.samples();
+    std::thread::Builder::new()
+        .name("twinleaf-web samples".to_string())
+        .spawn(move || loop {
+            let next = samples.recv();
+            if let Err(RecvError::Lagged(lost)) = next {
+                log::warn!("The web page lost {lost} batches of samples");
+                continue;
+            }
+            let ended = next.is_err();
+            if mailbox.send(Mail::Samples(next)).is_err() || ended {
+                return;
+            }
+        })?;
+    Ok(())
+}
+
+/// Runs the hub until its samples end: each batch and job in the order they
+/// come, and every FLUSH, SPECTRUM_EVERY and MEMORY_EVERY the new points,
+/// the spectra and what the buffer holds. Only this thread touches the hub,
+/// and whatever it does delays everything after it, so each job must be
+/// short. One that is not is logged.
+fn run(mut hub: Hub, mail: &mpsc::Receiver<Mail>) {
     let mut last_flush = Instant::now();
     let mut last_spectrum = Instant::now();
     let mut last_memory = Instant::now();
     loop {
-        match samples.recv_timeout(Duration::from_millis(5)) {
-            Ok(batch) => hub.lock().unwrap().ingest(&batch),
-            Err(RecvError::Timeout) | Err(RecvError::Lagged(_)) => {}
-            Err(error) => {
+        match mail.recv_timeout(Duration::from_millis(5)) {
+            Ok(Mail::Samples(Ok(batch))) => timed("ingest", || hub.ingest(&batch)),
+            Ok(Mail::Samples(Err(error))) => {
                 log::warn!("The web page's samples ended: {error}");
                 return;
             }
+            Ok(Mail::Job(job)) => timed(job.name, || (job.run)(&mut hub)),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
         }
         // Each period runs from the start of the last work, so the work's own
         // time does not stretch it.
         if last_flush.elapsed() >= FLUSH {
             last_flush = Instant::now();
-            hub.lock().unwrap().flush();
+            timed("flush", || hub.flush());
         }
         if last_spectrum.elapsed() >= SPECTRUM_EVERY {
             last_spectrum = Instant::now();
-            hub.lock().unwrap().spectra();
+            timed("spectra", || hub.spectra());
         }
         if last_memory.elapsed() >= MEMORY_EVERY {
             last_memory = Instant::now();
-            hub.lock().unwrap().send_memory();
+            timed("memory", || hub.send_memory());
         }
+    }
+}
+
+/// Runs `work` on the hub's thread, and logs it when it takes longer than
+/// SLOW_JOB.
+fn timed(name: &str, work: impl FnOnce()) {
+    let start = Instant::now();
+    work();
+    let took = start.elapsed();
+    if took >= SLOW_JOB {
+        log::warn!(
+            "The web page's hub spent {took:?} on {name}, which held up everything after it"
+        );
     }
 }
 
@@ -338,7 +463,22 @@ impl Hub {
             budget: Some(RAW_BYTES),
             memory_sent: None,
             feed: Feed::new(),
+            history_seconds: RAW_SECONDS,
+            mailbox: None,
+            decimation: 0,
         }
+    }
+
+    /// The levels a trace of `rate` is decimated to, at the hub's decimation.
+    fn levels_for(&self, rate: f64) -> FpcsLevels {
+        let mut levels = FpcsLevels::new(
+            ratio_for(rate, self.points_per_second),
+            LEVEL_FACTOR,
+            LEVELS,
+            HISTORY_SECONDS,
+        );
+        levels.set_retention(HISTORY_SECONDS, self.history_seconds);
+        levels
     }
 
     fn ingest(&mut self, batch: &SampleBatch) {
@@ -379,7 +519,7 @@ impl Hub {
                 epoch: epoch.clone(),
             };
             let window = ((rate * 8.0) as usize).clamp(256, WELCH_WINDOW);
-            let decimation = Fpcs::new(ratio_for(rate, self.points_per_second), HISTORY_SECONDS);
+            let decimation = self.levels_for(rate);
             self.feed.message(&Message::Trace {
                 trace: info.clone(),
             });
@@ -389,14 +529,14 @@ impl Hub {
                 key,
                 live: ColumnProcessor::new(key, decimation),
                 spectrum: ColumnProcessor::new(key, Welch::new(window, rate)),
-                last_sent: f64::NEG_INFINITY,
+                last_sent: vec![f64::NEG_INFINITY; LEVELS],
                 generation: None,
             });
         }
     }
 
     /// Catches each trace's decimator up with the buffer and sends the new
-    /// points.
+    /// points of every level.
     fn flush(&mut self) {
         let mut chunks = Vec::new();
         for trace in &mut self.traces {
@@ -406,24 +546,33 @@ impl Hub {
             let generation = run.generations().stream;
             let new_run = trace.generation.is_some_and(|g| g != generation);
             trace.generation = Some(generation);
-            let out = trace.live.catch_up(&self.buffer);
-            if new_run {
-                // The processor replayed a new run, whose times may start over.
-                trace.last_sent = f64::NEG_INFINITY;
-            }
-            let start = out.partition_point(|&(t, _)| t <= trace.last_sent);
-            if start == out.len() {
-                continue;
-            }
-            let breaks = gap_times(self.buffer.run(&trace.key.stream_key()));
-            let mut split = split_at_breaks(trace.info.id, trace.last_sent, &out[start..], &breaks);
-            if new_run {
-                if let Some(first) = split.first_mut() {
-                    first.brk = true;
+            let breaks = gap_times(Some(run));
+            let levels = trace.live.catch_up(&self.buffer);
+            for (level, (fpcs, last_sent)) in levels.iter().zip(&mut trace.last_sent).enumerate() {
+                if new_run {
+                    // The processor replayed a new run, whose times may start over.
+                    *last_sent = f64::NEG_INFINITY;
                 }
+                let out = fpcs.output();
+                let start = out.partition_point(|&(t, _)| t <= *last_sent);
+                if start == out.len() {
+                    continue;
+                }
+                let mut split = split_at_breaks(
+                    trace.info.id,
+                    level as u8,
+                    *last_sent,
+                    &out[start..],
+                    &breaks,
+                );
+                if new_run {
+                    if let Some(first) = split.first_mut() {
+                        first.brk = true;
+                    }
+                }
+                *last_sent = out.last().unwrap().0;
+                chunks.extend(split);
             }
-            trace.last_sent = out.last().unwrap().0;
-            chunks.extend(split);
         }
         if !chunks.is_empty() {
             self.feed.binary(|seq| encode(&chunks, seq));
@@ -465,17 +614,35 @@ impl Hub {
     fn history(&self) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         for trace in &self.traces {
-            let out = trace.live.output();
-            let end = out.partition_point(|&(t, _)| t <= trace.last_sent);
             let breaks = gap_times(self.buffer.run(&trace.key.stream_key()));
-            chunks.extend(split_at_breaks(
-                trace.info.id,
-                f64::NEG_INFINITY,
-                &out[..end],
-                &breaks,
-            ));
+            for (level, (fpcs, &last_sent)) in
+                trace.live.output().iter().zip(&trace.last_sent).enumerate()
+            {
+                let out = fpcs.output();
+                let end = out.partition_point(|&(t, _)| t <= last_sent);
+                chunks.extend(split_at_breaks(
+                    trace.info.id,
+                    level as u8,
+                    f64::NEG_INFINITY,
+                    &out[..end],
+                    &breaks,
+                ));
+            }
         }
         chunks
+    }
+
+    /// The decimation as the page hears it: points per second per trace, and
+    /// the seconds each level keeps.
+    fn config(&self) -> Message {
+        Message::Config {
+            pps: self.points_per_second,
+            levels: (0..LEVELS)
+                .map(|k| {
+                    (HISTORY_SECONDS * LEVEL_FACTOR.pow(k as u32) as f64).min(self.history_seconds)
+                })
+                .collect(),
+        }
     }
 
     /// The hub's part of a page's snapshot, its traces and their history.
@@ -494,12 +661,7 @@ impl Hub {
         if !chunks.is_empty() {
             frames.push(Frame::Binary(encode(&chunks, 0)));
         }
-        frames.push(
-            Message::Config {
-                pps: self.points_per_second,
-            }
-            .frame(),
-        );
+        frames.push(self.config().frame());
         frames.push(self.memory().frame());
         frames
     }
@@ -614,8 +776,14 @@ impl Hub {
     }
 
     /// Sets the raw history the buffer keeps, dropping what no longer fits
-    /// at once, and tells every page.
+    /// at once, and the most each level of the decimation keeps, and tells
+    /// every page.
     fn set_history(&mut self, seconds: f64, bytes: usize) {
+        self.history_seconds = seconds;
+        for trace in &mut self.traces {
+            trace.live.op_mut().set_retention(HISTORY_SECONDS, seconds);
+        }
+        self.feed.message(&self.config());
         self.buffer.set_max_age(Some(seconds));
         self.budget = Some(bytes);
         let held_budget = self.held_budget();
@@ -657,60 +825,97 @@ impl Hub {
         }
     }
 
-    /// Changes the decimation and re-decimates every raw row the buffer keeps.
+    /// Changes the decimation. Each trace's levels are decimated anew from
+    /// every raw row the buffer keeps, which takes long, so with a mailbox
+    /// that runs on a thread of its own over a frozen copy of the buffer, and
+    /// posts the new levels back. Until then the old levels go on. A trace
+    /// that comes in the meantime is decimated anew from the start.
     fn set_points_per_second(&mut self, pps: f64) {
         self.points_per_second = pps;
-        for trace in &mut self.traces {
-            trace
-                .live
-                .op_mut()
-                .set_ratio(ratio_for(trace.info.rate, pps));
-            trace.live.invalidate();
-            trace.live.catch_up(&self.buffer);
-            trace.last_sent = trace
-                .live
-                .output()
-                .last()
-                .map_or(f64::NEG_INFINITY, |p| p.0);
+        self.decimation += 1;
+        let decimation = self.decimation;
+        let frozen = self.buffer.frozen();
+        let fresh: Vec<ColumnProcessor<FpcsLevels>> = self
+            .traces
+            .iter()
+            .map(|trace| ColumnProcessor::new(trace.key, self.levels_for(trace.info.rate)))
+            .collect();
+        let replay = move || -> Vec<ColumnProcessor<FpcsLevels>> {
+            fresh
+                .into_iter()
+                .map(|mut levels| {
+                    levels.catch_up(&frozen);
+                    levels
+                })
+                .collect()
+        };
+        let Some(mailbox) = self.mailbox.clone() else {
+            let levels = replay();
+            return self.decimated(decimation, levels);
+        };
+        let replaying = std::thread::Builder::new()
+            .name("twinleaf-web decimation".to_string())
+            .spawn(move || {
+                let levels = replay();
+                let _ = mailbox.send(Mail::Job(Job {
+                    name: "decimated",
+                    run: Box::new(move |hub| hub.decimated(decimation, levels)),
+                }));
+            });
+        if let Err(error) = replaying {
+            log::warn!("The web page's hub could not decimate anew: {error}");
+        }
+    }
+
+    /// Puts `levels`, decimated anew for change `decimation`, in place of
+    /// each trace's, caught up with the rows that came since, and sends every
+    /// page the history again. A replay a later change overtook is dropped.
+    fn decimated(&mut self, decimation: u64, levels: Vec<ColumnProcessor<FpcsLevels>>) {
+        if decimation != self.decimation {
+            return;
+        }
+        for (trace, mut live) in self.traces.iter_mut().zip(levels) {
+            for (fpcs, last_sent) in live.catch_up(&self.buffer).iter().zip(&mut trace.last_sent) {
+                *last_sent = fpcs.output().last().map_or(f64::NEG_INFINITY, |p| p.0);
+            }
+            trace.live = live;
         }
         self.feed.message(&Message::Clear);
         let chunks = self.history();
         if !chunks.is_empty() {
             self.feed.binary(|seq| encode(&chunks, seq));
         }
-        self.feed.message(&Message::Config { pps });
+        self.feed.message(&self.config());
     }
 
-    /// Every raw row of trace `id` within [t0, t1], none decimated, from the
-    /// history held for paused plots where the buffer no longer reaches; or,
-    /// when there are more than `limit`, only how many. With them, the
-    /// oldest time the history still holds of the trace.
-    fn rows(&self, id: u16, t0: f64, t1: f64, limit: usize) -> Option<Rows> {
+    /// The raw rows of trace `id` within [t0, t1], from the history held for
+    /// paused plots where the buffer no longer reaches, to read once the hub
+    /// is released. The batches share the history's chunks, so gathering
+    /// them copies no rows.
+    fn gather(&self, id: u16, t0: f64, t1: f64) -> Option<Gathered> {
         let trace = self.traces.get(id as usize)?;
         let key = trace.key.stream_key();
         self.buffer.run(&key)?;
-        let spans = self.spans(&key, t0, t1);
-        let count = spans
-            .iter()
-            .map(|(_, rows)| (rows.end - rows.start) as usize)
-            .sum();
-        let oldest = self.oldest(&key);
-        let (mut x, mut y) = (Vec::new(), Vec::new());
-        if count <= limit {
-            for (run, rows) in spans {
-                for batch in run.rows(rows) {
-                    if let Some(values) = batch.column(trace.key.column_id) {
-                        x.extend_from_slice(batch.timestamps());
-                        y.extend(values.to_f64().iter());
-                    }
-                }
-            }
-        }
-        Some(Rows {
-            count,
-            oldest,
-            x,
-            y,
+        let spans = self
+            .spans(&key, t0, t1)
+            .into_iter()
+            .map(|(run, rows)| GatheredSpan {
+                start: rows.start,
+                len: rows.end - rows.start,
+                gaps: run
+                    .boundaries()
+                    .map(|(row, _, _)| row)
+                    .filter(|row| rows.contains(row))
+                    .collect(),
+                batches: run.rows(rows),
+            })
+            .collect();
+        Some(Gathered {
+            t0,
+            t1,
+            column: trace.key.column_id,
+            oldest: self.oldest(&key),
+            spans,
         })
     }
 
@@ -738,33 +943,75 @@ impl Hub {
             })
             .collect()
     }
+}
 
-    /// The raw rows of trace `id` within [t0, t1], decimated to about two
-    /// points per pixel only when there are more than that.
-    fn window(&self, id: u16, t0: f64, t1: f64, width: usize) -> Option<Window> {
-        let trace = self.traces.get(id as usize)?;
-        let key = trace.key.stream_key();
-        self.buffer.run(&key)?;
-        // The raw rows, the held history's then the buffer's, split at each
-        // run's gaps.
+/// The raw rows of one trace within [t0, t1], gathered on the hub's thread
+/// and read off it. Reading copies every row and may decimate them, which
+/// would hold up the samples behind it.
+pub(crate) struct Gathered {
+    t0: f64,
+    t1: f64,
+    column: ColumnId,
+    /// The oldest time the history holds of the trace.
+    oldest: Option<f64>,
+    /// The held history's rows, then the buffer's.
+    spans: Vec<GatheredSpan>,
+}
+
+/// The rows of one run within a [`Gathered`] range.
+struct GatheredSpan {
+    /// The run's row number of the first row.
+    start: u64,
+    len: u64,
+    /// The row numbers, in order, at which the run's samples were lost.
+    gaps: Vec<u64>,
+    batches: Vec<SampleBatch>,
+}
+
+impl Gathered {
+    /// Every row, none decimated; or, when there are more than `limit`, only
+    /// how many. With them, the oldest time the history still holds of the
+    /// trace.
+    pub(crate) fn rows(self, limit: usize) -> Rows {
+        let count = self.spans.iter().map(|span| span.len as usize).sum();
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        if count <= limit {
+            for batch in self.spans.iter().flat_map(|span| &span.batches) {
+                if let Some(values) = batch.column(self.column) {
+                    x.extend_from_slice(batch.timestamps());
+                    y.extend(values.to_f64().iter());
+                }
+            }
+        }
+        Rows {
+            count,
+            oldest: self.oldest,
+            x,
+            y,
+        }
+    }
+
+    /// The rows split at each gap, decimated to about two points per pixel
+    /// of `width` only when there are more than that.
+    pub(crate) fn window(self, width: usize) -> Window {
         let mut segments: Vec<Vec<(f64, f64)>> = vec![Vec::new()];
         let mut raw: usize = 0;
-        for (run, rows) in self.spans(&key, t0, t1) {
-            raw += (rows.end - rows.start) as usize;
+        for span in &self.spans {
+            raw += span.len as usize;
             // Where the held history ends and the buffer begins may be a hole,
             // so a new span is a new segment, which the page draws apart.
             if !segments.last().unwrap().is_empty() {
                 segments.push(Vec::new());
             }
-            let gaps: Vec<u64> = run.boundaries().map(|(row, _, _)| row).collect();
-            let mut row = rows.start;
-            for batch in run.rows(rows) {
-                let Some(values) = batch.column(trace.key.column_id) else {
+            let mut row = span.start;
+            for batch in &span.batches {
+                let Some(values) = batch.column(self.column) else {
                     row += batch.timestamps().len() as u64;
                     continue;
                 };
                 for (&t, &v) in batch.timestamps().iter().zip(values.to_f64().iter()) {
-                    if gaps.binary_search(&row).is_ok() && !segments.last().unwrap().is_empty() {
+                    if span.gaps.binary_search(&row).is_ok() && !segments.last().unwrap().is_empty()
+                    {
                         segments.push(Vec::new());
                     }
                     segments.last_mut().unwrap().push((t, v));
@@ -789,12 +1036,12 @@ impl Hub {
                 }
             })
             .collect();
-        Some(Window {
-            t0,
-            t1,
+        Window {
+            t0: self.t0,
+            t1: self.t1,
             ratio,
             chunks,
-        })
+        }
     }
 }
 
@@ -900,9 +1147,11 @@ mod tests {
         chunks
     }
 
-    fn points(chunks: &[Chunk]) -> Vec<(f64, f32)> {
+    /// The points of level `level` in `chunks`, in order.
+    fn points(chunks: &[Chunk], level: u8) -> Vec<(f64, f32)> {
         chunks
             .iter()
+            .filter(|c| c.level == level)
             .flat_map(|c| c.points.iter().copied())
             .collect()
     }
@@ -921,7 +1170,8 @@ mod tests {
             hub.ingest(&batch);
         }
         let first = |hub: &Hub| {
-            hub.window(0, 0.0, 1.0, 8192)
+            hub.gather(0, 0.0, 1.0)
+                .map(|g| g.window(8192))
                 .and_then(|w| w.chunks.first().map(|c| c.x[0]))
         };
         assert!(
@@ -950,7 +1200,10 @@ mod tests {
             hub.ingest(&batch);
         }
         // Rows 0..4000 stand at 0.01..40 s; all of them, each once.
-        let rows = hub.rows(0, 0.0, 40.0, usize::MAX).unwrap();
+        let rows = hub
+            .gather(0, 0.0, 40.0)
+            .map(|g| g.rows(usize::MAX))
+            .unwrap();
         let mut seen = rows.y.clone();
         seen.dedup();
         assert_eq!(seen.len(), rows.y.len(), "no row twice");
@@ -980,12 +1233,12 @@ mod tests {
             hub.ingest(&batch);
         }
         // At 100 Hz, row n stands at (n + 1) / 100 s.
-        let rows = hub.rows(0, 1.0, 2.0, 1000).unwrap();
+        let rows = hub.gather(0, 1.0, 2.0).map(|g| g.rows(1000)).unwrap();
         assert_eq!(rows.count, 101);
         assert_eq!(rows.y.first(), Some(&99.0));
         assert_eq!(rows.x.len(), 101);
         assert_eq!(rows.oldest, Some(0.01));
-        let over = hub.rows(0, 1.0, 2.0, 100).unwrap();
+        let over = hub.gather(0, 1.0, 2.0).map(|g| g.rows(100)).unwrap();
         assert_eq!((over.count, over.x.len()), (101, 0));
     }
 
@@ -1043,8 +1296,8 @@ mod tests {
             }
             hub.flush();
         }
-        let sent = points(&heard(&mut rx));
-        assert!(!sent.is_empty());
+        let sent = heard(&mut rx);
+        assert!(!points(&sent, 0).is_empty());
         let snapshot: Vec<Chunk> = hub
             .snapshot()
             .iter()
@@ -1054,15 +1307,21 @@ mod tests {
             })
             .flatten()
             .collect();
-        assert_eq!(points(&snapshot), sent);
+        for level in 0..LEVELS as u8 {
+            assert_eq!(
+                points(&snapshot, level),
+                points(&sent, level),
+                "level {level}"
+            );
+        }
         // What comes after the snapshot starts where it ends.
         let mut later = hub.feed.subscribe().1;
         for batch in samples(&mut parser, 2000, 100) {
             hub.ingest(&batch);
         }
         hub.flush();
-        let next = points(&heard(&mut later));
-        assert!(next.first().unwrap().0 > sent.last().unwrap().0);
+        let next = points(&heard(&mut later), 0);
+        assert!(next.first().unwrap().0 > points(&sent, 0).last().unwrap().0);
     }
 
     #[test]
@@ -1105,6 +1364,116 @@ mod tests {
         assert_eq!(kinds, ["clear", "points", "config"]);
     }
 
+    /// The type of each message `rx` heard, "points" for a binary frame.
+    fn kinds(rx: &mut broadcast::Receiver<Arc<Frame>>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|frame| match &*frame {
+                Frame::Text(text) => serde_json::from_str::<serde_json::Value>(text).unwrap()
+                    ["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                Frame::Binary(_) => "points".to_string(),
+            })
+            .collect()
+    }
+
+    /// The job a hub with a mailbox posted to it, run with the hub.
+    fn run_posted(hub: &mut Hub, mail: &mpsc::Receiver<Mail>) -> &'static str {
+        match mail.recv_timeout(Duration::from_secs(10)) {
+            Ok(Mail::Job(job)) => {
+                (job.run)(hub);
+                job.name
+            }
+            _ => panic!("no job was posted"),
+        }
+    }
+
+    /// With a mailbox, a new decimation is replayed off the hub's thread.
+    /// The samples that come meanwhile are decimated at the old one, and the
+    /// new levels take them in when they arrive.
+    #[test]
+    fn a_new_decimation_is_replayed_off_the_hubs_thread() {
+        let mut hub = Hub::new();
+        let (mailbox, mail) = mpsc::channel();
+        hub.mailbox = Some(mailbox);
+        let mut parser = parser();
+        for batch in samples(&mut parser, 0, 1000) {
+            hub.ingest(&batch);
+        }
+        hub.flush();
+        let mut rx = hub.feed.subscribe().1;
+        hub.set_points_per_second(10.0);
+        assert!(
+            kinds(&mut rx).is_empty(),
+            "the old levels go on until the new arrive"
+        );
+        for batch in samples(&mut parser, 1000, 500) {
+            hub.ingest(&batch);
+        }
+        let newest = hub
+            .buffer
+            .run(&hub.traces[0].key.stream_key())
+            .unwrap()
+            .last_timestamp();
+        assert_eq!(run_posted(&mut hub, &mail), "decimated");
+        assert_eq!(kinds(&mut rx), ["clear", "points", "config"]);
+        let finest = &hub.traces[0].live.output()[0];
+        assert_eq!(finest.ratio(), ratio_for(hub.traces[0].info.rate, 10.0));
+        let last = finest.output().last().unwrap().0;
+        assert!(
+            newest.is_some_and(|newest| newest - last < 1.0),
+            "the new levels took in what came meanwhile"
+        );
+    }
+
+    /// A replay that a later change of decimation overtook is dropped.
+    #[test]
+    fn an_overtaken_decimation_is_dropped() {
+        let mut hub = Hub::new();
+        let (mailbox, mail) = mpsc::channel();
+        hub.mailbox = Some(mailbox);
+        let mut parser = parser();
+        for batch in samples(&mut parser, 0, 1000) {
+            hub.ingest(&batch);
+        }
+        let mut rx = hub.feed.subscribe().1;
+        hub.set_points_per_second(10.0);
+        hub.set_points_per_second(20.0);
+        run_posted(&mut hub, &mail);
+        run_posted(&mut hub, &mail);
+        assert_eq!(kinds(&mut rx), ["clear", "points", "config"]);
+        let finest = &hub.traces[0].live.output()[0];
+        assert_eq!(finest.ratio(), ratio_for(hub.traces[0].info.rate, 20.0));
+    }
+
+    /// No level keeps more than the raw history, and the page hears so.
+    #[test]
+    fn the_raw_history_caps_every_level() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        for batch in samples(&mut parser, 0, 100) {
+            hub.ingest(&batch);
+        }
+        let mut rx = hub.feed.subscribe().1;
+        hub.set_history(600.0, RAW_BYTES);
+        let kept: Vec<f64> = hub.traces[0]
+            .live
+            .output()
+            .iter()
+            .map(Fpcs::retention_seconds)
+            .collect();
+        assert_eq!(kept, [120.0, 480.0, 600.0, 600.0, 600.0, 600.0]);
+        let Frame::Text(text) = &*rx.try_recv().unwrap() else {
+            panic!("the config is text")
+        };
+        let config: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            config["levels"],
+            serde_json::json!([120.0, 480.0, 600.0, 600.0, 600.0, 600.0])
+        );
+    }
+
     #[test]
     fn only_a_spectrum_some_page_shows_is_sent() {
         let mut hub = Hub::new();
@@ -1139,7 +1508,7 @@ mod tests {
         {
             hub.ingest(&batch);
         }
-        let window = hub.window(0, -1e9, 1e9, 10_000).unwrap();
+        let window = hub.gather(0, -1e9, 1e9).map(|g| g.window(10_000)).unwrap();
         assert_eq!(window.chunks.len(), 2);
     }
 
@@ -1150,9 +1519,49 @@ mod tests {
         for batch in samples(&mut parser, 0, 1000) {
             hub.ingest(&batch);
         }
-        let window = hub.window(0, 1.0, 2.0, 1000).unwrap();
+        let window = hub.gather(0, 1.0, 2.0).map(|g| g.window(1000)).unwrap();
         assert_eq!(window.ratio, 1);
         assert!(window.chunks[0].x.len() >= 100);
-        assert!(hub.window(1, 1.0, 2.0, 1000).is_none());
+        assert!(hub.gather(1, 1.0, 2.0).map(|g| g.window(1000)).is_none());
+    }
+
+    /// Every level of a trace goes out, each coarser one with about a
+    /// LEVEL_FACTOR of the points of the one before.
+    #[test]
+    fn every_level_goes_out() {
+        let mut hub = Hub::new();
+        let mut rx = hub.feed.subscribe().1;
+        let mut parser = parser();
+        for batch in samples(&mut parser, 0, 20_000) {
+            hub.ingest(&batch);
+        }
+        hub.flush();
+        let sent = heard(&mut rx);
+        let counts: Vec<usize> = (0..3).map(|level| points(&sent, level).len()).collect();
+        for pair in counts.windows(2) {
+            let ratio = pair[0] as f64 / pair[1] as f64;
+            assert!((3.0..5.0).contains(&ratio), "{counts:?}");
+        }
+    }
+
+    /// A read gathered from the hub gives the rows it gathered, though the
+    /// hub takes more samples and drops its oldest before the read is done.
+    #[test]
+    fn a_gathered_read_keeps_what_it_gathered() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        for batch in samples(&mut parser, 0, 1000) {
+            hub.ingest(&batch);
+        }
+        let gathered = hub.gather(0, -1e9, 1e9).unwrap();
+        hub.set_history(1.0, RAW_BYTES);
+        for batch in samples(&mut parser, 1000, 2000) {
+            hub.ingest(&batch);
+        }
+        let now = hub.gather(0, -1e9, 1e9).unwrap().rows(usize::MAX);
+        assert!(now.x[0] > 0.0, "the hub still holds its first row");
+        let rows = gathered.rows(usize::MAX);
+        assert_eq!(rows.count, 1000);
+        assert_eq!(rows.y, (0..1000).map(f64::from).collect::<Vec<_>>());
     }
 }

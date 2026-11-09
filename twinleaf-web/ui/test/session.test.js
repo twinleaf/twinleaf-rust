@@ -13,9 +13,10 @@ function pointsFrame(seq, chunks) {
   dv.setBigUint64(8, BigInt(seq), true);
   dv.setUint16(16, chunks.length, true);
   let off = 18;
-  for (const [id, brk, xs, ys] of chunks) {
+  for (const [id, brk, xs, ys, level = 0] of chunks) {
     dv.setUint16(off, id, true);
     dv.setUint8(off + 2, brk ? 1 : 0);
+    dv.setUint8(off + 3, level);
     dv.setUint32(off + 4, xs.length, true);
     off += 8;
     xs.forEach((x, i) => dv.setFloat64(off + i * 8, x, true));
@@ -101,6 +102,62 @@ describe('a session', () => {
     expect(s.apply(decodeFrame(pointsFrame(0, [[0, false, [1, 2], [5, 6]]])))).toBe(true);
     expect(s.byKey.get('sine.a').length).toBe(2);
     expect(s.latest).toBe(2);
+  });
+
+  it('runs its clock evenly however late the batches arrive', () => {
+    const s = new Session('h');
+    s.text({ type: 'trace', trace: meta(0, '/', 'sine', 'a') });
+    // A batch every 16.7 or 33.3 ms, each up to 10 ms late, ticked at 240 Hz.
+    let seed = 1;
+    const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    const FRAME = 1000 / 240, DEVICE = 100;
+    let next = 0, sent = 0;
+    const frames = [];
+    for (let perf = 0; perf < 6000; perf += FRAME) {
+      while (next <= perf) {
+        const upTo = (next - 5) / 1000 + DEVICE;
+        s.apply(decodeFrame(pointsFrame(0, [[0, false, [upTo], [0]]])), next + rand() * 10);
+        sent++;
+        next += rand() < 0.3 ? 33.3 : 16.7;
+      }
+      s.tick(perf);
+      frames.push([perf, s.now(perf)]);
+    }
+    expect(sent).toBeGreaterThan(200);
+    // After the first second the clock advances one device second each page second, within the slew.
+    const steady = frames.filter(([perf]) => perf > 1000);
+    for (let i = 1; i < steady.length; i++) {
+      const rate = (steady[i][1] - steady[i - 1][1]) / ((steady[i][0] - steady[i - 1][0]) / 1000);
+      expect(Math.abs(rate - 1)).toBeLessThanOrEqual(0.005 + 1e-9);
+    }
+    // It trails the newest point by about the least delay a batch arrived with.
+    const [perf, now] = steady.at(-1);
+    expect(perf / 1000 + DEVICE - now).toBeGreaterThan(0.004);
+    expect(perf / 1000 + DEVICE - now).toBeLessThan(0.02);
+  });
+
+  it('sets its clock at once when the device time jumps', () => {
+    const s = new Session('h');
+    s.text({ type: 'trace', trace: meta(0, '/', 'sine', 'a') });
+    s.apply(decodeFrame(pointsFrame(0, [[0, false, [10], [0]]])), 0);
+    s.tick(0);
+    expect(s.now(0)).toBe(10);
+    s.apply(decodeFrame(pointsFrame(0, [[0, false, [50], [0]]])), 100);
+    s.tick(100);
+    expect(s.now(100)).toBe(50);
+  });
+
+  it('keeps each level of a trace apart, each for as long as the hub says', () => {
+    const s = new Session('h');
+    s.text({ type: 'trace', trace: meta(0, '/', 'sine', 'a') });
+    s.text({ type: 'config', pps: 500, levels: [10, 40, 160] });
+    s.apply(decodeFrame(pointsFrame(0, [[0, false, [0, 30, 60], [1, 2, 3]], [0, false, [0, 60], [1, 3], 2]])));
+    const t = s.byKey.get('sine.a');
+    expect(t.levels.length).toBe(3);
+    expect([t.length, t.levels[1].length, t.levels[2].length]).toEqual([1, 0, 2]);
+    expect(t.levels[2].keep).toBe(160);
+    t.clear();
+    expect(t.levels.every((l) => l.length === 0)).toBe(true);
   });
 
   it('calls a point of a trace it never heard of a gap', () => {

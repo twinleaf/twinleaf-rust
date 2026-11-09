@@ -40,7 +40,8 @@ export function signalKey(trace) {
 
 /**
  * Decodes one binary frame, change `seq` or 0 in a snapshot: points, as
- * {kind: 'points', seq, chunks: [{id, brk, xs, ys}]}, where `brk` lifts the
+ * {kind: 'points', seq, chunks: [{id, level, brk, xs, ys}]}, where `level` is
+ * the decimation the points are of, 0 the finest, and `brk` lifts the
  * pen before the chunk's first point, or the spectra of a round, as
  * {kind: 'spectra', seq, spectra: [{id, f, a, floor}]}, a floor null when
  * there is none.
@@ -56,6 +57,7 @@ export function decodeFrame(buf) {
     for (let c = 0; c < count; c++) {
       const id = dv.getUint16(off, true);
       const brk = dv.getUint8(off + 2) === 1;
+      const level = dv.getUint8(off + 3);
       const n = dv.getUint32(off + 4, true);
       off += 8;
       const xs = new Float64Array(n), ys = new Float32Array(n);
@@ -63,7 +65,7 @@ export function decodeFrame(buf) {
       off += n * 8;
       for (let i = 0; i < n; i++) ys[i] = dv.getFloat32(off + i * 4, true);
       off += n * 4;
-      chunks.push({ id, brk, xs, ys });
+      chunks.push({ id, level, brk, xs, ys });
     }
     return { kind: 'points', seq, chunks };
   }
