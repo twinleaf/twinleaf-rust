@@ -786,7 +786,7 @@
         focused={ws.focusedId === id}
         selected={ws.selected.has(id)}
         onSelect={(shift, clicks) => select(id, shift, clicks)}
-        maximized={ws.maximized === id}
+        maximized={!!ws.maximized?.includes(id)}
         onFocus={(e) => {
           // Focus moved here from the keyboard selects the plot, as a click on it does.
           if (e && focusedByKeyboard(e.target)) pressOn(id);
@@ -810,11 +810,16 @@
         targetIds={(keys) => targetIdsOf(id, keys)}
         onStartMove={(e) => drags.startMove(id, e)}
         onSplit={(dir, keys) => {
-          const p = newPlot('time', 'overlay', []);
-          history.group('Split', () => ws.addPlot(p, id, dir));
-          if (keys) focusPlot(p.id);
+          // Each plot it acts on gets an empty plot beside it, and the new plots are selected, to fill next.
+          const ids = targetIdsOf(id, keys), made = ids.map(() => newPlot('time', 'overlay', []));
+          history.group(ids.length > 1 ? `Split ${plotsText(ids.length)}` : 'Split', () => ids.forEach((at, i) => ws.addPlot(made[i], at, dir)));
+          ws.selected.clear();
+          for (const p of made) ws.selected.add(p.id);
+          if (keys) focusPlot(made[0].id);
+          else ws.focusedId = made[0].id;
+          refreshToolbar();
         }}
-        onMaximize={() => (ws.maximized = ws.maximized === id ? null : id)}
+        onMaximize={(keys) => (ws.maximized = ws.maximized?.includes(id) ? null : targetIdsOf(id, keys))}
         onMoveToTab={(tabId) => {
           const ids = targetIdsOf(id);
           history.group(`Move ${plotsText(ids.length)} to ${ws.tabs.find((t) => t.id === tabId)?.name ?? 'a tab'}`, () => {

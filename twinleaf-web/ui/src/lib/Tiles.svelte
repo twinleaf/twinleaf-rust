@@ -7,21 +7,24 @@
   //
   // While a gap is dragged the tiles show the layout with that split at the
   // pointer's ratio; letting go gives the ratio to `onResize(path, ratio)`.
-  import { GUTTER, gutters, plotIds, rects, setRatio } from './layout.js';
+  import { GUTTER, gutters, plotIds, rects, restrict, setRatio } from './layout.js';
   import Separator from './Separator.svelte';
 
   /**
    * layout: the tree. leafContent: a snippet that renders one plot by id.
    * drop: where a dragged signal would go, {plotId, edge}. maximized: the
-   * plot that fills the box. lifted, landed: the plots being moved, and
-   * those that just landed, as Sets.
+   * plots that fill the box, laid out among themselves as the layout has
+   * them, or null. lifted, landed: the plots being moved, and those that
+   * just landed, as Sets.
    */
   let { layout, leafContent, drop, maximized, lifted, landed, onResize } = $props();
 
   let box;
   /** The split being dragged and the ratio under the pointer, {path, ratio}, or null. */
   let live = $state(null);
-  const shown = $derived(live ? setRatio(layout, live.path, live.ratio) : layout);
+  const max = $derived(maximized ? new Set(maximized) : null);
+  const dragged = $derived(live ? setRatio(layout, live.path, live.ratio) : layout);
+  const shown = $derived(max ? restrict(dragged, max) : dragged);
 
   const UNIT = { x: 0, y: 0, w: 1, h: 1 }, NONE = { x: 0, y: 0, w: 0, h: 0 };
   const num = (v) => +v.toFixed(6);
@@ -47,7 +50,7 @@
 
 <div class="tile-box" bind:this={box} style="--gutter: {GUTTER}px">
   {#each plotIds(layout) as id (id)}
-    <div class="leaf" class:max={maximized === id} class:lifted={lifted?.has(id)} class:landed={landed?.has(id)} data-plot={id} style={maximized === id ? '' : tiles.get(id)}>
+    <div class="leaf" class:max={max?.has(id)} class:lifted={lifted?.has(id)} class:landed={landed?.has(id)} data-plot={id} style={tiles.get(id) ?? ''}>
       {@render leafContent(id)}
       {#if drop?.plotId === id}
         <div class="drop-hint {drop.edge}"></div>

@@ -112,7 +112,7 @@ describe('Escape', () => {
     const page = await mountPage(KEYS, 'columns');
     try {
       const [a, b] = plotIds(page.ws.layout);
-      page.ws.maximized = a;
+      page.ws.maximized = [a];
       page.ws.selected.add(a);
       page.ws.selected.add(b);
       page.ws.focusedId = a;
@@ -122,7 +122,7 @@ describe('Escape', () => {
       flushSync();
       expect(page.ws.selected.size).toBe(0);
       expect(page.ws.focusedId).toBe(null);
-      expect(page.ws.maximized).toBe(a);
+      expect(page.ws.maximized).toEqual([a]);
     } finally {
       page.dispose();
     }

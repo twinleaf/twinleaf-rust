@@ -224,7 +224,7 @@ export class Drags {
       const lands = drop && target && ws.activeId === lifted.tabId && ws.tab.layout === lifted.tree;
       // What is put down nowhere leaves the tab as it was, its plot maximized again.
       if (!lands) {
-        if (ws.activeId === lifted.tabId && ws.maximized === null && ws.plots[lifted.maximized]) ws.maximized = lifted.maximized;
+        if (ws.activeId === lifted.tabId && ws.maximized === null && lifted.maximized?.every((id) => ws.plots[id])) ws.maximized = lifted.maximized;
         return;
       }
       // The drop is one step: where the plots land, and the size the plot

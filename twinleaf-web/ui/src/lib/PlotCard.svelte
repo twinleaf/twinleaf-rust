@@ -240,8 +240,9 @@
     const has = new Set(plot.items.map((i) => i.key)), f = signalFilter.trim().toLowerCase();
     return session.signals.filter((t) => !has.has(t.key) && t.key.toLowerCase().includes(f));
   });
+  /** Adds signal `key` to each plot a command here acts on that does not show it. */
   function addSignal(key) {
-    if (!plot.items.some((i) => i.key === key)) onEdit(`Add ${key}`, { items: [...plot.items, chip(key)] });
+    onEach(`Add ${key}`, (p) => (p.items.some((i) => i.key === key) ? null : { items: [...p.items, chip(key)] }));
   }
   function filterKey(e) {
     // Escape and Tab go on to the menu, which closes; every other key stays here.
@@ -589,7 +590,7 @@
       kind: openKind,
       splitRight: () => onSplit('row', true),
       splitDown: () => onSplit('col', true),
-      maximize: onMaximize,
+      maximize: () => onMaximize(true),
       close: () => onRemove(true),
       fitY: () => eachPv((p) => p.autoscale(), true),
       legend: () => toggleLegend(true),
@@ -677,7 +678,7 @@
   <!-- The header picks the plot up from anywhere empty, as a title bar does. -->
   <div
     class="plot-head flex h-7 shrink-0 cursor-grab items-center gap-1.5 border-b bg-card px-1.5"
-    ondblclick={(e) => empty(e) && onMaximize()}
+    ondblclick={(e) => empty(e) && onMaximize(false)}
     onpointerdown={(e) => !e.shiftKey && empty(e) && onStartMove(e)}
     role="toolbar"
     tabindex="-1"
@@ -807,7 +808,7 @@
       />
       <IconButton icon={RiSplitH} label="Split right" keys={['|']} class="split" tabindex={-1} onclick={() => onSplit('row')} />
       <IconButton icon={RiSplitV} label="Split down" keys={['−']} class="split" tabindex={-1} onclick={() => onSplit('col')} />
-      <IconButton icon={maximized ? RiFullscreenExit : RiFullscreen} label={maximized ? 'Restore' : 'Maximize'} keys={['F']} class="maximize" tabindex={-1} onclick={onMaximize} />
+      <IconButton icon={maximized ? RiFullscreenExit : RiFullscreen} label={maximized ? 'Restore' : 'Maximize'} keys={['F']} class="maximize" tabindex={-1} onclick={() => onMaximize(false)} />
       <IconButton icon={RiClose} label="Close plot" keys={['Delete']} tabindex={-1} onclick={() => onRemove()} />
     </div>
   </div>
@@ -1080,7 +1081,7 @@
       <ContextMenu.Label class="menu-group">Arrange</ContextMenu.Label>
       <ContextMenu.Item onSelect={() => onSplit('row')}><RiSplitH class="menu-icon" />Split right<ContextMenu.Shortcut><kbd>|</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Item onSelect={() => onSplit('col')}><RiSplitV class="menu-icon" />Split down<ContextMenu.Shortcut><kbd>_</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-      <ContextMenu.Item onSelect={onMaximize}>{#if maximized}<RiFullscreenExit class="menu-icon" />Restore{:else}<RiFullscreen class="menu-icon" />Maximize{/if}<ContextMenu.Shortcut><kbd>F</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => onMaximize(false)}>{#if maximized}<RiFullscreenExit class="menu-icon" />Restore{:else}<RiFullscreen class="menu-icon" />Maximize{/if}<ContextMenu.Shortcut><kbd>F</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Sub>
         <ContextMenu.SubTrigger disabled={!otherTabs.length}><RiTab class="menu-icon" />Move to tab</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>

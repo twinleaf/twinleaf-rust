@@ -55,7 +55,7 @@ function run(s, { ws, history }) {
   const before = stateOf(ws);
   if (s.t === 'split' && id) history.group('Split', () => ws.addPlot(newPlot('time', 'overlay', []), id, s.dir));
   else if (s.t === 'close' && id) history.group('Close', () => ws.closePlot(id));
-  else if (s.t === 'maximize' && id) ws.maximized = ws.maximized === id ? null : id;
+  else if (s.t === 'maximize' && id) ws.maximized = ws.maximized?.includes(id) ? null : [id];
   else if (s.t === 'click' && id) ws.focusedId = id;
   else if (s.t === 'select' && id) ws.selected.add(id);
   else if (s.t === 'arrange') history.group('Arrange', () => ws.arrange(s.name));
@@ -90,9 +90,9 @@ describe('after any run of edits, undos and redos', () => {
   it('the selection holds only plots of the open tab', () =>
     always((ws, ids) => [...ws.selected].every((i) => ids.has(i)), [{ t: 'select', at: 0 }, { t: 'reset' }]),
   );
-  it('the maximized plot is one of the open tab, or none', () =>
+  it('the maximized plots are of the open tab, or there are none', () =>
     always(
-      (ws, ids) => ws.maximized === null || ids.has(ws.maximized),
+      (ws, ids) => ws.maximized === null || (ws.maximized.length > 0 && ws.maximized.every((i) => ids.has(i))),
       [{ t: 'split', at: 0, dir: 'row' }, { t: 'maximize', at: 1 }, { t: 'undo' }],
     ),
   );

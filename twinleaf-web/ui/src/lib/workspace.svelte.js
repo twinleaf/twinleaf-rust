@@ -32,8 +32,8 @@ export class Workspace {
   layout = $derived(this.tab.layout);
   /** The plot clicked or focused last, in the open tab. */
   focusedId = $state(null);
-  /** The plot that fills the tab, or null. */
-  maximized = $state(null);
+  /** The plots that fill the tab, as an array of ids, or null. */
+  maximized = $state.raw(null);
   /** The plots selected in the open tab, by id. */
   selected = new SvelteSet();
   /** The plot last focused in each tab, for coming back to it. */
@@ -66,7 +66,10 @@ export class Workspace {
   #prune() {
     const plots = this.tab?.plots ?? {};
     for (const id of [...this.selected]) if (!plots[id]) this.selected.delete(id);
-    if (this.maximized !== null && !plots[this.maximized]) this.maximized = null;
+    if (this.maximized?.some((id) => !plots[id])) {
+      const kept = this.maximized.filter((id) => plots[id]);
+      this.maximized = kept.length ? kept : null;
+    }
     if (this.focusedId !== null && !plots[this.focusedId]) this.focusedId = null;
   }
   /** The open tab replaced by `fn(tab)`. */
@@ -171,7 +174,6 @@ export class Workspace {
       }),
     );
     this.selected.delete(plotId);
-    if (this.maximized === plotId) this.maximized = null;
   }
 
   /** Adds plot `p` to the open tab, beside plot `where` along `dir`, or else at the end, and focuses it. */
@@ -235,7 +237,6 @@ export class Workspace {
       const { [id]: _, ...plots } = t.plots;
       return { ...t, plots, layout: removePlot(t.layout, id) };
     });
-    if (this.maximized === id) this.maximized = null;
     this.selected.delete(id);
   }
 
