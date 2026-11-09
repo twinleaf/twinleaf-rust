@@ -39,7 +39,9 @@
   import DragOverlay from './lib/DragOverlay.svelte';
   import FocusRing from './lib/FocusRing.svelte';
   import Toasts from './lib/Toasts.svelte';
-  import { toast } from './lib/toast.svelte.js';
+  import { noticeOf, toast } from './lib/toast.svelte.js';
+  import { DeviceWrites } from './lib/writes.svelte.js';
+  import WriteNotice from './lib/WriteNotice.svelte';
   import { MAX_COPY_ROWS, blockTable, lostSeconds, writeTables } from './lib/copy.js';
   import { timeAxis } from './lib/plot.js';
   import { leave, navigate, remember } from './lib/focus.js';
@@ -90,6 +92,18 @@
   selection.changed = () => refreshToolbar();
   const drags = new Drags(ws, refreshToolbar, history);
   setContext('selection', selection);
+  // What the panels write to devices and run on them, and its notices
+  // (writes.svelte.js). No device write is an undo step, and Revert writes
+  // only to the devices checked in the Devices panel.
+  const writes = new DeviceWrites(hub, {
+    open: () => writeNotice.open(),
+    close: () => writeNotice.close(),
+    report: (level, text, detail) => toast[level](text, [], detail),
+  }, { checked: (route) => !unchecked.has(route) });
+  const writeNotice = noticeOf('device-write', WriteNotice, { writes }, () => writes.closed());
+  // The notice of device writes, whose Revert writes through this page, goes with it.
+  onMount(() => () => writeNotice.close());
+  setContext('writes', writes);
   drags.closePlot = (id) => closePlot(id);
   drags.axisDropAt = (plotId, x, y) => [...registry].find((pv) => pv.plotId === plotId)?.axisDropAt(x, y) ?? null;
   /** The PlotViews on the page, which the frame loop draws. */

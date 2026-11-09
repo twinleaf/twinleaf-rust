@@ -7,14 +7,13 @@
   // A panel of actions alone is a row of buttons instead, each running its
   // action on every checked device that has it.
   //
-  // A cell shows the device's announced value, or one read on request for an
-  // entry no announcement keeps. A value written shows from the call until
-  // the device announces anew, so an announcement older than the write never
-  // steps the cell back. A row whose
+  // A cell shows the device's value as the page's DeviceWrites has it
+  // (writes.svelte.js): announced, read on request for an entry no
+  // announcement keeps, or written and not yet announced anew. A row whose
   // devices' values differ, a known value beside an unknown one included,
   // is marked ≠. Writing sends one value to every checked device that has
-  // the entry writable, each encoded by that device's own type, and shows
-  // each device's outcome in its cell.
+  // the entry writable, each encoded by that device's own type, shows each
+  // device's outcome in its cell, and a notice that offers Revert.
   //
   // Rows are picked as a sheet's are, to copy: a click picks one, Shift a
   // run from the last clicked, Ctrl or ⌘ adds or drops one; Shift with the
@@ -26,10 +25,8 @@
   // Up to MAX_COLUMNS devices get a column each; more share one column,
   // which shows the value they agree on or how many values they differ in.
   // Each cell reads its own device's value, so one device's change redraws
-  // only its cells. The caches here are of one hub, as the parent remounts
-  // this for each session.
-  import { getContext, tick } from 'svelte';
-  import { SvelteMap } from 'svelte/reactivity';
+  // only its cells.
+  import { getContext, tick, untrack } from 'svelte';
   import { getCoreRowModel } from '@tanstack/table-core';
   import { createSvelteTable, FlexRender, renderSnippet } from '$lib/components/ui/data-table/index.js';
   import * as Table from '$lib/components/ui/table/index.js';
@@ -37,11 +34,11 @@
   import { Button } from '$lib/components/ui/button/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
   import Tip from './Tip.svelte';
-  import { api } from './protocol.js';
   import { sameValue } from './session.svelte.js';
   import { controlOf, deviceLabel, isButtons, isFavorites, mergeRows, panelRows, writersOf } from './properties.js';
   import { writeTables } from './copy.js';
   import { toast } from './toast.svelte.js';
+  import * as words from './words.js';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import RiStar from '@lucide/svelte/icons/star';
   import RiCopy from '@lucide/svelte/icons/clipboard-copy';
@@ -54,8 +51,6 @@
    */
   let { devices, channels = undefined, panel = 'properties' } = $props();
 
-  /** How long a cell shows that a write took, in ms. */
-  const OK_MS = 1500;
   /** The rows PageUp and PageDown move by. */
   const PAGE = 10;
   /** The most devices that get a column each. */
@@ -71,22 +66,11 @@
   const grouped = $derived(!channels || channels.length > 1 || starredOnly);
   const buttons = $derived(isButtons(channels));
 
-  // Values read on request, each device's outcome of the last call of a
-  // name, and the values written, by route and name. A written value is
-  // {value, over, inFlight}: `over` the announced value it replaces.
-  const reads = new SvelteMap();
-  const outcomes = new SvelteMap();
-  const written = new SvelteMap();
-  const key = (route, name) => `${route}\u0000${name}`;
-
-  /** The value shown for `name` on device `d`, or undefined when none is known. */
-  function valueOf(d, name) {
-    const k = key(d.route, name);
-    const announced = d.values.get(name);
-    const w = written.get(k);
-    if (w && (w.inFlight || sameValue(announced, w.over))) return w.value;
-    return announced !== undefined ? announced : reads.get(k);
-  }
+  // The page's writes to devices: each value shown, each device's outcome
+  // of its last call, and the notices.
+  const writes = getContext('writes');
+  const valueOf = (d, name) => writes.valueOf(d, name);
+  const outcomeOf = (d, name) => writes.outcomeOf(d.route, name);
   const show = (v) => (v === undefined ? '' : v === null ? '·' : String(v));
   /** Whether the devices that have `row` disagree, a known value beside an unknown one included. */
   function mixed(row) {
@@ -97,9 +81,9 @@
   const shared = (row) => (mixed(row) ? undefined : valueOf(devices.find((d) => row.entries.has(d.route)) ?? { route: '', values: new Map() }, row.name));
 
   /** The devices whose last call of `row` failed, or may have. */
-  const failures = (row) => devices.filter((d) => ['error', 'refused', 'unknown'].includes(outcomes.get(key(d.route, row.name))?.state));
-  const failureText = (row) => failures(row).map((d) => `${d.route}: ${outcomes.get(key(d.route, row.name))?.error ?? 'unknown'}`).join('; ');
-  const busy = (row) => devices.some((d) => outcomes.get(key(d.route, row.name))?.state === 'busy');
+  const failures = (row) => devices.filter((d) => ['error', 'refused', 'unknown'].includes(outcomeOf(d, row.name)?.state));
+  const failureText = (row) => failures(row).map((d) => `${words.device(d)}: ${words.outcome(outcomeOf(d, row.name).state, outcomeOf(d, row.name).error)}`).join('; ');
+  const busy = (row) => devices.some((d) => outcomeOf(d, row.name)?.state === 'busy');
 
   /** How many values the devices that have `row` differ in, an unknown one included. */
   function variety(row) {
@@ -152,53 +136,14 @@
     if (!row || row.name === lastRow) return;
     lastRow = row.name;
     draft = show(shared(row));
-    readMissing(row);
+    // Announcements keep only some entries: the rest are read.
+    untrack(() => writes.readMissing(row.name, devices.filter((d) => row.entries.get(d.route)?.readable)));
   });
 
-  /** Reads `row` from each device that has no value of it, as announcements keep only some entries. */
-  function readMissing(row) {
-    for (const d of devices) {
-      if (!row.entries.get(d.route)?.readable || valueOf(d, row.name) !== undefined) continue;
-      api
-        .read(d.route, [row.name])
-        .then((reply) => {
-          const got = reply.values[row.name];
-          if (got?.state === 'ok') reads.set(key(d.route, row.name), got.value);
-        })
-        .catch(() => {});
-    }
-  }
-
-  /** Calls `row` on every device a write reaches, with `text`, and shows each device's outcome. */
-  async function write(row, text) {
-    const targets = writersOf(row, devices);
-    if (!targets.length) return;
-    for (const d of targets) {
-      outcomes.set(key(d.route, row.name), { state: 'busy' });
-      if (controlOf(row.rpc) !== 'action') written.set(key(d.route, row.name), { value: text, over: d.values.get(row.name), inFlight: true });
-    }
-    let results;
-    try {
-      results = (await api.call(row.name, text, targets.map((d) => d.route))).results;
-    } catch (error) {
-      results = targets.map((d) => ({ state: 'unknown', route: d.route, error: error.message }));
-    }
-    for (const result of results) {
-      const k = key(result.route, row.name);
-      const w = written.get(k);
-      if (result.state !== 'ok') {
-        // Nothing was written, or nobody knows what was: the cell shows what the device announces.
-        written.delete(k);
-        const error = result.state === 'skipped' ? 'Not sent, as another device refused the call' : result.error;
-        outcomes.set(k, { state: result.state, error });
-        continue;
-      }
-      if (w) written.set(k, { ...w, value: result.value ?? w.value, inFlight: false });
-      else if (result.value !== null) reads.set(k, result.value);
-      outcomes.set(k, { state: 'ok' });
-      setTimeout(() => outcomes.get(k)?.state === 'ok' && outcomes.delete(k), OK_MS);
-    }
-  }
+  /** Writes `text` to `row` on every device a write reaches. */
+  const write = (row, text) => writes.write([{ name: row.name, devices: writersOf(row, devices) }], text, controlOf(row.rpc) === 'toggle');
+  /** Runs action `row` on every device that has it. */
+  const run = (row) => writes.run([row.name], () => writersOf(row, devices));
 
   // The rows picked: this panel's by name, and every panel's, each property
   // once, in page order.
@@ -270,7 +215,7 @@
       tick().then(() => document.getElementById(`prop-${active}`)?.scrollIntoView({ block: 'nearest' }));
     } else if (e.key === 'Enter' && current) {
       const control = controlOf(current.rpc);
-      if (control === 'action') write(current, '');
+      if (control === 'action') run(current);
       else if (control === 'toggle') write(current, shared(current) ? 'false' : 'true');
       else editor?.focus();
     } else return;
@@ -311,8 +256,8 @@
 
 {#snippet valueCell({ row, device })}
   {@const entry = row.entries.get(device.route)}
-  {@const out = outcomes.get(key(device.route, row.name))}
-  <span class="cell {out?.state ?? ''}" title={out?.error ?? show(valueOf(device, row.name))}>
+  {@const out = outcomeOf(device, row.name)}
+  <span class="cell {out?.state ?? ''}" title={out && out.state !== 'busy' && out.state !== 'ok' ? words.outcome(out.state, out.error) : show(valueOf(device, row.name))}>
     {#if !entry}<span class="absent" title="This device has no {row.name}">—</span>
     {:else if controlOf(entry) === 'action'}<span class="absent">action</span>
     {:else}{show(valueOf(device, row.name))}{/if}
@@ -328,7 +273,7 @@
       {#each rows as row (row.name)}
         {@const reach = writersOf(row, devices)}
         {@const failed = failures(row)}
-        <Tip text={failed.length ? failureText(row) : `Run on ${reach.length} device${reach.length === 1 ? '' : 's'}`}>
+        <Tip text={failed.length ? failureText(row) : words.runOn(reach.length)}>
           {#snippet children(tip)}
             <Button
               {...tip}
@@ -336,7 +281,7 @@
               variant="outline"
               class={busy(row) ? 'opacity-60' : failed.length ? 'text-destructive' : ''}
               disabled={!reach.length}
-              onclick={() => write(row, '')}
+              onclick={() => run(row)}
             >
               {row.name}{#if failed.length}<b class="mark bad">✕{devices.length > 1 ? failed.length : ''}</b>{/if}
             </Button>
@@ -427,7 +372,7 @@
   <div class="write-bar">
     <span class="wname">{current.name}</span>
     {#if control === 'action'}
-      <Button size="xs" variant="outline" disabled={!reach.length} onclick={() => write(current, '')}>Run on {reach.length}</Button>
+      <Button size="xs" variant="outline" disabled={!reach.length} onclick={() => run(current)}>{words.runOn(reach.length)}</Button>
     {:else if control === 'toggle'}
       <Button size="xs" variant="outline" disabled={!reach.length} onclick={() => write(current, 'true')}>On</Button>
       <Button size="xs" variant="outline" disabled={!reach.length} onclick={() => write(current, 'false')}>Off</Button>
@@ -441,7 +386,7 @@
         aria-label="New value of {current.name}"
         onkeydown={editorKey}
       />
-      <Button size="xs" variant="outline" disabled={!reach.length || draft.trim() === ''} onclick={() => write(current, draft.trim())}>Write to {reach.length}</Button>
+      <Button size="xs" variant="outline" disabled={!reach.length || draft.trim() === ''} onclick={() => write(current, draft.trim())}>{words.writeTo(reach.length)}</Button>
     {/if}
   </div>
 {/if}

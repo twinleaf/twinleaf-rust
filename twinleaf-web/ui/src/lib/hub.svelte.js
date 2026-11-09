@@ -4,10 +4,11 @@
 // must be numbered one more than the last. A gap closes the socket, and the
 // snapshot of the socket opened in its place fills it, the one way the page
 // comes to hold a hub's state (see protocol.js). The plots' views, which
-// outlive any hub, read the time through `now`.
+// outlive any hub, read the time through `now`. The devices' RPCs go
+// through `call` and `read`.
 
 import { Session } from './session.svelte.js';
-import { decodeFrame, holdMessage, spectraMessage } from './protocol.js';
+import { api, decodeFrame, holdMessage, spectraMessage } from './protocol.js';
 import { WINDOW_LIMITS } from './window.js';
 
 /** How long the page waits before it opens a socket that closed on its own. */
@@ -116,6 +117,16 @@ export class Hub {
   /** Device time that page time `perfMs` corresponds to. */
   now(perfMs) {
     return this.session.now(perfMs);
+  }
+
+  /** Calls RPC `name` with `value`, as typed, on the devices at `routes`: protocol.js `api.call`. */
+  call(name, value, routes) {
+    return api.call(name, value, routes);
+  }
+
+  /** Reads `names` of the device at `route`: protocol.js `api.read`. */
+  read(route, names) {
+    return api.read(route, names);
   }
 
   /** Opens the socket, and opens it again whenever it closes, until `close`. */

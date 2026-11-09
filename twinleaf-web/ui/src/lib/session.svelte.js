@@ -215,6 +215,8 @@ export class Device {
   firmware = $state(null);
   /** connecting, alive or lost. */
   presence = $state('connecting');
+  /** How many times its presence turned alive: one more each time it reconnects. */
+  connections = $state(0);
   /** {rpcs} once its RPC table loaded, {error, rpcs: []} if it did not, or null before. */
   table = $state.raw(null);
   /** The values it last announced, by RPC name. */
@@ -224,12 +226,25 @@ export class Device {
     this.route = route;
   }
 
+  /** How many times each announced value changed, by RPC name, so a value set back to what it was is still a change. */
+  #changes = new Map();
+
   /** Takes the values of a `settings` message, changing only those that differ. */
   announce(values) {
-    for (const name of [...this.values.keys()]) if (!(name in values)) this.values.delete(name);
+    for (const name of [...this.values.keys()]) if (!(name in values)) this.#change(name, () => this.values.delete(name));
     for (const [name, value] of Object.entries(values)) {
-      if (!this.values.has(name) || !sameValue(this.values.get(name), value)) this.values.set(name, value);
+      if (!this.values.has(name) || !sameValue(this.values.get(name), value)) this.#change(name, () => this.values.set(name, value));
     }
+  }
+
+  /** How many times the announced value of `name` changed: it read with the value, which changes with it. */
+  changes(name) {
+    return this.#changes.get(name) ?? 0;
+  }
+
+  #change(name, apply) {
+    this.#changes.set(name, this.changes(name) + 1);
+    apply();
   }
 }
 
@@ -333,8 +348,12 @@ export class Session {
         for (const route of msg.routes) this.device(route);
         return;
       // The server sends a device's messages only while the routes list it.
-      case 'device':
-        return void Object.assign(this.devices.get(msg.route) ?? {}, { name: msg.name, serial: msg.serial, firmware: msg.firmware, presence: msg.presence });
+      case 'device': {
+        const d = this.devices.get(msg.route);
+        if (!d) return;
+        if (msg.presence === 'alive' && d.presence !== 'alive') d.connections++;
+        return void Object.assign(d, { name: msg.name, serial: msg.serial, firmware: msg.firmware, presence: msg.presence });
+      }
       case 'table': {
         const d = this.devices.get(msg.route);
         if (d) d.table = msg.error ? { error: msg.error, rpcs: [] } : { rpcs: msg.rpcs };

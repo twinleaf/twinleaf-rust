@@ -26,14 +26,20 @@ const typed = (text) => (text === 'true' ? true : text === 'false' ? false : tex
  * A hub with no socket that has announced `signals`, keys as 'stream.column',
  * each a trace of route '/' in volts, and, with `rpcs`, a device at each of
  * `routes` whose RPC table they are, each {name, channel, value, type,
- * access}: type f32 and access read and write unless given, and `value`
- * one for every device or an array of one per route.
+ * access, announced}: type f32 and access read and write unless given,
+ * `value` one for every device or an array of one per route, and
+ * `announced` false for an entry no announcement keeps, which a read
+ * answers nothing of.
  *
- * Its devices answer calls: `calls` lists each {name, value, routes}, and
- * `answer(name, value, route)` gives each device's outcome, by default ok
- * with the value as the device takes it. A device that took a value of an
- * entry it reads announces it. `announce(route, values)` has a device
- * announce new values, as another client's write would, and
+ * Its devices answer calls as the server does (`twinleaf-web/src/devices.rs`
+ * `call`): `calls` lists each {name, value, routes}, and `answer(name,
+ * value, route)` gives each device's outcome, by default ok with the value
+ * as the device takes it, or {state, error} for error, unknown or refused.
+ * A device that refuses refuses the whole call: nothing is sent, and every
+ * other device is skipped. A device that took a value of an entry it
+ * announces announces it. While `slow`, each reply waits for `release()`,
+ * which answers the oldest call waiting. `announce(route, values)` has a
+ * device announce new values, as another client's write would, and
  * `presence(route, state)` changes a device's presence.
  */
 export function stubHub(signals = [], rpcs = [], routes = ['/']) {
@@ -45,9 +51,9 @@ export function stubHub(signals = [], rpcs = [], routes = ['/']) {
     const [stream, column] = key.split('.');
     hub.text({ type: 'trace', seq: ++seq, trace: { id, route: '/', stream, column, units: 'V', rate: 100 } });
   });
-  const table = rpcs.map(({ name, channel, type = 'f32', access = ['read', 'write'] }) => ({ name, channel, type, access }));
-  const read = new Set(table.filter((r) => r.access.includes('read')).map((r) => r.name));
-  const values = new Map(routes.map((route, i) => [route, Object.fromEntries(rpcs.filter((p) => read.has(p.name)).map((p) => [p.name, (Array.isArray(p.value) ? p.value[i] : p.value) ?? 0]))]));
+  const table = rpcs.map(({ name, channel, type = 'f32', access = ['read', 'write'] }) => ({ name, channel, type, access, readable: access.includes('read') }));
+  const announced = new Set(rpcs.filter((p) => (p.access ?? ['read', 'write']).includes('read') && p.announced !== false).map((p) => p.name));
+  const values = new Map(routes.map((route, i) => [route, Object.fromEntries(rpcs.filter((p) => announced.has(p.name)).map((p) => [p.name, (Array.isArray(p.value) ? p.value[i] : p.value) ?? 0]))]));
   hub.announce = (route, patch) => {
     Object.assign(values.get(route), patch);
     hub.text({ type: 'settings', seq: ++seq, route, values: { ...values.get(route) } });
@@ -63,13 +69,24 @@ export function stubHub(signals = [], rpcs = [], routes = ['/']) {
   }
   hub.calls = [];
   hub.answer = (name, value) => ({ state: 'ok', value: value === '' ? null : typed(value) });
-  hub.call = async (name, value, to) => {
-    hub.calls.push({ name, value, routes: to });
-    const results = await Promise.all(to.map(async (route) => ({ route, ...(await hub.answer(name, value, route)) })));
-    for (const r of results) if (r.state === 'ok' && read.has(name)) hub.announce(r.route, { [name]: r.value });
-    return { sent: to.length, results };
+  hub.slow = false;
+  const waiting = [];
+  hub.release = () => waiting.shift()?.();
+  /** The reply to a call: refused and skipped when any device refuses, else each device's answer. */
+  const reply = (name, value, to) => {
+    const answers = to.map((route) => ({ route, ...hub.answer(name, value, route) }));
+    if (answers.some((r) => r.state === 'refused')) {
+      return { sent: false, results: answers.map((r) => (r.state === 'refused' ? { route: r.route, state: 'refused', error: r.error } : { route: r.route, state: 'skipped' })) };
+    }
+    for (const r of answers) if (r.state === 'ok' && announced.has(name)) hub.announce(r.route, { [name]: typed(value) });
+    return { sent: true, results: answers };
   };
-  hub.read = async (route, names) => ({ values: Object.fromEntries(names.map((n) => [n, { state: 'ok', value: values.get(route)?.[n] }])) });
+  hub.call = (name, value, to) => {
+    hub.calls.push({ name, value, routes: to });
+    if (!hub.slow) return Promise.resolve(reply(name, value, to));
+    return new Promise((done) => waiting.push(() => done(reply(name, value, to))));
+  };
+  hub.read = async (route, names) => ({ values: Object.fromEntries(names.filter((n) => announced.has(n)).map((n) => [n, { state: 'ok', value: values.get(route)?.[n] }])) });
   return hub;
 }
 

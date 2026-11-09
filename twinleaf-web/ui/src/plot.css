@@ -536,6 +536,17 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .write-bar .wvalue { flex: 1; min-width: 60px; font-family: var(--font-data); }
 .write-bar .reach { color: var(--muted-foreground); }
 
+/* The device writes' notice, drawn as Sonner draws the page's other notices, and the lines under any notice's text. */
+[data-sonner-toast] [data-description] { white-space: pre-line; }
+.write-notice { display: flex; align-items: center; gap: 8px; width: var(--width); padding: 12px 14px; border: 1px solid var(--normal-border); border-radius: var(--border-radius); background: var(--normal-bg); color: var(--normal-text); box-shadow: 0 4px 12px rgb(0 0 0 / 0.1); font-size: 13px; }
+.write-notice-icon { width: 16px; height: 16px; flex: none; }
+.write-notice[data-level=warning] .write-notice-icon { color: var(--warning, #d97706); }
+.write-notice[data-level=error] .write-notice-icon { color: var(--destructive); }
+.write-notice-body { flex: 1; min-width: 0; line-height: 1.4; }
+.write-notice-text { font-weight: 500; }
+.write-notice-detail { color: var(--muted-foreground); font-size: 12px; }
+.write-notice-revert { flex: none; height: 24px; padding: 0 8px; border-radius: 4px; background: var(--normal-text); color: var(--normal-bg); font-size: 12px; font-weight: 500; cursor: pointer; }
+
 /* The device picker. */
 .picker { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
 .picker .now, .picker .notice { color: var(--muted-foreground); font-size: 12px; }
