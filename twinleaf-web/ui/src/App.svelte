@@ -302,11 +302,137 @@
     }),
   );
   function docksResized(sizes) {
-    const shown = [docks.shown('left') && 'left', 'tiles', docks.shown('right') && 'right'].filter(Boolean);
+    // The panes are left, tiles and right, a hidden dock's collapsed to its rail.
     try {
-      shown.forEach((side, i) => side !== 'tiles' && localStorage.setItem(DOCK.keys[side], String((dockSize[side] = sizes[i]))));
+      [['left', sizes[0]], ['right', sizes[2]]].forEach(([side, size]) => {
+        if (docks.shown(side) && size >= DOCK.min) localStorage.setItem(DOCK.keys[side], String((dockSize[side] = size)));
+      });
     } catch {}
   }
+  /** Each dock's width as a drag of its handle began, which it opens to again when that drag collapsed it. */
+  const dragFrom = { left: null, right: null };
+  /** Hides dock `side` when a drag of its handle took its pane below a dock's least width, collapsing it to the rail. */
+  function dockCollapsed(side, size) {
+    if (size >= DOCK.min || !docks.shown(side)) return;
+    if (dragFrom[side] !== null) {
+      dockSize[side] = dragFrom[side];
+      try {
+        localStorage.setItem(DOCK.keys[side], String(dockSize[side]));
+      } catch {}
+    }
+    docks.hide(side, true);
+  }
+
+  // A dock that hides or shows slides, as its pane collapses or opens to its
+  // width, the tiles and their plots giving it room or taking its room back.
+  // The pane group's `sliding` class carries the transition only for the
+  // slide, so a drag of a handle follows the pointer.
+  //
+  // A dock and its rail are one frame in the dock's pane, which collapses to
+  // the rail's width rather than to nothing, so the row keeps its width and
+  // nothing beside the panes comes or goes. Sliding, the frame's outer edge,
+  // top and bottom stay put and its inner edge moves with the pane's, the
+  // tiles beside it in step. Its panels keep the width they have open,
+  // `contentSize` in px, pinned to the outer edge and cut off by the moving
+  // edge, so they never reflow; shutting, they fade out by the slide's
+  // midpoint, and opening, they fade in after it. The toggle sits at the
+  // frame's top right, as the rail's does: the right dock shrinks into it,
+  // and the left dock's rides its inner edge to the rail's spot.
+  let dockGroup = $state(null);
+  /** The room the panes share, in px: the group less its handles. */
+  let paneRoom = $state(0);
+  /** A rail's width in px: one holding panels has its show button; an empty one is a strip to drop on, wider while a panel is dragged. */
+  const RAIL_PX = { panels: 26, empty: 8, awaiting: 56 };
+  const railPx = (side) => (docks.dragging ? RAIL_PX.awaiting : docks[side].length ? RAIL_PX.panels : RAIL_PX.empty);
+  /** Each side's rail as a share of the panes' room, the size its pane collapses to. */
+  const railPct = $derived({ left: paneRoom ? (railPx('left') / paneRoom) * 100 : 0, right: paneRoom ? (railPx('right') / paneRoom) * 100 : 0 });
+  /**
+   * The size `side`'s pane starts at, its width or its rail's while hidden.
+   * Read once as the panes mount: a hide or a show after that is a slide.
+   */
+  const startSize = (side) => untrack(() => (docks.shown(side) ? dockSize[side] : railPct[side]));
+  const paneSize = (el) => (narrow.current ? el.offsetHeight : el.offsetWidth);
+  const panesOf = () => [...(dockGroup?.children ?? [])].filter((el) => el.hasAttribute('data-pane-id'));
+  $effect(() => {
+    if (!dockGroup) return;
+    const measure = () => (paneRoom = panesOf().reduce((n, el) => n + paneSize(el), 0));
+    const watch = new ResizeObserver(() => !dockGroup.classList.contains('sliding') && measure());
+    watch.observe(dockGroup);
+    measure();
+    return () => watch.disconnect();
+  });
+  // Whether a side's frame is its rail or holds its panels. It turns to the
+  // rail only once a slide shut ends.
+  let railed = $state(untrack(() => ({ left: !docks.shown('left'), right: !docks.shown('right') })));
+  /** Each side's slide under way, 'opening' or 'closing', or null. */
+  let slide = $state({ left: null, right: null });
+  let contentSize = $state({ left: null, right: null });
+  /**
+   * How long a dock takes to slide: opening over Material's duration-medium2,
+   * shutting over medium1, as a collapse is quicker; both on its standard
+   * easing (plot.css).
+   */
+  const DOCK_SLIDE_MS = { opening: 300, closing: 250 };
+  /** How long a slide waits to start when no frame comes, in ms. */
+  const SLIDE_START_MS = 100;
+  let slideDone;
+  let settled = false;
+  $effect(() => {
+    const want = { left: docks.shown('left'), right: docks.shown('right') };
+    const rail = { left: railPct.left, right: railPct.right };
+    untrack(() => {
+      for (const side of ['left', 'right']) {
+        const pane = dockPanes[side];
+        const now = pane?.getSize?.();
+        if (!pane || now === undefined || !paneRoom) continue;
+        const target = want[side] ? dockSize[side] : rail[side];
+        // Already there, as a drag of the handle collapses the pane itself:
+        // the frame turns to the rail, or back, at once.
+        if (Math.abs(now - target) < 0.01) {
+          if (railed[side] === want[side]) railed = { ...railed, [side]: !want[side] };
+          continue;
+        }
+        // The first measure only sets a hidden dock's rail to its width: no slide.
+        if (!settled) {
+          pane.resize(target);
+          continue;
+        }
+        const own = panesOf().find((el) => el.dataset.paneId === `dock-${side}`);
+        // A rail growing or shrinking, as a panel is dragged, has no panels to pin.
+        const kind = want[side] === railed[side] ? (want[side] ? 'opening' : 'closing') : null;
+        // The panels keep the width the frame has open: the width it has now
+        // when shutting, the width it opens to when opening. A frame's border
+        // and padding, 1 and 6 px a side, are not theirs.
+        const open = want[side] ? (paneRoom * dockSize[side]) / 100 : own ? paneSize(own) : 0;
+        contentSize = { ...contentSize, [side]: kind ? open - 14 : null };
+        slide = { ...slide, [side]: kind };
+        if (want[side]) railed = { ...railed, [side]: false };
+        clearTimeout(slideDone);
+        const ms = kind === 'opening' ? DOCK_SLIDE_MS.opening : DOCK_SLIDE_MS.closing;
+        // The slide starts a frame after the panels mount, so the work of
+        // mounting them is not the slide's first frame; or after
+        // SLIDE_START_MS, on a page the browser draws no frames for, so the
+        // dock still ends where it should.
+        let started = false;
+        const start = () => {
+          if (started) return;
+          started = true;
+          dockGroup?.style.setProperty('--slide-ms', `${ms}ms`);
+          dockGroup?.classList.add('sliding');
+          pane.resize(target);
+          slideDone = setTimeout(() => {
+            dockGroup?.classList.remove('sliding');
+            railed = { left: !docks.shown('left'), right: !docks.shown('right') };
+            slide = { left: null, right: null };
+            contentSize = { left: null, right: null };
+          }, ms + 50);
+        };
+        requestAnimationFrame(() => requestAnimationFrame(start));
+        setTimeout(start, SLIDE_START_MS);
+      }
+      if (paneRoom) settled = true;
+    });
+  });
 
   function newPlotWith(keys) {
     ws.addPlot(newPlot('time', 'overlay', keys));
@@ -647,17 +773,31 @@
 {/snippet}
 
 {#snippet dockFrame(side)}
-  <aside class="flex min-h-0 flex-1 cursor-crosshair flex-col overflow-hidden rounded-lg border bg-card p-1.5" onpointerdown={(e) => drags.startMarquee(e)}>
-    <Dock {docks} {side} content={panelBody} />
+  <!-- The dock's frame, its rail too: it fills its pane, and its panels keep their open size while it slides. -->
+  <aside
+    class="dock-frame {side} flex min-h-0 flex-1 cursor-crosshair flex-col overflow-hidden rounded-lg border bg-card"
+    class:rail={railed[side]}
+    class:holding={docks[side].length > 0}
+    class:awaiting={railed[side] && docks.dragging}
+    class:opening={slide[side] === 'opening'}
+    class:closing={slide[side] === 'closing'}
+    class:pinned={contentSize[side] !== null}
+    style:--content={contentSize[side] !== null ? `${contentSize[side]}px` : null}
+    onpointerdown={(e) => drags.startMarquee(e)}
+  >
+    <Dock {docks} {side} content={panelBody} railed={railed[side]} />
   </aside>
 {/snippet}
 
 {#snippet dockHandle(side)}
   <Resizable.Handle
+    disabled={!docks.shown(side)}
+    data-dock-hidden={docks.shown(side) ? undefined : ''}
     aria-label="{side === 'left' ? 'Left' : 'Right'} dock width"
     title={prefs.hints ? 'Drag to resize; double-click resets' : undefined}
     class="mx-[3px] bg-transparent transition-colors after:w-3 hover:bg-primary/60 data-[direction=vertical]:mx-0 data-[direction=vertical]:my-[3px] data-[direction=vertical]:after:h-3"
     ondblclick={() => dockPanes[side]?.resize(DOCK.default)}
+    onDraggingChange={(dragging) => (dragFrom[side] = dragging ? dockSize[side] : null)}
   />
 {/snippet}
 
@@ -805,15 +945,12 @@
 
     {#key narrow.current}
     <div class="docked" class:narrow={narrow.current}>
-    {#if !docks.shown('left')}<Dock {docks} side="left" content={panelBody} />{/if}
-    <Resizable.PaneGroup direction={narrow.current ? 'vertical' : 'horizontal'} class="layout" onLayout={docksResized}>
-      {#if docks.shown('left')}
-        <Resizable.Pane id="dock-left" order={1} bind:this={dockPanes.left} defaultSize={dockSize.left} minSize={DOCK.min} maxSize={DOCK.max} class="flex min-h-0">
-          {@render dockFrame('left')}
-        </Resizable.Pane>
-        {@render dockHandle('left')}
-      {/if}
-      <Resizable.Pane id="tiles" order={2} defaultSize={100 - (docks.shown('left') ? dockSize.left : 0) - (docks.shown('right') ? dockSize.right : 0)} class="flex min-h-0 min-w-0">
+    <Resizable.PaneGroup direction={narrow.current ? 'vertical' : 'horizontal'} class="layout" bind:ref={dockGroup} onLayoutChange={docksResized}>
+      <Resizable.Pane id="dock-left" order={1} bind:this={dockPanes.left} defaultSize={startSize('left')} minSize={DOCK.min} maxSize={DOCK.max} collapsible collapsedSize={railPct.left} onResize={(size) => dockCollapsed('left', size)} class="flex min-h-0">
+        {@render dockFrame('left')}
+      </Resizable.Pane>
+      {@render dockHandle('left')}
+      <Resizable.Pane id="tiles" order={2} defaultSize={100 - startSize('left') - startSize('right')} class="flex min-h-0 min-w-0">
         <main class="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5">
           <TabStrip {ws} {drags} onClose={closeTab} />
           <div class="tiles" data-focus="plots" tabindex="-1" class:has-max={ws.maximized} class:drop-target={drags.drop?.outer && !drags.drop.edge}>
@@ -829,14 +966,11 @@
           </div>
         </main>
       </Resizable.Pane>
-      {#if docks.shown('right')}
-        {@render dockHandle('right')}
-        <Resizable.Pane id="dock-right" order={3} bind:this={dockPanes.right} defaultSize={dockSize.right} minSize={DOCK.min} maxSize={DOCK.max} class="flex min-h-0">
-          {@render dockFrame('right')}
-        </Resizable.Pane>
-      {/if}
+      {@render dockHandle('right')}
+      <Resizable.Pane id="dock-right" order={3} bind:this={dockPanes.right} defaultSize={startSize('right')} minSize={DOCK.min} maxSize={DOCK.max} collapsible collapsedSize={railPct.right} onResize={(size) => dockCollapsed('right', size)} class="flex min-h-0">
+        {@render dockFrame('right')}
+      </Resizable.Pane>
     </Resizable.PaneGroup>
-    {#if !docks.shown('right')}<Dock {docks} side="right" content={panelBody} />{/if}
     </div>
     {/key}
 

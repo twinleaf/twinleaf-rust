@@ -47,29 +47,58 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .tab-slot { display: flex; }
 #dnd-action-dragged-el.dock-panel { height: 28px !important; overflow: hidden !important; padding: 0 6px !important; background: var(--popover) !important; border: 1px solid var(--primary) !important; border-radius: var(--radius) !important; box-shadow: 0 6px 16px rgb(0 0 0 / 0.45) !important; }
 
-/* The docks beside the tiles, and their panels (Dock.svelte). An empty
-   dock is a rail along the edge, wide enough to drop on while a panel is
+/* The docks beside the tiles, and their panels (Dock.svelte). Each dock is
+   a frame in its own pane, padded around its panels; hidden, the same frame
+   is its rail, bare, as wide as its pane collapses to. An empty dock's rail
+   is a strip without a frame, wide enough to drop on while a panel is
    dragged. */
 .docked { flex: 1 1 0; min-height: 0; display: flex; }
 .docked.narrow { flex-direction: column; }
 .docked > .layout { flex: 1; min-width: 0; }
-.dock-side { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; }
+/* A dock slides open over Material's duration-medium2 and shut over
+   medium1 (App.svelte sets --slide-ms), on its standard easing, every pane
+   on the same curve so the tiles' edge and the dock's move as one. */
+.layout.sliding > [data-pane] { transition: flex-grow var(--slide-ms, 250ms) cubic-bezier(0.2, 0, 0, 1); }
+/* A hidden dock's handle keeps its room, the gap between the tiles and the
+   rail as between the tiles and the dock, but shows nothing and takes no
+   pointer. */
+.layout > [data-pane-resizer][data-dock-hidden] { visibility: hidden; pointer-events: none; }
+.dock-frame { position: relative; padding: 6px; }
+.dock-frame.rail { padding: 0; }
+.dock-frame.rail.holding { cursor: pointer; }
+.dock-frame.rail.holding:hover { border-color: var(--ring); }
+.dock-frame.rail:not(.holding) { border-color: transparent; background: transparent; }
+.dock-frame.awaiting { border: 1px dashed var(--primary); background: color-mix(in oklch, var(--primary) 8%, transparent); }
+/* While the frame slides, its panels keep the width they have open, pinned
+   to the outer edge, and the frame's moving edge cuts them off. Shutting,
+   they are gone by the slide's midpoint; opening, they come in after it. */
+.dock-frame.pinned > .dock-side { flex: none; width: var(--content); }
+.dock-frame.pinned.right > .dock-side { align-self: flex-end; }
+.dock-frame.pinned.left > .dock-side { align-self: flex-start; }
+.docked.narrow .dock-frame.pinned > .dock-side { flex: none; width: auto; height: var(--content); align-self: stretch; }
+.docked.narrow .dock-frame.pinned.right > .dock-side { margin-top: auto; }
+.dock-frame.closing .dock { opacity: 0; transition: opacity calc(var(--slide-ms, 250ms) / 2) linear; }
+.dock-frame.opening .dock { animation: dock-in calc(var(--slide-ms, 300ms) / 2) linear calc(var(--slide-ms, 300ms) / 2) both; }
+@keyframes dock-in { from { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .layout.sliding > [data-pane] { transition: none; }
+  .dock-frame.closing .dock { transition: none; }
+  .dock-frame.opening .dock { animation: none; }
+}
+/* The frame holds the toggle, not the panels, so it stays at the frame's
+   top right however the panels are pinned. */
+.dock-side { position: static; display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .dock { display: flex; flex-direction: column; gap: 4px; min-height: 0; flex: 1; overflow-y: auto; scrollbar-width: thin; }
-.dock-side.rail { flex: none; width: 8px; margin: 8px 0; overflow: hidden; border-radius: var(--radius); transition: width 0.15s, height 0.15s; }
-.dock-side.rail.hidden { width: 26px; cursor: pointer; border: 1px solid var(--border); background: var(--card); }
-.dock-side.rail.hidden:hover { border-color: var(--ring); }
-.docked.narrow .dock-side.rail { width: auto; height: 8px; margin: 0 12px; }
-.docked.narrow .dock-side.rail.hidden { height: 26px; }
-.dock-side.rail.awaiting { width: 56px; border: 1px dashed var(--primary); background: color-mix(in oklch, var(--primary) 8%, transparent); }
-.docked.narrow .dock-side.rail.awaiting { width: auto; height: 48px; }
 .dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: 2px; border-radius: var(--radius); }
-/* Hide sits at the top right of a dock, in its first header's row; Show
-   heads a hidden dock's rail. */
-.dock-button { position: absolute; top: 3px; right: 2px; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
+/* Show sits centred across the rail; Hide sits at the very same spot of
+   the frame open, its top right, in its first header's row: 3 px of the
+   rail's 26 either side of the 20 px button, less the frame's 1 px border,
+   from which the button is placed. */
+.dock-button { position: absolute; top: 8px; right: 2px; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
 .dock-button:hover { background: var(--secondary); color: var(--foreground); }
 .dock-button svg { width: 14px; height: 14px; }
-.dock-side.rail .dock-button { right: 2px; }
-.dock > .dock-panel:first-child .dock-head { padding-right: 26px; }
+.dock-frame.rail .dock-button { right: auto; left: 50%; transform: translateX(-50%); }
+.dock-side > .dock > .dock-panel:first-child .dock-head { padding-right: 26px; }
 .dock-panel { display: flex; flex-direction: column; min-height: 0; flex: none; }
 .dock-panel.open.shrinks { flex: 0 1 auto; min-height: 72px; }
 .dock-panel.open:not(.shrinks) { flex: none; }

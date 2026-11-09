@@ -29,27 +29,35 @@
   import { focusedByKeyboard } from './keys.js';
   import Tip from './Tip.svelte';
 
-  /** `docks` is the page's Docks, `side` this dock's, and `content(id)` draws a panel's body. */
-  let { docks, side, content } = $props();
+  /**
+   * `docks` is the page's Docks, `side` this dock's, and `content(id)` draws
+   * a panel's body. `railed` draws the rail in the panels' place: the page
+   * says when, as a dock sliding shut keeps its panels until it has.
+   */
+  let { docks, side, content, railed } = $props();
 
   // Panels slide only while one is dragged, so a fold resizes them in place.
   const FLIP_MS = 150;
+  /** How long to wait for a hidden dock's rail, which appears once the dock has slid shut, in ms. */
+  const RAIL_WAIT_MS = 600;
   /**
    * Hides or shows the dock. The dock is drawn anew either way, so focus
-   * that was in it moves to the new one: to its show button once hidden,
-   * into its panels once shown.
+   * that was in it moves to the new one: to its rail's show button once
+   * the rail is there, into its panels once shown.
    */
   function setHidden(hidden) {
     const had = root?.contains(document.activeElement);
     docks.hide(side, hidden);
     if (!had) return;
-    tick().then(() => {
-      const now = document.querySelector(`.dock-side.${side}`);
-      if (!now) return;
+    const until = performance.now() + RAIL_WAIT_MS;
+    const land = () => {
+      const now = document.querySelector(hidden ? `.dock-side.${side}.rail` : `.dock-side.${side}:not(.rail)`);
+      if (!now) return void (performance.now() < until && requestAnimationFrame(land));
       const show = hidden && now.querySelector('.dock-button');
       if (show) focusNode(show);
       else if (!enter(now)) focusNode(now);
-    });
+    };
+    tick().then(land);
   }
   let root = $state(null);
   /** How far the pointer may move between press and release for a click on a header to fold it, not drag it, in px. */
@@ -63,7 +71,7 @@
   }
   let items = $state([]);
   let dragging = $state(false);
-  const rail = $derived(!docks.shown(side));
+  const rail = $derived(railed);
   $effect(() => {
     const committed = rail ? [] : docks[side];
     if (!dragging) items = committed.map((p) => ({ ...p }));
