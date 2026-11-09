@@ -31,10 +31,10 @@
 //! decides which breaks start a new run at all. [`RunSplitLevel`] decides
 //! which streams roll to a new table when one does.
 
-use super::continuity::{Boundary, Generations};
-use super::filter::ColumnFilter;
-use super::metadata::{StreamKey, StreamMetadataSnapshot};
-use super::sample::{native_types, ColumnArray, SampleBatch};
+use crate::data::model::continuity::{Boundary, Generations};
+use crate::data::model::filter::ColumnFilter;
+use crate::data::model::sample::{native_types, ColumnArray, SampleBatch};
+use crate::data::model::schema::{StreamKey, StreamMetadataSnapshot};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
@@ -716,8 +716,8 @@ fn hdf_name_component(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::continuity::{Change, Loss};
-    use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
+    use crate::data::model::continuity::{Change, Loss};
+    use crate::data::model::sample::{BatchContext, ColumnData, SampleBatchBuilder};
     use crate::data::tests::fixtures;
     use crate::proto::data::DataType;
     use std::path::PathBuf;
@@ -1097,7 +1097,7 @@ mod tests {
         //! wrong layout.
 
         use super::*;
-        use crate::data::sample::ColumnBuilder;
+        use crate::data::model::sample::ColumnBuilder;
         use hdf5_pure::{CompoundMember, Datatype};
         use proptest::prelude::*;
 

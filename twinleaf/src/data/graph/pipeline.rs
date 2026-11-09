@@ -1,9 +1,9 @@
 //! Incremental per-column computation driven by a [`Buffer`].
 
-use super::buffer::{Buffer, Run};
-use super::continuity::Generations;
-use super::metadata::ColumnKey;
-use super::sample::ColumnArray;
+use crate::data::model::continuity::Generations;
+use crate::data::model::sample::ColumnArray;
+use crate::data::model::schema::ColumnKey;
+use crate::data::store::buffer::{Buffer, Run};
 use std::ops::Range;
 
 /// What a [`ColumnOp`] needs of the rows it is fed between two resets.
@@ -149,7 +149,7 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
         }
     }
 
-    fn feed_span(&mut self, span: &super::sample::SampleBatch) {
+    fn feed_span(&mut self, span: &crate::data::model::sample::SampleBatch) {
         if let Some(values) = span.column(self.key.column_id) {
             self.op.update_batch(span.timestamps(), values);
         }
@@ -183,8 +183,8 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::metadata::{DeviceRecord, SegmentRecord, StreamMetadataSnapshot};
-    use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
+    use crate::data::model::sample::{BatchContext, ColumnData, SampleBatchBuilder};
+    use crate::data::model::schema::{DeviceRecord, SegmentRecord, StreamMetadataSnapshot};
     use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::DataType;

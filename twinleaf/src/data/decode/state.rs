@@ -4,13 +4,13 @@
 //! materializing sample values. Packet consumers decide whether to decode the
 //! validated bytes immediately or retain only their metadata and boundaries.
 
-use super::continuity::{Boundary, Change, Generations, Loss};
-use super::decode::{decode_samples, decodes};
-use super::metadata::{
+use crate::data::decode::body::{decode_samples, decodes};
+use crate::data::model::continuity::{Boundary, Change, Generations, Loss};
+use crate::data::model::sample::{sample_time, BatchContext, RowSource, SampleBatchBuilder};
+use crate::data::model::schema::{
     rate_hz, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery, SegmentRecord,
     StreamKey, StreamMetadataSnapshot, StreamRecord, StreamSchema,
 };
-use super::sample::{sample_time, BatchContext, RowSource, SampleBatchBuilder};
 use crate::proto::data as wire;
 use crate::proto::data::MAX_SAMPLE_NUMBER;
 use crate::proto::heartbeat::Heartbeat;
@@ -983,7 +983,7 @@ impl DeviceState {
 }
 
 /// Result of applying one packet to the ordered metadata and continuity state.
-pub(super) enum PacketEvent<'a> {
+pub(in crate::data) enum PacketEvent<'a> {
     Applied,
     WaitingForMetadata,
     /// The stream has a column of a type this build cannot decode.
@@ -994,14 +994,14 @@ pub(super) enum PacketEvent<'a> {
 
 /// Route-aware state machine shared by incremental and seekable packet readers.
 #[derive(Clone)]
-pub(super) struct ParseState {
+pub(in crate::data) struct ParseState {
     ignore_session: bool,
     devices: Vec<DeviceState>,
     global_generation: u32,
 }
 
 impl ParseState {
-    pub(super) fn new(ignore_session: bool) -> Self {
+    pub(in crate::data) fn new(ignore_session: bool) -> Self {
         Self {
             ignore_session,
             devices: Vec::new(),
@@ -1024,7 +1024,7 @@ impl ParseState {
         self.devices.iter().find(|device| device.route == route)
     }
 
-    pub(super) fn apply_packet<'a>(
+    pub(in crate::data) fn apply_packet<'a>(
         &'a mut self,
         packet: &'a tio::Packet,
     ) -> Result<PacketEvent<'a>, DataError> {
@@ -1065,7 +1065,7 @@ impl ParseState {
     /// another device, or the same one with another layout. Each stream keeps
     /// its last rows, and each device's next record says whether it is the
     /// same device, as [`DeviceState::relearn_metadata`] does.
-    pub(super) fn relearn(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
+    pub(in crate::data) fn relearn(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
         for device in &mut self.devices {
             if routes(&device.route) {
                 device.relearn_metadata();
@@ -1076,7 +1076,7 @@ impl ParseState {
     /// Forgets the metadata of every route `routes` accepts and ends its
     /// runs. The generation counters keep counting, and no stamp from before
     /// the reset recurs after it.
-    pub(super) fn reset(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
+    pub(in crate::data) fn reset(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
         self.global_generation += 1;
         for device in &mut self.devices {
             if routes(&device.route) {
@@ -1085,7 +1085,10 @@ impl ParseState {
         }
     }
 
-    pub(super) fn take_metadata_queries_for(&mut self, route: DeviceRoute) -> Vec<MetadataQuery> {
+    pub(in crate::data) fn take_metadata_queries_for(
+        &mut self,
+        route: DeviceRoute,
+    ) -> Vec<MetadataQuery> {
         let index = self.device_index(route);
         self.devices[index]
             .take_metadata_query()
@@ -1093,27 +1096,27 @@ impl ParseState {
             .collect()
     }
 
-    pub(super) fn apply_metadata_reply(&mut self, query: MetadataQuery, reply: &[u8]) {
+    pub(in crate::data) fn apply_metadata_reply(&mut self, query: MetadataQuery, reply: &[u8]) {
         let index = self.device_index(query.route);
         self.devices[index].apply_metadata_reply(query, reply, &mut self.global_generation);
     }
 
     /// Gives up on `query`. Returns `false` if the query was already stale.
-    pub(super) fn fail_metadata_query(&mut self, query: MetadataQuery) -> bool {
+    pub(in crate::data) fn fail_metadata_query(&mut self, query: MetadataQuery) -> bool {
         let index = self.device_index(query.route);
         self.devices[index].fail_metadata_query(query)
     }
 
-    pub(super) fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
+    pub(in crate::data) fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
         self.device(route)?.metadata_snapshot()
     }
 
     #[cfg(feature = "host")]
-    pub(super) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
+    pub(in crate::data) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
         self.device(route).map(|device| device.metadata_revision)
     }
 
-    pub(super) fn routes(&self) -> Vec<DeviceRoute> {
+    pub(in crate::data) fn routes(&self) -> Vec<DeviceRoute> {
         self.devices.iter().map(|device| device.route).collect()
     }
 }

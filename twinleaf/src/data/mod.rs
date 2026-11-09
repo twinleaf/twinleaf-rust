@@ -140,42 +140,40 @@ println!("{} samples", writer.finish()?.total_samples);
 "#
 )]
 
-mod buffer;
-mod coalesce;
-mod continuity;
+// The module is kept in five parts, each a folder: `model`, what a batch is;
+// `decode`, packets into batches; `store`, what is kept of each stream;
+// `graph`, computation over what is kept; and `logfile`, recorded logs. Every
+// public item is exported here, at the path it has always had.
 mod decode;
-mod filter;
-mod metadata;
-mod parser;
-mod pipeline;
-mod reader;
-mod sample;
-mod state;
+mod graph;
+mod logfile;
+mod model;
+mod store;
 
 #[cfg(feature = "hdf5")]
 #[cfg_attr(docsrs, doc(cfg(feature = "hdf5")))]
-pub mod export;
+pub use logfile::export;
 
 #[cfg(feature = "processing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "processing")))]
-pub mod ops;
+pub use graph::ops;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
 #[doc(no_inline)]
 pub use crate::proto::data::DataType;
-pub use buffer::{Buffer, Run};
-pub use continuity::{Boundary, BoundaryClass, Change, Generations, Loss};
-pub use filter::ColumnFilter;
-pub use metadata::{
+pub use decode::parser::{PacketOutcome, PacketParser};
+pub use decode::state::{DataError, StreamDataError};
+pub use graph::pipeline::{ColumnOp, ColumnProcessor, Continuity};
+pub use logfile::reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
+pub use model::continuity::{Boundary, BoundaryClass, Change, Generations, Loss};
+pub use model::filter::ColumnFilter;
+#[cfg(feature = "host")]
+pub(crate) use model::sample::RowSource;
+pub use model::sample::{ColumnArray, ColumnData, SampleBatch, SampleRow, ScalarBuffer};
+pub use model::schema::{
     ColumnKey, DeviceMetadataSnapshot, MetadataQuery, StreamKey, StreamMetadataSnapshot,
     StreamSchema,
 };
-pub use parser::{PacketOutcome, PacketParser};
-pub use pipeline::{ColumnOp, ColumnProcessor, Continuity};
-pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
-#[cfg(feature = "host")]
-pub(crate) use sample::RowSource;
-pub use sample::{ColumnArray, ColumnData, SampleBatch, SampleRow, ScalarBuffer};
-pub use state::{DataError, StreamDataError};
+pub use store::buffer::{Buffer, Run};

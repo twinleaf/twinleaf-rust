@@ -1,7 +1,7 @@
 //! Shared field values for the unit tests of `data`, and the packets a
 //! device sends, for the tests of every layer above it.
 
-use crate::data::metadata::{
+use crate::data::model::schema::{
     ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord,
     StreamSchema,
 };

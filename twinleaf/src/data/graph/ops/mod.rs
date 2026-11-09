@@ -1,5 +1,5 @@
-//! Signal processing over one column, as [`ColumnOp`](super::ColumnOp)s for a
-//! [`ColumnProcessor`](super::ColumnProcessor) to drive.
+//! Signal processing over one column, as [`ColumnOp`](crate::data::ColumnOp)s for a
+//! [`ColumnProcessor`](crate::data::ColumnProcessor) to drive.
 //!
 //! - [`Fpcs`] decimates a column for drawing and keeps its peaks.
 //! - [`FpcsLevels`] decimates a column at several ratios at once, so a plot of

@@ -3,8 +3,8 @@
 //! [`SampleBatch`] holds immutable columnar rows, one [`ColumnArray`] per
 //! column of its [`StreamSchema`], and [`SampleRow`] views one row.
 
-use super::continuity::{Boundary, Generations};
-use super::metadata::{SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamSchema};
+use crate::data::model::continuity::{Boundary, Generations};
+use crate::data::model::schema::{SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamSchema};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
@@ -274,11 +274,11 @@ native_types!(define_columns);
 
 /// The metadata, boundary and generations that every row of a batch shares.
 #[derive(Debug, Clone)]
-pub(super) struct BatchContext {
-    pub(super) metadata: StreamMetadataSnapshot,
+pub(in crate::data) struct BatchContext {
+    pub(in crate::data) metadata: StreamMetadataSnapshot,
     /// At most one boundary per batch, anchored at its first row.
-    pub(super) boundary: Option<Boundary>,
-    pub(super) generations: Generations,
+    pub(in crate::data) boundary: Option<Boundary>,
+    pub(in crate::data) generations: Generations,
 }
 
 /// Rows of one stream from one device, held column-major.
@@ -370,7 +370,7 @@ impl SampleBatchBuilder {
     /// # Panics
     ///
     /// Panics if the schema has a column of a type this build cannot decode.
-    pub(super) fn new(context: BatchContext, capacity: usize) -> Self {
+    pub(in crate::data) fn new(context: BatchContext, capacity: usize) -> Self {
         let columns = context
             .metadata
             .schema()
@@ -389,15 +389,15 @@ impl SampleBatchBuilder {
         }
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(in crate::data) fn len(&self) -> usize {
         self.sample_numbers.len()
     }
 
-    pub(super) fn generations(&self) -> Generations {
+    pub(in crate::data) fn generations(&self) -> Generations {
         self.context.generations
     }
 
-    pub(super) fn accepts(&self, rows: &impl RowSource) -> bool {
+    pub(in crate::data) fn accepts(&self, rows: &impl RowSource) -> bool {
         self.context.generations == rows.generations()
             && self.context.metadata.segment_record() == rows.segment_record()
             && self.context.metadata.schema() == rows.schema()
@@ -411,7 +411,7 @@ impl SampleBatchBuilder {
     /// Panics if `cells` yields too few values or a value its column cannot
     /// hold. Debug builds also panic if it yields too many.
     #[cfg(test)]
-    pub(super) fn push_row(
+    pub(in crate::data) fn push_row(
         &mut self,
         n: SampleNumber,
         cells: impl IntoIterator<Item = ColumnData>,
@@ -428,7 +428,7 @@ impl SampleBatchBuilder {
     /// Appends `rows` samples numbered from `first`, with their timestamps,
     /// and returns every column, in schema order, for the caller to append
     /// exactly `rows` values to each.
-    pub(super) fn push_samples(
+    pub(in crate::data) fn push_samples(
         &mut self,
         first: SampleNumber,
         rows: usize,
@@ -447,7 +447,7 @@ impl SampleBatchBuilder {
     /// # Panics
     ///
     /// Panics if `rows` is out of bounds.
-    pub(super) fn freeze_rows(&self, rows: Range<usize>) -> SampleBatch {
+    pub(in crate::data) fn freeze_rows(&self, rows: Range<usize>) -> SampleBatch {
         let mut context = self.context.clone();
         if rows.start != 0 {
             context.boundary = None;
@@ -464,7 +464,7 @@ impl SampleBatchBuilder {
     }
 
     /// Freezes the accumulated rows into a shareable batch.
-    pub(super) fn finish(self) -> SampleBatch {
+    pub(in crate::data) fn finish(self) -> SampleBatch {
         SampleBatch::new(
             self.context,
             self.sample_numbers.into(),
@@ -714,7 +714,7 @@ impl std::fmt::Display for SampleRow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::continuity::Change;
+    use crate::data::model::continuity::Change;
     use crate::data::tests::fixtures::{self, column, device, segment, stream};
     use crate::proto::data::DataType;
 

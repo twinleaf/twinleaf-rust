@@ -24,10 +24,10 @@
 //! on. The copy shares the chunks, which never change, so only the rows still
 //! accumulating are copied.
 
-use super::coalesce::BatchCoalescer;
-use super::continuity::{Boundary, Generations};
-use super::metadata::{StreamKey, StreamMetadataSnapshot};
-use super::sample::SampleBatch;
+use crate::data::model::continuity::{Boundary, Generations};
+use crate::data::model::sample::SampleBatch;
+use crate::data::model::schema::{StreamKey, StreamMetadataSnapshot};
+use crate::data::store::coalesce::BatchCoalescer;
 use crate::proto::SampleNumber;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -489,7 +489,7 @@ impl Run {
 
     /// Returns the retained rows within `rows` as contiguous spans in row
     /// order.
-    pub(super) fn row_spans(&self, rows: Range<u64>) -> Vec<SampleBatch> {
+    pub(in crate::data) fn row_spans(&self, rows: Range<u64>) -> Vec<SampleBatch> {
         let retained = self.retained_rows();
         let (first, last) = (rows.start.max(retained.start), rows.end.min(retained.end));
         if first >= last {
@@ -656,10 +656,10 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::continuity::{BoundaryClass, Change, Loss};
-    use crate::data::metadata::{ColumnKey, DeviceRecord, SegmentRecord};
-    use crate::data::pipeline::{ColumnOp, ColumnProcessor, Continuity};
-    use crate::data::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
+    use crate::data::graph::pipeline::{ColumnOp, ColumnProcessor, Continuity};
+    use crate::data::model::continuity::{BoundaryClass, Change, Loss};
+    use crate::data::model::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
+    use crate::data::model::schema::{ColumnKey, DeviceRecord, SegmentRecord};
     use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::DataType;

@@ -97,7 +97,7 @@ const LONGEST_BLIP: u64 = 2_500;
 /// mutant is equivalent, with the reason.
 /// - S1. In `Mounts::feed` in `proxy/engine/mod.rs`, queue each packet twice,
 ///   `mount.outbox.stream(shown.clone())` before `mount.outbox.stream(shown)`.
-/// - S2. In `StreamTracker::detect_boundary` in `data/state.rs`, count one
+/// - S2. In `StreamTracker::detect_boundary` in `data/decode/state.rs`, count one
 ///   more, `first_sample_n.value() - expected.value() + 1`. In the same
 ///   function, drop `opened &&` from the condition `opened && self.relearned`
 ///   of the `Restarted` branch, so a gap after a link loss is told as
