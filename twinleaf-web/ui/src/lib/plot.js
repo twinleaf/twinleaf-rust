@@ -57,7 +57,9 @@ export function axisSlots(keys, sides = {}) {
  */
 export function timeAxis(epoch) {
   if (epoch === 'unix') {
-    const date = (t) => new Date(t * 1000);
+    // To the nearest millisecond: seconds times 1000 can land a hair under a
+    // whole millisecond, which a Date would cut down to the one before.
+    const date = (t) => new Date(Math.round(t * 1000));
     const two = (n) => String(n).padStart(2, '0');
     const clock = (d) => `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
     return {
@@ -71,7 +73,10 @@ export function timeAxis(epoch) {
         if (sec) return `:${two(sec)}`;
         return `${two(d.getHours())}:${two(d.getMinutes())}`;
       },
-      readout: (t) => `${clock(date(t))}.${String(Math.floor((t % 1) * 1000)).padStart(3, '0')}`,
+      readout(t) {
+        const d = date(t);
+        return `${clock(d)}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+      },
     };
   }
   return {

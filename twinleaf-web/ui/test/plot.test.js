@@ -275,6 +275,13 @@ describe('timeAxis', () => {
     expect(label(at(13, 5, 15))).toBe(':15');
     expect(label(at(13, 5, 15, 250))).toBe('.250');
   });
+  it('reads Unix time to the nearest millisecond, never the one below', () => {
+    const t = new Date(2026, 10, 8, 14, 3, 7).getTime() / 1000 + 0.12;
+    const { readout, label } = timeAxis('unix');
+    expect(readout(t)).toBe('14:03:07.120');
+    expect(label(t)).toBe('.120');
+    expect(readout(new Date(2026, 10, 8, 14, 3, 7).getTime() / 1000 + 0.9996)).toBe('14:03:08.000');
+  });
   it('labels any other clock in its own seconds', () => {
     expect(timeAxis('systime').label(12.5)).toBe('12.5 s');
   });
