@@ -20,7 +20,7 @@
   <Command.Input placeholder="Add a signal, switch tab, arrange…" />
   <Command.List>
     <Command.Empty>Nothing matches.</Command.Empty>
-    <Command.Group heading="Add to the highlighted plot">
+    <Command.Group heading="Add to the selected plots">
       {#each session.signals as t (t.key)}
         <Command.Item value={`add ${t.key}`} onSelect={() => run(() => act.addSignal(t.key))}>{t.key}</Command.Item>
       {/each}

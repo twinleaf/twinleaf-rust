@@ -173,7 +173,6 @@ export class Workspace {
         return t.id === tabId ? { ...t, plots: { ...t.plots, [plotId]: p }, layout: append(t.layout, plotId) } : t;
       }),
     );
-    this.selected.delete(plotId);
   }
 
   /** Adds plot `p` to the open tab, beside plot `where` along `dir`, or else at the end, and focuses it. */
@@ -181,10 +180,11 @@ export class Workspace {
     this.placePlot(p, where ? splitBeside(this.layout, where, p.id, dir) : append(this.layout, p.id));
   }
 
-  /** Adds plot `p` to the open tab, the tab then laid out as `layout`, and focuses it. */
+  /** Adds plot `p` to the open tab, the tab then laid out as `layout`, and focuses it; plots maximized show the rest again, so it shows. */
   placePlot(p, layout) {
     this.#edit((t) => ({ ...t, plots: { ...t.plots, [p.id]: p }, layout }));
     this.focusedId = p.id;
+    this.maximized = null;
   }
 
   /** Gives plot `id` of the open tab the fields of `patch`, as an edit; a patch that changes nothing is none. */
@@ -230,7 +230,6 @@ export class Workspace {
       const { [id]: _, ...plots } = t.plots;
       return { ...t, plots, layout: removePlot(t.layout, id) };
     });
-    this.selected.delete(id);
   }
 
   /** Arranges the open tab's plots as layout.js preset `name`; quadrants first fills the tab to four plots. */

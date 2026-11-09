@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { frames, mountPage } from './browser/page.js';
+import { centre, frames, mountPage } from './browser/page.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine']];
@@ -22,12 +22,12 @@ const LIST = [
   ['dock headers', () => [...document.querySelectorAll('.dock-head')], false],
   ['the status bar', () => [...document.querySelectorAll('.status-bar')], false],
   ['the gaps between plots', () => [...document.querySelectorAll('.tiles .separator')], false],
-  ['the plots', () => [...document.querySelectorAll('.tiles .leaf')], true],
+  ['the plots: their bodies and headers', () => [...document.querySelectorAll('.tiles .leaf .plot-body, .tiles .leaf .plot-head')], true],
   ['the window slider', () => [...document.querySelectorAll('button[aria-label="Time window"]')], true],
   ['the eraser', () => [...document.querySelectorAll('button[aria-label="Clear the cursors"]')], true],
   ['File', () => [...document.querySelectorAll('button')].filter((b) => b.textContent.trim() === 'File'), true],
   ['Commands', () => [...document.querySelectorAll('button.search')], true],
-  ['the Signals list', () => [...document.querySelectorAll('.palette')], true],
+  ['the Signals panel: its search, its signals and its list', () => [...document.querySelectorAll('input[type=search], .palette .chip, .palette')], true],
 ];
 
 /** A press and its release on `el`, as a click's are, so whatever it starts ends. */
@@ -39,7 +39,7 @@ function press(el, init = {}) {
 
 describe('a press', () => {
   it('on each control the list names keeps the plots selected or clears them, as it says', async () => {
-    const page = await mountPage(KEYS, 'columns');
+    const page = await mountPage(KEYS, 'columns', 0, ['vector.x', 'vector.y']);
     try {
       for (const [name, find, keeps] of LIST) {
         const els = find();
@@ -108,7 +108,7 @@ describe('a press', () => {
 });
 
 describe('Escape', () => {
-  it('deselects everything, and leaves a maximized plot and the cursors as they are', async () => {
+  it('deselects everything, and leaves a maximized plot as it is', async () => {
     const page = await mountPage(KEYS, 'columns');
     try {
       const [a, b] = plotIds(page.ws.layout);
@@ -183,6 +183,111 @@ describe('a signal clicked in the Signals list', () => {
       for (const id of [a, c]) expect(page.ws.plots[id].items.map((i) => i.key)).toContain('vector.x');
       expect(page.ws.plots[b].items.map((i) => i.key)).not.toContain('vector.x');
       expect(page.history.undos.length).toBe(1);
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
+describe('Escape, pressed again', () => {
+  it('with focus on a plot’s control goes out a level, and selects nothing', async () => {
+    const page = await mountPage(KEYS, 'columns');
+    try {
+      const [a] = plotIds(page.ws.layout);
+      page.ws.selected.add(a);
+      flushSync();
+      await commands.key('Shift');
+      document.querySelector(`.leaf[data-plot="${a}"] .plot-head button`).focus();
+      for (let i = 0; i < 3; i++) {
+        await commands.key('Escape');
+        flushSync();
+        expect(page.ws.selected.size, `after Escape ${i + 1}`).toBe(0);
+      }
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
+describe('F from the keys', () => {
+  it('maximizes the selection, and again restores, whichever plot was clicked last', async () => {
+    const page = await mountPage(KEYS, 'columns');
+    try {
+      const [a, b, c] = plotIds(page.ws.layout);
+      page.ws.selected.add(a);
+      page.ws.selected.add(c);
+      page.ws.focusedId = b;
+      flushSync();
+      document.body.focus();
+      await commands.key('f');
+      flushSync();
+      expect([...page.ws.maximized].sort()).toEqual([a, c].sort());
+      await commands.key('f');
+      flushSync();
+      expect(page.ws.maximized).toBe(null);
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
+describe('a split', () => {
+  it('undone and done again selects the new plots again', async () => {
+    const page = await mountPage(KEYS, 'columns');
+    try {
+      const ids = plotIds(page.ws.layout);
+      page.ws.selected.add(ids[0]);
+      flushSync();
+      const body = document.querySelector(`.leaf[data-plot="${ids[0]}"] .plot-body`);
+      const r = body.getBoundingClientRect();
+      body.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }));
+      flushSync();
+      await frames();
+      [...document.querySelectorAll('[role=menuitem]')].find((m) => m.textContent.trim().startsWith('Split right')).click();
+      flushSync();
+      const made = plotIds(page.ws.layout).filter((p) => !ids.includes(p));
+      expect([...page.ws.selected]).toEqual(made);
+      page.history.undo();
+      page.history.redo();
+      flushSync();
+      expect([...page.ws.selected]).toEqual(made);
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
+describe('a click on one of several selected plots', () => {
+  it('narrows the selection to it a moment later, unless a deselect comes first', async () => {
+    const page = await mountPage(KEYS, 'columns');
+    try {
+      const ids = plotIds(page.ws.layout);
+      document.body.focus();
+      await commands.key('Control+a');
+      const [x, y] = centre(document.querySelector(`.leaf[data-plot="${ids[0]}"] .plot-body`));
+      await commands.mouse([['move', x, y], ['down'], ['up']]);
+      await commands.key('Escape');
+      await new Promise((done) => setTimeout(done, 400));
+      flushSync();
+      expect(page.ws.selected.size).toBe(0);
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
+describe('a digit', () => {
+  it('selects its plot alone, the plot that has focus already among them', async () => {
+    const page = await mountPage(KEYS, 'columns');
+    try {
+      const [a] = plotIds(page.ws.layout);
+      await commands.key('1');
+      flushSync();
+      await frames();
+      await commands.key('Control+a');
+      await commands.key('1');
+      flushSync();
+      expect([...page.ws.selected]).toEqual([a]);
     } finally {
       page.dispose();
     }

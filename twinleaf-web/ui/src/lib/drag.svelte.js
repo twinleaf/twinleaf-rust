@@ -11,6 +11,7 @@ import { dock, dockOuter, holderDir, leaf, rects } from './layout.js';
 import { OUTER_SHARE, cellAt, moveCells, signalCells } from './moves.js';
 import { chip, newPlot } from './tabs.js';
 import { DRAG_START } from './constants.js';
+import { Selection } from './selection.svelte.js';
 
 const LANDED_MS = 700;
 /** The empty background a box selection starts on, besides what listens for it: a dock, a panel's body, a list's own space below its items. */
@@ -72,6 +73,8 @@ export class Drags {
     this.ws = ws;
     this.changed = changed;
     this.history = history;
+    /** What the drags do to the plot selection: the page's, set by it. */
+    this.selection = new Selection(ws, changed);
   }
 
   /** Runs `fn` as one undo step named `label`. */
@@ -108,9 +111,7 @@ export class Drags {
       stop();
       window.removeEventListener('keydown', key, true);
       this.marquee = null;
-      ws.selected.clear();
-      ws.focusedId = null;
-      this.changed();
+      this.selection.clear();
     };
     window.addEventListener('keydown', key, true);
     const stop = follow(
@@ -119,21 +120,18 @@ export class Drags {
         drawn = true;
         const m = { x: Math.min(x0, ev.clientX), y: Math.min(y0, ev.clientY), w: Math.abs(ev.clientX - x0), h: Math.abs(ev.clientY - y0) };
         this.marquee = m;
-        const hit = new Set(base);
+        // The plots it touches, of those that show: only the maximized ones while some are.
+        const hit = new Set(base), shown = ws.maximized && new Set(ws.maximized);
         for (const el of document.querySelectorAll('.leaf[data-plot]')) {
           const r = el.getBoundingClientRect();
-          if (r.left < m.x + m.w && r.right > m.x && r.top < m.y + m.h && r.bottom > m.y) hit.add(el.dataset.plot);
+          if ((!shown || shown.has(el.dataset.plot)) && r.left < m.x + m.w && r.right > m.x && r.top < m.y + m.h && r.bottom > m.y) hit.add(el.dataset.plot);
         }
-        ws.selected.clear();
-        for (const id of hit) ws.selected.add(id);
+        this.selection.only([...hit], null);
       },
       () => {
         window.removeEventListener('keydown', key, true);
-        // A click that draws no box clears the selection, but in what keeps it, as the Signals list.
-        if (!drawn && !e.shiftKey && !e.target.closest?.('[data-keeps-selection]')) {
-          ws.selected.clear();
-          ws.focusedId = null;
-        }
+        // A click that draws no box clears the selection, but in what keeps it, as the Signals panel.
+        if (!drawn && !e.shiftKey && !this.selection.keeps(e.target)) this.selection.clear();
         this.marquee = null;
         this.changed();
       },
@@ -210,9 +208,7 @@ export class Drags {
       ev.preventDefault();
       ev.stopPropagation();
       cancel();
-      ws.selected.clear();
-      ws.focusedId = null;
-      this.changed();
+      this.selection.clear();
     };
     window.addEventListener('keydown', key, true);
     const end = (drop) => {
@@ -234,7 +230,6 @@ export class Drags {
         if (lifted.remembers) ws.setPlot(plotId, { dockSize: lifted.remembers });
         if (target.tabId) {
           for (const id of group) ws.movePlotToTab(id, target.tabId);
-          ws.selected.clear();
         } else ws.setLayout(target.cell.next);
       });
       if (!target.tabId) this.flash(group);

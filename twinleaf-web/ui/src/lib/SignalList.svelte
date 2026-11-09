@@ -105,8 +105,8 @@
   type="search"
   bind:value={query}
   placeholder="Search {session.signals.length} signals"
-  title="Drag a signal onto the plots, or click it to add it to the highlighted one"
-  aria-label="Search signals: arrows move, Enter adds to the focused plot, Shift+Enter makes a new one"
+  title="Drag a signal onto the plots, or click it to add it to the selected ones"
+  aria-label="Search signals: arrows move, Enter adds to the selected plots, Shift+Enter makes a new one"
   onkeydown={searchKey}
   onfocus={() => (focused = true)}
   onblur={() => (focused = false)}
@@ -118,7 +118,6 @@
 <ScrollArea class="palette-scroll">
   <div
     {...props}
-    data-keeps-selection
     oncontextmenucapture={(e) => {
       menuKey = e.target.closest?.('.chip')?.dataset.key ?? null;
       if (!menuKey) e.preventDefault(), e.stopPropagation();
@@ -127,7 +126,7 @@
     role="listbox"
     tabindex="0"
     data-focus-own
-    aria-label="Signals: Enter adds to the focused plot, Shift+Enter makes a new one"
+    aria-label="Signals: Enter adds to the selected plots, Shift+Enter makes a new one"
     aria-activedescendant={focused && palette[active] ? `pal-${palette[active].id}` : undefined}
     use:dndzone={{ items: palette, type: 'trace', flipDurationMs: FLIP_MS, dropFromOthersDisabled: true, dropTargetStyle: {}, delayTouchStart: true, zoneTabIndex: 0, zoneItemTabIndex: -1, autoAriaDisabled: true }}
     onconsider={consider}

@@ -19,7 +19,8 @@
   import { exportText, importText, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
   import { actionFor } from './lib/keymap.js';
-  import { focusedByKeyboard, keepsKey, plotKeys } from './lib/keys.js';
+  import { keepsKey, plotKeys } from './lib/keys.js';
+  import { Selection } from './lib/selection.svelte.js';
   import { api } from './lib/protocol.js';
   import { THEMES, TRACE_WIDTH, prefs } from './lib/prefs.svelte.js';
   import RiSun from '@lucide/svelte/icons/sun';
@@ -83,7 +84,10 @@
   const { hub, ws, history } = getContext('page');
   setContext('history', history);
   const views = new Views(hub, viewChanged);
+  // What a press, a click, a key or focus does to the plot selection.
+  const selection = new Selection(ws, () => refreshToolbar());
   const drags = new Drags(ws, refreshToolbar, history);
+  drags.selection = selection;
   drags.closePlot = (id) => closePlot(id);
   drags.axisDropAt = (plotId, x, y) => [...registry].find((pv) => pv.plotId === plotId)?.axisDropAt(x, y) ?? null;
   /** The PlotViews on the page, which the frame loop draws. */
@@ -145,14 +149,6 @@
     refreshToolbar();
   }
   /**
-   * A press anywhere clears the selection and the plot clicked last, but in
-   * what works on the plots: the plots themselves, a menu or popover, and
-   * what is marked data-keeps-selection (the window slider, the eraser,
-   * File, Commands and the Signals list). A press with Shift keeps it, to
-   * add to it; scrolling with the wheel is no press.
-   */
-  const KEEPS_SELECTION = '.leaf, [data-keeps-selection], [data-slot$=-content], [role=menu], [role=dialog], [role=listbox]';
-  /**
    * The browser's own right-click menu shows only where it has something to
    * offer: in a field, and over text that is selected. Everywhere else a
    * right-click opens the page's menu for what is under it, or nothing.
@@ -161,26 +157,6 @@
     if (e.target instanceof Element && e.target.closest('input, textarea, [contenteditable]')) return;
     if (getSelection()?.toString()) return;
     e.preventDefault();
-  }
-  function pressOnBackground(e) {
-    if (e.button !== 0 || e.shiftKey || !(e.target instanceof Element) || e.target.closest(KEEPS_SELECTION)) return;
-    deselect();
-  }
-  /** Clears the selection and the plot clicked last. */
-  function deselect() {
-    if (!ws.selected.size && ws.focusedId === null) return;
-    ws.selected.clear();
-    ws.focusedId = null;
-    refreshToolbar();
-  }
-  /** Selects plot `id` alone, unless it is selected already, so a press on its controls acts on it, or on the selection it is in. */
-  function pressOn(id) {
-    if (!ws.selected.has(id)) {
-      ws.selected.clear();
-      ws.selected.add(id);
-    }
-    ws.focusedId = id;
-    refreshToolbar();
   }
 
   /** Every time plot's view in the tab, which the toolbar's Live button acts on. */
@@ -250,26 +226,6 @@
     hub.session.fetchWindow(id, 'overview', traces, lo, hi, window.innerWidth * 2);
   }
 
-  /** A click on plot `id` selects it alone; with Shift it adds the plot to
-   * the selection or takes it out. A click on one of several selected plots
-   * narrows the selection to it once the double-click time has passed, so a
-   * double-click still acts on them all. Esc, or a click on empty space,
-   * clears the selection. */
-  let narrowing;
-  const DOUBLE_CLICK_MS = 300;
-  function select(id, shift, clicks) {
-    clearTimeout(narrowing);
-    const selected = ws.selected;
-    const only = () => {
-      selected.clear();
-      selected.add(id);
-      refreshToolbar();
-    };
-    if (shift) selected.has(id) ? selected.delete(id) : selected.add(id);
-    else if (!selected.has(id)) only();
-    else if (selected.size > 1 && clicks === 1) narrowing = setTimeout(only, DOUBLE_CLICK_MS);
-    refreshToolbar();
-  }
 
   // Closing a tab with plots asks first: `closing` is the tab the dialog
   // asks about, and shows it. The dialog's Close button closes the tab and
@@ -706,13 +662,12 @@
     // Escape, once a menu or a drag has had it, deselects; with nothing
     // selected it goes out a level. It never clears cursors or restores a
     // maximized plot.
-    if (e.key === 'Escape' && !keepsKey(e) && (ws.selected.size || ws.focusedId !== null)) {
+    if (e.key === 'Escape' && !e.defaultPrevented && !keepsKey(e) && (ws.selected.size || ws.focusedId !== null)) {
       e.preventDefault();
-      return deselect();
+      return selection.clear();
     }
-    // Tab, the arrows, Enter, Escape and F6 move through the page's tree
-    // (focus.js). A plot acts on its own Escape first.
-    if (navigate(e, (n) => n.matches('[data-focus=plot]'))) return;
+    // Tab, the arrows, Enter, Escape and F6 move through the page's tree (focus.js).
+    if (navigate(e)) return;
     // What is typed into a field, a menu or dialog's own keys, and the keys
     // that press a button focused from the keyboard stay there (keys.js).
     if (keepsKey(e)) return;
@@ -733,15 +688,15 @@
     // Ctrl+A outside a field selects every plot of the tab, not the page's text.
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
       e.preventDefault();
-      ws.selected.clear();
-      for (const id of plotIds(ws.layout)) ws.selected.add(id);
-      return refreshToolbar();
+      return selection.only(ws.maximized ?? plotIds(ws.layout), null);
     }
     const action = actionFor('page', e);
     if (action === 'goToPlot') {
-      const id = plotIds(ws.layout)[+e.key - 1];
+      // The plots as they show: only the maximized ones while some are.
+      const id = (ws.maximized ?? plotIds(ws.layout))[+e.key - 1];
       if (!id) return;
       e.preventDefault();
+      selection.only([id]);
       return focusPlot(id);
     }
     if (action === 'help') return void (keysOpen = true);
@@ -768,7 +723,7 @@
 
 <!-- Nothing on the page drags natively: plots, signals and tabs move by
      pointer, and a native drag would only carry a picture of the page. -->
-<svelte:window onkeydown={onKey} onkeyup={onKeyUp} onfocusin={remember} onpointerdowncapture={pressOnBackground} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
+<svelte:window onkeydown={onKey} onkeyup={onKeyUp} onfocusin={remember} onpointerdowncapture={(e) => selection.press(e)} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
 <canvas class="gl-layer" bind:this={glCanvas}></canvas>
 
 {#snippet plotTile(id)}
@@ -787,41 +742,31 @@
         otherTabs={ws.tabs.filter((t) => t.id !== ws.activeId)}
         focused={ws.focusedId === id}
         selected={ws.selected.has(id)}
-        onSelect={(shift, clicks) => select(id, shift, clicks)}
+        onSelect={(shift, clicks) => selection.click(id, shift, clicks)}
         maximized={!!ws.maximized?.includes(id)}
         onFocus={(e) => {
-          // Focus moved here from the keyboard selects the plot, as a click on it does.
-          if (e && focusedByKeyboard(e.target)) pressOn(id);
-          else ws.focusedId = id;
+          selection.focusIn(id, e);
           refreshToolbar();
         }}
-        onPress={() => pressOn(id)}
+        onPress={() => selection.pressOn(id)}
         onRemove={(keys) => closePlots(targetIdsOf(id, keys), keys)}
         onEach={(what, fn, keys) => eachPlot(id, what, fn, keys)}
         onEdit={(what, patch) => history.group(what, () => ws.setPlot(id, patch))}
         onView={(patch) => ws.setView(id, patch)}
-        onContext={() => {
-          // A right-click on a plot outside the selection selects it alone, so the menu acts on what is highlighted.
-          if (!ws.selected.has(id)) {
-            ws.selected.clear();
-            ws.selected.add(id);
-          }
-          ws.focusedId = id;
-          refreshToolbar();
-        }}
+        onContext={() => selection.pressOn(id)}
         targetIds={(keys) => targetIdsOf(id, keys)}
         onStartMove={(e) => drags.startMove(id, e)}
         onSplit={(dir, keys) => {
           // Each plot it acts on gets an empty plot beside it, and the new plots are selected, to fill next.
+          // In one step with them, so redo selects them again.
           const ids = targetIdsOf(id, keys), made = ids.map(() => newPlot('time', 'overlay', []));
-          history.group(ids.length > 1 ? `Split ${plotsText(ids.length)}` : 'Split', () => ids.forEach((at, i) => ws.addPlot(made[i], at, dir)));
-          ws.selected.clear();
-          for (const p of made) ws.selected.add(p.id);
+          history.group(ids.length > 1 ? `Split ${plotsText(ids.length)}` : 'Split', () => {
+            ids.forEach((at, i) => ws.addPlot(made[i], at, dir));
+            selection.only(made.map((p) => p.id));
+          });
           if (keys) focusPlot(made[0].id);
-          else ws.focusedId = made[0].id;
-          refreshToolbar();
         }}
-        onMaximize={(keys) => (ws.maximized = ws.maximized?.includes(id) ? null : targetIdsOf(id, keys))}
+        onMaximize={(keys) => (ws.maximized = ws.maximized && (keys || ws.maximized.includes(id)) ? null : targetIdsOf(id, keys))}
         onMoveToTab={(tabId) => {
           const ids = targetIdsOf(id);
           history.group(`Move ${plotsText(ids.length)} to ${ws.tabs.find((t) => t.id === tabId)?.name ?? 'a tab'}`, () => {
@@ -847,7 +792,10 @@
   {#if id === 'devices'}
     <Devices session={hub.session} {unchecked} />
   {:else if id === 'signals'}
-    <SignalList session={hub.session} {drags} onAdd={addSignal} onNewPlot={newPlotWith} />
+    <!-- The whole panel keeps the plot selection: its search, its list and its scrollbar. -->
+    <div class="contents" data-keeps-selection>
+      <SignalList session={hub.session} {drags} onAdd={addSignal} onNewPlot={newPlotWith} />
+    </div>
   {:else}
     {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} />{/key}
   {/if}

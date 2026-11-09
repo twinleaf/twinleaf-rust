@@ -32,10 +32,13 @@
   const place = (u, g) =>
     `left: calc(${num(u.x * 100)}% + ${num(g.x)} * var(--gutter)); top: calc(${num(u.y * 100)}% + ${num(g.y)} * var(--gutter)); ` +
     `width: calc(${num(u.w * 100)}% + ${num(g.w)} * var(--gutter)); height: calc(${num(u.h * 100)}% + ${num(g.h)} * var(--gutter));`;
-  const tiles = $derived.by(() => {
-    const u = rects(shown, UNIT, 0), g = rects(shown, NONE, 1);
+  /** Where each plot of `tree` is drawn. */
+  const placed = (tree) => {
+    const u = rects(tree, UNIT, 0), g = rects(tree, NONE, 1);
     return new Map([...u].map(([id, r]) => [id, place(r, g.get(id))]));
-  });
+  };
+  // The maximized plots where they fill the box; the rest where the layout has them, hidden.
+  const tiles = $derived(max ? new Map([...placed(dragged), ...placed(shown)]) : placed(shown));
   const gaps = $derived.by(() => {
     const u = gutters(shown, UNIT, 0), g = gutters(shown, NONE, 1);
     return u.map((gap, i) => ({ gap, style: place(gap, g[i]) }));
@@ -50,7 +53,7 @@
 
 <div class="tile-box" bind:this={box} style="--gutter: {GUTTER}px">
   {#each plotIds(layout) as id (id)}
-    <div class="leaf" class:max={max?.has(id)} class:lifted={lifted?.has(id)} class:landed={landed?.has(id)} data-plot={id} style={tiles.get(id) ?? ''}>
+    <div class="leaf" class:max={max?.has(id)} class:lifted={lifted?.has(id)} class:landed={landed?.has(id)} data-plot={id} style={tiles.get(id)}>
       {@render leafContent(id)}
       {#if drop?.plotId === id}
         <div class="drop-hint {drop.edge}"></div>

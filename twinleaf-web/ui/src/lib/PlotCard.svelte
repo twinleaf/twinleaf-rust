@@ -263,8 +263,8 @@
   // pick-up from the header. The capture sees the press before the header
   // or the plot takes it for a move or a pan.
   let pressedAt = null;
-  /** The plot's own controls, a press on which selects the plot first. */
-  const CONTROLS = 'button, [role=button], [role=combobox], input';
+  /** The plot's header and controls, a press on which selects the plot first: its grip and its header start the same move. */
+  const CONTROLS = '.plot-head, button, [role=button], [role=combobox], input';
   function pressed(e) {
     pressedAt = [e.clientX, e.clientY];
     if (e.button === 0 && !e.shiftKey && e.target.closest?.(CONTROLS)) onPress?.();

@@ -83,9 +83,9 @@ function isNode(el) {
   return el.matches(NODE) || (el.matches(CONTROL) && parentOf(el) !== null);
 }
 
-/** Whether `el` can take focus now: shown, enabled and not left out. */
+/** Whether `el` can take focus now: shown, enabled and not left out, as a plot hidden behind maximized ones is. */
 function usable(el) {
-  return !el.disabled && !el.closest('[inert], [aria-hidden=true], [data-focus-skip], [role=separator]') && el.getClientRects().length > 0;
+  return !el.disabled && !el.closest('[inert], [aria-hidden=true], [data-focus-skip], [role=separator]') && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
 }
 
 /** The page's tree, read from the DOM as it is when asked. */
