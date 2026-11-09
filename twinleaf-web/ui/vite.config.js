@@ -12,10 +12,14 @@ function count(name, fallback) {
   return +v;
 }
 
+/** The port the browser tests' runner listens on, TL_TEST_PORT, so checkouts can run them side by side. */
+const testPort = count('TL_TEST_PORT', 9420);
+
 export default defineConfig({
   plugins: [tailwindcss(), svelte()],
-  // Tests bundle dependencies apart from the dev server, which shares this folder.
-  cacheDir: process.env.VITEST ? 'node_modules/.vite-test' : 'node_modules/.vite',
+  // Tests bundle dependencies apart from the dev server, which shares this
+  // folder, and apart from tests run on another port.
+  cacheDir: process.env.VITEST ? `node_modules/.vite-test-${testPort}` : 'node_modules/.vite',
   resolve: { alias: { $lib: path.resolve('./src/lib') } },
   test: {
     // FC_RUNS sets how many cases each property tries; FC_SEED and FC_PATH
@@ -42,7 +46,7 @@ export default defineConfig({
             enabled: true,
             provider: 'playwright',
             headless: true,
-            api: { host: '127.0.0.1', port: 9420, strictPort: true },
+            api: { host: '127.0.0.1', port: testPort, strictPort: true },
             viewport: { width: 1200, height: 900 },
             // A property's failure prints its case to replay; a picture adds nothing.
             screenshotFailures: false,
