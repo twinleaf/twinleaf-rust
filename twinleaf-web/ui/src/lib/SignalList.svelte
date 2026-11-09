@@ -24,7 +24,6 @@
   import Swatch from './Swatch.svelte';
   import ColorPicker from './ColorPicker.svelte';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
-  import { claimMenu, releaseMenu } from './menus.js';
   import RiAdd from '@lucide/svelte/icons/plus';
   import RiNewPlot from '@lucide/svelte/icons/square-plus';
   import RiPalette from '@lucide/svelte/icons/palette';
@@ -81,8 +80,6 @@
   }
 
   let menuOpen = $state(false);
-  const closeMenu = () => (menuOpen = false);
-  $effect(() => (menuOpen ? claimMenu(closeMenu) : releaseMenu(closeMenu)));
   let menuKey = $state(null); // the signal a right-click opened the menu for
   let active = $state(0);
   let focused = $state(false);

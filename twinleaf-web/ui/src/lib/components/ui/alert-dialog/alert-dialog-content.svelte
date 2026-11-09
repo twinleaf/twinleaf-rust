@@ -1,6 +1,7 @@
 <script>
 	import { AlertDialog as AlertDialogPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils.js";
+	import { overlayContent } from "$lib/overlay.svelte.js";
 	import AlertDialogOverlay from "./alert-dialog-overlay.svelte";
 	import AlertDialogPortal from "./alert-dialog-portal.svelte";
 	let {
@@ -8,8 +9,11 @@
 		class: className,
 		size = "default",
 		portalProps,
+		onCloseAutoFocus,
 		...restProps
 	} = $props();
+	// What opens inside the dialog is its own, and focus goes back as it closes (overlay.svelte.js).
+	const layer = overlayContent();
 </script>
 
 <AlertDialogPortal {...portalProps}>
@@ -23,5 +27,6 @@
 			className
 		)}
 		{...restProps}
+		onCloseAutoFocus={(e) => (layer.closing(e), onCloseAutoFocus?.(e))}
 	/>
 </AlertDialogPortal>

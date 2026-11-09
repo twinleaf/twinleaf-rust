@@ -1,6 +1,7 @@
 <script>
 	import { DropdownMenu as DropdownMenuPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils.js";
+	import { overlayContent } from "$lib/overlay.svelte.js";
 	import DropdownMenuPortal from "./dropdown-menu-portal.svelte";
 	let {
 		ref = $bindable(null),
@@ -12,8 +13,12 @@
 		align = "start",
 		portalProps,
 		class: className,
+		onInteractOutside,
+		onCloseAutoFocus,
 		...restProps
 	} = $props();
+	// A press outside, or another layer opening, leaves focus where it put it (overlay.svelte.js).
+	const layer = overlayContent();
 </script>
 
 <DropdownMenuPortal {...portalProps}>
@@ -28,5 +33,7 @@
 			className
 		)}
 		{...restProps}
+		onInteractOutside={(e) => (layer.outside(), onInteractOutside?.(e))}
+		onCloseAutoFocus={(e) => (layer.closing(e), onCloseAutoFocus?.(e))}
 	/>
 </DropdownMenuPortal>

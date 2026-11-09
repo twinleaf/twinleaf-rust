@@ -1,6 +1,7 @@
 <script>
 	import { Popover as PopoverPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils.js";
+	import { overlayContent } from "$lib/overlay.svelte.js";
 	import PopoverPortal from "./popover-portal.svelte";
 	let {
 		ref = $bindable(null),
@@ -8,8 +9,12 @@
 		sideOffset = 4,
 		align = "center",
 		portalProps,
+		onInteractOutside,
+		onCloseAutoFocus,
 		...restProps
 	} = $props();
+	// A press outside, or another layer opening, leaves focus where it put it (overlay.svelte.js).
+	const layer = overlayContent();
 </script>
 
 <PopoverPortal {...portalProps}>
@@ -23,5 +28,7 @@
 			className
 		)}
 		{...restProps}
+		onInteractOutside={(e) => (layer.outside(), onInteractOutside?.(e))}
+		onCloseAutoFocus={(e) => (layer.closing(e), onCloseAutoFocus?.(e))}
 	/>
 </PopoverPortal>

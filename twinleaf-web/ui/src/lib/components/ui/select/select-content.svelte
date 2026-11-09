@@ -1,6 +1,7 @@
 <script>
 	import { Select as SelectPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils.js";
+	import { overlayContent } from "$lib/overlay.svelte.js";
 	import SelectPortal from "./select-portal.svelte";
 	import SelectScrollDownButton from "./select-scroll-down-button.svelte";
 	import SelectScrollUpButton from "./select-scroll-up-button.svelte";
@@ -16,8 +17,12 @@
 		// menu, so a press on another menu's button only closed this one. Without
 		// it, the press reaches its target, and the page's one-menu rule closes this.
 		preventScroll = false,
+		onInteractOutside,
+		onCloseAutoFocus,
 		...restProps
 	} = $props();
+	// A press outside, or another layer opening, leaves focus where it put it (overlay.svelte.js).
+	const layer = overlayContent();
 </script>
 
 <SelectPortal {...portalProps}>
@@ -32,6 +37,8 @@
 			className
 		)}
 		{...restProps}
+		onInteractOutside={(e) => (layer.outside(), onInteractOutside?.(e))}
+		onCloseAutoFocus={(e) => (layer.closing(e), onCloseAutoFocus?.(e))}
 	>
 		<SelectScrollUpButton />
 		<SelectPrimitive.Viewport

@@ -80,7 +80,7 @@
   import RiQuadrants from '@lucide/svelte/icons/grid-2x2';
   import RiFocusArrange from '@lucide/svelte/icons/layout-panel-left';
   import RiUpload from '@lucide/svelte/icons/upload';
-  import { counted, pressOutsideKeepsFocus } from './lib/menus.js';
+  import { counted } from './lib/menus.js';
   import RiCheck from '@lucide/svelte/icons/check';
   import RiChevron from '@lucide/svelte/icons/chevron-down';
 
@@ -178,9 +178,9 @@
   const tabViews = () => ws.timeIds().map((id) => views.of(id));
   // The top bar's menus and popovers: each opens 2 px below the bar, as a
   // plot's header menus open below the header (its 24 px buttons sit 5 px
-  // above the 34 px bar's foot), and a press on another's button opens it.
+  // above the 34 px bar's foot), and a press on another's button opens it
+  // (overlay.svelte.js).
   const BAR_OFFSET = 7;
-  const layoutMenu = pressOutsideKeepsFocus(), fileMenu = pressOutsideKeepsFocus(), settingsMenu = pressOutsideKeepsFocus(), windowMenu = pressOutsideKeepsFocus();
   /** Each theme's icon. */
   const THEME_ICONS = { light: RiSun, dark: RiMoon, system: RiSystem };
   /** Each arrangement's picture in the Layout menu. */
@@ -941,7 +941,7 @@
             </Popover.Trigger>
           {/snippet}
         </Tip>
-        <Popover.Content class="axis-pop w-auto gap-0 p-1.5" align="start" sideOffset={BAR_OFFSET} {...windowMenu}>
+        <Popover.Content class="axis-pop w-auto gap-0 p-1.5" align="start" sideOffset={BAR_OFFSET}>
           <div class="axis-row">
             <span>Window</span>
             <WindowSlider value={span} onchange={setSpan} widest={hub.liveSeconds()} />
@@ -958,7 +958,7 @@
           {/snippet}
         </Tip>
         <!-- Each arrangement beside a picture of it, as the plot menus lead with icons. -->
-        <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET} {...layoutMenu}>
+        <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET}>
           <!-- A check on the arrangement the tab is in now, if any. -->
           {@const now = ws.arrangement()}
           <DropdownMenu.Label>Arrange this tab<span class="menu-value">{plotsText(plotIds(ws.layout).length)}</span></DropdownMenu.Label>
@@ -978,7 +978,7 @@
             </DropdownMenu.Trigger>
           {/snippet}
         </Tip>
-        <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET} {...fileMenu}>
+        <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET}>
           <DropdownMenu.Item onSelect={exportTabs}><RiDownload class="menu-icon" />Export every tab…<span class="menu-value">{counted(ws.tabs.length, 'tab')}</span></DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => importInput.click()}><RiUpload class="menu-icon" />Import tabs…</DropdownMenu.Item>
           <DropdownMenu.Separator />
@@ -999,7 +999,7 @@
         <!-- A grouped form: each section a heading over rows of a label and
              its control, the labels in one column and the controls in the
              other (plot.css, .settings-pop). -->
-        <Popover.Content class="w-80 gap-0 p-0" align="end" sideOffset={BAR_OFFSET} {...settingsMenu}>
+        <Popover.Content class="w-80 gap-0 p-0" align="end" sideOffset={BAR_OFFSET}>
           <div class="settings-pop">
             <section aria-labelledby="set-display">
               <h3 id="set-display">Display</h3>

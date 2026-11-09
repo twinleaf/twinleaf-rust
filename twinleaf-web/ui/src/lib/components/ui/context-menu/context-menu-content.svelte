@@ -1,6 +1,7 @@
 <script>
 	import { ContextMenu as ContextMenuPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils.js";
+	import { overlayContent } from "$lib/overlay.svelte.js";
 	import ContextMenuPortal from "./context-menu-portal.svelte";
 	let {
 		ref = $bindable(null),
@@ -10,8 +11,12 @@
 		// it, the press reaches its target, and the page's one-menu rule closes this.
 		preventScroll = false,
 		class: className,
+		onInteractOutside,
+		onCloseAutoFocus,
 		...restProps
 	} = $props();
+	// A press outside, or another layer opening, leaves focus where it put it (overlay.svelte.js).
+	const layer = overlayContent();
 </script>
 
 <ContextMenuPortal {...portalProps}>
@@ -24,5 +29,7 @@
 			className
 		)}
 		{...restProps}
+		onInteractOutside={(e) => (layer.outside(), onInteractOutside?.(e))}
+		onCloseAutoFocus={(e) => (layer.closing(e), onCloseAutoFocus?.(e))}
 	/>
 </ContextMenuPortal>

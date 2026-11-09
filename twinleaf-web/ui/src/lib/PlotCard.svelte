@@ -12,7 +12,7 @@
   import RiRemoveAxis from '@lucide/svelte/icons/trash-2';
   import RiFit from '@lucide/svelte/icons/unfold-vertical';
   import RiFitX from '@lucide/svelte/icons/unfold-horizontal';
-  import { claimMenu, common, counted, releaseMenu } from './menus.js';
+  import { common, counted } from './menus.js';
   import RiSpan from '@lucide/svelte/icons/ruler-dimension-line';
   import RiShowOnly from '@lucide/svelte/icons/eye';
   import RiHide from '@lucide/svelte/icons/eye-off';
@@ -174,12 +174,6 @@
   const shown = (v) => String(+v.toPrecision(6));
   /** The one signal the axis right-clicked scales, whose colour its popover sets, or null for a shared axis. */
   const axisKey = $derived(region.kind === 'y' && region.keys.length === 1 && region.keys[0] !== 'shared' ? region.keys[0] : null);
-  // Each of the plot's menus closes the page's others as it opens.
-  const closeAxis = () => (axisOpen = false), closeMenu = () => (menuOpen = false), closeSignals = () => (signalsOpen = false);
-  const closeXAxis = () => (xAxisOpen = false), closeReadout = () => (readoutOpen = false);
-  const opened = (open, close) => (open ? claimMenu(close) : releaseMenu(close));
-  $effect(() => opened(axisOpen, closeAxis));
-  $effect(() => opened(menuOpen, closeMenu));
   // What a copy of the plot would hold, asked of the hub at each right-click
   // that opens or moves the menu, since the window may have changed while it
   // was shut or open. The right-click sets the placeholder itself, so the
@@ -222,9 +216,6 @@
       offs.forEach((off) => off());
     };
   });
-  $effect(() => opened(signalsOpen, closeSignals));
-  $effect(() => opened(xAxisOpen, closeXAxis));
-  $effect(() => opened(readoutOpen, closeReadout));
   function contextAt(e) {
     // The cursors' readout has a menu of its own.
     if (e.target.closest?.('.cursor-readout')) return;

@@ -3,6 +3,7 @@
 	import XIcon from '@lucide/svelte/icons/x';
 	import { Button } from "$lib/components/ui/button/index.js";
 	import { cn } from "$lib/utils.js";
+	import { overlayContent } from "$lib/overlay.svelte.js";
 	import DialogOverlay from "./dialog-overlay.svelte";
 	import DialogPortal from "./dialog-portal.svelte";
 	let {
@@ -11,8 +12,11 @@
 		portalProps,
 		children,
 		showCloseButton = true,
+		onCloseAutoFocus,
 		...restProps
 	} = $props();
+	// What opens inside the dialog is its own, and focus goes back as it closes (overlay.svelte.js).
+	const layer = overlayContent();
 </script>
 
 <DialogPortal {...portalProps}>
@@ -25,6 +29,7 @@
 			className
 		)}
 		{...restProps}
+		onCloseAutoFocus={(e) => (layer.closing(e), onCloseAutoFocus?.(e))}
 	>
 		{@render children?.()}
 		{#if showCloseButton}
