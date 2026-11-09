@@ -205,7 +205,7 @@ describe('A paused view, given the history its plot captured', () => {
 describe('A plot switched between kinds', () => {
   it('keeps each kind’s y ranges apart, so a spectrum never reads a time plot’s as log10', () => {
     const cfg = { kind: 'time' };
-    const pv = Object.assign(Object.create(PlotView.prototype), { config: () => cfg, yByKind: new Map() });
+    const pv = Object.assign(Object.create(PlotView.prototype), { config: () => cfg, view: new View({ now: () => 0 }) });
     expect(pv.yRange('shared', -1, 1, true)).toEqual([-1.16, 1.16]);
     cfg.kind = 'spectrum';
     const [lo, hi] = pv.yRange('shared', -4, 0, false);
@@ -218,12 +218,17 @@ describe('A plot switched between kinds', () => {
 
 describe('Y cursors', () => {
   // A plot of one shared y axis, 0 to 10 over a 100 px lane from y = 0.
-  const plot = (kind = 'time') => {
+  const plot = (kind = 'time', view = new View({ now: () => 0 })) => {
     const cfg = { kind };
-    const pv = Object.assign(Object.create(PlotView.prototype), { config: () => cfg, yCursorsByKind: new Map(), specCursors: { a: null, b: null }, log: false });
+    const pv = Object.assign(Object.create(PlotView.prototype), { config: () => cfg, view, log: false });
     pv.yAxes = [{ key: 'shared', lane: { x: 40, y: 0, w: 200, h: 100 }, range: [0, 10], x0: 0, x1: 40 }];
     return { pv, cfg };
   };
+  it('are the view’s, so a plot drawn again with it finds them', () => {
+    const { pv } = plot();
+    pv.setYCursor('shared', 'b', 5);
+    expect(plot('time', pv.view).pv.yCursors.get('shared')).toEqual({ a: null, b: 5 });
+  });
   it('are found near their line, across the lane or on their tag in the gutter', () => {
     const { pv } = plot();
     pv.setYCursor('shared', 'a', 5); // y = 50
@@ -247,10 +252,33 @@ describe('Y cursors', () => {
     pv.setYCursor('shared', 'a', 5);
     cfg.kind = 'spectrum';
     expect(pv.yCursors.get('shared')).toBeUndefined();
-    expect(pv.clearCursors()).toBe(true);
+    expect(pv.view.clearCursors()).toBe(true);
     cfg.kind = 'time';
     expect(pv.yCursors.get('shared')).toBeUndefined();
-    expect(pv.clearCursors()).toBe(false);
+    expect(pv.view.clearCursors()).toBe(false);
+  });
+});
+
+describe('A plot’s view', () => {
+  const plot = (cfg, view) => Object.assign(Object.create(PlotView.prototype), { config: () => cfg, view });
+  it('holds its y ranges, so a plot drawn again with it finds them', () => {
+    const view = new View({ now: () => 0 }), cfg = { kind: 'time' };
+    plot(cfg, view).setYBounds(['shared'], 1, 2);
+    expect(plot(cfg, view).yBounds('shared')).toEqual([1, 2]);
+  });
+  it('holds the spectrum a paused spectrum shows, so a plot drawn again with it shows that one', () => {
+    const view = new View({ now: () => 0 }), t = { spectrum: 'first' };
+    expect(plot({ kind: 'spectrum' }, view).spectrumOf(t)).toBe('first');
+    view.pause(0);
+    t.spectrum = 'second';
+    expect(plot({ kind: 'spectrum' }, view).spectrumOf(t)).toBe('first');
+  });
+  it('clears every cursor in one place, time X cursors with the rest', () => {
+    const view = new View({ now: () => 0 });
+    view.cursors = { a: 1, b: null };
+    expect(view.clearCursors()).toBe(true);
+    expect(view.cursors).toEqual({ a: null, b: null });
+    expect(view.clearCursors()).toBe(false);
   });
 });
 

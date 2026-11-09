@@ -570,13 +570,8 @@
   }
   /** Clears the cursors of plots `ids`, by default the selection's or every plot's, and says whether any were placed. */
   function clearCursors(ids = selection.pageTargets('view')) {
-    const placed = (c) => c && (c.a !== null || c.b !== null);
     let had = false;
-    for (const id of ids) {
-      const vw = views.get(id);
-      if (vw) (had ||= placed(vw.cursors)), (vw.cursors = { a: null, b: null });
-    }
-    for (const pv of registry) if (ids.includes(pv.plotId)) had = pv.clearCursors() || had;
+    for (const id of ids) had = views.get(id)?.clearCursors() || had;
     return had;
   }
   const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addSignal, newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };

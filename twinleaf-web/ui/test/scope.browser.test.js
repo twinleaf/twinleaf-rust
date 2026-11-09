@@ -95,7 +95,7 @@ const Y_FIELDS = ['Lowest value shown', 'Highest value shown'], F_FIELDS = ['Low
 async function spectraWithCursors(page) {
   setEvery(page, { kind: 'spectrum' });
   await settle();
-  eachPv(page, (pv) => (pv.specCursors = { a: 3, b: 7 }));
+  eachPv(page, (pv) => (pv.view.specCursors = { a: 3, b: 7 }));
 }
 /** Every time plot's view with X1 and X2 placed in what it shows. */
 function timeCursors(page) {
@@ -155,7 +155,7 @@ const COMMANDS = {
   'the x popover’s cursor clear': {
     prepare: spectraWithCursors,
     act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await button('Clear the X cursors')),
-    acted: (page, id) => page.pv(id).specCursors.a === null,
+    acted: (page, id) => page.pv(id).view.specCursors.a === null,
   },
   'the readout’s zoom to X1–X2, on spectra': {
     prepare: spectraWithCursors,
@@ -170,7 +170,7 @@ const COMMANDS = {
   'the readout’s Clear X cursors': {
     prepare: spectraWithCursors,
     act: async (page, id) => (await rightClick(spots(page, id)['the readout']), await choose('Clear X cursors')),
-    acted: (page, id) => page.pv(id).specCursors.a === null,
+    acted: (page, id) => page.pv(id).view.specCursors.a === null,
   },
   'the readout’s Clear Y cursors': {
     prepare: yCursors,

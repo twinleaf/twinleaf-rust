@@ -439,10 +439,7 @@ export class PlotView {
     Object.assign(this, { body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY });
     this.zoomBand = null; // [x0, x1] in client px while a Ctrl+drag marks a range to zoom to
     this.ctx = overlay.getContext('2d');
-    this.yByKind = new Map(); // plot kind -> its y ranges, see `y`
     this.specHover = null;
-    this.specCursors = { a: null, b: null }; // a spectrum's X1 and X2, in Hz
-    this.yCursorsByKind = new Map(); // plot kind -> its Y cursors, see `yCursors`
     this.yAxes = []; // the y axes, as last drawn: {key, lane, range, side, slot, x0, x1, color, plans}
     this.tabs = []; // the tabs cursors not yet placed rest as, as last drawn
     this.tagsPlaced = [];
@@ -499,28 +496,28 @@ export class PlotView {
   }
 
   /**
-   * The y ranges of the plot's kind, range key -> {range, auto}. Each kind
-   * keeps its own, and a spectrum its own for each y scale, as a log axis's
-   * are log10 of what it shows: switching kind or scale and back finds each
-   * as it was left.
+   * The y ranges of the plot's kind, which its view holds, range key ->
+   * {range, auto}. Each kind keeps its own, and a spectrum its own for each
+   * y scale, as a log axis's are log10 of what it shows: switching kind or
+   * scale and back finds each as it was left.
    */
   get y() {
     const cfg = this.config();
     const kind = cfg.kind === 'spectrum' ? `spectrum:${cfg.yLog ? 'log' : 'linear'}` : cfg.kind;
-    let ranges = this.yByKind.get(kind);
-    if (!ranges) this.yByKind.set(kind, (ranges = new Map()));
+    let ranges = this.view.yByKind.get(kind);
+    if (!ranges) this.view.yByKind.set(kind, (ranges = new Map()));
     return ranges;
   }
 
   /**
-   * The Y cursors of the plot's kind, range key -> {a, b}: Y1 and Y2 of the
-   * y axis with that key, each a value in the axis's units or null. Each kind
-   * keeps its own, as its axes differ.
+   * The Y cursors of the plot's kind, which its view holds, range key ->
+   * {a, b}: Y1 and Y2 of the y axis with that key, each a value in the
+   * axis's units or null. Each kind keeps its own, as its axes differ.
    */
   get yCursors() {
     const kind = this.config().kind;
-    let cursors = this.yCursorsByKind.get(kind);
-    if (!cursors) this.yCursorsByKind.set(kind, (cursors = new Map()));
+    let cursors = this.view.yCursorsByKind.get(kind);
+    if (!cursors) this.view.yCursorsByKind.set(kind, (cursors = new Map()));
     return cursors;
   }
 
@@ -1476,21 +1473,11 @@ export class PlotView {
     else this.yCursors.delete(key);
   }
 
-  /** Removes a spectrum's X cursors and every Y cursor, and says whether any were placed. A time plot's X cursors are its view's. */
-  clearCursors() {
-    const placed = (c) => c.a !== null || c.b !== null;
-    let had = placed(this.specCursors);
-    for (const cursors of this.yCursorsByKind.values()) for (const c of cursors.values()) had ||= placed(c);
-    this.specCursors = { a: null, b: null };
-    this.yCursorsByKind.clear();
-    return had;
-  }
-
   /** How many cursors are placed: X1 and X2, and each Y1 and Y2 of every kind. */
   cursorsPlaced() {
     const { a, b } = this.markers();
     let n = (a !== null) + (b !== null);
-    for (const cursors of this.yCursorsByKind.values()) for (const c of cursors.values()) n += (c.a !== null) + (c.b !== null);
+    for (const cursors of this.view.yCursorsByKind.values()) for (const c of cursors.values()) n += (c.a !== null) + (c.b !== null);
     return n;
   }
 
@@ -1512,14 +1499,14 @@ export class PlotView {
 
   /** The hover position and the X1 and X2 cursors, as a and b, in this plot's x units. */
   markers() {
-    if (this.config().kind === 'spectrum') return { hover: this.specHover, ...this.specCursors };
+    if (this.config().kind === 'spectrum') return { hover: this.specHover, ...this.view.specCursors };
     return { hover: this.hoverTime.t, ...this.view.cursors };
   }
 
   setMarker(name, value) {
     if (this.config().kind === 'spectrum') {
       if (name === 'hover') this.specHover = value;
-      else this.specCursors[name] = value;
+      else this.view.specCursors[name] = value;
     } else if (name === 'hover') this.hoverTime.t = value;
     else for (const v of this.targets()) v.cursors[name] = value;
   }
@@ -1847,9 +1834,9 @@ export class PlotView {
    * streams, and the one it showed when the view paused until it streams again.
    */
   spectrumOf(t) {
-    this.shownSpectra ??= new WeakMap(); // Trace -> spectrum
-    if (this.view.live || !this.shownSpectra.has(t)) this.shownSpectra.set(t, t.spectrum);
-    return this.shownSpectra.get(t);
+    const held = this.view.spectra;
+    if (this.view.live || !held.has(t)) held.set(t, t.spectrum);
+    return held.get(t);
   }
 
 }
@@ -1876,9 +1863,11 @@ const X_LABEL_GAP = 8;
 const AXIS_DROP = 48;
 
 /**
- * One time plot's x range: live, trailing the newest samples by `delay`, or
- * paused at `right`. It reads the time from the hub, so it outlives any one
- * hub's session.
+ * What one plot shows: a time plot's x range, live, trailing the newest
+ * samples by `delay`, or paused at `right`; the plot's cursors and y
+ * ranges; and the spectra a paused spectrum holds. It reads the time from
+ * the hub, so it outlives any one hub's session, and it outlives the plot's
+ * component, so a remount keeps all of them.
  */
 export class View {
   live = true;
@@ -1890,7 +1879,11 @@ export class View {
   right = 0; // device time of the right edge when paused
   pausedAt = null; // device time it paused at, the end of what it captured
   limits = null; // [oldest, newest] a paused view stays within, as its plot last drew it
-  cursors = { a: null, b: null }; // placed, device time
+  cursors = { a: null, b: null }; // a time plot's X1 and X2, placed, device time
+  specCursors = { a: null, b: null }; // a spectrum's X1 and X2, in Hz
+  yCursorsByKind = new Map(); // plot kind -> range key -> Y1 and Y2, {a, b}: PlotView's `yCursors`
+  yByKind = new Map(); // plot kind, a spectrum's by y scale -> range key -> {range, auto}: PlotView's `y`
+  spectra = new Map(); // Trace -> the spectrum a spectrum plot shows of it, held while paused: PlotView's `spectrumOf`
   listeners = new Set();
 
   constructor(hub) {
@@ -2003,6 +1996,17 @@ export class View {
     this.pausedAt = null;
     this.cursors = { a: null, b: null };
     this.notify();
+  }
+
+  /** Removes every cursor: X1 and X2 of either kind and every Y cursor. Says whether any were placed. */
+  clearCursors() {
+    const placed = (c) => c.a !== null || c.b !== null;
+    let had = placed(this.cursors) || placed(this.specCursors);
+    for (const byKey of this.yCursorsByKind.values()) for (const c of byKey.values()) had ||= placed(c);
+    this.cursors = { a: null, b: null };
+    this.specCursors = { a: null, b: null };
+    this.yCursorsByKind.clear();
+    return had;
   }
 
   onChange(fn) {
