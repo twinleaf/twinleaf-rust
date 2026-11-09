@@ -12,7 +12,8 @@
   import RiRemoveAxis from '@lucide/svelte/icons/trash-2';
   import RiFit from '@lucide/svelte/icons/unfold-vertical';
   import RiFitX from '@lucide/svelte/icons/unfold-horizontal';
-  import { claimMenu, releaseMenu } from './menus.js';
+  import { claimMenu, common, counted, releaseMenu } from './menus.js';
+  import RiSpan from '@lucide/svelte/icons/ruler-dimension-line';
   import RiShowOnly from '@lucide/svelte/icons/eye';
   import RiHide from '@lucide/svelte/icons/eye-off';
   import RiPalette from '@lucide/svelte/icons/palette';
@@ -44,7 +45,7 @@
   import RiZoomTo from '@lucide/svelte/icons/zoom-in';
   import RiExport from '@lucide/svelte/icons/file-down';
   import RiWarn from '@lucide/svelte/icons/triangle-exclamation-point';
-  import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
+  import { PlotView, axisSlots, colorOf, cursorText, monitorOf } from './plot.js';
   import { colors } from './colors.svelte.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, KINDS, MODES, kindLabel } from './constants.js';
@@ -55,7 +56,8 @@
   import WindowSlider from './WindowSlider.svelte';
 
   let {
-    plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
+    plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [], tabName = '',
+    targetPlots = () => [plot],
     onFocus, onPress, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
     onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
     onEach, targetIds = () => [plot.id], onKey,
@@ -93,6 +95,43 @@
     const on = !plot.legend;
     onEach(on ? 'Show the legend' : 'Hide the legend', () => ({ legend: on }));
   };
+  // What the menus' rows say of the plots their commands act on (menus.js):
+  // a count over them, a setting they share, or how many they are where a
+  // row names plots. Each is read as its menu opens.
+  /** The PlotViews of the plots a command here acts on. */
+  const targetPvs = () => {
+    const ids = targetIds();
+    return [...registry].filter((p) => ids.includes(p.plotId));
+  };
+  /** How many plots a command here acts on, as a row's value, when more than this one. */
+  const plotsValue = () => (targetIds().length > 1 ? counted(targetIds().length, 'plot') : null);
+  /** The distance between X1 and X2 on the plots a command here acts on that have the pair, or null while none has. */
+  function xSpan() {
+    return common(targetPvs().flatMap((p) => {
+      const { a, b } = p.markers();
+      return a !== null && b !== null ? [cursorText(p.xKind()).span(b - a)] : [];
+    }));
+  }
+  /** The first X cursor placed on the plots a command here acts on that have one, named to tell it from its pair, or from the view's width. */
+  function xFirst() {
+    return common(targetPvs().flatMap((p) => {
+      const { a, b } = p.markers(), at = a ?? b;
+      if (at === null) return [];
+      const between = a !== null && b !== null ? Math.abs(b - a) : p.xd ? p.xd[1] - p.xd[0] : 0;
+      return [`${a !== null ? 'X1' : 'X2'} ${cursorText(p.xKind()).at(at, between)}`];
+    }));
+  }
+  /** The signals of the axis Add Y cursors would land on, on each plot it acts on from this plot's y axis `key` (`eachAxis`), or null on none. */
+  const yLands = (key) => {
+    const names = [];
+    eachAxis(key, (p, axis) => names.push(p.axisName(axis)));
+    return common(names);
+  };
+  /** How many cursors the plots a command here acts on have placed, or null with none. */
+  const placed = () => {
+    const n = targetPvs().reduce((n, p) => n + p.cursorsPlaced(), 0);
+    return n ? `${n} placed` : null;
+  };
   /** The name list `list` (KINDS, MODES) gives value `v`. */
   const nameIn = (list, v) => list.find((x) => x[0] === v)?.[1] ?? v;
   /** Sets `field` to `value` on each plot a command here acts on of this plot's kind, as a frequency axis's scale; `what` names the step. */
@@ -107,6 +146,11 @@
   const unitsOf = (key) => session.trace(key)?.meta.units ?? '';
   /** An independent plot's axes, {left, right}, each the signal keys from the plot outward. */
   const slots = $derived(plot.mode === 'independent' ? axisSlots(drawnItems().map((i) => i.key), plot.axisSides) : null);
+  /** Which side plot `p`'s axis of signal `key` is on, as a menu names it: Left, Right or None. */
+  const sideOf = (p, key) => {
+    const s = axisSlots(p.items.filter((i) => !i.hidden).map((i) => i.key), p.axisSides);
+    return s.left.includes(key) ? 'Left' : s.right.includes(key) ? 'Right' : 'None';
+  };
   /** Whether signal `key` has no axis of its own on an independent plot. */
   const axisless = (key) => !!slots && !slots.left.includes(key) && !slots.right.includes(key);
   /** Puts signal `key`'s axis on `side`, 'left' or 'right', or hides it with 'none', on each independent plot a command here acts on that shows it. */
@@ -163,16 +207,19 @@
     };
     copyCheck = COUNTING;
     ask();
-    // A wheel over the plot zooms it with the menu still open: the count
-    // follows once the view rests, keeping the last one shown meanwhile.
-    const off = view.onChange(() => {
-      clearTimeout(timer);
-      timer = setTimeout(ask, RECOUNT_MS);
-    });
+    // A wheel over a plot zooms it with the menu still open: the count
+    // follows once the views of every plot a copy would hold rest, keeping
+    // the last one shown meanwhile.
+    const offs = targets().map((v) =>
+      v.onChange(() => {
+        clearTimeout(timer);
+        timer = setTimeout(ask, RECOUNT_MS);
+      }),
+    );
     return () => {
       current = false;
       clearTimeout(timer);
-      off();
+      offs.forEach((off) => off());
     };
   });
   $effect(() => opened(signalsOpen, closeSignals));
@@ -650,12 +697,17 @@
   const description = $derived(`${kindLabel(plot.kind, plot.mode)} plot: ${plot.items.map((i) => i.key).join(', ') || 'no signals'}`);
 </script>
 
+<!-- A row's value in its trailing column, when it has one. -->
+{#snippet value(text)}{#if text}<span class="menu-value">{text}</span>{/if}{/snippet}
+<!-- The distance between X1 and X2, after a ruler, when a pair is placed. -->
+{#snippet span()}{@const d = xSpan()}{#if d}<span class="menu-value"><RiSpan />{d}</span>{/if}{/snippet}
 <!-- A signal's own menu, on its chip and on its row of the legend: what
      it shows, how it looks, where it goes. `close` closes the menu it is in. -->
 {#snippet signalMenu(key, close)}
   {@const item = plot.items.find((i) => i.key === key)}
   {@const side = slots ? (slots.left.includes(key) ? 'left' : slots.right.includes(key) ? 'right' : 'none') : null}
-  <ContextMenu.Item onSelect={() => showOnly(key)}><RiShowOnly class="menu-icon" />Show only this</ContextMenu.Item>
+  {@const hides = plot.items.filter((i) => i.key !== key && !i.hidden).length}
+  <ContextMenu.Item onSelect={() => showOnly(key)}><RiShowOnly class="menu-icon" />Show only this{@render value(hides ? `hides ${hides}` : null)}</ContextMenu.Item>
   {#if plot.items.some((i) => i.hidden)}
     <ContextMenu.Item onSelect={showAll}><RiShowOnly class="menu-icon" />Show all</ContextMenu.Item>
   {/if}
@@ -667,7 +719,7 @@
   </ContextMenu.Sub>
   {#if side}
     <ContextMenu.Sub>
-      <ContextMenu.SubTrigger><RiAxis class="menu-icon" />Axis</ContextMenu.SubTrigger>
+      <ContextMenu.SubTrigger><RiAxis class="menu-icon" />Axis{@render value(common(targetPlots().filter((p) => p.mode === 'independent' && p.items.some((i) => i.key === key)).map((p) => sideOf(p, key))))}</ContextMenu.SubTrigger>
       <ContextMenu.SubContent>
         <ContextMenu.RadioGroup value={side} onValueChange={(v) => setSide(key, v)}>
           <ContextMenu.RadioItem value="left">Left</ContextMenu.RadioItem>
@@ -678,7 +730,7 @@
     </ContextMenu.Sub>
   {/if}
   <ContextMenu.Sub>
-    <ContextMenu.SubTrigger><RiMove class="menu-icon" />Move to</ContextMenu.SubTrigger>
+    <ContextMenu.SubTrigger><RiMove class="menu-icon" />Move to{@render value(counted(otherPlots.length, 'plot'))}</ContextMenu.SubTrigger>
     <ContextMenu.SubContent class="max-w-72">
       <ContextMenu.Item onSelect={() => onMoveSignal?.(key, null)}>New plot</ContextMenu.Item>
       {#if otherPlots.length}<ContextMenu.Separator />{/if}
@@ -810,7 +862,7 @@
         </ScrollArea>
         {#if plot.items.length}
           <ContextMenu.Separator />
-          <ContextMenu.Item variant="destructive" onSelect={removeAll}><RiTrash class="menu-icon" />Remove every signal</ContextMenu.Item>
+          <ContextMenu.Item variant="destructive" onSelect={removeAll}><RiTrash class="menu-icon" />Remove every signal{@render value(counted(targetPlots().reduce((n, p) => n + p.items.length, 0), 'signal'))}</ContextMenu.Item>
         {/if}
         {/if}
       </ContextMenu.Content>
@@ -1043,12 +1095,12 @@
                   {/snippet}
                 </ContextMenu.Trigger>
                 <ContextMenu.Content class="menu-icons">
-                  <ContextMenu.Item onSelect={copyReadout}><RiCopy class="menu-icon" />Copy table</ContextMenu.Item>
-                  {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2</ContextMenu.Item>{/if}
+                  <ContextMenu.Item onSelect={copyReadout}><RiCopy class="menu-icon" />Copy table{@render value(counted((c.x ? 1 + plot.items.length : 0) + c.ys.length, 'row'))}</ContextMenu.Item>
+                  {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2{@render span()}</ContextMenu.Item>{/if}
                   <ContextMenu.Separator />
-                  {#if c.x}<ContextMenu.Item onSelect={() => eachPv((p) => p.clearXCursors())}><RiXCursors class="menu-icon" />Clear X cursors</ContextMenu.Item>{/if}
-                  {#if c.ys.length}<ContextMenu.Item onSelect={() => eachPv((p) => p.clearYCursors())}><RiYCursors class="menu-icon" />Clear Y cursors</ContextMenu.Item>{/if}
-                  <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors</ContextMenu.Item>
+                  {#if c.x}<ContextMenu.Item onSelect={() => eachPv((p) => p.clearXCursors())}><RiXCursors class="menu-icon" />Clear X cursors{@render value(xFirst())}</ContextMenu.Item>{/if}
+                  {#if c.ys.length}<ContextMenu.Item onSelect={() => eachPv((p) => p.clearYCursors())}><RiYCursors class="menu-icon" />Clear Y cursors{@render value(counted(targetPvs().reduce((n, p) => n + p.yCursorAxes(), 0), 'axis', 'axes'))}</ContextMenu.Item>{/if}
+                  <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors{@render value(placed())}</ContextMenu.Item>
                 </ContextMenu.Content>
               </ContextMenu.Root>
             </div>
@@ -1076,16 +1128,16 @@
           {#if copyCheck}<span class="menu-value" class:warn={copyCheck.state !== 'ok'} title={copyCheck.reason}>{#if copyCheck.state !== 'ok'}<RiWarn />{/if}{rowsText(copyCheck.rows)}</span>{/if}
           <ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut>
         </ContextMenu.Item>
-        <ContextMenu.Item onSelect={() => onExport?.()}><RiExport class="menu-icon" />Export data…</ContextMenu.Item>
+        <ContextMenu.Item onSelect={() => onExport?.()}><RiExport class="menu-icon" />Export data…{@render value(plotsValue())}</ContextMenu.Item>
       {/if}
       <ContextMenu.Label>Cursors</ContextMenu.Label>
       <!-- Cursors are dragged out of the axes; these place a pair in view. -->
-      <ContextMenu.Item onSelect={() => eachPv((p) => p.addXCursors())}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => eachAxis(region.keys?.[0], (p, axis) => p.addYCursors(axis))}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
-      <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => eachPv((p) => p.addXCursors())}><RiXCursors class="menu-icon" />Add X cursors{@render span()}</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => eachAxis(region.keys?.[0], (p, axis) => p.addYCursors(axis))}><RiYCursors class="menu-icon" />Add Y cursors{@render value(yLands(region.keys?.[0]))}</ContextMenu.Item>
+      <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors{@render value(placed())}</ContextMenu.Item>
       <ContextMenu.Label>Show</ContextMenu.Label>
       <ContextMenu.Sub>
-        <ContextMenu.SubTrigger><RiKind class="menu-icon" />Kind</ContextMenu.SubTrigger>
+        <ContextMenu.SubTrigger><RiKind class="menu-icon" />Kind{@render value(common(targetPlots().map((p) => nameIn(KINDS, p.kind))))}</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
           <ContextMenu.RadioGroup value={plot.kind} onValueChange={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, () => ({ kind: v }))}>
             {#each KINDS as [kind, kl]}<ContextMenu.RadioItem value={kind}>{kl}</ContextMenu.RadioItem>{/each}
@@ -1093,7 +1145,7 @@
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
       <ContextMenu.Sub>
-        <ContextMenu.SubTrigger><RiLayout class="menu-icon" />Layout</ContextMenu.SubTrigger>
+        <ContextMenu.SubTrigger><RiLayout class="menu-icon" />Layout{@render value(common(targetPlots().map((p) => nameIn(MODES, p.mode))))}</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
           <ContextMenu.RadioGroup value={plot.mode} onValueChange={(v) => onEach(`Layout ${nameIn(MODES, v)}`, () => ({ mode: v }))}>
             {#each MODES as [mode, ml]}<ContextMenu.RadioItem value={mode}>{ml}</ContextMenu.RadioItem>{/each}
@@ -1105,13 +1157,13 @@
       <ContextMenu.Item onSelect={() => onSplit('col')}><RiSplitV class="menu-icon" />Split down<ContextMenu.Shortcut><kbd>_</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Item onSelect={() => onMaximize(false)}>{#if maximized}<RiFullscreenExit class="menu-icon" />Restore{:else}<RiFullscreen class="menu-icon" />Maximize{/if}<ContextMenu.Shortcut><kbd>F</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Sub>
-        <ContextMenu.SubTrigger disabled={!otherTabs.length}><RiTab class="menu-icon" />Move to tab</ContextMenu.SubTrigger>
+        <ContextMenu.SubTrigger disabled={!otherTabs.length}><RiTab class="menu-icon" />Move to tab{@render value(tabName)}</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
           {#each otherTabs as t (t.id)}<ContextMenu.Item onSelect={() => onMoveToTab(t.id)}>{t.name}</ContextMenu.Item>{/each}
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
       <ContextMenu.Separator />
-      <ContextMenu.Item variant="destructive" onSelect={() => onRemove()}><RiClose class="menu-icon" />Close plot<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Item variant="destructive" onSelect={() => onRemove()}><RiClose class="menu-icon" />Close plot{@render value(plotsValue() ?? counted(plot.items.length, 'signal'))}<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
     </ContextMenu.Content>
   </ContextMenu.Root>
 </div>

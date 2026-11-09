@@ -9,7 +9,8 @@
 // caught where it is made.
 
 import { Selection } from './selection.svelte.js';
-import { append, plotIds, presets, removePlot, setRatio, splitBeside } from './layout.js';
+import { append, equal, plotIds, presets, removePlot, setRatio, splitBeside } from './layout.js';
+import { ARRANGEMENTS } from './constants.js';
 import { VIEW_FIELDS, chip, defaultContent, emptyTab, newPlot, remapIds } from './tabs.js';
 
 /** `v` with every object in it frozen, in development; as it is otherwise. */
@@ -237,6 +238,17 @@ export class Workspace {
       const { [id]: _, ...plots } = t.plots;
       return { ...t, plots, layout: removePlot(t.layout, id) };
     });
+  }
+
+  /**
+   * The first arrangement of ARRANGEMENTS, by name, that `arrange` would
+   * leave the open tab laid out as it is now, or null for none.
+   */
+  arrangement() {
+    const ids = plotIds(this.layout);
+    if (!ids.length) return null;
+    const as = (name) => (name === 'quadrants' ? ids.length === 4 && equal(this.layout, presets.grid(ids)) : equal(this.layout, presets[name](ids)));
+    return ARRANGEMENTS.map(([name]) => name).find(as) ?? null;
   }
 
   /** Arranges the open tab's plots as layout.js preset `name`; quadrants first fills the tab to four plots. */

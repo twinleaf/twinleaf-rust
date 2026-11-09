@@ -80,7 +80,8 @@
   import RiQuadrants from '@lucide/svelte/icons/grid-2x2';
   import RiFocusArrange from '@lucide/svelte/icons/layout-panel-left';
   import RiUpload from '@lucide/svelte/icons/upload';
-  import { pressOutsideKeepsFocus } from './lib/menus.js';
+  import { counted, pressOutsideKeepsFocus } from './lib/menus.js';
+  import RiCheck from '@lucide/svelte/icons/check';
   import RiChevron from '@lucide/svelte/icons/chevron-down';
 
   // The hub, the tabs as the page edits them, their undo and redo, and the
@@ -135,7 +136,9 @@
   const targetsOf = (id) => selection.targets(id).map((i) => views.of(i));
   /** The plots a command made on plot `id` acts on, as the Selection says. */
   const targetIdsOf = (id) => selection.targets(id);
-  const plotsText = (n) => `${n} plot${n === 1 ? '' : 's'}`;
+  const plotsText = (n) => counted(n, 'plot');
+  /** Plot `id`'s name in a list of plots: its signals, or Empty plot. */
+  const labelOf = (id) => ws.plots[id]?.items.map((i) => i.key).join(', ') || 'Empty plot';
   /**
    * Gives each of plots `ids` the fields `fn(plot)` returns, if any, as
    * one step undo names `what`.
@@ -456,6 +459,17 @@
   function addSignal(key) {
     const ids = selection.pageTargets('plot');
     if (ids.length) history.group(ids.length > 1 ? `Add ${key} (${plotsText(ids.length)})` : `Add ${key}`, () => ws.addTo(ids, key));
+  }
+  /**
+   * What the Signals list's Add to plot says of signal `key`, as {text,
+   * can}: the plot it would join, or how many, from the same selection the
+   * command acts on; or why it joins none.
+   */
+  function addsTo(key) {
+    const ids = selection.pageTargets('plot'), lacking = ids.filter((id) => !ws.plots[id].items.some((i) => i.key === key));
+    if (!ids.length) return { text: 'No plot selected', can: false };
+    if (!lacking.length) return { text: 'Already shown', can: false };
+    return { text: lacking.length > 1 ? plotsText(lacking.length) : labelOf(lacking[0]), can: true };
   }
   /** Moves keyboard focus to plot `id`, once it is on the page. */
   async function focusPlot(id) {
@@ -821,6 +835,8 @@
         {renderer}
         {registry}
         otherTabs={ws.tabs.filter((t) => t.id !== ws.activeId)}
+        tabName={ws.tab.name}
+        targetPlots={() => targetIdsOf(id).map((i) => ws.plots[i])}
         focused={ws.focusedId === id}
         selected={ws.selected.has(id)}
         onSelect={(shift, clicks) => selection.click(id, shift, clicks)}
@@ -847,7 +863,7 @@
         onLandSignal={(item, items) => drags.landSignal(item, items ? id : null, items)}
         otherPlots={plotIds(ws.layout)
           .filter((p) => p !== id)
-          .map((p) => ({ id: p, label: ws.plots[p]?.items.map((i) => i.key).join(', ') || 'Empty plot' }))}
+          .map((p) => ({ id: p, label: labelOf(p) }))}
         onMoveSignal={(key, to) => moveSignal(id, key, to)}
         onCheckCopy={() => copyCheck(targetIdsOf(id))}
         onExport={() => openExport(targetIdsOf(id))}
@@ -863,7 +879,7 @@
   {:else if id === 'signals'}
     <!-- The whole panel keeps the plot selection: its search, its list and its scrollbar. -->
     <div class="contents" data-keeps-selection>
-      <SignalList session={hub.session} {drags} onAdd={addSignal} onNewPlot={newPlotWith} />
+      <SignalList session={hub.session} {drags} onAdd={addSignal} onNewPlot={newPlotWith} {addsTo} />
     </div>
   {:else}
     {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} panel={id} />{/key}
@@ -943,10 +959,12 @@
         </Tip>
         <!-- Each arrangement beside a picture of it, as the plot menus lead with icons. -->
         <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET} {...layoutMenu}>
-          <DropdownMenu.Label>Arrange this tab</DropdownMenu.Label>
+          <!-- A check on the arrangement the tab is in now, if any. -->
+          {@const now = ws.arrangement()}
+          <DropdownMenu.Label>Arrange this tab<span class="menu-value">{plotsText(plotIds(ws.layout).length)}</span></DropdownMenu.Label>
           {#each ARRANGEMENTS as [name, label]}
             {@const Icon = ARRANGE_ICONS[name]}
-            <DropdownMenu.Item onSelect={() => history.group(`Arrange as ${label}`, () => ws.arrange(name))}><Icon class="menu-icon" />{label}</DropdownMenu.Item>
+            <DropdownMenu.Item onSelect={() => history.group(`Arrange as ${label}`, () => ws.arrange(name))}><Icon class="menu-icon" />{label}{#if name === now}<span class="menu-value" aria-label="The layout now"><RiCheck /></span>{/if}</DropdownMenu.Item>
           {/each}
           <DropdownMenu.Separator />
           <DropdownMenu.Item onSelect={() => history.group('Reset', () => ws.reset())}><RiReset class="menu-icon" />Reset to default</DropdownMenu.Item>
@@ -961,10 +979,11 @@
           {/snippet}
         </Tip>
         <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET} {...fileMenu}>
-          <DropdownMenu.Item onSelect={exportTabs}><RiDownload class="menu-icon" />Export every tab…</DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={exportTabs}><RiDownload class="menu-icon" />Export every tab…<span class="menu-value">{counted(ws.tabs.length, 'tab')}</span></DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => importInput.click()}><RiUpload class="menu-icon" />Import tabs…</DropdownMenu.Item>
           <DropdownMenu.Separator />
-          <DropdownMenu.Item onSelect={() => openExport(selection.pageTargets('view'))}><RiExport class="menu-icon" />Export data…</DropdownMenu.Item>
+          {@const exports = selection.pageTargets('view').length}
+          <DropdownMenu.Item onSelect={() => openExport(selection.pageTargets('view'))}><RiExport class="menu-icon" />Export data…<span class="menu-value">{selection.plots.size ? `${exports} selected` : plotsText(exports)}</span></DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Root>
       <input type="file" accept="application/json,.json" hidden bind:this={importInput} onchange={importTabs} />

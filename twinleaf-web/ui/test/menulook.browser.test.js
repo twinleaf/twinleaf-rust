@@ -87,7 +87,7 @@ describe('every menu', () => {
       // One frame, type and room for every menu, its submenus too.
       const [first, ...rest] = [...looks];
       for (const [name, l] of rest) expect(l, `${name} looks as ${first[0]} does`).toBe(first[1]);
-      expect(edges, 'rows measured').toBeGreaterThan(25);
+      expect(edges, 'rows measured').toBeGreaterThan(40);
       expect(values, 'values seen').toBeGreaterThan(3);
       expect(shortcuts, 'shortcuts seen').toBeGreaterThan(3);
     } finally {

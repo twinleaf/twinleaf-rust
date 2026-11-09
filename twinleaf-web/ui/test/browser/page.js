@@ -98,9 +98,11 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
  * in `units` and a device with `rpcs` at each of `routes`, as `stubHub`
  * takes them. localStorage holds `saved`, by key as JSON, and nothing
  * else, as it mounts. What the page asks of /api is refused, as a hub that
- * has gone away refuses it, until the page is disposed of.
+ * has gone away refuses it, until the page is disposed of; but with
+ * `rowsPerSecond`, /api/rows counts that many rows a second of each
+ * signal's window.
  */
-export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {} } = {}) {
+export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null } = {}) {
   localStorage.clear();
   for (const [k, v] of Object.entries(saved)) localStorage.setItem(k, JSON.stringify(v));
   const ps = keys.map((k) => newPlot('time', 'overlay', k));
@@ -111,7 +113,16 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
   const hub = stubHub(signals, rpcs, routes, units);
   const registry = new Set();
   const fetched = window.fetch;
-  window.fetch = (url, init) => (String(url).startsWith('/api/') ? Promise.resolve(new Response(JSON.stringify({ error: 'no hub in a test' }), { status: 503 })) : fetched(url, init));
+  const reply = (body, status = 200) => Promise.resolve(new Response(JSON.stringify(body), { status }));
+  window.fetch = (url, init) => {
+    const at = new URL(String(url), location.href);
+    if (!at.pathname.startsWith('/api/')) return fetched(url, init);
+    if (at.pathname === '/api/rows' && rowsPerSecond !== null) {
+      const span = Number(at.searchParams.get('t1')) - Number(at.searchParams.get('t0'));
+      return reply({ count: Math.round(span * rowsPerSecond), oldest: 0, x: [], y: [] });
+    }
+    return reply({ error: 'no hub in a test' }, 503);
+  };
   const app = mount(App, { target, context: new Map([['page', { hub, ws, history, registry }]]) });
   await frames();
   return {

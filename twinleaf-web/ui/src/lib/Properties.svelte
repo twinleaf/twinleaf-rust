@@ -39,6 +39,7 @@
   import Tip from './Tip.svelte';
   import { controlOf, deviceLabel, isButtons, isFavorites, mergeRows, panelRows, sameShown, writersOf } from './properties.js';
   import { editBar, kindOf } from './editbar.js';
+  import { counted } from './menus.js';
   import { writeTables } from './copy.js';
   import { toast } from './toast.svelte.js';
   import * as words from './words.js';
@@ -390,18 +391,20 @@
 {/snippet}
 </ContextMenu.Trigger>
 <ContextMenu.Content class="menu-icons">
-  {@const copies = copied().length}
-  <ContextMenu.Item onSelect={copyRows}><RiCopy class="menu-icon" />Copy {copies > 1 ? `${copies} rows` : 'row'}<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+  <!-- What Copy copies (`copied`): every picked row, or the active row. -->
+  {@const copies = copied()}
+  {@const one = copies.length === 1 ? copies[0] : null}
+  <ContextMenu.Item onSelect={copyRows}><RiCopy class="menu-icon" />Copy {copies.length > 1 ? `${copies.length} rows` : 'row'}{#if copies.length}<span class="menu-value">{one ? show(shared(one)) || 'Mixed' : `${counted(copies.length, 'row')} · ${counted(devices.filter((d) => copies.some((r) => r.entries.has(d.route))).length, 'device')}`}</span>{/if}<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>
   <!-- A pick some of whose rows are pinned offers both, each for the rows it changes. -->
   {@const names = pinNames()}
   {@const toPin = names.filter((n) => !favorites.has(n))}
   {@const toUnpin = names.filter((n) => favorites.has(n))}
   {@const count = (list) => (toPin.length && toUnpin.length) || list.length > 1 ? `${list.length} ` : ''}
   {#if toPin.length}
-    <ContextMenu.Item onSelect={() => pin(toPin, true)}><RiStar class="menu-icon" />Pin {count(toPin)}to Favorites</ContextMenu.Item>
+    <ContextMenu.Item onSelect={() => pin(toPin, true)}><RiStar class="menu-icon" />Pin {count(toPin)}to Favorites<span class="menu-value">{favorites.names.size} pinned</span></ContextMenu.Item>
   {/if}
   {#if toUnpin.length}
-    <ContextMenu.Item onSelect={() => pin(toUnpin, false)}><RiStar class="menu-icon" />Unpin {count(toUnpin)}from Favorites</ContextMenu.Item>
+    <ContextMenu.Item onSelect={() => pin(toUnpin, false)}><RiStar class="menu-icon" />Unpin {count(toUnpin)}from Favorites<span class="menu-value">{favorites.names.size} pinned</span></ContextMenu.Item>
   {/if}
 </ContextMenu.Content>
 </ContextMenu.Root>

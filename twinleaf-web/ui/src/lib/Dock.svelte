@@ -34,6 +34,7 @@
   import { enter, focusNode } from './focus.js';
   import { focusedByKeyboard } from './keys.js';
   import Tip from './Tip.svelte';
+  import { counted } from './menus.js';
 
   /**
    * `docks` is the page's Docks, `side` this dock's, and `content(id)` draws
@@ -194,9 +195,9 @@
         </ContextMenu.Trigger>
         <ContextMenu.Content class="menu-icons">
           <ContextMenu.Item onSelect={() => docks.toggle(p.id)}><RiFold class="menu-icon" />{p.open ? 'Fold' : 'Unfold'}</ContextMenu.Item>
-          <ContextMenu.Item disabled={i === 0} onSelect={() => docks.step(p.id, -1)}><RiUp class="menu-icon" />Move up</ContextMenu.Item>
-          <ContextMenu.Item disabled={i === items.length - 1} onSelect={() => docks.step(p.id, 1)}><RiDown class="menu-icon" />Move down</ContextMenu.Item>
-          <ContextMenu.Item onSelect={() => docks.moveTo(p.id, other, docks[other].length)}>{#if other === 'left'}<RiToLeft class="menu-icon" />{:else}<RiToRight class="menu-icon" />{/if}Move to the {other} dock</ContextMenu.Item>
+          <ContextMenu.Item disabled={i === 0} onSelect={() => docks.step(p.id, -1)}><RiUp class="menu-icon" />Move up<span class="menu-value">{i + 1} of {items.length}</span></ContextMenu.Item>
+          <ContextMenu.Item disabled={i === items.length - 1} onSelect={() => docks.step(p.id, 1)}><RiDown class="menu-icon" />Move down<span class="menu-value">{i + 1} of {items.length}</span></ContextMenu.Item>
+          <ContextMenu.Item onSelect={() => docks.moveTo(p.id, other, docks[other].length)}>{#if other === 'left'}<RiToLeft class="menu-icon" />{:else}<RiToRight class="menu-icon" />{/if}Move to the {other} dock<span class="menu-value">{counted(docks[other].length, 'panel')}</span></ContextMenu.Item>
           <ContextMenu.Separator />
           <ContextMenu.Item onSelect={() => setHidden(true)}><HideIcon class="menu-icon" />Hide the {side} dock</ContextMenu.Item>
           <ContextMenu.Item onSelect={() => docks.reset()}><RiReset class="menu-icon" />Reset every panel</ContextMenu.Item>

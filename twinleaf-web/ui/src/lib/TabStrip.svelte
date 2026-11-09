@@ -14,6 +14,7 @@
   import { plotIds } from './layout.js';
   import { actionFor } from './keymap.js';
   import { prefs } from './prefs.svelte.js';
+  import { counted } from './menus.js';
 
   /**
    * `onClose(t)` closes tab `t`, asking first when it has plots;
@@ -124,9 +125,9 @@
           </ContextMenu.Trigger>
           <ContextMenu.Content class="menu-icons">
             <ContextMenu.Item onSelect={() => startRename(t.id)}><RiRename class="menu-icon" />Rename<ContextMenu.Shortcut><kbd>F2</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-            <ContextMenu.Item onSelect={() => history.group('Duplicate tab', () => ws.duplicateTab(t))}><RiCopy class="menu-icon" />Duplicate</ContextMenu.Item>
+            <ContextMenu.Item onSelect={() => history.group('Duplicate tab', () => ws.duplicateTab(t))}><RiCopy class="menu-icon" />Duplicate<span class="menu-value">{counted(plotIds(t.layout).length, 'plot')}</span></ContextMenu.Item>
             <ContextMenu.Separator />
-            <ContextMenu.Item variant="destructive" onSelect={() => onClose(t)}><RiClose class="menu-icon" />Close</ContextMenu.Item>
+            <ContextMenu.Item variant="destructive" onSelect={() => onClose(t)}><RiClose class="menu-icon" />Close<span class="menu-value">{counted(plotIds(t.layout).length, 'plot')}</span></ContextMenu.Item>
           </ContextMenu.Content>
         </ContextMenu.Root>
       </div>

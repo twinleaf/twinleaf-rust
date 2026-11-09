@@ -253,7 +253,9 @@ describe('a property row', () => {
             expect([...page.ws.selection.rows].sort(), 'a right-click on a picked row keeps the pick').toEqual([...keys].sort());
             const toPin = names.filter((n) => !pinned.includes(n)), toUnpin = names.filter((n) => pinned.includes(n));
             const count = (list) => ((toPin.length && toUnpin.length) || list.length > 1 ? `${list.length} ` : '');
-            const items = menuItems().map((m) => m.textContent.trim()).filter((t) => /^(Pin|Unpin)/.test(t));
+            // An item's label, less its value (the Favorites' count).
+            const label = (m) => [...m.childNodes].filter((n) => !n.classList?.contains('menu-value')).map((n) => n.textContent).join('').trim();
+            const items = menuItems().map(label).filter((t) => /^(Pin|Unpin)/.test(t));
             expect(items).toEqual([...(toPin.length ? [`Pin ${count(toPin)}to Favorites`] : []), ...(toUnpin.length ? [`Unpin ${count(toUnpin)}from Favorites`] : [])]);
             if (toPin.length && toUnpin.length) seen.both++;
             const pin = k % 2 === 0 ? toPin.length > 0 : !toUnpin.length;

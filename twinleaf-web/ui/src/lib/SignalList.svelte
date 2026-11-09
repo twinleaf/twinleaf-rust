@@ -31,9 +31,14 @@
   import RiCopy from '@lucide/svelte/icons/clipboard-copy';
   import { actionFor, stepIn } from './keymap.js';
   import { uid } from './tabs.js';
+  import { kindLabel } from './constants.js';
 
-  /** `drags` is the page's Drags; `onAdd(key)` adds to the selected plots, `onNewPlot(keys)` makes a plot. */
-  let { session, drags, onAdd, onNewPlot } = $props();
+  /**
+   * `drags` is the page's Drags; `onAdd(key)` adds to the selected plots,
+   * `onNewPlot(keys)` makes a plot, and `addsTo(key)` says where Add to
+   * plot would put the signal, as {text, can}.
+   */
+  let { session, drags, onAdd, onNewPlot, addsTo = () => ({ text: '', can: true }) } = $props();
 
   const FLIP_MS = 150;
   /** The keys the search keeps for its caret, though the list moves by them. */
@@ -162,8 +167,9 @@
 </ContextMenu.Trigger>
 <ContextMenu.Content class="menu-icons">
   {#if menuKey}
-    <ContextMenu.Item onSelect={() => onAdd(menuKey)}><RiAdd class="menu-icon" />Add to plot<ContextMenu.Shortcut><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-    <ContextMenu.Item onSelect={() => onNewPlot([menuKey])}><RiNewPlot class="menu-icon" />New plot<ContextMenu.Shortcut><kbd>⇧</kbd><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+    {@const adds = addsTo(menuKey)}
+    <ContextMenu.Item disabled={!adds.can} onSelect={() => onAdd(menuKey)}><RiAdd class="menu-icon" />Add to plot{#if adds.text}<span class="menu-value">{adds.text}</span>{/if}<ContextMenu.Shortcut><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+    <ContextMenu.Item onSelect={() => onNewPlot([menuKey])}><RiNewPlot class="menu-icon" />New plot<span class="menu-value">{kindLabel('time', 'overlay')}</span><ContextMenu.Shortcut><kbd>⇧</kbd><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
     <ContextMenu.Sub>
       <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorOf({ key: menuKey })}"></i>{#if colors.picked[menuKey] === undefined}Auto{/if}</span></ContextMenu.SubTrigger>
       <ContextMenu.SubContent class="p-1.5"><ColorPicker key={menuKey} ondone={() => (menuOpen = false)} /></ContextMenu.SubContent>

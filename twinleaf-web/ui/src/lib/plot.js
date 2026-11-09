@@ -86,6 +86,57 @@ export function timeAxis(epoch) {
   };
 }
 
+/**
+ * How a menu names the X cursors of a plot, by the kind of its x axis:
+ * 'unix', any other epoch, or 'hz' for a spectrum's frequencies.
+ * `at(x, span)` names a cursor at x of a pair `span` apart, to as many
+ * decimals as tell the pair apart: whole seconds for a span of 2 s or more,
+ * milliseconds from 2 ms, microseconds below. A Unix time is the time of
+ * day, with its date when that is not today's or the pair runs past the
+ * day; another clock's seconds have their digits grouped. `span(s)` names
+ * the distance between them: in seconds with an SI prefix below a minute,
+ * then in minutes, hours or days and the next unit down. Frequencies take
+ * an SI prefix throughout.
+ */
+export function cursorText(kind) {
+  if (kind === 'hz') return { at: (f) => si(f, 'Hz'), span: (s) => si(s, 'Hz') };
+  const decimals = (span) => (span >= 2 ? 0 : span >= 2e-3 ? 3 : 6);
+  /** `t` to `d` decimals, as its whole seconds and the digits after the point. */
+  const split = (t, d) => {
+    const [whole, frac = ''] = t.toFixed(d).split('.');
+    return [Number(whole), frac];
+  };
+  const two = (n) => String(n).padStart(2, '0');
+  const span = (s) => {
+    s = Math.abs(s);
+    if (s < 60) return si(s, 's');
+    if (s < 3600) return `${Math.floor(s / 60)} min ${two(Math.floor(s % 60))} s`;
+    if (s < 86400) return `${Math.floor(s / 3600)} h ${two(Math.floor((s % 3600) / 60))} min`;
+    return `${Math.floor(s / 86400)} d ${two(Math.floor((s % 86400) / 3600))} h`;
+  };
+  if (kind === 'unix') {
+    const day = (t) => new Date(t * 1000).toDateString();
+    return {
+      at(t, between) {
+        const [whole, frac] = split(t, decimals(between));
+        const d = new Date(whole * 1000);
+        const clock = `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}${frac ? `.${frac}` : ''}`;
+        const dated = day(t) !== day(Date.now() / 1000) || day(t) !== day(t + between);
+        return dated ? `${d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} ${clock}` : clock;
+      },
+      span,
+    };
+  }
+  return {
+    at(t, between) {
+      const [whole, frac] = split(t, decimals(between));
+      const grouped = String(Math.abs(whole)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+      return `${t < 0 ? '−' : ''}${grouped}${frac ? `.${frac}` : ''} s`;
+    },
+    span,
+  };
+}
+
 /** How many lanes a plot of `n` signals in `mode` has. */
 export const lanesOf = (mode, n) => (mode === 'stacked' ? Math.max(1, n) : 1);
 
@@ -1433,6 +1484,30 @@ export class PlotView {
     this.specCursors = { a: null, b: null };
     this.yCursorsByKind.clear();
     return had;
+  }
+
+  /** How many cursors are placed: X1 and X2, and each Y1 and Y2 of every kind. */
+  cursorsPlaced() {
+    const { a, b } = this.markers();
+    let n = (a !== null) + (b !== null);
+    for (const cursors of this.yCursorsByKind.values()) for (const c of cursors.values()) n += (c.a !== null) + (c.b !== null);
+    return n;
+  }
+
+  /** How many of the plot's y axes have a Y cursor placed. */
+  yCursorAxes() {
+    return this.yAxes.filter((a) => this.hasYCursors(a.key)).length;
+  }
+
+  /** The signals of y axis `key`, as the readout names them, or null while the plot draws no such axis. */
+  axisName(key) {
+    const a = this.yAxes.find((a) => a.key === key);
+    return a ? a.plans.map((p) => p.t.key).join(', ') : null;
+  }
+
+  /** What the plot's x axis counts, for `cursorText`: 'hz' on a spectrum, else its first trace's epoch. */
+  xKind() {
+    return this.config().kind === 'spectrum' ? 'hz' : (this.traces()[0]?.meta.epoch ?? 'zero');
   }
 
   /** The hover position and the X1 and X2 cursors, as a and b, in this plot's x units. */

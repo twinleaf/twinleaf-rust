@@ -37,10 +37,12 @@ export async function menuPage() {
   return { ...page, ids };
 }
 
-/** Where on plot `id` its plot area is, in client px. */
+/** A spot of plot `id`'s plot area, in client px. */
 export function plotArea(page, id) {
-  const P = page.pv(id).geo.plot;
-  return [P.x + P.w / 2, P.y + P.h / 2];
+  const P = page.pv(id)?.geo?.plot;
+  expect(P, `plot ${id} drawn`).toBeTruthy();
+  // Its lower right, clear of the readout and the legend in their corners.
+  return [P.x + P.w * 0.75, P.y + P.h * 0.75];
 }
 
 /** Each menu of the page, `open(page, id)` opening it on plot `id` where it is a plot's, and returning it. */
