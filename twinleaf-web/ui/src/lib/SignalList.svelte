@@ -1,3 +1,11 @@
+<script module>
+  /** The signals of `signals` with every word of `query` in their key, or as their units. */
+  export function matching(signals, query) {
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    return signals.filter((t) => words.every((w) => t.key.toLowerCase().includes(w) || (t.meta.units ?? '').toLowerCase() === w));
+  }
+</script>
+
 <script>
   // Every signal the hub has, or those the search matches, to drag onto the
   // tiles or add to the highlighted plot.
@@ -32,11 +40,8 @@
   let palette = $state([]);
   let dragging = false;
   let query = $state('');
-  /** Whether signal `t` has every word of the search in its key or units. */
-  const matches = (t, words) => words.every((w) => t.key.toLowerCase().includes(w) || (t.meta.units ?? '').toLowerCase() === w);
   const refresh = () => {
-    const words = query.toLowerCase().split(/s+/).filter(Boolean);
-    palette = session.signals.filter((t) => matches(t, words)).map((t) => ({ id: `pal:${t.key}`, key: t.key }));
+    palette = matching(session.signals, query).map((t) => ({ id: `pal:${t.key}`, key: t.key }));
     // Untracked, so the effect that refreshes follows the signals and the search alone.
     active = untrack(() => Math.min(active, Math.max(0, palette.length - 1)));
   };
