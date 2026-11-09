@@ -262,22 +262,36 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .trace-chip .eye svg { width: 12px; height: 12px; }
 .trace-chip .eye:hover { color: var(--foreground); }
 .trace-chip .eye[aria-pressed=false] { opacity: 0.6; }
-/* A menu's shortcuts as key caps, so | and _ read as the keys they are. */
-[data-slot=context-menu-shortcut] { display: inline-flex; gap: 3px; }
-[data-slot=context-menu-shortcut] kbd { min-width: 18px; padding: 0 4px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; background: var(--secondary); color: var(--muted-foreground); font: 11px/15px var(--font-data); text-align: center; }
-/* A menu whose items lead with an icon, as the plot header's buttons show
-   them: the icon takes the room a check mark would, muted beside its label. */
-.menu-icons :is([data-slot^=context-menu-item], [data-slot=context-menu-sub-trigger], [data-slot^=dropdown-menu-item], [data-slot$=-menu-label]) { padding-left: 8px; white-space: nowrap; }
+/* What the hints switch shows: key caps and shortcuts, while the root's
+   data-hints is on (prefs.svelte.js). */
+:root[data-hints=off] [data-hint] { display: none; }
+/* Every menu, dropdown and submenu has one look: rows that lead with an
+   icon, muted beside the label, as the plot header's buttons show them, in
+   the room a check mark would take; and as wide as its widest row. */
+:is([data-slot$=-menu-content], [data-slot$=-menu-sub-content]) { min-width: max-content; }
+.menu-icons :is([data-slot^=context-menu-item], [data-slot=context-menu-sub-trigger], [data-slot^=dropdown-menu-item], [data-slot=dropdown-menu-sub-trigger], [data-slot$=-menu-label]) { padding-left: 8px; white-space: nowrap; }
 .menu-icon { color: var(--muted-foreground); }
-/* A menu's group names, small and muted over their items. */
-.menu-icons [data-slot=context-menu-label].menu-group { padding: 6px 8px 2px; font-size: 11px; font-weight: 500; color: var(--muted-foreground); }
-/* An item with a second line under its name, as Copy data's count. */
-.menu-two { display: flex; flex-direction: column; line-height: 18px; }
-.menu-two small { display: flex; align-items: center; gap: 4px; font-size: 11px; line-height: 14px; color: var(--muted-foreground); }
-.menu-two small.warn { color: var(--warning, #d97706); }
-.menu-two small svg { width: 12px; height: 12px; }
-/* A menu row's current value, before its submenu's arrow. */
-.menu-value { margin-left: auto; padding-left: 16px; color: var(--muted-foreground); font-size: 12px; }
+/* A group's name: an uppercase caption with a rule running after it to the
+   menu's edge, which is the break between groups. */
+[data-slot$=-menu-label] { display: flex; align-items: center; gap: 8px; padding: 10px 8px 3px; font-size: 10px; line-height: 14px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted-foreground); }
+[data-slot$=-menu-label]:first-child { padding-top: 4px; }
+[data-slot$=-menu-label]::after { content: ''; flex: 1; min-width: 12px; height: 1px; background: var(--border); }
+/* A row's trailing column, on the row's right edge: its value, in
+   fixed-width digits and at least a column wide, so the values of a menu
+   line up; or while the hints show, its shortcut in the value's place. A
+   warning, its reason in its tooltip, and the value of a row that cannot be
+   chosen, which says why, keep the column. The arrow of a submenu follows
+   the value. */
+.menu-value { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; min-width: 76px; margin-left: auto; padding-left: 16px; color: var(--muted-foreground); font-size: 12px; line-height: 20px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.menu-value.warn { color: var(--warning, #d97706); pointer-events: auto; }
+.menu-value svg { width: 12px; height: 12px; }
+.menu-value + svg { margin-left: 4px; }
+[data-slot$=-menu-label] .menu-value { order: 1; min-width: 0; padding-left: 0; font-size: 11px; font-weight: 400; letter-spacing: normal; text-transform: none; }
+:root[data-hints=on] [role^=menuitem]:not([data-disabled]):has([data-slot$=-shortcut]) .menu-value:not(.warn), :root[data-hints=on] [role^=menuitem]:is([data-disabled], :has(.menu-value.warn)):has(.menu-value) [data-slot$=-shortcut] { display: none; }
+/* A menu's shortcuts as key caps, so | and _ read as the keys they are. */
+[data-slot$=-menu-shortcut] { display: inline-flex; gap: 3px; }
+[data-slot$=-menu-shortcut] kbd { min-width: 18px; padding: 0 4px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; background: var(--secondary); color: var(--muted-foreground); font: 11px/15px var(--font-data); text-align: center; }
+/* A colour's pill, as the chips draw it. */
 .menu-value i { display: inline-block; width: 12px; height: 3px; border-radius: 2px; vertical-align: middle; background: var(--c); }
 /* A chip answers the pointer as a whole, as Material and Fluent chips do;
    a hidden signal's chip stays, dimmed. */

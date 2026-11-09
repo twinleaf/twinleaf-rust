@@ -20,6 +20,7 @@
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
   import { colorOf } from './plot.js';
+  import { colors } from './colors.svelte.js';
   import Swatch from './Swatch.svelte';
   import ColorPicker from './ColorPicker.svelte';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
@@ -164,7 +165,7 @@
     <ContextMenu.Item onSelect={() => onAdd(menuKey)}><RiAdd class="menu-icon" />Add to plot<ContextMenu.Shortcut><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
     <ContextMenu.Item onSelect={() => onNewPlot([menuKey])}><RiNewPlot class="menu-icon" />New plot<ContextMenu.Shortcut><kbd>⇧</kbd><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
     <ContextMenu.Sub>
-      <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorOf({ key: menuKey })}"></i></span></ContextMenu.SubTrigger>
+      <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorOf({ key: menuKey })}"></i>{#if colors.picked[menuKey] === undefined}Auto{/if}</span></ContextMenu.SubTrigger>
       <ContextMenu.SubContent class="p-1.5"><ColorPicker key={menuKey} ondone={() => (menuOpen = false)} /></ContextMenu.SubContent>
     </ContextMenu.Sub>
     <ContextMenu.Separator />

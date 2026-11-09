@@ -4,8 +4,10 @@
 // light or dark, as it changes.
 //
 // The theme is the `dark` class on the page's root, which app.css's tokens
-// follow. It is set before `dark` changes, so whatever reads the tokens when
-// `dark` changes, as plot.js's theme() does, reads the new ones.
+// follow. The class is set before `dark` changes, so whatever reads the
+// tokens when `dark` changes, as plot.js's theme() does, reads the new
+// ones. The hints are the root's `data-hints`, 'on' or 'off', which shows
+// or hides everything marked `data-hint` (plot.css).
 
 const KEY = 'tl-prefs';
 
@@ -54,6 +56,7 @@ export class Prefs {
   setHints(on) {
     this.hints = on;
     this.save();
+    this.apply();
   }
 
   setTraceWidth(px) {
@@ -67,10 +70,13 @@ export class Prefs {
     this.apply();
   }
 
-  /** Shows the theme: the root's class first, then `dark`. */
+  /** Shows the theme, the root's class first and then `dark`, and the hints, as the root's `data-hints`. */
   apply() {
     const dark = this.theme === 'dark' || (this.theme === 'system' && (this.media?.matches ?? true));
-    if (typeof document !== 'undefined') document.documentElement.classList.toggle('dark', dark);
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.toggle('dark', dark);
+      document.documentElement.dataset.hints = this.hints ? 'on' : 'off';
+    }
     this.dark = dark;
   }
 

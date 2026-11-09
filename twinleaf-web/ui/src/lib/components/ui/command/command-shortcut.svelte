@@ -1,7 +1,7 @@
 <script>
-	// Shows only while hints show (prefs.svelte.js), so a menu without them fits its labels.
+	// A hint: it shows only while the hints show (prefs.svelte.js), so a menu
+	// without them fits its labels, and its row's value takes its place.
 	import { cn } from "$lib/utils.js";
-	import { prefs } from "$lib/prefs.svelte.js";
 	let {
 		ref = $bindable(null),
 		class: className,
@@ -10,13 +10,12 @@
 	} = $props();
 </script>
 
-{#if prefs.hints}
 <span
 	bind:this={ref}
 	data-slot="command-shortcut"
+	data-hint
 	class={cn("text-muted-foreground group-data-selected/command-item:text-foreground ml-auto text-xs tracking-widest", className)}
 	{...restProps}
 >
 	{@render children?.()}
 </span>
-{/if}

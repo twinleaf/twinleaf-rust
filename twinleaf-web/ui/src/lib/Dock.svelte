@@ -24,6 +24,12 @@
   import RiShowLeft from '@lucide/svelte/icons/panel-left-open';
   import RiHideRight from '@lucide/svelte/icons/panel-right-close';
   import RiShowRight from '@lucide/svelte/icons/panel-right-open';
+  import RiFold from '@lucide/svelte/icons/chevrons-down-up';
+  import RiUp from '@lucide/svelte/icons/arrow-up';
+  import RiDown from '@lucide/svelte/icons/arrow-down';
+  import RiToLeft from '@lucide/svelte/icons/panel-left';
+  import RiToRight from '@lucide/svelte/icons/panel-right';
+  import RiReset from '@lucide/svelte/icons/rotate-ccw';
   import { PANELS } from './docks.svelte.js';
   import { enter, focusNode } from './focus.js';
   import { focusedByKeyboard } from './keys.js';
@@ -186,14 +192,14 @@
             </header>
           {/snippet}
         </ContextMenu.Trigger>
-        <ContextMenu.Content class="w-48">
-          <ContextMenu.Item onSelect={() => docks.toggle(p.id)}>{p.open ? 'Fold' : 'Unfold'}</ContextMenu.Item>
-          <ContextMenu.Item disabled={i === 0} onSelect={() => docks.step(p.id, -1)}>Move up</ContextMenu.Item>
-          <ContextMenu.Item disabled={i === items.length - 1} onSelect={() => docks.step(p.id, 1)}>Move down</ContextMenu.Item>
-          <ContextMenu.Item onSelect={() => docks.moveTo(p.id, other, docks[other].length)}>Move to the {other} dock</ContextMenu.Item>
+        <ContextMenu.Content class="menu-icons">
+          <ContextMenu.Item onSelect={() => docks.toggle(p.id)}><RiFold class="menu-icon" />{p.open ? 'Fold' : 'Unfold'}</ContextMenu.Item>
+          <ContextMenu.Item disabled={i === 0} onSelect={() => docks.step(p.id, -1)}><RiUp class="menu-icon" />Move up</ContextMenu.Item>
+          <ContextMenu.Item disabled={i === items.length - 1} onSelect={() => docks.step(p.id, 1)}><RiDown class="menu-icon" />Move down</ContextMenu.Item>
+          <ContextMenu.Item onSelect={() => docks.moveTo(p.id, other, docks[other].length)}>{#if other === 'left'}<RiToLeft class="menu-icon" />{:else}<RiToRight class="menu-icon" />{/if}Move to the {other} dock</ContextMenu.Item>
           <ContextMenu.Separator />
-          <ContextMenu.Item onSelect={() => setHidden(true)}>Hide the {side} dock</ContextMenu.Item>
-          <ContextMenu.Item onSelect={() => docks.reset()}>Reset every panel</ContextMenu.Item>
+          <ContextMenu.Item onSelect={() => setHidden(true)}><HideIcon class="menu-icon" />Hide the {side} dock</ContextMenu.Item>
+          <ContextMenu.Item onSelect={() => docks.reset()}><RiReset class="menu-icon" />Reset every panel</ContextMenu.Item>
         </ContextMenu.Content>
       </ContextMenu.Root>
       {#if p.open && !p[SHADOW]}

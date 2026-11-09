@@ -5,7 +5,6 @@
   import RiKeys from '@lucide/svelte/icons/keyboard';
   import RiWarn from '@lucide/svelte/icons/triangle-alert';
   import Tip from './Tip.svelte';
-  import { prefs } from './prefs.svelte.js';
   import HistorySettings from './HistorySettings.svelte';
   import * as Popover from '$lib/components/ui/popover/index.js';
   import { bytesText as bytes, spanText as span } from './units.js';
@@ -55,6 +54,6 @@
   <span class="spacer"></span>
   <span class="item" title="GPU: {hud.gpu || 'unknown'}">{hud.fps.toFixed(0)} fps</span>
   <Tip text="Every key and mouse gesture">
-    {#snippet children(tip)}<button {...tip} class="item keys" onclick={onKeys}><RiKeys />Keys{#if prefs.hints}<kbd>?</kbd>{/if}</button>{/snippet}
+    {#snippet children(tip)}<button {...tip} class="item keys" onclick={onKeys}><RiKeys />Keys<kbd data-hint>?</kbd></button>{/snippet}
   </Tip>
 </footer>

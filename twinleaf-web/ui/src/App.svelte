@@ -594,8 +594,9 @@
 
   /**
    * What Ctrl+C on plots `ids` would copy, from the hub's count of the rows,
-   * as {state, text}: 'ok', 'too-many' past what a paste holds, or
-   * 'partial' when history no longer holds the window's start.
+   * as {state, rows, reason}: 'ok', 'too-many' past what a paste holds, or
+   * 'partial' when history no longer holds the window's start, the reason
+   * saying which.
    */
   async function copyCheck(ids) {
     const session = hub.session, now = hub.now(performance.now());
@@ -613,9 +614,9 @@
       total += replies.reduce((n, r) => n + r.count, 0);
       replies.forEach((r, i) => (lost = Math.max(lost, lostSeconds(t0, r.oldest, traces[i].meta.rate))));
     }
-    if (total > MAX_COPY_ROWS) return { state: 'too-many', text: `${total.toLocaleString()} rows, more than a paste holds: export instead` };
-    if (lost) return { state: 'partial', text: `The first ${lost.toFixed(1)} s are no longer in history` };
-    return { state: 'ok', text: `${total.toLocaleString()} rows` };
+    if (total > MAX_COPY_ROWS) return { state: 'too-many', rows: total, reason: 'More than a paste holds: export instead' };
+    if (lost) return { state: 'partial', rows: total, reason: `The first ${lost.toFixed(1)} s are no longer in history` };
+    return { state: 'ok', rows: total };
   }
 
   async function copyData(ids) {
@@ -905,7 +906,7 @@
     <!-- One row: what acts on the plots, then the page's own settings. -->
     <header class="top-bar" data-focus="toolbar" tabindex="-1">
       <span class="brand">Twinleaf Hub</span>
-      <button class="search" data-keeps-selection onclick={() => (paletteOpen = true)}><RiSearch />Commands{#if prefs.hints}<kbd>Ctrl K</kbd>{/if}</button>
+      <button class="search" data-keeps-selection onclick={() => (paletteOpen = true)}><RiSearch />Commands<kbd data-hint>Ctrl K</kbd></button>
       <span class="divider"></span>
       <Tip text={live ? 'Pause every plot' : 'Every plot follows live'}>
         {#snippet children(tip)}

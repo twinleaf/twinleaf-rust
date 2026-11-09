@@ -8,6 +8,7 @@
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import IconButton from './IconButton.svelte';
   import RiCopy from '@lucide/svelte/icons/copy';
+  import RiRename from '@lucide/svelte/icons/pencil';
   import RiClose from '@lucide/svelte/icons/x';
   import RiAdd from '@lucide/svelte/icons/plus';
   import { plotIds } from './layout.js';
@@ -121,11 +122,11 @@
               </div>
             {/snippet}
           </ContextMenu.Trigger>
-          <ContextMenu.Content>
-            <ContextMenu.Item onSelect={() => startRename(t.id)}>Rename<ContextMenu.Shortcut><kbd>F2</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-            <ContextMenu.Item onSelect={() => history.group('Duplicate tab', () => ws.duplicateTab(t))}>Duplicate</ContextMenu.Item>
+          <ContextMenu.Content class="menu-icons">
+            <ContextMenu.Item onSelect={() => startRename(t.id)}><RiRename class="menu-icon" />Rename<ContextMenu.Shortcut><kbd>F2</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+            <ContextMenu.Item onSelect={() => history.group('Duplicate tab', () => ws.duplicateTab(t))}><RiCopy class="menu-icon" />Duplicate</ContextMenu.Item>
             <ContextMenu.Separator />
-            <ContextMenu.Item variant="destructive" onSelect={() => onClose(t)}>Close</ContextMenu.Item>
+            <ContextMenu.Item variant="destructive" onSelect={() => onClose(t)}><RiClose class="menu-icon" />Close</ContextMenu.Item>
           </ContextMenu.Content>
         </ContextMenu.Root>
       </div>

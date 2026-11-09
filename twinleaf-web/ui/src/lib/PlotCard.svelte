@@ -45,6 +45,7 @@
   import RiExport from '@lucide/svelte/icons/file-down';
   import RiWarn from '@lucide/svelte/icons/triangle-exclamation-point';
   import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
+  import { colors } from './colors.svelte.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, KINDS, MODES, kindLabel } from './constants.js';
   import { writeTables } from './copy.js';
@@ -141,8 +142,11 @@
   // menu's first frame already has its line.
   let copyCheck = $state(null);
   let copyAsk = $state(0);
+  /** What Copy data says while the hub counts the rows. */
+  const COUNTING = { state: 'ok', rows: null };
+  const rowsText = (n) => (n === null ? 'Counting…' : `${n.toLocaleString()} row${n === 1 ? '' : 's'}`);
   function recountCopy() {
-    if (plot.items.length) copyCheck = { state: 'ok', text: 'Counting rows…' };
+    if (plot.items.length) copyCheck = COUNTING;
     copyAsk++;
   }
   /** How long the view must rest, while the menu is open, before the count is asked again, in ms. */
@@ -157,7 +161,7 @@
       const n = ++asked;
       onCheckCopy?.().then((check) => current && n === asked && (copyCheck = check), () => current && n === asked && (copyCheck = null));
     };
-    copyCheck = { state: 'ok', text: 'Counting rows…' };
+    copyCheck = COUNTING;
     ask();
     // A wheel over the plot zooms it with the menu still open: the count
     // follows once the view rests, keeping the last one shown meanwhile.
@@ -658,7 +662,7 @@
   <ContextMenu.Item onSelect={() => toggleHidden(key)}>{#if item?.hidden}<RiShowOnly class="menu-icon" />Show{:else}<RiHide class="menu-icon" />Hide{/if}</ContextMenu.Item>
   <ContextMenu.Separator />
   <ContextMenu.Sub>
-    <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorFor(key)}"></i></span></ContextMenu.SubTrigger>
+    <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorFor(key)}"></i>{#if colors.picked[key] === undefined}Auto{/if}</span></ContextMenu.SubTrigger>
     <ContextMenu.SubContent class="p-1.5"><ColorPicker {key} ondone={close} /></ContextMenu.SubContent>
   </ContextMenu.Sub>
   {#if side}
@@ -759,7 +763,7 @@
           </div>
         {/snippet}
       </ContextMenu.Trigger>
-      <ContextMenu.Content class={menuChip ? 'menu-icons' : 'w-64'}>
+      <ContextMenu.Content class={menuChip ? 'menu-icons' : 'menu-icons w-64'}>
         {#if menuChip}
           {@render signalMenu(menuChip, () => (signalsOpen = false))}
         {:else}
@@ -806,7 +810,7 @@
         </ScrollArea>
         {#if plot.items.length}
           <ContextMenu.Separator />
-          <ContextMenu.Item variant="destructive" onSelect={removeAll}>Remove every signal</ContextMenu.Item>
+          <ContextMenu.Item variant="destructive" onSelect={removeAll}><RiTrash class="menu-icon" />Remove every signal</ContextMenu.Item>
         {/if}
         {/if}
       </ContextMenu.Content>
@@ -1066,25 +1070,20 @@
            is; then closing it. Copy data says first when a copy would hold
            too much or come back short, from the hub's count of the rows. -->
       {#if plot.items.length}
-        <ContextMenu.Label class="menu-group">Data</ContextMenu.Label>
+        <ContextMenu.Label>Data</ContextMenu.Label>
         <ContextMenu.Item disabled={copyCheck?.state === 'too-many'} onSelect={() => onCopy?.()}>
-          <RiCopy class="menu-icon" />
-          <span class="menu-two">
-            Copy data
-            {#if copyCheck?.text}<small class:warn={copyCheck.state !== 'ok'}>{#if copyCheck.state !== 'ok'}<RiWarn />{/if}{copyCheck.text}</small>{/if}
-          </span>
+          <RiCopy class="menu-icon" />Copy data
+          {#if copyCheck}<span class="menu-value" class:warn={copyCheck.state !== 'ok'} title={copyCheck.reason}>{#if copyCheck.state !== 'ok'}<RiWarn />{/if}{rowsText(copyCheck.rows)}</span>{/if}
           <ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut>
         </ContextMenu.Item>
         <ContextMenu.Item onSelect={() => onExport?.()}><RiExport class="menu-icon" />Export data…</ContextMenu.Item>
-        <ContextMenu.Separator />
       {/if}
-      <ContextMenu.Label class="menu-group">Cursors</ContextMenu.Label>
+      <ContextMenu.Label>Cursors</ContextMenu.Label>
       <!-- Cursors are dragged out of the axes; these place a pair in view. -->
       <ContextMenu.Item onSelect={() => eachPv((p) => p.addXCursors())}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
       <ContextMenu.Item onSelect={() => eachAxis(region.keys?.[0], (p, axis) => p.addYCursors(axis))}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
       <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors</ContextMenu.Item>
-      <ContextMenu.Separator />
-      <ContextMenu.Label class="menu-group">Show</ContextMenu.Label>
+      <ContextMenu.Label>Show</ContextMenu.Label>
       <ContextMenu.Sub>
         <ContextMenu.SubTrigger><RiKind class="menu-icon" />Kind</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
@@ -1101,8 +1100,7 @@
           </ContextMenu.RadioGroup>
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
-      <ContextMenu.Separator />
-      <ContextMenu.Label class="menu-group">Arrange</ContextMenu.Label>
+      <ContextMenu.Label>Arrange</ContextMenu.Label>
       <ContextMenu.Item onSelect={() => onSplit('row')}><RiSplitH class="menu-icon" />Split right<ContextMenu.Shortcut><kbd>|</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Item onSelect={() => onSplit('col')}><RiSplitV class="menu-icon" />Split down<ContextMenu.Shortcut><kbd>_</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Item onSelect={() => onMaximize(false)}>{#if maximized}<RiFullscreenExit class="menu-icon" />Restore{:else}<RiFullscreen class="menu-icon" />Maximize{/if}<ContextMenu.Shortcut><kbd>F</kbd></ContextMenu.Shortcut></ContextMenu.Item>
