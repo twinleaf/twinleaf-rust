@@ -2,7 +2,7 @@
   // The layout tabs: drag to reorder, double-click or F2 to rename, and a
   // menu on right-click. The strip is one stop in the Tab order, on the open
   // tab, and the arrows move focus along it (keymap.js, `tabs`).
-  import { tick } from 'svelte';
+  import { getContext, tick } from 'svelte';
   import { flip } from 'svelte/animate';
   import { dndzone } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
@@ -19,6 +19,7 @@
    * `onReorder(ids)` puts the tabs in the order of `ids`.
    */
   let { ws, drags, onClose, onReorder } = $props();
+  const history = getContext('history');
 
   const FLIP_MS = 150;
   let renaming = $state(null);
@@ -37,7 +38,7 @@
   function commitRename(t, name) {
     // Escape ends the rename first, so the blur that follows keeps nothing.
     if (renaming !== t.id) return;
-    if (name.trim()) t.name = name.trim();
+    if (name.trim()) history.group('Rename tab', () => ws.renameTab(t.id, name.trim()));
     renaming = null;
   }
   function tabKey(e, t) {
@@ -115,14 +116,14 @@
                   <span title={prefs.hints ? 'Double-click to rename' : undefined}>{t.name}</span>
                   <span class="text-[11px] text-muted-foreground">{plotIds(t.layout).length}</span>
                 {/if}
-                <IconButton icon={RiCopy} label="Duplicate {t.name}" class="size-5" tabindex={-1} onclick={(e) => (e.stopPropagation(), ws.duplicateTab(t))} />
+                <IconButton icon={RiCopy} label="Duplicate {t.name}" class="size-5" tabindex={-1} onclick={(e) => (e.stopPropagation(), history.group('Duplicate tab', () => ws.duplicateTab(t)))} />
                 <IconButton icon={RiClose} label="Close {t.name}" class="size-5" tabindex={-1} onclick={(e) => (e.stopPropagation(), onClose(t))} />
               </div>
             {/snippet}
           </ContextMenu.Trigger>
           <ContextMenu.Content>
             <ContextMenu.Item onSelect={() => startRename(t.id)}>Rename<ContextMenu.Shortcut><kbd>F2</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-            <ContextMenu.Item onSelect={() => ws.duplicateTab(t)}>Duplicate</ContextMenu.Item>
+            <ContextMenu.Item onSelect={() => history.group('Duplicate tab', () => ws.duplicateTab(t))}>Duplicate</ContextMenu.Item>
             <ContextMenu.Separator />
             <ContextMenu.Item variant="destructive" onSelect={() => onClose(t)}>Close</ContextMenu.Item>
           </ContextMenu.Content>
@@ -130,5 +131,5 @@
       </div>
     {/each}
   </div>
-  <IconButton icon={RiAdd} label="New layout" variant="outline" size="icon-sm" onclick={() => ws.addTab()} />
+  <IconButton icon={RiAdd} label="New layout" variant="outline" size="icon-sm" onclick={() => history.group('New tab', () => ws.addTab())} />
 </div>

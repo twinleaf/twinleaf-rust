@@ -12,7 +12,6 @@
   // every plot. Space pauses spectra too; the toolbar sets time plots only.
   import { getContext, onMount, setContext, tick, untrack } from 'svelte';
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
-  import { favorites } from './lib/favorites.svelte.js';
   import { Views } from './lib/views.js';
   import { Drags } from './lib/drag.svelte.js';
   import { Renderer } from './lib/gl.js';
@@ -83,11 +82,6 @@
   // main.js makes them: the panels reach the History to make a command one step.
   const { hub, ws, history } = getContext('page');
   setContext('history', history);
-  $effect(() => {
-    JSON.stringify(ws.tabs);
-    favorites.names;
-    untrack(() => history.observe());
-  });
   const views = new Views(hub, viewChanged);
   const drags = new Drags(ws, refreshToolbar, history);
   drags.closePlot = (id) => closePlot(id);
@@ -126,11 +120,17 @@
    */
   const targetIdsOf = (id, fromKeys = false) => (ws.selected.has(id) || (fromKeys && ws.selected.size) ? [...ws.selected] : [id]).filter((i) => ws.plots[i]);
   const plotsText = (n) => `${n} plot${n === 1 ? '' : 's'}`;
-  /** Runs `fn(plot)` on each plot a command on plot `id` acts on, as one step undo names `what`. */
+  /**
+   * Gives each plot a command on plot `id` acts on the fields `fn(plot)`
+   * returns, if any, as one step undo names `what`.
+   */
   function eachPlot(id, what, fn, fromKeys = false) {
     const ids = targetIdsOf(id, fromKeys);
     history.group(ids.length > 1 ? `${what} (${plotsText(ids.length)})` : what, () => {
-      for (const i of ids) fn(ws.plots[i]);
+      for (const i of ids) {
+        const patch = fn(ws.plots[i]);
+        if (patch) ws.setPlot(i, patch);
+      }
     });
   }
   /** The views the toolbar acts on: the highlighted time plots', or every time plot's. */
@@ -263,10 +263,11 @@
   let closing = $state(null);
   function closeTab(t) {
     if (plotIds(t.layout).length) closing = t;
-    else ws.closeTab(t);
+    else history.group('Close tab', () => ws.closeTab(t));
   }
   function confirmClose() {
-    ws.closeTab(closing);
+    const t = closing;
+    history.group('Close tab', () => ws.closeTab(t));
     closing = null;
   }
 
@@ -284,7 +285,8 @@
     e.currentTarget.value = '';
     if (!file) return;
     try {
-      ws.addTabs(importText(await file.text()));
+      const tabs = importText(await file.text());
+      history.group('Import', () => ws.addTabs(tabs));
       importError = '';
     } catch (err) {
       importError = `Import failed: ${err.message}`;
@@ -455,7 +457,7 @@
   });
 
   function newPlotWith(keys) {
-    ws.addPlot(newPlot('time', 'overlay', keys));
+    history.group('New plot', () => ws.addPlot(newPlot('time', 'overlay', keys)));
   }
   /** Adds signal `key` from the Signals list to every selected plot, or else as Workspace.addToFocused does. */
   function addSignal(key) {
@@ -572,7 +574,7 @@
     for (const pv of registry) if (ids.includes(pv.plotId)) had = pv.clearCursors() || had;
     return had;
   }
-  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addToFocused: (key) => ws.addToFocused(key), newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };
+  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addToFocused: (key) => history.group(`Add ${key}`, () => ws.addToFocused(key)), newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };
 
   let paletteOpen = $state(false);
   let keysOpen = $state(false);
@@ -755,10 +757,12 @@
 <canvas class="gl-layer" bind:this={glCanvas}></canvas>
 
 {#snippet plotTile(id)}
+  <!-- Its own plot, so an edit to another plot does not reach this one. -->
+  {@const plot = ws.plots[id]}
   {#key id}
-    {#if renderer && ws.plots[id]}
+    {#if renderer && plot}
       <PlotCard
-        plot={ws.plots[id]}
+        {plot}
         {hub}
         view={views.of(id)}
         targets={() => targetsOf(id)}
@@ -776,6 +780,8 @@
         }}
         onRemove={(keys) => closePlots(targetIdsOf(id, keys), keys)}
         onEach={(what, fn, keys) => eachPlot(id, what, fn, keys)}
+        onEdit={(what, patch) => history.group(what, () => ws.setPlot(id, patch))}
+        onView={(patch) => ws.setView(id, patch)}
         onContext={() => {
           // A right-click on a plot outside the selection selects it alone, so the menu acts on what is highlighted.
           if (!ws.selected.has(id)) {
@@ -789,7 +795,7 @@
         onStartMove={(e) => drags.startMove(id, e)}
         onSplit={(dir, keys) => {
           const p = newPlot('time', 'overlay', []);
-          ws.addPlot(p, id, dir);
+          history.group('Split', () => ws.addPlot(p, id, dir));
           if (keys) focusPlot(p.id);
         }}
         onMaximize={() => (ws.maximized = ws.maximized === id ? null : id)}
@@ -900,10 +906,10 @@
           <DropdownMenu.Label>Arrange this tab</DropdownMenu.Label>
           {#each ARRANGEMENTS as [name, label]}
             {@const Icon = ARRANGE_ICONS[name]}
-            <DropdownMenu.Item onSelect={() => ws.arrange(name)}><Icon class="menu-icon" />{label}</DropdownMenu.Item>
+            <DropdownMenu.Item onSelect={() => history.group(`Arrange as ${label}`, () => ws.arrange(name))}><Icon class="menu-icon" />{label}</DropdownMenu.Item>
           {/each}
           <DropdownMenu.Separator />
-          <DropdownMenu.Item onSelect={() => ws.reset()}><RiReset class="menu-icon" />Reset to default</DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={() => history.group('Reset', () => ws.reset())}><RiReset class="menu-icon" />Reset to default</DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Root>
       <DropdownMenu.Root>

@@ -1,12 +1,11 @@
 // The tab strip follows the tabs. On the whole page, tabs are dragged to new
-// places with the real mouse, held there past the moment a quick edit joins
-// the step before, with undo and redo between. After every step the page
+// places with the real mouse and held there a while, with undo and redo
+// between. After every step the page
 // still has every tab it had, and the strip shows them in their order.
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, drag, frames, mountPage } from './browser/page.js';
-import { MERGE_MS } from '../src/lib/history.svelte.js';
 
 const stripOrder = () => [...document.querySelectorAll('[role=tablist] [data-tab]')].map((e) => e.dataset.tab);
 
@@ -29,7 +28,7 @@ async function run(s, { ws, history }) {
     // Past the far half of the tab it lands beside, held there a while.
     // Picked up by its name, as a person does; its buttons start no drag.
     const from = centre(a.querySelector('span'));
-    await drag(from, [bx + (r.width / 3) * Math.sign(bx - from[0]), by], [[bx, by]], MERGE_MS + 100);
+    await drag(from, [bx + (r.width / 3) * Math.sign(bx - from[0]), by], [[bx, by]], 500);
     await new Promise((done) => setTimeout(done, 300));
     if (ws.tabs.map((t) => t.id).join() !== before) moved++;
   } else if (s.t === 'undo') history.undo();

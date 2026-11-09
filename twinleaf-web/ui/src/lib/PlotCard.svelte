@@ -2,7 +2,7 @@
   // One plot of a tab: its header of signals and actions, the plot body the
   // WebGL layer draws behind, and its menus. The drawing is plot.js's
   // PlotView; this is the plot's controls.
-  import { onMount, tick } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
@@ -56,8 +56,8 @@
   let {
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
     onFocus, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
-    onTraceDragStart, onLandSignal, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
-    onEach = (what, fn) => fn(plot), targetIds = () => [plot.id], onContext,
+    onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
+    onEach, targetIds = () => [plot.id], onContext,
   } = $props();
 
   /** Runs `fn(pv)` on the PlotView of each plot a command here acts on; `fromKeys` as the page's targetIds takes it. */
@@ -68,12 +68,12 @@
   /** Shows or hides the legend of each plot a command here acts on, all as this plot's turns. */
   const toggleLegend = (fromKeys = false) => {
     const on = !plot.legend;
-    onEach(on ? 'Show the legend' : 'Hide the legend', (p) => (p.legend = on), fromKeys);
+    onEach(on ? 'Show the legend' : 'Hide the legend', () => ({ legend: on }), fromKeys);
   };
   /** The name list `list` (KINDS, MODES) gives value `v`. */
   const nameIn = (list, v) => list.find((x) => x[0] === v)?.[1] ?? v;
   /** Sets `field` to `value` on each plot a command here acts on, of this plot's kind; `what` names the step. */
-  const setEach = (what, field, value) => onEach(what, (p) => p.kind === plot.kind && (p[field] = value));
+  const setEach = (what, field, value) => onEach(what, (p) => (p.kind === plot.kind ? { [field]: value } : null));
 
   const session = $derived(hub.session);
   /** The signal `key`'s colour, units and rate, once the hub has its trace. */
@@ -88,7 +88,7 @@
   const axisless = (key) => !!slots && !slots.left.includes(key) && !slots.right.includes(key);
   /** Puts signal `key`'s axis on `side`, 'left' or 'right', or hides it with 'none'. */
   function setSide(key, side) {
-    plot.axisSides = { ...plot.axisSides, [key]: side };
+    onEdit(side === 'none' ? `Hide ${key}'s axis` : `${key}'s axis on the ${side}`, { axisSides: { ...plot.axisSides, [key]: side } });
   }
 
   // A right-click shows what it was on: the time axis's window, or the
@@ -215,7 +215,7 @@
     else if (plot.xScale !== 'linear' && lo <= 0) fBoundsError = 'A log axis starts above zero';
     else {
       fBoundsError = '';
-      plot.fRange = [lo, hi];
+      onView({ fRange: [lo, hi] });
       return true;
     }
     return false;
@@ -241,7 +241,7 @@
     return session.signals.filter((t) => !has.has(t.key) && t.key.toLowerCase().includes(f));
   });
   function addSignal(key) {
-    if (!plot.items.some((i) => i.key === key)) plot.items.push(chip(key));
+    if (!plot.items.some((i) => i.key === key)) onEdit(`Add ${key}`, { items: [...plot.items, chip(key)] });
   }
   function filterKey(e) {
     // Escape and Tab go on to the menu, which closes; every other key stays here.
@@ -338,7 +338,7 @@
       plotId: plot.id,
       renderer,
       onFocus,
-      onFrequencies: (lo, hi) => (plot.fRange = [lo, hi]),
+      onFrequencies: (lo, hi) => onView({ fRange: [lo, hi] }),
       onFitY: () => eachPv((p) => p.autoscale()),
       config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null }),
     });
@@ -419,19 +419,20 @@
     for (const item of dropped) onLandSignal?.(item, [...plot.items, item]);
   }
   function remove(id) {
-    plot.items = plot.items.filter((i) => i.id !== id);
+    const item = plot.items.find((i) => i.id === id);
+    if (item) onEdit(`Remove ${item.key}`, { items: plot.items.filter((i) => i !== item) });
   }
   // A signal the plot keeps but does not draw, as a legend hides a series.
   let menuChip = $state(null); // the signal a right-click on its chip opened the menu for
   let legendMenuOpen = $state(false);
   let legendKey = $state(null); // the signal a right-click on its legend row opened the legend's menu for
-  const toggleHidden = (key) => (plot.items = plot.items.map((i) => (i.key === key ? { ...i, hidden: !i.hidden } : i)));
+  const toggleHidden = (key) => onEdit(`${plot.items.find((i) => i.key === key)?.hidden ? 'Show' : 'Hide'} ${key}`, { items: plot.items.map((i) => (i.key === key ? { ...i, hidden: !i.hidden } : i)) });
   // Whether a spectrum draws the signal's noise floor line, which its chip's eye turns on and off.
-  const toggleFloor = (key) => (plot.items = plot.items.map((i) => (i.key === key ? { ...i, floorHidden: !i.floorHidden } : i)));
+  const toggleFloor = (key) => onEdit(`${plot.items.find((i) => i.key === key)?.floorHidden ? 'Show' : 'Hide'} ${key}'s noise floor`, { items: plot.items.map((i) => (i.key === key ? { ...i, floorHidden: !i.floorHidden } : i)) });
   /** The units of what the plot shows of signal `key`: a spectrum's are per √Hz. */
   const unitsShown = (key) => unitsOf(key) && (plot.kind === 'spectrum' ? `${unitsOf(key)}/√Hz` : unitsOf(key));
-  const showOnly = (key) => (plot.items = plot.items.map((i) => ({ ...i, hidden: i.key !== key })));
-  const showAll = () => (plot.items = plot.items.map((i) => ({ ...i, hidden: false })));
+  const showOnly = (key) => onEdit(`Show only ${key}`, { items: plot.items.map((i) => ({ ...i, hidden: i.key !== key })) });
+  const showAll = () => onEdit('Show every signal', { items: plot.items.map((i) => ({ ...i, hidden: false })) });
   /** Whether `e` happened on the header itself or the empty part of its chips. */
   const empty = (e) => e.target === e.currentTarget || e.target.classList?.contains('trace-zone');
 
@@ -472,7 +473,7 @@
   /** Removes every signal and keeps the menu open on its filter, as adding one does, to add others. */
   function removeAll(e) {
     e.preventDefault();
-    onEach('Remove every signal', (p) => (p.items = []));
+    onEach('Remove every signal', () => ({ items: [] }));
     tick().then(() => addInput?.focus());
   }
   /** Gives focus back to the plot when a menu opened from the keys closes. */
@@ -497,12 +498,17 @@
   const LEGEND_INSET = { side: 8, top: 22, monitorTop: 32 };
   /** How near, in px, a dragged legend or readout comes to an edge or the middle before it snaps there. */
   const LEGEND_SNAP = 12;
+  /** The legend or readout being dragged, {place, at}: shown where the pointer has it, and kept once let go. */
+  let overlayDrag = $state.raw(null);
+  /** Where the legend or readout `place` sits: `plot[place]`, or where a drag has it, or else `fallback`. */
+  const atOf = (place, fallback) => (overlayDrag?.place === place ? overlayDrag.at : plot[place]) ?? fallback;
   /**
    * Drags the legend or the cursors' readout within the plot, keeping where
-   * it sits in `plot[place]`. That is a share of the room around it, 0 to
-   * 1 across and down, so it stays in its place, a corner or between, as the
-   * plot resizes. Across and down, it snaps to either edge and the middle:
-   * the nine places of a corner, an edge's middle or the centre.
+   * it sits in `plot[place]`, as one edit when it is let go. That is a share
+   * of the room around it, 0 to 1 across and down, so it stays in its place,
+   * a corner or between, as the plot resizes. Across and down, it snaps to
+   * either edge and the middle: the nine places of a corner, an edge's
+   * middle or the centre.
    */
   function dragOverlay(e, place) {
     // Its drag is its own, not the plot's pan.
@@ -525,19 +531,42 @@
       const at = Math.min(1, Math.max(0, offset / room));
       return [0, 0.5, 1].find((a) => Math.abs(a - at) * room < LEGEND_SNAP) ?? at;
     };
+    // The pointer is held to it, so the drag ends where it was let go, or
+    // with nothing kept when the pointer is lost or Escape is pressed.
+    const el = e.currentTarget, pointer = e.pointerId;
+    el.setPointerCapture(pointer);
     const move = (ev) => {
-      plot[place] = {
-        x: share(ev.clientX - dx - room.l, room.r - room.l - own.width),
-        y: share(ev.clientY - dy - room.t, room.b - room.t - own.height),
-      };
+      const at = { x: share(ev.clientX - dx - room.l, room.r - room.l - own.width), y: share(ev.clientY - dy - room.t, room.b - room.t - own.height) };
+      overlayDrag = { place, at };
     };
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+    const end = (keep) => {
+      el.removeEventListener('pointermove', move);
+      el.removeEventListener('pointerup', up);
+      el.removeEventListener('lostpointercapture', lost);
+      window.removeEventListener('keydown', key, true);
+      if (el.hasPointerCapture(pointer)) el.releasePointerCapture(pointer);
+      endOverlayDrag = null;
+      const d = overlayDrag;
+      overlayDrag = null;
+      if (d && keep) onEdit(place === 'legendAt' ? 'Move the legend' : 'Move the readout', { [place]: d.at });
     };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    const up = () => end(true);
+    const lost = () => end(false);
+    const key = (ev) => {
+      if (ev.key !== 'Escape') return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      end(false);
+    };
+    el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', up);
+    el.addEventListener('lostpointercapture', lost);
+    window.addEventListener('keydown', key, true);
+    endOverlayDrag = () => end(false);
   }
+  /** Ends a legend or readout drag with nothing kept: the plot going away mid-drag. */
+  let endOverlayDrag = null;
+  onDestroy(() => endOverlayDrag?.());
   /** Keys pressed on the plot, its drawing and signals included. What keeps its own keys, as keys.js says, keeps them. */
   function plotKey(e) {
     const inside = e.target !== card && e.target !== zone;
@@ -650,7 +679,7 @@
     tabindex="-1"
   >
     <IconButton icon={RiDraggable} label="Drag onto a plot's edge to dock, its middle to swap, or a tab to move" class="grip cursor-grab touch-none text-muted-foreground" tabindex={-1} data-focus-skip onpointerdown={onStartMove} />
-    <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} onKind={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, (p) => (p.kind = v))} onMode={(v) => onEach(`Layout ${nameIn(MODES, v)}`, (p) => (p.mode = v))} />
+    <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} onKind={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, () => ({ kind: v }))} onMode={(v) => onEach(`Layout ${nameIn(MODES, v)}`, () => ({ mode: v }))} />
     <!-- The plot's signals, each with its value at the hover, or its newest
          while live, unless the legend shows the values. Right-clicking them
          adds or removes signals. -->
@@ -805,7 +834,7 @@
           <span>to</span>
           <input aria-label="Highest frequency shown" type="text" inputmode="decimal" bind:value={fBounds.hi} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
           <Tip text="Every frequency">
-            {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Show every frequency" onclick={() => ((plot.fRange = null), (xAxisOpen = false))}><RiFitX /></button>{/snippet}
+            {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Show every frequency" onclick={() => (onView({ fRange: null }), (xAxisOpen = false))}><RiFitX /></button>{/snippet}
           </Tip>
         </div>
         {#if fBoundsError}<div class="axis-error">{fBoundsError}</div>{/if}
@@ -863,8 +892,8 @@
         <div class="axis-row" role="group" aria-label="Density scale">
           <span>Scale</span>
           <div class="seg">
-            <button class:on={plot.yScale !== 'linear'} aria-pressed={plot.yScale !== 'linear'} onclick={() => (plot.yScale = 'log')}>Log</button>
-            <button class:on={plot.yScale === 'linear'} aria-pressed={plot.yScale === 'linear'} onclick={() => (plot.yScale = 'linear')}>Linear</button>
+            <button class:on={plot.yScale !== 'linear'} aria-pressed={plot.yScale !== 'linear'} onclick={() => setEach('Log density scale', 'yScale', 'log')}>Log</button>
+            <button class:on={plot.yScale === 'linear'} aria-pressed={plot.yScale === 'linear'} onclick={() => setEach('Linear density scale', 'yScale', 'linear')}>Linear</button>
           </div>
         </div>
       {/if}
@@ -895,7 +924,7 @@
                no taller than part of the plot, where it was dragged to. A
                row's menu is its chip's. -->
           {#if plot.legend && plot.items.length}
-            {@const at = plot.legendAt ?? LEGEND_AT}
+            {@const at = atOf('legendAt', LEGEND_AT)}
             <div class="legend-layer" oncontextmenu={(e) => e.stopPropagation()}>
               <ContextMenu.Root bind:open={legendMenuOpen}>
                 <ContextMenu.Trigger>
@@ -916,7 +945,7 @@
                   {#if legendKey}
                     {@render signalMenu(legendKey, () => (legendMenuOpen = false))}
                   {:else}
-                    <ContextMenu.Item onSelect={() => onEach('Hide the legend', (p) => (p.legend = false))}><RiLegend class="menu-icon" />Hide the legend<ContextMenu.Shortcut><kbd>L</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+                    <ContextMenu.Item onSelect={() => onEach('Hide the legend', () => ({ legend: false }))}><RiLegend class="menu-icon" />Hide the legend<ContextMenu.Shortcut><kbd>L</kbd></ContextMenu.Shortcut></ContextMenu.Item>
                   {/if}
                 </ContextMenu.Content>
               </ContextMenu.Root>
@@ -930,7 +959,7 @@
           {#if legend.cursors}
             {@const c = legend.cursors}
             {@const extra = !!c.x?.rate || c.ys.some((y) => y.ratio)}
-            {@const at = plot.readoutAt ?? READOUT_AT}
+            {@const at = atOf('readoutAt', READOUT_AT)}
             <div class="readout-layer" oncontextmenu={(e) => e.stopPropagation()}>
               <ContextMenu.Root bind:open={readoutOpen}>
                 <ContextMenu.Trigger>
@@ -1030,7 +1059,7 @@
       <ContextMenu.Sub>
         <ContextMenu.SubTrigger><RiKind class="menu-icon" />Kind</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
-          <ContextMenu.RadioGroup value={plot.kind} onValueChange={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, (p) => (p.kind = v))}>
+          <ContextMenu.RadioGroup value={plot.kind} onValueChange={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, () => ({ kind: v }))}>
             {#each KINDS as [kind, kl]}<ContextMenu.RadioItem value={kind}>{kl}</ContextMenu.RadioItem>{/each}
           </ContextMenu.RadioGroup>
         </ContextMenu.SubContent>
@@ -1038,7 +1067,7 @@
       <ContextMenu.Sub>
         <ContextMenu.SubTrigger><RiLayout class="menu-icon" />Layout</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
-          <ContextMenu.RadioGroup value={plot.mode} onValueChange={(v) => onEach(`Layout ${nameIn(MODES, v)}`, (p) => (p.mode = v))}>
+          <ContextMenu.RadioGroup value={plot.mode} onValueChange={(v) => onEach(`Layout ${nameIn(MODES, v)}`, () => ({ mode: v }))}>
             {#each MODES as [mode, ml]}<ContextMenu.RadioItem value={mode}>{ml}</ContextMenu.RadioItem>{/each}
           </ContextMenu.RadioGroup>
         </ContextMenu.SubContent>

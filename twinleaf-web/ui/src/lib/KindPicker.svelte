@@ -17,12 +17,12 @@
   import { KINDS, MODES } from './constants.js';
 
   /**
-   * `plot` is the plot whose `kind` and `mode` these set. `open` is the kind
+   * `plot` is the plot whose `kind` and `mode` these show. `open` is the kind
    * dropdown's, which the parent's K key opens, and `onOpenChange` hears
    * both dropdowns, so the parent can take focus back once neither is open.
-   * `onKind(kind)` and `onMode(mode)` set them, by default on `plot` alone.
+   * `onKind(kind)` and `onMode(mode)` set them.
    */
-  let { plot, open = $bindable(false), onOpenChange, onKind = (v) => (plot.kind = v), onMode = (v) => (plot.mode = v) } = $props();
+  let { plot, open = $bindable(false), onOpenChange, onKind, onMode } = $props();
 
   const ICONS = { time: RiTime, spectrum: RiSpectrum, overlay: RiOverlay, independent: RiIndependent, stacked: RiStacked };
   const nameOf = (list, value) => list.find(([v]) => v === value)?.[1] ?? value;

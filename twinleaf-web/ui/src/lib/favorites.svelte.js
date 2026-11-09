@@ -37,8 +37,12 @@ export class Favorites {
     this.set(next);
   }
 
+  /** Told of every change to the stars before it is made: History's check that an undo step holds it. */
+  guard = null;
+
   /** Makes `names` the starred names. */
   set(names) {
+    this.guard?.();
     this.names = new Set(names);
     try {
       this.storage?.setItem(KEY, JSON.stringify([...this.names]));

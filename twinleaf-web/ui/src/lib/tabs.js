@@ -17,7 +17,6 @@
 // Outside tools read that key and shape, so `tabFromJson` is the one place
 // that reads it, and a change to it changes the key.
 
-import { SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
 import { fromJson, plotIds, presets } from './layout.js';
 
 export const SAVE_KEY = 'tl-plot-tabs-v2';
@@ -29,7 +28,15 @@ let n = 0;
 export const uid = (prefix) => `${prefix}-${++n}-${Math.random().toString(36).slice(2, 6)}`;
 /** A plot's item showing signal `key`. */
 export const chip = (key) => ({ id: uid('c'), key });
-export const newPlot = (kind, mode, keys) => ({ id: uid('p'), kind, mode, items: keys.map(chip) });
+/**
+ * What a plot is until it is set otherwise: log scales and no legend. Every
+ * plot holds each, so setting a field to what it already shows changes
+ * nothing.
+ */
+export const PLOT_DEFAULTS = Object.freeze({ xScale: 'log', yScale: 'log', legend: false });
+/** Plot fields that are what its view shows, not what was edited: no undo step holds them. */
+export const VIEW_FIELDS = new Set(['fRange']);
+export const newPlot = (kind, mode, keys) => ({ id: uid('p'), kind, mode, ...PLOT_DEFAULTS, items: keys.map(chip) });
 
 /** The plots and layout a new page starts with, of the simulator's signals. */
 export function defaultContent() {
@@ -69,16 +76,13 @@ export function tabFromJson(t) {
   const plots = {};
   for (const [id, p] of Object.entries(t.plots)) {
     if (!p || !Array.isArray(p.items)) return null;
-    plots[id] = { ...p, id, items: p.items.filter((i) => i && !i[SHADOW] && typeof i.key === 'string').map((i) => chip(i.key)) };
+    plots[id] = { ...PLOT_DEFAULTS, ...p, id, items: p.items.filter((i) => i && typeof i.key === 'string').map((i) => chip(i.key)) };
   }
   const layout = t.layout ? fromJson(t.layout) : null;
   const ids = plotIds(layout);
   if ((t.layout && !layout) || !ids.every((id) => plots[id]) || new Set(ids).size !== ids.length) return null;
   return { id: typeof t.id === 'string' ? t.id : uid('t'), name: t.name, plots, layout };
 }
-
-/** The tabs as JSON holds them: without the item the drag library shows where a tab would land. */
-const realTabs = (tabs) => tabs.filter((t) => !t[SHADOW]);
 
 /** The tabs kept in `storage`, or one default tab, as {tabs, activeId}. */
 export function loadTabs(storage) {
@@ -94,13 +98,13 @@ export function loadTabs(storage) {
 /** Keeps `tabs` and the open one in `storage`. A storage that refuses keeps nothing. */
 export function saveTabs(storage, tabs, activeId) {
   try {
-    storage.setItem(SAVE_KEY, JSON.stringify({ tabs: realTabs(tabs), activeId }));
+    storage.setItem(SAVE_KEY, JSON.stringify({ tabs, activeId }));
   } catch {}
 }
 
 /** The text of a file of `tabs`, to share them. */
 export function exportText(tabs) {
-  const data = { format: FILE_FORMAT, version: 1, tabs: realTabs(tabs).map(({ name, plots, layout }) => ({ name, plots, layout })) };
+  const data = { format: FILE_FORMAT, version: 1, tabs: tabs.map(({ name, plots, layout }) => ({ name, plots, layout })) };
   return JSON.stringify(data, null, 2);
 }
 

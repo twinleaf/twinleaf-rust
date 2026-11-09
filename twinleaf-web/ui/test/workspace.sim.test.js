@@ -59,7 +59,7 @@ function run(s, { ws, history }) {
   else if (s.t === 'click' && id) ws.focusedId = id;
   else if (s.t === 'select' && id) ws.selected.add(id);
   else if (s.t === 'arrange') history.group('Arrange', () => ws.arrange(s.name));
-  else if (s.t === 'dock' && id) history.group('Move', () => (ws.tab.layout = dock(ws.layout, id, pick(ids, s.to), s.edge)));
+  else if (s.t === 'dock' && id) history.group('Move', () => ws.setLayout(dock(ws.layout, id, pick(ids, s.to), s.edge)));
   else if (s.t === 'toTab' && id && others.length) history.group('Move to tab', () => ws.movePlotToTab(id, pick(others, s.tab).id));
   else if (s.t === 'tab') ws.selectTab(ws.tabs[s.at % ws.tabs.length].id);
   else if (s.t === 'addTab') history.group('New tab', () => ws.addTab());

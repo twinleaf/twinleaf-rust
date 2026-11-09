@@ -45,3 +45,24 @@ describe('the workspace', () => {
     expect(ws.spectrumKeys()).toContain('x.y');
   });
 });
+
+describe('what follows the open tab', () => {
+  it('hears a change to one plot only where it reads that plot', async () => {
+    const { flushSync } = await import('svelte');
+    const { probe } = await import('./workspace.svelte.js');
+    const p = probe();
+    p.change();
+    flushSync();
+    expect(p.runs).toEqual({ layout: 1, other: 1, changed: 2 });
+    p.dispose();
+  });
+
+  it('keeps a plot moved to the tab it is in', () => {
+    const t = makeTab('A');
+    const ws = new Workspace({ tabs: [t], activeId: t.id });
+    const [p] = plotIds(ws.layout);
+    ws.movePlotToTab(p, t.id);
+    expect(plotIds(ws.layout)).toContain(p);
+    expect(ws.plots[p]).toBeTruthy();
+  });
+});

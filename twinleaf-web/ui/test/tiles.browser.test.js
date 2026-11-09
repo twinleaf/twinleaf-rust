@@ -88,7 +88,7 @@ async function run(s, { ws, history }) {
   } else if (s.t === 'undo') history.undo();
   else if (s.t === 'redo') history.redo();
   else if (s.t === 'arrange') history.group('Arrange', () => ws.arrange(s.preset));
-  else if (s.t === 'dock' && ids.length) history.group('Move', () => (ws.tab.layout = dock(ws.layout, ids[s.a % ids.length], ids[s.b % ids.length], s.edge)));
+  else if (s.t === 'dock' && ids.length) history.group('Move', () => ws.setLayout(dock(ws.layout, ids[s.a % ids.length], ids[s.b % ids.length], s.edge)));
   else if (s.t === 'wait') await wait(300);
   flushSync();
   await frames();

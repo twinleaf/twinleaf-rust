@@ -215,11 +215,11 @@ export class Drags {
       // moved remembers.
       const label = group.size > 1 ? `Move ${group.size} plots` : 'Move plot';
       this.group(label, () => {
-        if (lifted.remembers && ws.plots[plotId]) ws.plots[plotId].dockSize = lifted.remembers;
+        if (lifted.remembers) ws.setPlot(plotId, { dockSize: lifted.remembers });
         if (target.tabId) {
           for (const id of group) ws.movePlotToTab(id, target.tabId);
           ws.selected.clear();
-        } else ws.tab.layout = target.cell.next;
+        } else ws.setLayout(target.cell.next);
       });
       if (!target.tabId) this.flash(group);
     };
@@ -321,23 +321,22 @@ export class Drags {
     const place = () => {
       if (opens) {
         const p = newPlot(ws.plots[to.plotId]?.kind ?? 'time', 'overlay', [item.key]);
-        ws.tab.plots[p.id] = p;
-        ws.tab.layout = to.plotId ? dock(ws.layout, p.id, to.plotId, to.edge) : dockOuter(ws.layout, leaf(p.id), to.edge, OUTER_SHARE);
-        ws.focusedId = p.id;
+        ws.placePlot(p, to.plotId ? dock(ws.layout, p.id, to.plotId, to.edge) : dockOuter(ws.layout, leaf(p.id), to.edge, OUTER_SHARE));
         return p.id;
       }
       const p = ws.plots[to.plotId];
       if (!p) return null;
       const seen = new Set();
-      p.items = (to.items ?? [...p.items, item]).map(own).filter((i) => !seen.has(i.key) && seen.add(i.key));
-      if (to.edge === 'axis') p.axisSides = { ...p.axisSides, [item.key]: to.side };
+      const items = (to.items ?? [...p.items, item]).map(own).filter((i) => !seen.has(i.key) && seen.add(i.key));
+      ws.setPlot(p.id, to.edge === 'axis' ? { items, axisSides: { ...p.axisSides, [item.key]: to.side } } : { items });
       return p.id;
     };
     const id = this.group('Move signal', () => {
       const id = place();
       if (id && from && from.id !== id) {
-        from.items = from.items.filter((i) => i.id !== item.id);
-        if (!from.items.length) this.closePlot(from.id);
+        const left = from.items.filter((i) => i.id !== item.id);
+        if (left.length) ws.setPlot(from.id, { items: left });
+        else this.closePlot(from.id);
       }
       return id;
     });

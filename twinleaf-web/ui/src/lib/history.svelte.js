@@ -1,50 +1,44 @@
 // Undo and redo for what a person edits on the page: the tabs, their plots
-// and layout, and the starred properties. A step is a snapshot before and
-// after, with the plots selected at each, so undo puts the selection back
-// as it was.
+// and layout, and the starred properties. A step holds the tabs and stars
+// before and after, with the plots selected at each, so undo puts the
+// selection back as it was.
 //
-// A command that changes several things, as closing every selected plot,
-// runs inside `group`, and so does the one write that ends a drag, so each
-// is one step. Nothing stays open past the call. Changes made outside any
-// group are steps of their own, and those that come within MERGE_MS of the
-// step before join it, so a change the page makes a moment after a command
-// lands in that command's step.
+// Every edit runs inside `group`: a command that changes several things, as
+// closing every selected plot, and the one write that ends a drag, are each
+// one step, and nothing stays open past the call. A group that throws puts
+// back what it changed and is no step. The Workspace's tabs are one frozen
+// value, so a step keeps them as they were without copying them. History
+// tells the Workspace and the Favorites to refuse, in development, an edit
+// made outside any group, as no step would hold it.
 //
-// What a view shows, as a spectrum's zoom, is not an edit: it is left out
-// of the snapshot and kept as it is when a step is undone.
+// What a view shows, as a spectrum's zoom, is not an edit: a step that
+// changes only that is none, and undo keeps it as it is.
 
-/** How soon after a step a change made outside any group joins it, in ms. */
-export const MERGE_MS = 400;
+import { VIEW_FIELDS } from './tabs.js';
+
 /** How many steps undo keeps. */
 const DEPTH = 200;
 
-/** Plot fields that are what a view shows, not what was edited. */
-const VIEW_FIELDS = new Set(['fRange']);
-/** The tabs as a snapshot: view fields left out. */
-function snapshotTabs(tabs) {
-  return JSON.stringify(tabs, (k, v) => {
-    if (VIEW_FIELDS.has(k)) return undefined;
-    return v;
-  });
-}
+/** The tabs as a step compares them: without view fields. */
+const edits = (tabs) => JSON.stringify(tabs, (k, v) => (VIEW_FIELDS.has(k) ? undefined : v));
 
 export class History {
-  /** The steps undo goes back through, oldest first, each {label, before, after, selBefore, selAfter, at}. */
-  undos = $state([]);
+  /** The steps undo goes back through, oldest first, each {label, before, after, selBefore, selAfter}. */
+  undos = $state.raw([]);
   /** The steps redo goes forward through, the next last. */
-  redos = $state([]);
+  redos = $state.raw([]);
   #grouping = false;
-  #last;
+  #restoring = false;
 
-  /**
-   * `ws` is the page's Workspace and `favorites` its Favorites. `now`
-   * gives the time in ms, for joining changes.
-   */
-  constructor(ws, favorites, now = () => performance.now()) {
+  /** `ws` is the page's Workspace and `favorites` its Favorites. */
+  constructor(ws, favorites) {
     this.ws = ws;
     this.favorites = favorites;
-    this.now = now;
-    this.#last = this.#read();
+    if (import.meta.env?.DEV) {
+      ws.guard = favorites.guard = () => {
+        if (!this.#grouping && !this.#restoring) throw new Error('an edit outside an undo step: run it in history.group');
+      };
+    }
   }
 
   /** What undo would take back, or null. */
@@ -59,89 +53,87 @@ export class History {
   /**
    * Runs `fn` as one step named `label`, kept if it changed anything, and
    * returns what it returns. A group inside a group is part of the outer.
+   * When `fn` throws, what it changed is put back, and the error goes on.
    */
   group(label, fn) {
     if (this.#grouping) return fn();
-    const before = this.#last, selBefore = this.#selection();
+    const before = this.#read(), selBefore = this.#selection();
     this.#grouping = true;
+    let done = false;
     try {
-      return fn();
+      const out = fn();
+      done = true;
+      return out;
     } finally {
       this.#grouping = false;
-      this.#commit(label, before, selBefore, false);
+      if (!done) this.#write(before, selBefore);
+      else {
+        const after = this.#read();
+        if (!this.#same(before, after)) {
+          this.undos = [...this.undos.slice(-(DEPTH - 1)), { label, before, after, selBefore, selAfter: this.#selection() }];
+          this.redos = [];
+        }
+      }
     }
-  }
-
-  /** Takes in a change made outside any group: the page calls this whenever the tabs or favorites change. */
-  observe() {
-    if (this.#grouping) return;
-    const now = this.#read();
-    if (now.key === this.#last.key) return;
-    const top = this.undos.at(-1);
-    if (top && !this.redos.length && this.now() - top.at < MERGE_MS) {
-      top.after = now;
-      top.selAfter = this.#selection();
-      top.at = this.now();
-      this.#last = now;
-      return;
-    }
-    this.#commit('Edit', this.#last, this.#selection(), true);
   }
 
   /** Takes back the last step, and returns its label, or null when there is none. */
   undo() {
-    return this.#step(this.undos, this.redos, 'before', 'selBefore');
+    const e = this.undos.at(-1);
+    if (!e) return null;
+    this.undos = this.undos.slice(0, -1);
+    this.redos = [...this.redos, e];
+    this.#write(e.before, e.selBefore);
+    return e.label;
   }
 
   /** Does again the step undo took back last, and returns its label, or null when there is none. */
   redo() {
-    return this.#step(this.redos, this.undos, 'after', 'selAfter');
-  }
-
-  #step(from, to, side, sel) {
-    const e = from.pop();
+    const e = this.redos.at(-1);
     if (!e) return null;
-    this.#write(e[side], e[sel]);
-    this.#last = this.#read();
-    e.at = -Infinity;
-    to.push(e);
+    this.redos = this.redos.slice(0, -1);
+    this.undos = [...this.undos, e];
+    this.#write(e.after, e.selAfter);
     return e.label;
   }
 
-  #commit(label, before, selBefore, observed) {
-    const after = this.#read();
-    if (after.key === before.key) return;
-    this.undos.push({ label, before, after, selBefore, selAfter: this.#selection(), at: this.now(), observed });
-    if (this.undos.length > DEPTH) this.undos.shift();
-    this.redos = [];
-    this.#last = after;
+  /** What steps change: the tabs, as the frozen value they are, and the starred names. */
+  #read() {
+    return { tabs: this.ws.tabs, favorites: [...this.favorites.names].sort() };
   }
 
-  /** The snapshot of what steps change: `key` compares them, `tabs` restores them. */
-  #read() {
-    const tabs = snapshotTabs(this.ws.tabs);
-    const favorites = JSON.stringify([...this.favorites.names].sort());
-    return { key: tabs + favorites, tabs, favorites, activeId: this.ws.activeId };
+  /** Whether `a` and `b` hold the same edits. */
+  #same(a, b) {
+    return (a.tabs === b.tabs || edits(a.tabs) === edits(b.tabs)) && a.favorites.join('\n') === b.favorites.join('\n');
   }
 
   #selection() {
     return { tab: this.ws.activeId, selected: [...this.ws.selected], focusedId: this.ws.focusedId };
   }
 
-  /** Puts snapshot `s` back, keeps each plot's view fields as they are now, and opens the tab of `sel` with its plots selected. */
+  /** Puts `s` back, keeps each plot's view fields as they are now, and opens the tab of `sel` with its plots selected. */
   #write(s, sel) {
-    if (snapshotTabs(this.ws.tabs) !== s.tabs) {
-      const views = new Map(this.ws.tabs.flatMap((t) => Object.values(t.plots)).map((p) => [p.id, p]));
-      const tabs = JSON.parse(s.tabs);
-      for (const t of tabs) {
-        for (const p of Object.values(t.plots)) {
-          const was = views.get(p.id);
-          if (was) for (const f of VIEW_FIELDS) if (f in was) p[f] = was[f];
-        }
-      }
-      this.ws.tabs = tabs;
+    if (s.tabs !== this.ws.tabs) {
+      const now = new Map(this.ws.tabs.flatMap((t) => Object.values(t.plots)).map((p) => [p.id, p]));
+      const keep = (p) => {
+        const was = now.get(p.id);
+        const view = was && [...VIEW_FIELDS].filter((f) => was[f] !== p[f]);
+        return view?.length ? { ...p, ...Object.fromEntries(view.map((f) => [f, was[f]])) } : p;
+      };
+      const kept = s.tabs.map((t) => {
+        const plots = Object.fromEntries(Object.entries(t.plots).map(([id, p]) => [id, keep(p)]));
+        return Object.keys(plots).some((id) => plots[id] !== t.plots[id]) ? { ...t, plots } : t;
+      });
+      this.ws.restore(kept.some((t, i) => t !== s.tabs[i]) ? kept : s.tabs);
     }
-    if (JSON.stringify([...this.favorites.names].sort()) !== s.favorites) this.favorites.set(JSON.parse(s.favorites));
+    if ([...this.favorites.names].sort().join('\n') !== s.favorites.join('\n')) {
+      this.#restoring = true;
+      try {
+        this.favorites.set(s.favorites);
+      } finally {
+        this.#restoring = false;
+      }
+    }
     const tab = this.ws.tabs.some((t) => t.id === sel.tab) ? sel.tab : this.ws.tabs[0].id;
     if (tab !== this.ws.activeId) this.ws.selectTab(tab);
     this.ws.selected.clear();
