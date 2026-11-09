@@ -37,9 +37,10 @@ export class Selection {
   /** Runs whenever the plots selected change: the page's, to show them. */
   changed = () => {};
 
-  /** `exists(id)` tells whether plot `id` is in the open tab. */
-  constructor(exists) {
+  /** `exists(id)` tells whether plot `id` is in the open tab, and `all()` gives every plot it shows, as Ctrl+A selects them. */
+  constructor(exists, all) {
     this.exists = exists;
+    this.all = all;
   }
 
   /** Whether a press on `target`, an element, keeps the selection. */
@@ -108,9 +109,19 @@ export class Selection {
     this.#setRows(keys);
   }
 
-  /** The plots a command on plot `id` acts on: every selected plot when `id` is one of them, or from the keys whenever any is selected; else `id` alone. */
-  targets(id, fromKeys = false) {
-    return (this.plots.has(id) || (fromKeys && this.plots.size) ? [...this.plots] : [id]).filter((i) => this.exists(i));
+  /** The plots a command made on plot `id`, from its menu or its header, acts on: every selected plot when `id` is one of them, else `id` alone. */
+  targets(id) {
+    return (this.plots.has(id) ? [...this.plots] : [id]).filter((i) => this.exists(i));
+  }
+
+  /**
+   * The plots a command made from the page or the keys acts on, `scope` its
+   * kind (keymap.js `scopeOf`): the selection; with none, for a 'view'
+   * command every plot shown, as after Ctrl+A, and for a 'plot' command none.
+   */
+  pageTargets(scope) {
+    if (this.plots.size) return [...this.plots].filter((i) => this.exists(i));
+    return scope === 'view' ? this.all() : [];
   }
 
   /** What an undo step keeps of the selection. */

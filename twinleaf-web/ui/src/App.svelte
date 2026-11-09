@@ -7,9 +7,11 @@
   //
   // Each time plot has a View of its own (views.js). A gesture on a plot acts
   // on every selected plot when the plot is one of them, or else on it alone.
-  // The toolbar and Space act on the highlighted plots: the selection, or
-  // else the plot clicked last, or else, after a click on empty background,
-  // every plot. Space pauses spectra too; the toolbar sets time plots only.
+  // A command from the page or the keys acts on the selection; with none, a
+  // view command (the toolbar, Space, Ctrl+C, Export, the eraser, pan, zoom,
+  // follow, fit y) on every plot shown, and a plot command on none
+  // (selection.svelte.js `pageTargets`). Space pauses spectra too; the
+  // toolbar, pan and zoom set time plots only.
   import { getContext, onMount, setContext, tick, untrack } from 'svelte';
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
   import { Views } from './lib/views.js';
@@ -18,8 +20,8 @@
   import { plotIds } from './lib/layout.js';
   import { exportText, importText, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
-  import { actionFor } from './lib/keymap.js';
-  import { keepsKey, plotKeys } from './lib/keys.js';
+  import { actionFor, scopeOf } from './lib/keymap.js';
+  import { keepsKey, plotPickers } from './lib/keys.js';
   import { api } from './lib/protocol.js';
   import { THEMES, TRACE_WIDTH, prefs } from './lib/prefs.svelte.js';
   import RiSun from '@lucide/svelte/icons/sun';
@@ -117,15 +119,14 @@
   });
 
   const targetsOf = (id) => selection.targets(id).map((i) => views.of(i));
-  /** The plots a command on plot `id` acts on, as the Selection says, `fromKeys` when the keys gave it. */
-  const targetIdsOf = (id, fromKeys = false) => selection.targets(id, fromKeys);
+  /** The plots a command made on plot `id` acts on, as the Selection says. */
+  const targetIdsOf = (id) => selection.targets(id);
   const plotsText = (n) => `${n} plot${n === 1 ? '' : 's'}`;
   /**
-   * Gives each plot a command on plot `id` acts on the fields `fn(plot)`
-   * returns, if any, as one step undo names `what`.
+   * Gives each of plots `ids` the fields `fn(plot)` returns, if any, as
+   * one step undo names `what`.
    */
-  function eachPlot(id, what, fn, fromKeys = false) {
-    const ids = targetIdsOf(id, fromKeys);
+  function eachPlot(ids, what, fn) {
     history.group(ids.length > 1 ? `${what} (${plotsText(ids.length)})` : what, () => {
       for (const i of ids) {
         const patch = fn(ws.plots[i]);
@@ -133,11 +134,12 @@
       }
     });
   }
-  /** The views the toolbar acts on: the highlighted time plots', or every time plot's. */
+  /** The views the toolbar acts on: those of the time plots it acts on. */
   function chosen() {
-    const ids = ws.highlighted().filter((id) => ws.plots[id]?.kind === 'time');
-    return (ids.length ? ids : ws.timeIds()).map((id) => views.of(id));
+    return timeViews(selection.pageTargets('view'));
   }
+  /** The views of the time plots of `ids`. */
+  const timeViews = (ids) => ids.filter((id) => ws.plots[id]?.kind === 'time').map((id) => views.of(id));
   /** The plot of `id` in any tab. */
   const plotAnywhere = (id) => ws.tabs.find((t) => t.plots[id])?.plots[id];
   function viewChanged(id) {
@@ -520,7 +522,7 @@
   /**
    * The toolbar's Live button: pauses every time plot of the tab while all
    * follow live, or has them all follow live. Space does the same for the
-   * highlighted plots alone.
+   * selected plots alone.
    */
   function toggleLive() {
     const perf = performance.now();
@@ -532,7 +534,7 @@
     views.setDelay(ms / 1000);
   }
   /** Clears the cursors of plots `ids`, by default the selection's or every plot's, and says whether any were placed. */
-  function clearCursors(ids = ws.selected.size ? [...ws.selected] : plotIds(ws.layout)) {
+  function clearCursors(ids = selection.pageTargets('view')) {
     const placed = (c) => c && (c.a !== null || c.b !== null);
     let had = false;
     for (const id of ids) {
@@ -653,6 +655,52 @@
   /** The plot `el` is in, by id, or null. */
   const plotAt = (el) => el?.closest?.('.leaf[data-plot]')?.dataset.plot ?? null;
 
+  /** How far an arrow pans, as a share of the span, and zooms, as a factor. */
+  const PAN = 0.1, ZOOM = 1.25;
+  /**
+   * Acts by plot key `e` (keymap.js, place 'plot'), wherever it was
+   * pressed, on the plots it acts on (selection.svelte.js `pageTargets`).
+   * A picker opens on the plot clicked last when it is one of them, else
+   * on the first. A key with no plots to act on does nothing, and goes on.
+   */
+  function plotKey(e) {
+    const action = actionFor('plot', e);
+    const ids = action ? selection.pageTargets(scopeOf(action)) : [];
+    if (!ids.length) return;
+    const perf = performance.now(), back = e.key === 'ArrowLeft' || e.key === 'ArrowDown';
+    const lead = ids.includes(ws.focusedId) ? ws.focusedId : ids[0];
+    const act = {
+      splitRight: () => splitPlots(ids, 'row', true),
+      splitDown: () => splitPlots(ids, 'col', true),
+      maximize: () => (ws.maximized = ws.maximized ? null : ids),
+      close: () => closePlots(ids, true),
+      fitY: () => registry.forEach((p) => ids.includes(p.plotId) && p.autoscale()),
+      legend: () => {
+        const on = !ws.plots[lead].legend;
+        eachPlot(ids, on ? 'Show the legend' : 'Hide the legend', () => ({ legend: on }));
+      },
+      follow: () => ids.forEach((id) => views.of(id).follow(true)),
+      pan: () => timeViews(ids).forEach((v) => v.pan((e.shiftKey ? 1 : PAN) * (back ? -1 : 1), perf)),
+      zoom: () => timeViews(ids).forEach((v) => v.zoom(back ? ZOOM : 1 / ZOOM, v.live ? 1 : 0.5, perf)),
+    }[action];
+    if (!act && !plotPickers.get(lead)?.(action)) return;
+    e.preventDefault();
+    act?.();
+  }
+  /**
+   * Puts an empty plot beside each of plots `ids`, on side `dir` of it, as
+   * one step that selects the new plots, to fill next, so redo selects them
+   * again. From the keys, focus goes to the first.
+   */
+  function splitPlots(ids, dir, fromKeys = false) {
+    const made = ids.map(() => newPlot('time', 'overlay', []));
+    history.group(ids.length > 1 ? `Split ${plotsText(ids.length)}` : 'Split', () => {
+      ids.forEach((at, i) => ws.addPlot(made[i], at, dir));
+      selection.only(made.map((p) => p.id));
+    });
+    if (fromKeys) focusPlot(made[0].id);
+  }
+
   function onKey(e) {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();
@@ -685,11 +733,10 @@
       if (label) toast(`${redo ? 'Redo' : 'Undo'}: ${label}`);
       return refreshToolbar();
     }
-    // Ctrl+C with no text selected copies the highlighted plots' data.
+    // Ctrl+C with no text selected copies the data of the selected plots, or of every plot.
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'c' && !String(window.getSelection() ?? '')) {
       e.preventDefault();
-      const ids = ws.highlighted().length ? ws.highlighted() : ws.timeIds();
-      return void copyData(ids).catch((error) => toast.error(`Could not copy: ${error.message}`));
+      return void copyData(selection.pageTargets('view')).catch((error) => toast.error(`Could not copy: ${error.message}`));
     }
     // Ctrl+A outside a field selects every plot of the tab, not the page's text.
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
@@ -712,16 +759,15 @@
       return stepTab(e.key === ']' ? 1 : -1);
     }
     if (action !== 'pause' && action !== 'escape') {
-      // Every other key acts on the plot clicked last, wherever focus is,
-      // or else on the selection, through the first plot of it; in a table,
-      // whose rows are what is picked there, on no plot.
-      if (!action && !e.defaultPrevented && !e.target.closest?.('[role=grid]')) plotKeys.get(ws.focusedId ?? [...ws.selected][0])?.(e);
+      // Every other key is a plot's key, wherever focus is; in a table,
+      // whose rows are what is picked there, none.
+      if (!action && !e.defaultPrevented && !e.target.closest?.('[role=grid]')) plotKey(e);
       return;
     }
     if (action === 'escape') return leave();
-    // Space pauses the highlighted plots, or has them follow live again.
+    // Space pauses the selected plots, or every plot, or has them follow live again.
     e.preventDefault();
-    const perf = performance.now(), vs = ws.highlighted().map((id) => views.of(id));
+    const perf = performance.now(), vs = selection.pageTargets('view').map((id) => views.of(id));
     if (vs.some((v) => v.live)) for (const v of vs) v.pause(perf);
     else for (const v of vs) v.follow();
   }
@@ -752,24 +798,16 @@
         maximized={!!ws.maximized?.includes(id)}
         onFocus={() => selection.point(id)}
         onPress={() => selection.pressOn(id)}
-        onRemove={(keys) => closePlots(targetIdsOf(id, keys), keys)}
-        onEach={(what, fn, keys) => eachPlot(id, what, fn, keys)}
+        onRemove={() => closePlots(targetIdsOf(id))}
+        onEach={(what, fn) => eachPlot(targetIdsOf(id), what, fn)}
+        onKey={plotKey}
         onEdit={(what, patch) => history.group(what, () => ws.setPlot(id, patch))}
         onView={(patch) => ws.setView(id, patch)}
         onContext={() => selection.pressOn(id)}
-        targetIds={(keys) => targetIdsOf(id, keys)}
+        targetIds={() => targetIdsOf(id)}
         onStartMove={(e) => drags.startMove(id, e)}
-        onSplit={(dir, keys) => {
-          // Each plot it acts on gets an empty plot beside it, and the new plots are selected, to fill next.
-          // In one step with them, so redo selects them again.
-          const ids = targetIdsOf(id, keys), made = ids.map(() => newPlot('time', 'overlay', []));
-          history.group(ids.length > 1 ? `Split ${plotsText(ids.length)}` : 'Split', () => {
-            ids.forEach((at, i) => ws.addPlot(made[i], at, dir));
-            selection.only(made.map((p) => p.id));
-          });
-          if (keys) focusPlot(made[0].id);
-        }}
-        onMaximize={(keys) => (ws.maximized = ws.maximized && (keys || ws.maximized.includes(id)) ? null : targetIdsOf(id, keys))}
+        onSplit={(dir) => splitPlots(targetIdsOf(id), dir)}
+        onMaximize={() => (ws.maximized = ws.maximized?.includes(id) ? null : targetIdsOf(id))}
         onMoveToTab={(tabId) => {
           const ids = targetIdsOf(id);
           history.group(`Move ${plotsText(ids.length)} to ${ws.tabs.find((t) => t.id === tabId)?.name ?? 'a tab'}`, () => {
@@ -898,7 +936,7 @@
           <DropdownMenu.Item onSelect={exportTabs}><RiDownload class="menu-icon" />Export every tab…</DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => importInput.click()}><RiUpload class="menu-icon" />Import tabs…</DropdownMenu.Item>
           <DropdownMenu.Separator />
-          <DropdownMenu.Item onSelect={() => openExport(ws.selected.size ? [...ws.selected] : plotIds(ws.layout))}><RiExport class="menu-icon" />Export data…</DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={() => openExport(selection.pageTargets('view'))}><RiExport class="menu-icon" />Export data…</DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Root>
       <input type="file" accept="application/json,.json" hidden bind:this={importInput} onchange={importTabs} />

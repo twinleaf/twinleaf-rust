@@ -8,7 +8,9 @@
 // plot's pointer handling reads), `action` the name its place's handler
 // runs, and `what` what it does. `shift` true or false makes an entry take
 // only that Shift; without it, either. Places of one title share a section
-// of the sheet (`sheet`).
+// of the sheet (`sheet`). A plot's key is a plot command, which with no
+// plot selected does nothing, unless its `scope` is 'view': a view
+// command, which with none selected acts on every plot.
 
 const digits = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
 const MOVE = { show: ['Arrows', 'Home', 'End'], action: 'move', what: 'Move' };
@@ -43,10 +45,10 @@ export const KEYMAP = [
       { show: ['_'], keys: ['-', '_'], action: 'splitDown', what: 'Split down' },
       { show: ['F'], keys: ['f', 'F'], action: 'maximize', what: 'Maximize, restore' },
       { show: ['K'], keys: ['k', 'K'], action: 'kind', what: 'Kind and layout' },
-      { show: ['←', '→'], keys: ['ArrowLeft', 'ArrowRight'], action: 'pan', what: 'Pan; with Shift, a window' },
-      { show: ['↑', '↓'], keys: ['ArrowUp', 'ArrowDown'], action: 'zoom', what: 'Zoom time' },
-      { show: ['End'], keys: ['End'], action: 'follow', what: 'Follow live' },
-      { show: ['Y'], keys: ['y', 'Y'], action: 'fitY', what: 'Fit y' },
+      { show: ['←', '→'], keys: ['ArrowLeft', 'ArrowRight'], action: 'pan', scope: 'view', what: 'Pan; with Shift, a window' },
+      { show: ['↑', '↓'], keys: ['ArrowUp', 'ArrowDown'], action: 'zoom', scope: 'view', what: 'Zoom time' },
+      { show: ['End'], keys: ['End'], action: 'follow', scope: 'view', what: 'Follow live' },
+      { show: ['Y'], keys: ['y', 'Y'], action: 'fitY', scope: 'view', what: 'Fit y' },
       { show: ['L'], keys: ['l', 'L'], action: 'legend', what: 'Legend' },
       { show: ['Delete'], keys: ['Delete', 'Backspace'], action: 'close', what: 'Close' },
     ],
@@ -157,6 +159,11 @@ export function actionFor(place, e) {
   const entries = KEYMAP.find((p) => p.place === place)?.entries ?? [];
   const hit = entries.find((x) => x.keys?.includes(e.key) && (x.shift === undefined || x.shift === e.shiftKey));
   return hit?.action ?? null;
+}
+
+/** Whether plot key action `action` is a 'view' command or a 'plot' command. */
+export function scopeOf(action) {
+  return KEYMAP.find((p) => p.place === 'plot').entries.find((x) => x.action === action)?.scope ?? 'plot';
 }
 
 /**

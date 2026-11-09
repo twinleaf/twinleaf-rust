@@ -2,8 +2,9 @@
 // and without Shift, keyboard arrivals, row picks, undo restores, plots
 // going away and time passing. After every act the plots selected, the plot
 // clicked last and the rows picked are what the rules say; none names a plot
-// that is gone; plots and rows are never chosen together; and only a click
-// on one of several selected plots leaves anything to happen later.
+// that is gone; plots and rows are never chosen together; only a click
+// on one of several selected plots leaves anything to happen later; and the
+// plots a command acts on are what its origin and scope say.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fc from 'fast-check';
 import fs from 'node:fs';
@@ -35,6 +36,7 @@ const act = fc.oneof(
   fc.record({ t: fc.constant('restore') }),
   fc.record({ t: fc.constant('remove'), at: fc.nat() }),
   fc.record({ t: fc.constant('wait'), ms: fc.constantFrom(100, DOUBLE_CLICK_MS + 10) }),
+  fc.record({ t: fc.constant('targets'), at: fc.nat(), scope: fc.constantFrom('view', 'plot') }),
 );
 
 describe('the Selection, against a model of it', () => {
@@ -43,7 +45,7 @@ describe('the Selection, against a model of it', () => {
       fc.property(fc.array(act, { minLength: 1, maxLength: 30 }), (acts) => {
         vi.useFakeTimers();
         const plots = new Set(IDS);
-        const s = new Selection((id) => plots.has(id));
+        const s = new Selection((id) => plots.has(id), () => [...plots]);
         let saved = s.snapshot();
         let narrowing = null; // the plot a click will narrow to, if nothing comes first
         const pick = (k) => [...plots][k % Math.max(1, plots.size)];
@@ -51,7 +53,7 @@ describe('the Selection, against a model of it', () => {
         for (const a of acts) {
           const was = new Set(s.plots), wasRows = new Set(s.rows);
           const id = plots.size ? pick(a.at ?? 0) : null;
-          if (a.t !== 'wait' && a.t !== 'snapshot') narrowing = null;
+          if (a.t !== 'wait' && a.t !== 'snapshot' && a.t !== 'targets') narrowing = null;
           if (a.t === 'press') {
             s.press({ button: 0, shiftKey: a.shift, target: element(a.where) });
             const keeps = a.shift || a.where === 'plot' || a.where === 'keeper';
@@ -93,6 +95,13 @@ describe('the Selection, against a model of it', () => {
             plots.delete(id);
             s.prune();
             if (narrowing === id) narrowing = null;
+          } else if (a.t === 'targets' && id) {
+            // A command made on a plot acts on the selection it is in, or on it alone.
+            expect(s.targets(id).sort()).toEqual((was.has(id) ? [...was] : [id]).sort());
+            // One from the page or the keys acts on the selection; with none, a view command on what Ctrl+A would select, a plot command on nothing.
+            const ctrlA = new Selection((i) => plots.has(i), () => [...plots]);
+            ctrlA.only(ctrlA.all(), null);
+            expect(s.pageTargets(a.scope).sort()).toEqual((was.size ? [...was] : a.scope === 'view' ? [...ctrlA.plots] : []).sort());
           } else if (a.t === 'wait') {
             const before = state();
             vi.advanceTimersByTime(a.ms);

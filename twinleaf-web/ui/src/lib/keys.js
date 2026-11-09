@@ -1,15 +1,15 @@
-// Which keys stay where focus is, and which act on the page's highlighted
-// plot wherever focus is.
+// Which keys stay where focus is, and which act on the plots the keys act
+// on wherever focus is.
 //
 // What is typed into a field, and an open menu, list or dialog's own keys,
 // stay there. A button keeps the keys that press it, Enter and Space, only
 // when the keyboard moved focus to it. A button focused by a click keeps
 // none, so Space still pauses. The browser's :focus-visible cannot tell
 // them apart here: it turns on for a clicked button at the first key, before
-// the page hears it. Every other key acts on the highlighted plot, so
-// clicking a button in a plot's header, or anywhere else, never takes the
-// plot's keys away: which plot they act on is the page's state, not the
-// browser's focus.
+// the page hears it. Every other key acts on the plots the selection gives
+// it (selection.svelte.js `pageTargets`), so clicking a button in a plot's
+// header, or anywhere else, never takes the plots' keys away: which plots
+// they act on is the page's state, not the browser's focus.
 
 /** What keeps every key pressed in it. */
 const TYPING = 'input, textarea, select, [contenteditable], [role=combobox][aria-expanded=true], [role=menu], [role=menuitem], [role=listbox], [role=dialog], [data-slot=select-content]';
@@ -27,7 +27,7 @@ if (typeof window !== 'undefined') {
   window.addEventListener('focusin', (e) => (keyboardLast ? keyboardFocused.add(e.target) : keyboardFocused.delete(e.target)), true);
 }
 
-/** Whether key event `e` belongs to where it was pressed, rather than to the highlighted plot. */
+/** Whether key event `e` belongs to where it was pressed, rather than to the plots the keys act on. */
 export function keepsKey(e) {
   const at = e.target instanceof Element ? e.target : null;
   if (!at) return false;
@@ -42,5 +42,5 @@ export function focusedByKeyboard(el) {
   return keyboardFocused.has(el);
 }
 
-/** Each plot's key handler, by plot id, which acts on that plot wherever focus is. */
-export const plotKeys = new Map();
+/** Each plot's pickers the keys open, by plot id: `open(action)` opens the one for keymap.js plot action `action` and says whether it had one. */
+export const plotPickers = new Map();

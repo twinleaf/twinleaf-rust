@@ -45,8 +45,9 @@ async function oneStep(label, act, prepare = () => {}) {
 const plotEl = (page, i = 0) => document.querySelector(`.leaf[data-plot="${plotIds(page.ws.layout)[i]}"]`);
 
 describe('a control that edits', () => {
-  it('the legend key shows the legend', () =>
+  it('the legend key shows the legend of the selected plot', () =>
     oneStep(/legend/i, async (page) => {
+      page.ws.selection.only([plotIds(page.ws.layout)[0]]);
       plotEl(page).querySelector('.plot-card').focus();
       await commands.key('l');
     }));

@@ -33,7 +33,10 @@ export class Workspace {
   /** The plots that fill the tab, as an array of ids, or null. */
   maximized = $state.raw(null);
   /** The plots selected in the open tab, the plot clicked last and the rows picked, and their rules: their only writer. */
-  selection = new Selection((id) => id != null && !!this.plots?.[id]);
+  selection = new Selection(
+    (id) => id != null && !!this.plots?.[id],
+    () => this.shownIds(),
+  );
   /** The plot last focused in each tab, for coming back to it. */
   lastFocus = new Map();
   /** Told of every edit before it is made: History's check that an undo step holds it. */
@@ -98,12 +101,6 @@ export class Workspace {
   shownIds() {
     const ids = plotIds(this.layout);
     return this.maximized ? ids.filter((id) => this.maximized.includes(id)) : ids;
-  }
-
-  /** The highlighted plots: the selection, or the plot clicked last, or every plot in the tab. */
-  highlighted() {
-    if (this.selected.size) return [...this.selected];
-    return this.plots[this.focusedId] ? [this.focusedId] : plotIds(this.layout);
   }
 
   /** The time plots of the open tab. */

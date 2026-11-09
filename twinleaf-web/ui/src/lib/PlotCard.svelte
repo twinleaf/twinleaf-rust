@@ -27,7 +27,7 @@
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import IconButton from './IconButton.svelte';
   import KindPicker from './KindPicker.svelte';
-  import { keepsKey, plotKeys } from './keys.js';
+  import { keepsKey, plotPickers } from './keys.js';
   import Tip from './Tip.svelte';
   import RiDraggable from '@lucide/svelte/icons/grip-vertical';
   import RiSplitH from '@lucide/svelte/icons/columns-2';
@@ -57,18 +57,18 @@
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
     onFocus, onPress, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
     onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
-    onEach, targetIds = () => [plot.id], onContext,
+    onEach, targetIds = () => [plot.id], onContext, onKey,
   } = $props();
 
-  /** Runs `fn(pv)` on the PlotView of each plot a command here acts on; `fromKeys` as the page's targetIds takes it. */
-  const eachPv = (fn, fromKeys = false) => {
-    const ids = targetIds(fromKeys);
+  /** Runs `fn(pv)` on the PlotView of each plot a command here acts on. */
+  const eachPv = (fn) => {
+    const ids = targetIds();
     for (const p of registry) if (ids.includes(p.plotId)) fn(p);
   };
   /** Shows or hides the legend of each plot a command here acts on, all as this plot's turns. */
-  const toggleLegend = (fromKeys = false) => {
+  const toggleLegend = () => {
     const on = !plot.legend;
-    onEach(on ? 'Show the legend' : 'Hide the legend', () => ({ legend: on }), fromKeys);
+    onEach(on ? 'Show the legend' : 'Hide the legend', () => ({ legend: on }));
   };
   /** The name list `list` (KINDS, MODES) gives value `v`. */
   const nameIn = (list, v) => list.find((x) => x[0] === v)?.[1] ?? v;
@@ -225,6 +225,7 @@
     if (e.key === 'Enter' && applyBounds()) axisOpen = false;
   }
 
+  /** Runs `fn(view)` on the view of each plot a command here acts on. */
   const forTargets = (fn) => {
     for (const v of targets()) fn(v);
   };
@@ -348,7 +349,7 @@
       config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null }),
     });
     registry.add(pv);
-    plotKeys.set(plot.id, plotAction);
+    plotPickers.set(plot.id, openPicker);
     const sizing = new ResizeObserver(([entry]) => {
       const { width, height } = entry.contentRect;
       size = { width, height };
@@ -362,7 +363,7 @@
       unwatch();
       sizing.disconnect();
       registry.delete(pv);
-      if (plotKeys.get(plot.id) === plotAction) plotKeys.delete(plot.id);
+      if (plotPickers.get(plot.id) === openPicker) plotPickers.delete(plot.id);
     };
   });
 
@@ -487,7 +488,6 @@
     addFromKeys = false;
     queueMicrotask(() => card?.focus());
   }
-  const PAN = 0.1, ZOOM = 1.25;
 
   /** Where a legend sits before it is dragged: the top right corner. */
   const LEGEND_AT = { x: 1, y: 0 };
@@ -579,29 +579,13 @@
     // On a control in the header, the arrows move between the controls (focus.js).
     if (inside && e.key.startsWith('Arrow')) return;
     if (inside && keepsKey(e)) return;
-    plotAction(e);
+    onKey(e);
   }
-  /** Acts on the plot by key `e`, wherever it was pressed: the page sends this plot the keys while it is highlighted. */
-  function plotAction(e) {
-    const perf = performance.now(), time = plot.kind === 'time';
-    const back = e.key === 'ArrowLeft' || e.key === 'ArrowDown';
-    const act = {
-      enterSignals: () => (plot.items.length ? ((active = 0), zone.focus()) : openAdd()),
-      addSignals: openAdd,
-      kind: openKind,
-      splitRight: () => onSplit('row', true),
-      splitDown: () => onSplit('col', true),
-      maximize: () => onMaximize(true),
-      close: () => onRemove(true),
-      fitY: () => eachPv((p) => p.autoscale(), true),
-      legend: () => toggleLegend(true),
-      follow: () => forTargets((v) => v.follow(true)),
-      pan: time && (() => forTargets((v) => v.pan((e.shiftKey ? 1 : PAN) * (back ? -1 : 1), perf))),
-      zoom: time && (() => forTargets((v) => v.zoom(back ? ZOOM : 1 / ZOOM, v.live ? 1 : 0.5, perf))),
-    }[actionFor('plot', e)];
-    if (!act) return;
-    e.preventDefault();
-    act();
+  /** Opens this plot's picker for keymap.js plot action `action`, as the page asks when the keys act on this plot; says whether it has one. */
+  function openPicker(action) {
+    const open = { enterSignals: () => (plot.items.length ? ((active = 0), zone.focus()) : openAdd()), addSignals: () => openAdd(), kind: openKind }[action];
+    open?.();
+    return !!open;
   }
   /** The keys of the plot's signals while they have focus; the rest go on to the plot. */
   function signalsKey(e) {
@@ -1090,7 +1074,7 @@
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
       <ContextMenu.Separator />
-      <ContextMenu.Item variant="destructive" onSelect={onRemove}><RiClose class="menu-icon" />Close plot<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Item variant="destructive" onSelect={() => onRemove()}><RiClose class="menu-icon" />Close plot<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
     </ContextMenu.Content>
   </ContextMenu.Root>
 </div>
