@@ -7,7 +7,7 @@
 // a drop could go, and the one under the pointer is the target, named
 // beside it.
 
-import { dock, dockOuter, holderDir, leaf, rects, restrict } from './layout.js';
+import { dock, dockOuter, leaf, rects, restrict } from './layout.js';
 import { OUTER_SHARE, cellAt, moveCells, signalCells } from './moves.js';
 import { chip, newPlot } from './tabs.js';
 import { DRAG_START } from './constants.js';
@@ -158,7 +158,7 @@ export class Drags {
     const ws = this.ws;
     const [x0, y0] = [e.clientX, e.clientY];
     const group = new Set(ws.selected.has(plotId) && ws.selected.size > 1 ? ws.selected : [plotId]);
-    let lifted = null; // {tabId, tree, cells, shown, remembers, maximized} once picked up
+    let lifted = null; // {tabId, tree, cells, shown, maximized} once picked up
     let target = null; // the cell or tab the pointer is over: {cell, label} or {tabId}
     const targetAt = (x, y) => {
       const under = document.elementsFromPoint(x, y).find((el) => !el.closest('.move-ghost, .compass'));
@@ -181,15 +181,8 @@ export class Drags {
           if (Math.hypot(ev.clientX - x0, ev.clientY - y0) < DRAG_START) return;
           const r = document.querySelector('.tile-box').getBoundingClientRect();
           const box = { x: r.left, y: r.top, w: r.width, h: r.height };
-          const tree = ws.tab.layout, shown = rects(tree, box);
-          // A plot remembers the width it has beside another, or the height
-          // it has above or below one, as a share of the layout's box, kept
-          // once it lands (`remembers`). A group remembers nothing.
-          const plot = ws.plots[plotId], at = shown.get(plotId);
-          const dir = group.size === 1 && plot && at ? holderDir(tree, plotId) : null;
-          const remembers = dir === 'row' ? { ...plot.dockSize, w: at.w / box.w } : dir === 'col' ? { ...plot.dockSize, h: at.h / box.h } : null;
-          const size = group.size === 1 ? (remembers ?? plot?.dockSize ?? {}) : {};
-          lifted = { tabId: ws.activeId, tree, cells: moveCells(tree, box, group, size), shown, remembers, maximized: ws.maximized };
+          const tree = ws.tab.layout;
+          lifted = { tabId: ws.activeId, tree, cells: moveCells(tree, box, group), shown: rects(tree, box), maximized: ws.maximized };
           ws.maximized = null;
         }
         // A tab opened or a layout changed under the move, as by a key, ends it.
@@ -225,11 +218,9 @@ export class Drags {
         if (ws.activeId === lifted.tabId && ws.maximized === null && lifted.maximized?.every((id) => ws.plots[id])) ws.maximized = lifted.maximized;
         return;
       }
-      // The drop is one step: where the plots land, and the size the plot
-      // moved remembers.
+      // The drop is one step.
       const label = group.size > 1 ? `Move ${group.size} plots` : 'Move plot';
       this.group(label, () => {
-        if (lifted.remembers) ws.setPlot(plotId, { dockSize: lifted.remembers });
         if (target.tabId) {
           for (const id of group) ws.movePlotToTab(id, target.tabId);
         } else ws.setLayout(target.cell.next);

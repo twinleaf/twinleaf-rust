@@ -75,12 +75,6 @@ export function dock(root, plotId, targetId, edge) {
   });
 }
 
-/** The direction of the split holding the leaf showing `targetId`: null for a leaf alone, undefined when no leaf shows it. */
-export function holderDir(node, targetId, dir = null) {
-  if (node.type === 'leaf') return node.plotId === targetId ? dir : undefined;
-  return holderDir(node.a, targetId, node.dir) ?? holderDir(node.b, targetId, node.dir);
-}
-
 /** The tree with plots `a` and `b` in each other's place, every split as it was; the same tree when they are one. */
 export function swap(node, a, b) {
   if (!node || a === b) return node;

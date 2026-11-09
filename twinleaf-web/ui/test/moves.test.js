@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 import { GUTTER, equal, leaf, plotIds, rects, removeAll, split, swap } from '../src/lib/layout.js';
-import { MIN_PLOT, SHARE, SIDES, isColumn, moveCells } from '../src/lib/moves.js';
+import { MIN_PLOT, SIDES, isColumn, moveCells } from '../src/lib/moves.js';
 
 /** A layout tree of the plots `ids`, splits in either direction at any ratio. */
 const tree = (ids) =>
@@ -104,27 +104,45 @@ describe('the cells a plot move offers', () => {
     expect(checked).toBeGreaterThan(200);
   });
 
-  it('give a plot moved beside another the size it remembers that way, to the px, within its share', () => {
-    let checked = 0;
+  it('give a plot moved alone the size it had as it was picked up, to the px, wherever it docks, or else the nearest size that leaves both sides at least the smallest plot', () => {
+    let kept = 0, fitted = 0;
     fc.assert(
-      fc.property(anyMove, fc.double({ min: 0.05, max: 0.6, noNaN: true }), fc.nat(), ({ t, box }, want, k) => {
-        const all = plotIds(t), id = all[k % all.length];
-        for (const c of moveCells(t, box, new Set([id]), { w: want, h: want })) {
+      fc.property(anyMove, fc.nat(), ({ t, box }, k) => {
+        const all = plotIds(t), id = all[k % all.length], was = rects(t, box).get(id);
+        for (const c of moveCells(t, box, new Set([id]))) {
           if (c.edge === 'center') continue;
           const dim = isColumn(c.edge) ? 'w' : 'h';
           const after = rects(c.next, box), got = after.get(id)[dim];
           // What it shares is the split it made, along the edge's axis, less the gap.
           const room = (c.outer ? box[dim] : got + GUTTER + after.get(c.plotId)[dim]) - GUTTER;
-          const share = (want * box[dim]) / room;
-          const lo = Math.max(SHARE[0], MIN_PLOT[dim] / room), hi = Math.min(SHARE[1], 1 - MIN_PLOT[dim] / room);
-          if (share > lo && share < hi) {
-            expect(Math.abs(got - want * box[dim])).toBeLessThan(0.5);
-            checked++;
+          if (was[dim] > MIN_PLOT[dim] && room - was[dim] > MIN_PLOT[dim]) {
+            expect(Math.abs(got - was[dim])).toBeLessThan(0.5);
+            kept++;
+          } else {
+            // The nearest size that leaves both sides at least the smallest plot.
+            expect(Math.abs(got - Math.min(room - MIN_PLOT[dim], Math.max(MIN_PLOT[dim], was[dim])))).toBeLessThan(0.5);
+            fitted++;
           }
         }
       }),
     );
-    expect(checked).toBeGreaterThan(100);
+    expect(kept).toBeGreaterThan(100);
+    expect(fitted).toBeGreaterThan(10);
+  });
+
+  it('give a group half of what it shares, short of leaving a side below the smallest plot', () => {
+    let checked = 0;
+    everyCell((c, { t, box, group }) => {
+      if (group.size < 2 || group.size === plotIds(t).length || c.edge === 'center') return;
+      const dim = isColumn(c.edge) ? 'w' : 'h', after = rects(c.next, box);
+      const mine = c.preview[dim];
+      const room = (c.outer ? box[dim] : mine + GUTTER + after.get(c.plotId)[dim]) - GUTTER;
+      if (room / 2 > MIN_PLOT[dim] + 1) {
+        expect(Math.abs(mine - room / 2)).toBeLessThan(0.5);
+        checked++;
+      }
+    }, 50);
+    expect(checked).toBeGreaterThan(20);
   });
 
   it('bring a plot moved to the far edge of the layout and back to the size it had', () => {
@@ -133,13 +151,12 @@ describe('the cells a plot move offers', () => {
       fc.property(anyBox, fc.constantFrom('row', 'col'), fc.double({ min: 0.25, max: 0.75, noNaN: true }), (box, dir, r) => {
         const t = split(dir, leaf('a'), split(dir === 'row' ? 'col' : 'row', leaf('b'), leaf('c')), r);
         const dim = dir === 'row' ? 'w' : 'h';
-        const size = (tree) => ({ [dim]: rects(tree, box).get('a')[dim] / box[dim] });
         const [there, back] = dir === 'row' ? ['right', 'left'] : ['bottom', 'top'];
-        // A size the move need not fit: within SHARE of the layout, and leaving the rest at least the smallest plot.
-        const room = box[dim] - GUTTER, f = rects(t, box).get('a')[dim] / room;
-        if (f <= Math.max(SHARE[0], MIN_PLOT[dim] / room) || f >= Math.min(SHARE[1], 1 - MIN_PLOT[dim] / room)) return;
-        const out = moveCells(t, box, new Set(['a']), size(t)).find((c) => c.outer && c.edge === there);
-        const home = out && moveCells(out.next, box, new Set(['a']), size(out.next)).find((c) => c.outer && c.edge === back);
+        // A size the move need not fit: leaving the rest at least the smallest plot.
+        const was = rects(t, box).get('a')[dim];
+        if (was <= MIN_PLOT[dim] || box[dim] - GUTTER - was <= MIN_PLOT[dim]) return;
+        const out = moveCells(t, box, new Set(['a'])).find((c) => c.outer && c.edge === there);
+        const home = out && moveCells(out.next, box, new Set(['a'])).find((c) => c.outer && c.edge === back);
         if (!home) return;
         expect(Math.abs(rects(home.next, box).get('a')[dim] - rects(t, box).get('a')[dim])).toBeLessThan(0.5);
         checked++;
@@ -155,9 +172,8 @@ describe('the cells a plot move offers', () => {
     let t = split('col', leaf('big'), leaf('small'), 0.8);
     const start = rects(t, box).get('small').h;
     for (let i = 0; i < 8; i++) {
-      const size = { h: rects(t, box).get('small').h / box.h };
       const edge = plotIds(t)[0] === 'small' ? 'bottom' : 'top';
-      t = moveCells(t, box, new Set(['small']), size).find((c) => c.plotId === 'big' && c.edge === edge).next;
+      t = moveCells(t, box, new Set(['small'])).find((c) => c.plotId === 'big' && c.edge === edge).next;
     }
     expect(Math.abs(rects(t, box).get('small').h - start)).toBeLessThan(0.5);
   });
@@ -165,7 +181,7 @@ describe('the cells a plot move offers', () => {
   it('let the plots of a 2 by 2 grid, 672 px wide, take the place of or dock beside those below', () => {
     const t = split('col', split('row', leaf('a'), leaf('b')), split('row', leaf('c'), leaf('d')));
     const box = { x: 0, y: 0, w: 672, h: 800 };
-    const cells = moveCells(t, box, new Set(['a']), { w: rects(t, box).get('a').w / box.w });
+    const cells = moveCells(t, box, new Set(['a']));
     for (const id of ['c', 'd']) for (const edge of ['center', 'left', 'right']) expect(cells.some((c) => c.plotId === id && c.edge === edge), `${id} ${edge}`).toBe(true);
   });
 });

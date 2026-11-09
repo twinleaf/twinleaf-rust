@@ -5,14 +5,12 @@
 //
 // A cell is offered only where it changes the layout and leaves no plot it
 // shrinks smaller than MIN_PLOT. A plot dropped alone on another's middle
-// swaps places with it, each taking the other's box. Docked, what is moved
-// takes the size it last had
-// that way: docked beside a plot, the width it had when it last stood beside
-// one, and docked above or below, the height it had when it last stood above
-// or below one, each kept as a share of the layout's box (`size`). With
-// none, it takes half of what it shares: the plot it docks by, or the whole
-// layout along an outer edge. Either way, within SHARE of that, and within
-// what leaves both sides of the split at least MIN_PLOT along it.
+// swaps places with it, each taking the other's box. Docked, a plot moved
+// alone keeps the size it had as it was picked up, in px: its width docked
+// beside a plot, its height docked above or below one. A group takes half
+// of what it shares: the plot it docks by, or the whole layout along an
+// outer edge. Either way, within what leaves both sides of the split at
+// least MIN_PLOT along it.
 
 import { GUTTER, dock, dockNode, dockOuter, equal, leaf, plotIds, presets, rects, removeAll, restrict, swap } from './layout.js';
 
@@ -20,8 +18,6 @@ import { GUTTER, dock, dockNode, dockOuter, equal, leaf, plotIds, presets, rects
 export const MIN_PLOT = { w: 160, h: 100 };
 /** A compass cell's size, the distance from the middle to a side cell, and an outer cell's inset, in px. */
 export const CELL = 34, STEP = 42, OUTER_INSET = 24;
-/** The least and most of what it shares a moved plot takes. */
-export const SHARE = [0.2, 0.8];
 export const SIDES = { left: [-1, 0], right: [1, 0], top: [0, -1], bottom: [0, 1] };
 
 export const isColumn = (edge) => edge === 'left' || edge === 'right';
@@ -71,10 +67,11 @@ function around(rs) {
  * 'center' swaps a plot moved alone with it) or {edge, outer} along the layout's edge, with
  * its middle (x, y), where its name goes (lx, ly), its `label`, the layout
  * it makes, `next`, and the box the moved plots take in it, `preview`.
- * `size` {w, h} is what the moved plot remembers, as shares of the box.
  */
-export function moveCells(tree, box, group, size = {}, gap = GUTTER) {
+export function moveCells(tree, box, group, gap = GUTTER) {
   const shown = rects(tree, box, gap);
+  /** The size a plot moved alone keeps, in px; a group keeps none. */
+  const size = group.size === 1 ? shown.get([...group][0]) : null;
   const rest = removeAll(tree, group);
   const room = rects(rest, box, gap);
   const order = plotIds(restrict(tree, group));
@@ -82,14 +79,14 @@ export function moveCells(tree, box, group, size = {}, gap = GUTTER) {
   const moved = (edge) => (group.size === 1 ? restrict(tree, group) : isColumn(edge) ? presets.rows(order) : presets.columns(order));
   /**
    * The share of a split `of` px along `edge`'s axis that gives what is
-   * moved its remembered size, kept within SHARE and so that both sides of
-   * the split keep MIN_PLOT along it; null when the split cannot hold two.
+   * moved its size, kept so that both sides of the split keep MIN_PLOT
+   * along it; null when the split cannot hold two.
    */
   const share = (edge, of) => {
-    const dim = isColumn(edge) ? 'w' : 'h', want = size[dim], room = of[dim] - gap;
-    const lo = Math.max(SHARE[0], MIN_PLOT[dim] / room), hi = Math.min(SHARE[1], 1 - MIN_PLOT[dim] / room);
-    if (lo > hi) return null;
-    return Math.min(hi, Math.max(lo, want === undefined ? 0.5 : (want * box[dim]) / room));
+    const dim = isColumn(edge) ? 'w' : 'h', room = of[dim] - gap;
+    if (room < 2 * MIN_PLOT[dim]) return null;
+    const lo = MIN_PLOT[dim] / room;
+    return Math.min(1 - lo, Math.max(lo, size ? size[dim] / room : 0.5));
   };
   const cells = [];
   const offer = (cell, next) => {
