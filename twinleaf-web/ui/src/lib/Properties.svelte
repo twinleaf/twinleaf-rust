@@ -39,8 +39,7 @@
   import Tip from './Tip.svelte';
   import { api } from './protocol.js';
   import { sameValue } from './session.svelte.js';
-  import { controlOf, deviceLabel, mergeRows, writersOf } from './properties.js';
-  import { favorites } from './favorites.svelte.js';
+  import { controlOf, deviceLabel, isButtons, isFavorites, mergeRows, panelRows, writersOf } from './properties.js';
   import { writeTables } from './copy.js';
   import { toast } from './toast.svelte.js';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
@@ -50,9 +49,9 @@
   /**
    * `devices`: the checked Devices, a column each, in order. `channels`:
    * the RPC channels shown, as properties.js names them, every one by
-   * default.
+   * default. `panel` names the panel, so its rows' picks are told from
+   * another panel's.
    */
-  /** `panel` names the panel, so its rows' picks are told from another panel's. */
   let { devices, channels = undefined, panel = 'properties' } = $props();
 
   /** How long a cell shows that a write took, in ms. */
@@ -62,11 +61,15 @@
   /** The most devices that get a column each. */
   const MAX_COLUMNS = 8;
 
+  // The page's History, which makes each pin one step, and its stars.
+  const history = getContext('history');
+  const favorites = history.favorites;
+
   /** Whether this is the Favorites panel, of every starred property. */
-  const starredOnly = $derived(channels?.length === 1 && channels[0] === 'favorite');
-  const rows = $derived(starredOnly ? mergeRows(devices).filter((r) => favorites.has(r.name)) : mergeRows(devices, channels));
+  const starredOnly = $derived(isFavorites(channels));
+  const rows = $derived(panelRows(devices, channels, favorites));
   const grouped = $derived(!channels || channels.length > 1 || starredOnly);
-  const buttons = $derived(channels?.length === 1 && channels[0] === 'action');
+  const buttons = $derived(isButtons(channels));
 
   // Values read on request, each device's outcome of the last call of a
   // name, and the values written, by route and name. A written value is
@@ -130,12 +133,18 @@
     getRowId: (row) => row.name,
   });
 
-  // The row the arrows are on, and the editor below the table.
-  let active = $state(0);
+  // The rows picked, the page's row pick (selection.svelte.js), which spans
+  // panels, and the row the arrows are on, the page's one, when it is this
+  // panel's.
+  const selection = getContext('selection');
+  const prefix = `${panel}:`;
+  /** The index of the row the arrows are on, or -1 when it is another panel's or none. */
+  const active = $derived(rows.findIndex((r) => prefix + r.name === selection.rowAt));
+  const current = $derived(active < 0 ? undefined : rows[active]);
+  // The editor below the table.
   let draft = $state('');
   let editor = $state(null);
   let tableEl = $state(null);
-  const current = $derived(rows[Math.min(active, rows.length - 1)]);
   let lastRow = null;
   $effect(() => {
     // A new row fills the editor with the value every device agrees on.
@@ -191,55 +200,42 @@
     }
   }
 
-  // The rows picked to copy, by name: this panel's of the page's row pick,
-  // which spans panels. And the row a Shift pick runs from.
-  const selection = getContext('selection');
-  const prefix = `${panel}:`;
-  const picked = $derived(new Set([...(selection?.rows ?? [])].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length))));
-  /** Makes `names` this panel's picked rows, those of other panels kept with `others`, or let go. */
-  function setPicked(names, others = false) {
-    const kept = others ? [...selection.rows].filter((k) => !k.startsWith(prefix)) : [];
-    selection.pickRows([...kept, ...[...names].map((n) => prefix + n)]);
-  }
-  let anchor = 0;
-  /** Picks row `i` as a click with `e`'s keys does: alone, a run from the anchor with Shift, added or dropped with Ctrl or ⌘, in any panel. */
+  // The rows picked: this panel's by name, and every panel's, each property
+  // once, in page order.
+  const picked = $derived(new Set([...selection.rows].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length))));
+  const nameOf = (k) => k.slice(k.indexOf(':') + 1);
+  /** The names of every picked row, each once, in page order. */
+  const pickedNames = () => [...new Set((selection.rowOrder?.() ?? [...selection.rows]).filter((k) => selection.rows.has(k)).map(nameOf))];
+  /** Picks row `i` as a click with `e`'s keys does (`Selection.pickRow`). */
   function pick(i, e) {
     const name = rows[i]?.name;
     if (!name) return;
-    if (e.shiftKey) {
-      const [a, b] = [Math.min(anchor, i), Math.max(anchor, i)];
-      setPicked(rows.slice(a, b + 1).map((r) => r.name));
-    } else if (e.ctrlKey || e.metaKey) {
-      const next = new Set(picked);
-      if (!next.delete(name)) next.add(name);
-      setPicked(next, true);
-      anchor = i;
-    } else {
-      setPicked([name]);
-      anchor = i;
-    }
-    active = i;
+    selection.pickRow(prefix + name, e);
   }
   // Pins act on every picked row, or the active one, as one undo step.
-  const history = getContext('history');
   /** The names a pin from the menu acts on: the picked rows', or the active row's. */
-  const pinNames = () => (picked.size ? [...picked] : current ? [current.name] : []);
+  const pinNames = () => (selection.rows.size ? pickedNames() : current ? [current.name] : []);
   /** Stars `names` when `on`, or takes their stars away, as one step. */
   function pin(names, on) {
     const changed = names.filter((n) => favorites.has(n) !== on);
     if (!changed.length) return;
     const what = `${on ? 'Pin' : 'Unpin'} ${changed.length > 1 ? `${changed.length} ` : ''}${on ? 'to' : 'from'} Favorites`;
-    history ? history.group(what, () => favorites.pin(changed, on)) : favorites.pin(changed, on);
+    history.group(what, () => favorites.pin(changed, on));
   }
   /** A star clicked on row `name`: on a picked row it sets every picked row as this one turns, on another just this one. */
   function starClicked(name) {
     const on = !favorites.has(name);
-    pin(picked.has(name) ? [...picked] : [name], on);
+    pin(picked.has(name) ? pickedNames() : [name], on);
   }
-  /** Copies the picked rows, or the active one: a header of the devices, then each property and its values, as a sheet pastes them. */
+  /** The rows Copy copies: every picked row, each property once, in page order, or the active one. */
+  function copied() {
+    const byName = new Map(mergeRows(devices).map((r) => [r.name, r]));
+    const chosen = pickedNames().map((n) => byName.get(n)).filter(Boolean);
+    return chosen.length ? chosen : current ? [current] : [];
+  }
+  /** Copies `copied()`: a header of the devices, then each property and its values, as a sheet pastes them. */
   function copyRows() {
-    const chosen = rows.filter((r) => picked.has(r.name));
-    const list = chosen.length ? chosen : current ? [current] : [];
+    const list = copied();
     if (!list.length) return;
     const each = devices.length <= MAX_COLUMNS;
     const header = ['Property', ...(each ? devices.map(deviceLabel) : [`${devices.length} devices`])];
@@ -259,12 +255,14 @@
       return;
     }
     if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
-      setPicked(rows.map((r) => r.name));
+      selection.pickRows(rows.map((r) => prefix + r.name), current ? prefix + current.name : rows[0] ? prefix + rows[0].name : null);
       e.preventDefault();
       e.stopPropagation();
       return;
     }
-    const to = { ArrowDown: active + 1, ArrowUp: active - 1, Home: 0, End: n - 1, PageDown: active + PAGE, PageUp: active - PAGE }[e.key];
+    // From no row of this table, a move goes to its first row, or End to its last.
+    const steps = { ArrowDown: 1, ArrowUp: -1, PageDown: PAGE, PageUp: -PAGE };
+    const to = e.key === 'Home' ? 0 : e.key === 'End' ? n - 1 : e.key in steps ? (active < 0 ? 0 : active + steps[e.key]) : undefined;
     if (to !== undefined) {
       const i = Math.max(0, Math.min(n - 1, to));
       // The arrows pick the row they move to; with Shift they pick the run to it.
@@ -354,7 +352,7 @@
 <div {...props} class="props-wrap" oncontextmenucapture={(e) => {
   // A right-click on a row not picked picks it alone, as a sheet does.
   const i = Number(e.target.closest?.('tr[id^=prop-]')?.id.slice(5));
-  if (Number.isInteger(i) && !picked.has(rows[i]?.name)) pick(i, {});
+  if (Number.isInteger(i) && rows[i]) selection.rowMenu(prefix + rows[i].name);
 }}>
 <ScrollArea class="props">
   <Table.Root
@@ -407,7 +405,8 @@
 {/snippet}
 </ContextMenu.Trigger>
 <ContextMenu.Content class="menu-icons">
-  <ContextMenu.Item onSelect={copyRows}><RiCopy class="menu-icon" />Copy {picked.size > 1 ? `${picked.size} rows` : 'row'}<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+  {@const copies = copied().length}
+  <ContextMenu.Item onSelect={copyRows}><RiCopy class="menu-icon" />Copy {copies > 1 ? `${copies} rows` : 'row'}<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>
   <!-- A pick some of whose rows are pinned offers both, each for the rows it changes. -->
   {@const names = pinNames()}
   {@const toPin = names.filter((n) => !favorites.has(n))}

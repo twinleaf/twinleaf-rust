@@ -156,15 +156,22 @@
               onclick={(e) => clickHead(e, p.id)}
               onkeydowncapture={(e) => {
                 // Space folds or unfolds. Enter goes into the contents, unfolding them first.
-                // Both are the header's own, not the drag library's keyboard drag,
-                // whose listener on the header this capture runs before. They are
-                // the header's only when the keyboard moved focus to it, as keys.js
-                // has buttons keep them, so after a click Space still pauses the plots.
+                // They are the header's only when the keyboard moved focus to it, as
+                // keys.js has buttons keep them; after a click they are the page's, so
+                // Space pauses the plots. Neither ever reaches the drag library, whose
+                // listeners on the header and its panel this capture runs before: they
+                // would start a keyboard drag of the panel and keep the key from the
+                // page. The page has the keys from outside the drag zone instead.
                 const head = e.currentTarget;
                 if (e.key !== ' ' && e.key !== 'Enter') return;
-                if (!focusedByKeyboard(head)) return;
-                e.preventDefault();
                 e.stopImmediatePropagation();
+                if (!focusedByKeyboard(head)) {
+                  const handed = new KeyboardEvent('keydown', { key: e.key, code: e.code, shiftKey: e.shiftKey, bubbles: true, cancelable: true });
+                  root.dispatchEvent(handed);
+                  if (handed.defaultPrevented) e.preventDefault();
+                  return;
+                }
+                e.preventDefault();
                 if (e.key === ' ') docks.toggle(p.id);
                 else if (p.open) enter(head);
                 else {

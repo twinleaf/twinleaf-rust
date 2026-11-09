@@ -49,6 +49,20 @@ export function mergeRows(devices, channels = GROUPS.map(([channel]) => channel)
   return GROUPS.filter(([channel]) => channels.includes(channel)).flatMap(([channel, title]) => rows.filter((r) => (r.rpc.channel ?? null) === channel).map((r) => ({ ...r, group: title })));
 }
 
+/** Whether a panel of `channels` is the Favorites panel, of every starred property. */
+export const isFavorites = (channels) => channels?.length === 1 && channels[0] === 'favorite';
+/** Whether a panel of `channels` shows actions alone, as a row of buttons. */
+export const isButtons = (channels) => channels?.length === 1 && channels[0] === 'action';
+
+/**
+ * The rows a panel of `channels` shows of `devices`, as `mergeRows` gives
+ * them: the Favorites panel's are every row whose name `starred` (a
+ * Favorites) holds, and no `channels` is every channel.
+ */
+export function panelRows(devices, channels, starred) {
+  return isFavorites(channels) ? mergeRows(devices).filter((r) => starred.has(r.name)) : mergeRows(devices, channels);
+}
+
 /** The devices of `devices` a write of `row` reaches: those whose entry is writable, or an action. */
 export function writersOf(row, devices) {
   return devices.filter((d) => {

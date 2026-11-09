@@ -3,8 +3,11 @@
 // page gets trusted input as a person's would make it.
 
 /**
- * Moves the real mouse through `steps`, [type, x, y] with type 'move',
- * 'down' or 'up' and x, y in the test frame's CSS px, or ['wait', ms].
+ * Moves the real mouse through `steps`: ['move', x, y], x and y in the test
+ * frame's CSS px; ['down'] and ['up'], or ['down', 'right'] and
+ * ['up', 'right'] for the right button; ['hold', key] and ['let go', key]
+ * for a keyboard key held meanwhile, as Playwright names it; or
+ * ['wait', ms].
  */
 export async function mouse(ctx, steps) {
   const frame = await ctx.frame();
@@ -15,8 +18,10 @@ export async function mouse(ctx, steps) {
   const at = (x, y) => [box.x + x * scale, box.y + y * scale];
   for (const [type, x, y] of steps) {
     if (type === 'move') await ctx.page.mouse.move(...at(x, y));
-    else if (type === 'down') await ctx.page.mouse.down();
-    else if (type === 'up') await ctx.page.mouse.up();
+    else if (type === 'down') await ctx.page.mouse.down({ button: x ?? 'left' });
+    else if (type === 'up') await ctx.page.mouse.up({ button: x ?? 'left' });
+    else if (type === 'hold') await ctx.page.keyboard.down(x);
+    else if (type === 'let go') await ctx.page.keyboard.up(x);
     else if (type === 'wait') await new Promise((done) => setTimeout(done, x));
   }
 }

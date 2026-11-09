@@ -32,8 +32,8 @@
   import Devices from './lib/Devices.svelte';
   import Properties from './lib/Properties.svelte';
   import Dock from './lib/Dock.svelte';
-  import { Docks, PANELS } from './lib/docks.svelte.js';
-  import { byRoute } from './lib/properties.js';
+  import { Docks, PANELS, SIDES } from './lib/docks.svelte.js';
+  import { byRoute, isButtons, panelRows } from './lib/properties.js';
   import SignalList from './lib/SignalList.svelte';
   import TabStrip from './lib/TabStrip.svelte';
   import DragOverlay from './lib/DragOverlay.svelte';
@@ -274,6 +274,13 @@
     return new SvelteSet();
   });
   const checked = $derived([...hub.session.devices.values()].sort(byRoute).filter((d) => !unchecked.has(d.route)));
+  // The property rows the page shows, in page order, which a Shift pick runs
+  // along: each open panel of rows of the docks shown, left then right, top
+  // to bottom.
+  selection.rowOrder = () =>
+    SIDES.filter((side) => docks.shown(side))
+      .flatMap((side) => docks[side].filter((p) => p.open && PANELS[p.id].channels && !isButtons(PANELS[p.id].channels)))
+      .flatMap(({ id }) => panelRows(checked, PANELS[id].channels, history.favorites).map((r) => `${id}:${r.name}`));
 
   // Each dock's width, a share of the page, dragged at its edge or moved
   // with the arrows there, and kept for the next visit. A double-click puts

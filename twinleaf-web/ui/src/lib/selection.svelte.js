@@ -4,7 +4,11 @@
 // the drags, the Workspace (as plots go) and History (as it restores a step)
 // all go through its methods. Plots and rows are never chosen together:
 // choosing either lets go of the other. A row pick spans every panel, each
-// row named by its panel and its name.
+// row named by its panel and its name, and a Shift pick runs along the rows
+// in page order. The rows picked are those of the picks the page shows: a
+// pick whose panel folds, whose dock hides or that leaves Favorites stops
+// being picked while it is not shown, and the next pick starts from those
+// that are.
 //
 // A press anywhere clears them, but in what works on the plots: the plots
 // themselves, a menu or popover, and what is marked data-keeps-selection
@@ -31,8 +35,29 @@ export class Selection {
   plots = new SvelteSet();
   /** The plot clicked or focused last, or null. */
   last = $state(null);
-  /** The property rows picked, as `${panel}:${name}` keys. */
-  rows = $state.raw(new Set());
+  /** The property rows picked, shown or not, as `${panel}:${name}` keys, in the order picked. */
+  #picks = $state.raw([]);
+  /** The property row picked or moved to last, shown or not. */
+  #at = $state(null);
+  /** The row a Shift pick runs from: the row last picked without Shift, while any row is picked. */
+  #anchor = null;
+  /**
+   * Every property row the page shows, as keys, in page order: the page's
+   * to set, a function whose reads are tracked. With none, as with no page,
+   * every row picked shows.
+   */
+  rowOrder = $state.raw(null);
+  /** The rows the page shows, or null for every row. */
+  #shown = $derived(this.rowOrder ? new Set(this.rowOrder()) : null);
+  #rows = $derived(new Set(this.#shown ? this.#picks.filter((k) => this.#shown.has(k)) : this.#picks));
+  /** The property rows picked that the page shows, in the order picked: what every act on the rows picked acts on. */
+  get rows() {
+    return this.#rows;
+  }
+  /** The property row the arrows are on, picked or moved to last, while the page shows it, or null: where the page edits the rows picked. */
+  get rowAt() {
+    return this.#shown && !this.#shown.has(this.#at) ? null : this.#at;
+  }
   #narrowing;
   /** Runs whenever the plots selected change: the page's, to show them. */
   changed = () => {};
@@ -103,10 +128,38 @@ export class Selection {
     if (clicks === 1) this.#narrowing = setTimeout(() => this.exists(id) && this.#setPlots([id], id), DOUBLE_CLICK_MS);
   }
 
-  /** Makes `keys` (`${panel}:${name}`) the rows picked, letting go of the plots. */
-  pickRows(keys) {
+  /** Makes `keys` (`${panel}:${name}`) the rows picked, letting go of the plots, and `at` the row the arrows are on. */
+  pickRows(keys, at = this.#at) {
     this.#setPlots([], null);
     this.#setRows(keys);
+    this.#at = at;
+  }
+
+  /**
+   * A click on property row `key` with `mods`' keys, or an arrow moving to
+   * it: it picks the row alone; with Shift, the run to it from the row a
+   * pick started at, in page order (`rowOrder`), or the row alone when that
+   * row is not shown; with Ctrl or ⌘, it adds the row or drops it.
+   */
+  pickRow(key, { shiftKey = false, ctrlKey = false, metaKey = false } = {}) {
+    const order = this.rowOrder?.() ?? [];
+    if (shiftKey && order.includes(this.#anchor) && order.includes(key)) {
+      const [a, b] = [order.indexOf(this.#anchor), order.indexOf(key)].sort((x, y) => x - y);
+      this.pickRows(order.slice(a, b + 1));
+    } else {
+      if (ctrlKey || metaKey) {
+        const next = new Set(this.rows);
+        if (!next.delete(key)) next.add(key);
+        this.pickRows([...next]);
+      } else this.pickRows([key]);
+      this.#anchor = key;
+    }
+    this.#at = key;
+  }
+
+  /** A right-click on property row `key`: it picks the row alone, unless it is picked already. */
+  rowMenu(key) {
+    if (!this.rows.has(key)) this.pickRow(key);
   }
 
   /** The plots a command made on plot `id`, from its menu or its header, acts on: every selected plot when `id` is one of them, else `id` alone. */
@@ -154,6 +207,7 @@ export class Selection {
     if (!same) this.changed();
   }
   #setRows(keys) {
-    if (keys.length || this.rows.size) this.rows = new Set(keys);
+    if (!keys.length) this.#anchor = null;
+    if (keys.length || this.#picks.length) this.#picks = [...new Set(keys)];
   }
 }

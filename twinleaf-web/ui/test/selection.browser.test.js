@@ -370,6 +370,34 @@ describe('property rows', () => {
   });
 });
 
+describe('Space after a click on a dock header', () => {
+  it('pauses the plots, as anywhere, and starts no keyboard drag of the panel', async () => {
+    const page = await mountPage(KEYS, 'columns', 0, [], [{ name: 'gain', channel: 'setting' }, { name: 'temp', channel: 'report', access: ['read'] }]);
+    try {
+      const live = () => [...document.querySelectorAll('button')].find((b) => /^(Live|Follow live)$/.test(b.textContent.trim())).textContent.trim();
+      const head = (title) => document.querySelector(`.dock-panel[aria-label="${title}"] .dock-head`);
+      const was = live();
+      // A click folds the Settings panel and focuses its header.
+      await commands.mouse([['move', ...centre(head('Settings'))], ['down'], ['up']]);
+      flushSync();
+      await frames();
+      expect(document.activeElement).toBe(head('Settings'));
+      await commands.key(' ');
+      flushSync();
+      await frames();
+      expect(live(), 'Space pauses').not.toBe(was);
+      expect(head('Settings').tabIndex, 'the header stays in the Tab order').toBe(0);
+      // The page is not in a drag: a click on a row picks it.
+      const row = document.querySelector('.dock-panel[aria-label="Reports"] tr[id^=prop-] td:last-child');
+      await commands.mouse([['move', ...centre(row)], ['down'], ['up']]);
+      flushSync();
+      expect([...page.ws.selection.rows]).toEqual(['reports:temp']);
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
 describe('a split from the keys', () => {
   it('with several plots selected keeps every new plot selected, though it moves focus to one', async () => {
     const page = await mountPage(KEYS, 'columns');
