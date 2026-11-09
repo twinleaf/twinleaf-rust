@@ -85,13 +85,6 @@ describe('undo and redo', () => {
     expect(ws.plots[p].fRange).toEqual([1, 10]);
   });
 
-  it('ignore a pane’s rounding of its split', () => {
-    const { ws, history } = setup();
-    ws.layout.ratio = 0.5 + 1e-9;
-    history.observe();
-    expect(history.undos.length).toBe(0);
-  });
-
   it('take back pinning several properties', () => {
     const { favorites, history } = setup();
     history.group('Pin 3 to Favorites', () => favorites.pin(['a', 'b', 'c'], true));

@@ -20,3 +20,8 @@ export async function mouse(ctx, steps) {
     else if (type === 'wait') await new Promise((done) => setTimeout(done, x));
   }
 }
+
+/** Presses and lets go of keyboard key `key`, as Playwright names it. */
+export async function key(ctx, name) {
+  await ctx.page.keyboard.press(name);
+}

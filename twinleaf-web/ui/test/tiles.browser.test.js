@@ -40,8 +40,9 @@ const step = fc.oneof(
   fc.record({ t: fc.constant('wait') }),
 );
 
-/** How often each kind of step changed the layout, over every run: a kind that never did would leave the property vacuous. */
+/** How often each kind of step changed the layout, and how many moves were checked against their preview, over every run. */
 const changed = {};
+let previewed = 0;
 
 async function run(s, { ws, history }) {
   const ids = plotIds(ws.layout);
@@ -59,7 +60,25 @@ async function run(s, { ws, history }) {
       const [dx, dy] = { center: [0, 0], left: [-1, 0], right: [1, 0], top: [0, -1], bottom: [0, 1] }[s.cell];
       to = [cx + dx * STEP, cy + dy * STEP];
     }
-    if (grip) await drag(centre(grip), to);
+    if (grip) {
+      // Held over the cell, the preview shows where the plot will land; let go, it lands there.
+      const [x, y] = centre(grip);
+      await commands.mouse([['move', x, y], ['down'], ['move', x + 8, y + 8], ['move', (x + to[0]) / 2, (y + to[1]) / 2], ['move', ...to], ['wait', 150]]);
+      const box = document.querySelector('.drop-preview')?.getBoundingClientRect();
+      const steps = history.undos.length;
+      await commands.mouse([['up']]);
+      flushSync();
+      await frames();
+      // A preview shown at the drop is one step; none, none.
+      expect(history.undos.length - steps, 'steps a drop makes').toBe(box ? 1 : 0);
+      if (box && ws.layout !== before) {
+        const landed = [...ws.selected.has(a) && ws.selected.size > 1 ? ws.selected : [a]].map((id) => document.querySelector(`.leaf[data-plot="${id}"]`).getBoundingClientRect());
+        const x0 = Math.min(...landed.map((l) => l.left)), y0 = Math.min(...landed.map((l) => l.top));
+        const w = Math.max(...landed.map((l) => l.right)) - x0, h = Math.max(...landed.map((l) => l.bottom)) - y0;
+        expect(Math.max(Math.abs(box.left - x0), Math.abs(box.top - y0), Math.abs(box.width - w), Math.abs(box.height - h)), 'landed where the preview showed').toBeLessThan(1.5);
+        previewed++;
+      }
+    }
   } else if (s.t === 'gap') {
     const gaps = [...document.querySelectorAll('.tiles .separator')];
     if (gaps.length) {
@@ -106,6 +125,7 @@ describe('the tiles', () => {
       [{ t: 'move', a: 2, b: 1, cell: 'left' }, { t: 'undo' }, { t: 'move', a: 0, b: 0, cell: 'bottom' }, { t: 'redo' }],
     );
     for (const kind of ['move', 'gap', 'undo', 'arrange', 'dock']) expect(changed[kind], kind).toBeGreaterThan(0);
+    expect(previewed).toBeGreaterThan(0);
   }, 600_000);
 });
 
@@ -142,6 +162,51 @@ describe('a gap drag', () => {
     expect(page.ws.layout).toBe(undone);
     expect(page.history.redoLabel).toBe('Arrange');
     expect(misplaced(page.ws.layout)).toEqual([]);
+    page.dispose();
+  });
+});
+
+describe('a plot move', () => {
+  it('that Escape stops puts nothing down, records nothing and clears the selection', async () => {
+    const page = await mountPage([[], []], 'columns');
+    const [a, b] = plotIds(page.ws.layout);
+    page.ws.selected.add(b);
+    flushSync();
+    const layout = page.ws.layout;
+    // Its grip shows once the pointer is over the plot.
+    await commands.mouse([['move', ...centre(document.querySelector(`.leaf[data-plot="${a}"]`))]]);
+    const [x, y] = centre(document.querySelector(`.leaf[data-plot="${a}"] .grip`));
+    const [tx, ty] = centre(document.querySelector(`.leaf[data-plot="${plotIds(layout)[1]}"]`));
+    await commands.mouse([['move', x, y], ['down'], ['move', x + 8, y + 8], ['move', tx, ty - STEP], ['wait', 100]]);
+    expect(document.querySelector('.drop-preview')).not.toBe(null);
+    await commands.key('Escape');
+    await commands.mouse([['up']]);
+    flushSync();
+    await frames();
+    expect(page.ws.layout).toBe(layout);
+    expect(page.history.undos.length).toBe(0);
+    expect(page.ws.selected.size).toBe(0);
+    expect(page.ws.focusedId).toBe(null);
+    expect(document.querySelector('.drop-preview')).toBe(null);
+    page.dispose();
+  });
+
+  it('that a key opens another tab under puts nothing down in either tab', async () => {
+    const page = await mountPage([[], []], 'columns', 1);
+    const [a, b] = plotIds(page.ws.layout);
+    const tabs = page.ws.tabs;
+    await commands.mouse([['move', ...centre(document.querySelector(`.leaf[data-plot="${a}"]`))]]);
+    const [x, y] = centre(document.querySelector(`.leaf[data-plot="${a}"] .grip`));
+    const [tx, ty] = centre(document.querySelector(`.leaf[data-plot="${b}"]`));
+    await commands.mouse([['move', x, y], ['down'], ['move', x + 8, y + 8], ['move', tx, ty - STEP], ['wait', 100]]);
+    expect(document.querySelector('.drop-preview')).not.toBe(null);
+    page.ws.selectTab(page.ws.tabs[1].id);
+    flushSync();
+    await commands.mouse([['move', tx, ty - STEP + 2], ['up']]);
+    flushSync();
+    await frames();
+    expect(page.ws.tabs).toBe(tabs);
+    expect(page.history.undos.length).toBe(0);
     page.dispose();
   });
 });

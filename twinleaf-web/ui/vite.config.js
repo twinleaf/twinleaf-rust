@@ -2,7 +2,7 @@ import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
-import { mouse } from './test/browser/commands.js';
+import { key, mouse } from './test/browser/commands.js';
 
 /** A count from the environment, `fallback` when unset; anything but a positive integer is refused. */
 function count(name, fallback) {
@@ -46,7 +46,7 @@ export default defineConfig({
             viewport: { width: 1200, height: 900 },
             // A property's failure prints its case to replay; a picture adds nothing.
             screenshotFailures: false,
-            commands: { mouse },
+            commands: { key, mouse },
             // Edge comes with Windows; elsewhere Playwright's own Chromium.
             instances: [{ browser: 'chromium', launch: process.platform === 'win32' ? { channel: 'msedge' } : {} }],
           },

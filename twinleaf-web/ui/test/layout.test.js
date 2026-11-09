@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { append, dock, dockNode, dockOuter, gutters, leaf, leafSize, placeEdge, plotIds, presets, rects, removeAll, removePlot, restrict, setRatio, split, splitBeside } from '../src/lib/layout.js';
+import { append, dock, dockNode, dockOuter, equal, fromJson, gutters, leaf, placeEdge, plotIds, presets, ratio as normal, rects, removeAll, removePlot, restrict, setRatio, split, splitBeside } from '../src/lib/layout.js';
 
 describe('the layout tree', () => {
   it('lists its plots in reading order', () => {
@@ -130,7 +130,7 @@ describe('setRatio', () => {
         const before = rects(t, box), after = rects(setRatio(t, g.path, ratio), box);
         const under = new Set(plotIds([...g.path].reduce((n, side) => n[side], t)));
         for (const [id, r] of before) if (!under.has(id)) expect(sameBox(after.get(id), r)).toBe(true);
-        expect(gutters(setRatio(t, g.path, ratio), box).find((x) => x.path === g.path).ratio).toBe(ratio);
+        expect(gutters(setRatio(t, g.path, ratio), box).find((x) => x.path === g.path).ratio).toBe(normal(ratio));
       }),
     );
   });
@@ -145,25 +145,35 @@ describe('setRatio', () => {
   });
 });
 
-describe('leafSize', () => {
-  it('gives each leaf its share of the area by the splits’ ratios', () => {
-    const tree = split('row', leaf('a'), split('col', leaf('b'), leaf('c'), 0.25), 0.6);
-    expect(leafSize(tree, 'a', 1000, 800)).toEqual({ width: 600, height: 800 });
-    expect(leafSize(tree, 'b', 1000, 800)).toEqual({ width: 400, height: 200 });
-    expect(leafSize(tree, 'c', 1000, 800)).toEqual({ width: 400, height: 600 });
-    expect(leafSize(tree, 'z', 1000, 800)).toBeNull();
+describe('a layout read from JSON', () => {
+  it('is the tree every edit makes: no ids, ratios to the step', () => {
+    const saved = { type: 'split', id: 'n1-x', dir: 'row', ratio: 0.333333333, a: { type: 'leaf', id: 'n2-y', plotId: 'a' }, b: { type: 'leaf', id: 'n3-z', plotId: 'b' } };
+    expect(fromJson(saved)).toEqual(split('row', leaf('a'), leaf('b'), 0.3333));
   });
-  it('moving a plot to the other end of its column keeps its height', () => {
-    // A short plot under a tall one, moved above it: measured in the layout
-    // without it, its height is the same share of the column again.
-    const tiles = { width: 1000, height: 1000 };
-    let tree = split('col', leaf('big'), leaf('small'), 0.8);
-    for (let i = 0; i < 6; i++) {
-      const order = plotIds(tree), small = leafSize(tree, 'small', tiles.width, tiles.height).height / tiles.height;
-      const rest = removeAll(tree, new Set(['small']));
-      const room = leafSize(rest, 'big', tiles.width, tiles.height);
-      tree = dockNode(rest, leaf('small'), 'big', order[0] === 'small' ? 'bottom' : 'top', (small * tiles.height) / room.height);
+  it('is refused when it is not a tree of plots', () => {
+    for (const bad of [null, { type: 'leaf' }, { type: 'split', dir: 'row', ratio: 0.5, a: leaf('a') }, { type: 'split', dir: 'up', ratio: 0.5, a: leaf('a'), b: leaf('b') }, { type: 'split', dir: 'row', ratio: 'half', a: leaf('a'), b: leaf('b') }]) {
+      expect(fromJson(bad)).toBe(null);
     }
-    expect(leafSize(tree, 'small', 1000, 1000).height).toBeCloseTo(200);
+  });
+  it('reads back every tree as itself', () => {
+    fc.assert(
+      fc.property(anyTree, (t) => {
+        expect(equal(fromJson(JSON.parse(JSON.stringify(t))), t)).toBe(true);
+      }),
+    );
+  });
+});
+
+describe('equal', () => {
+  it('holds between trees that read the same and not when any plot, direction or ratio differs', () => {
+    fc.assert(
+      fc.property(anyTree, fc.nat(), (t, k) => {
+        expect(equal(t, JSON.parse(JSON.stringify(t)))).toBe(true);
+        const gs = gutters(t, { x: 0, y: 0, w: 1, h: 1 });
+        if (!gs.length) return;
+        const g = gs[k % gs.length];
+        expect(equal(setRatio(t, g.path, g.ratio > 0.5 ? 0.25 : 0.75), t)).toBe(false);
+      }),
+    );
   });
 });

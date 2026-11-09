@@ -20,14 +20,10 @@ const DEPTH = 200;
 
 /** Plot fields that are what a view shows, not what was edited. */
 const VIEW_FIELDS = new Set(['fRange']);
-/**
- * The tabs as a snapshot: view fields left out, and split ratios to a
- * thousandth, so a gap moved by less than that is no edit.
- */
+/** The tabs as a snapshot: view fields left out. */
 function snapshotTabs(tabs) {
   return JSON.stringify(tabs, (k, v) => {
     if (VIEW_FIELDS.has(k)) return undefined;
-    if (k === 'ratio' && typeof v === 'number') return Math.round(v * 1000) / 1000;
     return v;
   });
 }

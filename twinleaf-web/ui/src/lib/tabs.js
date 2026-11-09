@@ -18,7 +18,7 @@
 // that reads it, and a change to it changes the key.
 
 import { SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
-import { plotIds, presets } from './layout.js';
+import { fromJson, plotIds, presets } from './layout.js';
 
 export const SAVE_KEY = 'tl-plot-tabs-v2';
 /** The `format` of an exported file of tabs. */
@@ -71,8 +71,9 @@ export function tabFromJson(t) {
     if (!p || !Array.isArray(p.items)) return null;
     plots[id] = { ...p, id, items: p.items.filter((i) => i && !i[SHADOW] && typeof i.key === 'string').map((i) => chip(i.key)) };
   }
-  const layout = t.layout ?? null;
-  if (!plotIds(layout).every((id) => plots[id])) return null;
+  const layout = t.layout ? fromJson(t.layout) : null;
+  const ids = plotIds(layout);
+  if ((t.layout && !layout) || !ids.every((id) => plots[id]) || new Set(ids).size !== ids.length) return null;
   return { id: typeof t.id === 'string' ? t.id : uid('t'), name: t.name, plots, layout };
 }
 

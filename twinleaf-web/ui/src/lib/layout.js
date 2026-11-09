@@ -1,16 +1,40 @@
 // The tiling layout of a tab: a binary split tree of its plots.
 //
-//   leaf  {type: 'leaf', id, plotId}
-//   split {type: 'split', id, dir, ratio, a, b}
+//   leaf  {type: 'leaf', plotId}
+//   split {type: 'split', dir, ratio, a, b}
 //
 // dir 'row' puts a and b side by side; 'col' stacks a above b. ratio is a's
-// share. Every edit returns a new tree.
+// share, to RATIO_STEP. Trees carry no ids: two that read the same are
+// `equal`, and an edit returns a new tree, or, for setRatio and taking
+// plots out, the same one when it changes nothing.
 
-let n = 0;
-const uid = () => `n${++n}-${Math.random().toString(36).slice(2, 6)}`;
+/** The step every split's ratio is a whole number of. */
+export const RATIO_STEP = 1e-4;
+/** `r` as a split's ratio: to RATIO_STEP, inside (0, 1). */
+export const ratio = (r) => Math.min(1 - RATIO_STEP, Math.max(RATIO_STEP, Math.round(r / RATIO_STEP) * RATIO_STEP));
 
-export const leaf = (plotId) => ({ type: 'leaf', id: uid(), plotId });
-export const split = (dir, a, b, ratio = 0.5) => ({ type: 'split', id: uid(), dir, ratio, a, b });
+export const leaf = (plotId) => ({ type: 'leaf', plotId });
+export const split = (dir, a, b, r = 0.5) => ({ type: 'split', dir, ratio: ratio(r), a, b });
+
+/** Whether trees `a` and `b` read the same: the same plots, splits and ratios. */
+export function equal(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.type !== b.type) return false;
+  if (a.type === 'leaf') return a.plotId === b.plotId;
+  return a.dir === b.dir && a.ratio === b.ratio && equal(a.a, b.a) && equal(a.b, b.b);
+}
+
+/**
+ * The tree saved or imported JSON describes, in the form every edit makes,
+ * or null when it is not one: leaves of string plot ids, splits of 'row' or
+ * 'col' with a ratio.
+ */
+export function fromJson(node) {
+  if (node?.type === 'leaf') return typeof node.plotId === 'string' ? leaf(node.plotId) : null;
+  if (node?.type !== 'split' || (node.dir !== 'row' && node.dir !== 'col') || !Number.isFinite(node.ratio)) return null;
+  const a = fromJson(node.a), b = fromJson(node.b);
+  return a && b ? split(node.dir, a, b, node.ratio) : null;
+}
 
 export function plotIds(node) {
   if (!node) return [];
@@ -142,26 +166,13 @@ export function gutters(node, box, gap = GUTTER, path = '', out = []) {
   return gutters(node.b, b, gap, path + 'b', out);
 }
 
-/** The tree with the split at `path` (as `gutters` names it) at `ratio`; the same tree when it is there already. */
-export function setRatio(node, path, ratio) {
+/** The tree with the split at `path` (as `gutters` names it) at ratio `r`; the same tree when it is there already. */
+export function setRatio(node, path, r) {
   if (!node || node.type === 'leaf') return node;
-  if (!path) return node.ratio === ratio ? node : { ...node, ratio };
+  if (!path) return node.ratio === ratio(r) ? node : { ...node, ratio: ratio(r) };
   const side = path[0];
-  const next = setRatio(node[side], path.slice(1), ratio);
+  const next = setRatio(node[side], path.slice(1), r);
   return next === node[side] ? node : { ...node, [side]: next };
-}
-
-/**
- * The size {width, height} the leaf showing `plotId` has in a `width` by
- * `height` area, by its splits' ratios, or null when no leaf shows it.
- */
-export function leafSize(node, plotId, width, height) {
-  if (!node) return null;
-  if (node.type === 'leaf') return node.plotId === plotId ? { width, height } : null;
-  const row = node.dir === 'row';
-  const [wa, ha] = row ? [width * node.ratio, height] : [width, height * node.ratio];
-  const [wb, hb] = row ? [width - wa, height] : [width, height - ha];
-  return leafSize(node.a, plotId, wa, ha) ?? leafSize(node.b, plotId, wb, hb);
 }
 
 /** The tree with only the leaves showing `ids`, a Set, kept as they are arranged. */

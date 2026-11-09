@@ -2,77 +2,38 @@
 // a plot's edge, and the selection box. `Drags` holds what the overlay
 // draws while one goes on (DragOverlay.svelte), and edits the workspace.
 //
-// The compass: drop cells over the plot under the pointer, and for a moved
-// plot, cells along the layout's outer edge. A cell shows only where a drop
-// could go, and the one under the pointer is the target, named beside it.
+// The compass: drop cells over the plot under the pointer, and cells along
+// the layout's outer edge, as moves.js offers them. A cell shows only where
+// a drop could go, and the one under the pointer is the target, named
+// beside it.
 
-import { dock, dockNode, dockOuter, holderDir, leaf, leafSize, placeEdge, plotIds, presets, removeAll, restrict } from './layout.js';
+import { dock, dockOuter, holderDir, leaf, rects } from './layout.js';
+import { OUTER_SHARE, cellAt, moveCells, signalCells } from './moves.js';
 import { chip, newPlot } from './tabs.js';
 import { DRAG_START } from './constants.js';
 
-/** The smallest plot a split may leave, in px. */
-const MIN_PLOT = { w: 160, h: 100 };
-/** A compass cell's size, the distance from the middle to a side cell, and an outer cell's inset, in px. */
-const CELL = 34, STEP = 42, OUTER_INSET = 24;
-const SIDES = { left: [-1, 0], right: [1, 0], top: [0, -1], bottom: [0, 1] };
-/**
- * What is moved takes the size it last had that way: docked beside a plot,
- * the width it had when it last stood beside one, and docked above or below,
- * the height it had when it last stood above or below one, each kept as a
- * share of the whole layout. With none, it takes half of the plot it docks by. Either way,
- * within SHARE of that plot.
- */
-const SHARE = [0.2, 0.8];
-/** The share of the layout a signal dropped on an outer cell opens its plot with. */
-const OUTER_SHARE = 1 / 3;
 const LANDED_MS = 700;
 /** The empty background a box selection starts on, besides what listens for it: a dock, a panel's body, a list's own space below its items. */
 const EMPTY = '.dock, .dock-side, .dock-body, .palette, [data-slot=scroll-area-viewport]';
 
-const isColumn = (edge) => edge === 'left' || edge === 'right';
-const roomFor = (r, edge) => (isColumn(edge) ? r.width / 2 >= MIN_PLOT.w : r.height / 2 >= MIN_PLOT.h);
-const clampShare = (f) => Math.min(SHARE[1], Math.max(SHARE[0], f));
-
 /**
- * The cells for a pointer at (x, y): over the plot `plotId` laid out at `r`,
- * if any, with a middle cell when `middle` names it, and along the layout
- * `tiles` when `outer` names its cells. Returns the cells and the one under
- * the pointer.
+ * Runs `move` on every pointer move until the pointer is let go, then `up`
+ * with the last event. Returns a function that stops following, without `up`.
  */
-function compassAt(x, y, { plotId, r, middle, side, tiles, outer }) {
-  const cells = [];
-  if (plotId) {
-    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-    // A plot's cells are named under the compass, clear of every cell.
-    const lx = cx, ly = cy + STEP + CELL;
-    if (middle) cells.push({ edge: 'center', plotId, x: cx, y: cy, lx, ly, label: middle });
-    for (const [edge, [dx, dy]] of Object.entries(SIDES)) {
-      if (roomFor(r, edge)) cells.push({ edge, plotId, x: cx + dx * STEP, y: cy + dy * STEP, lx, ly, label: side(edge) });
-    }
-  }
-  if (outer) {
-    const mx = tiles.left + tiles.width / 2, my = tiles.top + tiles.height / 2;
-    const at = { left: [tiles.left + OUTER_INSET, my], right: [tiles.right - OUTER_INSET, my], top: [mx, tiles.top + OUTER_INSET], bottom: [mx, tiles.bottom - OUTER_INSET] };
-    // An edge cell is named a little inward of it.
-    const inward = { left: [64, 0], right: [-64, 0], top: [0, 40], bottom: [0, -40] };
-    for (const [edge, [ex, ey]] of Object.entries(at)) cells.push({ edge, outer: true, x: ex, y: ey, lx: ex + inward[edge][0], ly: ey + inward[edge][1], label: outer(edge) });
-  }
-  const hit = cells.find((c) => Math.abs(x - c.x) <= CELL / 2 && Math.abs(y - c.y) <= CELL / 2) ?? null;
-  for (const c of cells) c.active = c === hit;
-  return { cells, hit };
-}
-
-/** Runs `move` on every pointer move until the pointer is let go, then `up` with the last event. */
 function follow(move, up) {
-  const done = (ev) => {
+  const stop = () => {
     window.removeEventListener('pointermove', move);
     window.removeEventListener('pointerup', done);
     window.removeEventListener('pointercancel', done);
+  };
+  const done = (ev) => {
+    stop();
     up(ev);
   };
   window.addEventListener('pointermove', move);
   window.addEventListener('pointerup', done);
   window.addEventListener('pointercancel', done);
+  return stop;
 }
 
 export class Drags {
@@ -167,16 +128,13 @@ export class Drags {
    * Picks plot `plotId` up by its header or grip once the pointer moves a
    * few pixels, so a click or double-click there stays one.
    *
-   * While it is held, the layout stays as it is, and a box over it shows
-   * where the plot would land; the layout changes once, on the drop. A
-   * selected plot carries the whole selection, which docks beside another
-   * plot or moves to another tab. Dropped on a plot's middle, what is moved
-   * takes its place, as in a list: before it when it came from after it in
-   * reading order, after it otherwise, along the split that holds it, and
-   * that plot moves along beside it. Dropped on an
-   * outer cell, what is moved becomes a row or column across the layout. A
-   * group that lands in a column stacks, and one in a row lines up, in the
-   * order it read.
+   * While it is held, the layout stays as it is, the compass shows the
+   * cells moves.js offers over the plot under the pointer and along the
+   * layout's edge, and a box shows where the plot would land; the drop makes
+   * the layout that cell gives, as one step. A selected plot carries the
+   * whole selection, which docks beside another plot or moves to another
+   * tab. Escape, or a tab opened or a layout changed while it is held, as
+   * by a key, puts it down where it was; Escape also clears the selection.
    */
   startMove(plotId, e) {
     if (e.button !== 0) return;
@@ -184,8 +142,8 @@ export class Drags {
     const ws = this.ws;
     const [x0, y0] = [e.clientX, e.clientY];
     const group = new Set(ws.selected.has(plotId) && ws.selected.size > 1 ? ws.selected : [plotId]);
-    let lifted = null; // {original, rects, tiles, size, remembers} once picked up
-    let shown = null; // the target the preview shows
+    let lifted = null; // {tabId, tree, cells, shown, remembers, maximized} once picked up
+    let target = null; // the cell or tab the pointer is over: {cell, label} or {tabId}
     const targetAt = (x, y) => {
       const under = document.elementsFromPoint(x, y).find((el) => !el.closest('.move-ghost, .compass'));
       const tabEl = under?.closest('[data-tab]');
@@ -193,103 +151,78 @@ export class Drags {
         this.compass = null;
         return tabEl.dataset.tab === ws.activeId ? null : { tabId: tabEl.dataset.tab };
       }
-      // The plot under the pointer, as laid out when the move began.
+      // The plot under the pointer, as the layout lays it out.
       let over = null;
-      for (const [id, r] of lifted.rects) if (!group.has(id) && x >= r.left && x < r.right && y >= r.top && y < r.bottom) over = { id, r };
-      const { cells, hit } = compassAt(x, y, {
-        plotId: over?.id,
-        r: over?.r,
-        middle: 'Take its place',
-        side: (edge) => `Dock ${edge}`,
-        tiles: lifted.tiles,
-        outer: (edge) => `New ${isColumn(edge) ? 'column' : 'row'} at ${edge}`,
-      });
-      this.compass = cells;
-      if (!hit) return null;
-      if (hit.outer) return { outer: true, edge: hit.edge, label: hit.label };
-      // Taking a plot's place is docking on the edge a list's reorder would
-      // pick, along the split that held it before anything moved.
-      if (hit.edge === 'center') {
-        const order = plotIds(lifted.original);
-        const first = order.find((id) => group.has(id));
-        const before = order.indexOf(first) > order.indexOf(hit.plotId);
-        return { plotId: hit.plotId, edge: placeEdge(lifted.original, hit.plotId, before), label: hit.label };
-      }
-      return { plotId: hit.plotId, edge: hit.edge, label: hit.label };
+      for (const [id, r] of lifted.shown) if (!group.has(id) && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) over = id;
+      const cells = lifted.cells.filter((c) => c.outer || c.plotId === over);
+      const hit = cellAt(cells, x, y);
+      this.compass = cells.map((c) => ({ ...c, active: c === hit }));
+      return hit && { cell: hit, label: hit.label };
     };
-    const across = (edge) => (isColumn(edge) ? 'width' : 'height');
-    const shareOf = (edge, room) => {
-      const dim = across(edge), remembered = lifted.size[dim === 'width' ? 'w' : 'h'];
-      return clampShare(remembered === undefined ? 0.5 : (remembered * lifted.tiles[dim]) / room[dim]);
-    };
-    /** The part of box `r` along its `edge`, `share` of it deep. */
-    const part = (r, edge, share) => {
-      const w = isColumn(edge) ? r.width * share : r.width, h = isColumn(edge) ? r.height : r.height * share;
-      return { x: edge === 'right' ? r.right - w : r.left, y: edge === 'bottom' ? r.bottom - h : r.top, w, h };
-    };
-    /**
-     * The size plot `id` will have once what is moved is out of the layout,
-     * which a dock beside it shares: taking a plot out of a split gives its
-     * neighbour its room, so measuring the neighbour as it is now would give
-     * what is moved more than it had, a little more at every move.
-     */
-    const roomOf = (id) => leafSize(removeAll(lifted.original, group), id, lifted.tiles.width, lifted.tiles.height) ?? lifted.rects.get(id);
-    /** Where `target` would put what is moved, as a box over the plots, or null. */
-    const previewOf = (target) => {
-      if (!target || target.tabId) return null;
-      if (target.outer) return { ...part(lifted.tiles, target.edge, shareOf(target.edge, lifted.tiles)), outer: true };
-      // Drawn over the plot as it is now, at the size the dock will give.
-      const r = lifted.rects.get(target.plotId), room = roomOf(target.plotId), dim = across(target.edge);
-      return part(r, target.edge, Math.min(0.95, (shareOf(target.edge, room) * room[dim]) / r[dim]));
-    };
-    /** The layout `target` leaves. */
-    const layoutFor = (target) => {
-      const { original, tiles } = lifted;
-      const rest = removeAll(original, group);
-      const order = plotIds(restrict(original, group));
-      const moved = group.size === 1 ? restrict(original, group) : isColumn(target.edge) ? presets.rows(order) : presets.columns(order);
-      if (target.outer) return dockOuter(rest, moved, target.edge, shareOf(target.edge, tiles));
-      return dockNode(rest, moved, target.plotId, target.edge, shareOf(target.edge, roomOf(target.plotId)));
-    };
-    follow(
+    const stop = follow(
       (ev) => {
         if (!lifted) {
           if (Math.hypot(ev.clientX - x0, ev.clientY - y0) < DRAG_START) return;
-          const leaves = [...document.querySelectorAll('.leaf[data-plot]')];
-          const rects = new Map(leaves.map((el) => [el.dataset.plot, el.getBoundingClientRect()]));
-          const tiles = document.querySelector('.tiles').getBoundingClientRect();
+          const r = document.querySelector('.tile-box').getBoundingClientRect();
+          const box = { x: r.left, y: r.top, w: r.width, h: r.height };
+          const tree = ws.tab.layout, shown = rects(tree, box);
           // A plot remembers the width it has beside another, or the height
-          // it has above or below one, as a share of the layout, kept once it
-          // lands (`remembers`). A group remembers nothing and takes half.
-          const plot = ws.plots[plotId], r = rects.get(plotId);
-          const dir = group.size === 1 && plot && r ? holderDir(ws.tab.layout, plotId) : null;
-          const remembers = dir === 'row' ? { ...plot.dockSize, w: r.width / tiles.width } : dir === 'col' ? { ...plot.dockSize, h: r.height / tiles.height } : null;
+          // it has above or below one, as a share of the layout's box, kept
+          // once it lands (`remembers`). A group remembers nothing.
+          const plot = ws.plots[plotId], at = shown.get(plotId);
+          const dir = group.size === 1 && plot && at ? holderDir(tree, plotId) : null;
+          const remembers = dir === 'row' ? { ...plot.dockSize, w: at.w / box.w } : dir === 'col' ? { ...plot.dockSize, h: at.h / box.h } : null;
           const size = group.size === 1 ? (remembers ?? plot?.dockSize ?? {}) : {};
-          lifted = { original: ws.tab.layout, rects, size, remembers, tiles };
+          lifted = { tabId: ws.activeId, tree, cells: moveCells(tree, box, group, size), shown, remembers, maximized: ws.maximized };
           ws.maximized = null;
         }
-        shown = targetAt(ev.clientX, ev.clientY);
-        this.moving = { plotId, group, x: ev.clientX, y: ev.clientY, target: shown };
-        this.preview = previewOf(shown);
+        // A tab opened or a layout changed under the move, as by a key, ends it.
+        if (ws.activeId !== lifted.tabId || ws.tab.layout !== lifted.tree) return cancel();
+        target = targetAt(ev.clientX, ev.clientY);
+        this.moving = { plotId, group, x: ev.clientX, y: ev.clientY, target };
+        this.preview = target?.cell ? { ...target.cell.preview, outer: target.cell.outer } : null;
       },
-      (ev) => {
-        this.compass = null;
-        this.preview = null;
-        this.moving = null;
-        if (!lifted || !shown || ev.type === 'pointercancel') return;
-        // The drop is one step: where the plots land, and the size the plot
-        // moved remembers.
-        const label = group.size > 1 ? `Move ${group.size} plots` : 'Move plot';
-        this.group(label, () => {
-          if (lifted.remembers && ws.plots[plotId]) ws.plots[plotId].dockSize = lifted.remembers;
-          if (shown.tabId) {
-            for (const id of group) ws.movePlotToTab(id, shown.tabId);
-            ws.selected.clear();
-          } else ws.tab.layout = layoutFor(shown);
-        });
-        if (!shown.tabId) this.flash(group);
-      },
+      (ev) => end(ev.type === 'pointerup'),
     );
+    /** Ends the move with nothing put down. */
+    const cancel = () => {
+      stop();
+      end(false);
+    };
+    const key = (ev) => {
+      if (ev.key !== 'Escape') return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      cancel();
+      ws.selected.clear();
+      ws.focusedId = null;
+      this.changed();
+    };
+    window.addEventListener('keydown', key, true);
+    const end = (drop) => {
+      window.removeEventListener('keydown', key, true);
+      this.compass = null;
+      this.preview = null;
+      this.moving = null;
+      if (!lifted) return;
+      const lands = drop && target && ws.activeId === lifted.tabId && ws.tab.layout === lifted.tree;
+      // What is put down nowhere leaves the tab as it was, its plot maximized again.
+      if (!lands) {
+        if (ws.activeId === lifted.tabId && ws.maximized === null && ws.plots[lifted.maximized]) ws.maximized = lifted.maximized;
+        return;
+      }
+      // The drop is one step: where the plots land, and the size the plot
+      // moved remembers.
+      const label = group.size > 1 ? `Move ${group.size} plots` : 'Move plot';
+      this.group(label, () => {
+        if (lifted.remembers && ws.plots[plotId]) ws.plots[plotId].dockSize = lifted.remembers;
+        if (target.tabId) {
+          for (const id of group) ws.movePlotToTab(id, target.tabId);
+          ws.selected.clear();
+        } else ws.tab.layout = target.cell.next;
+      });
+      if (!target.tabId) this.flash(group);
+    };
   }
 
   /**
@@ -304,14 +237,22 @@ export class Drags {
     if (this.traceDragging) return;
     this.traceDragging = true;
     this.traceDrop = null;
+    // The cells over each plot, and along the edge, as the layout lays them out when the drag begins.
+    const tiles = document.querySelector('.tile-box')?.getBoundingClientRect();
+    const box = tiles && { x: tiles.left, y: tiles.top, w: tiles.width, h: tiles.height };
+    const tree = this.ws.layout, cellsOver = new Map();
+    const cellsFor = (plotId) => {
+      if (!cellsOver.has(plotId)) cellsOver.set(plotId, signalCells(tree, box, plotId));
+      return cellsOver.get(plotId);
+    };
     // Over a plot's header the signal joins its chips, and shows no compass.
     const move = (ev) => {
       const [x, y] = [ev.clientX, ev.clientY];
       const under = document.elementsFromPoint(x, y).find((e) => !e.closest('#dnd-action-dragged-el, .compass'));
       const el = under?.closest('[data-plot]');
       const plotId = el?.dataset.plot;
-      const tiles = document.querySelector('.tiles')?.getBoundingClientRect();
-      const onTiles = tiles && x >= tiles.left && x < tiles.right && y >= tiles.top && y < tiles.bottom;
+      const area = document.querySelector('.tiles')?.getBoundingClientRect();
+      const onTiles = area && x >= area.left && x < area.right && y >= area.top && y < area.bottom;
       // Beside an independent plot's edge, the signal joins that side's axes.
       const axis = plotId && under.closest('.plot-body') ? this.axisDropAt?.(plotId, x, y) : null;
       if (axis) {
@@ -321,20 +262,13 @@ export class Drags {
         return;
       }
       this.preview = null;
-      if (!this.ws.layout || !onTiles || (plotId && !under.closest('.plot-body'))) {
+      if (!tree || !box || !onTiles || (plotId && !under.closest('.plot-body'))) {
         this.compass = null;
         this.drop = plotId ? { plotId, edge: 'add' } : onTiles && !this.ws.layout ? { outer: true } : null;
         return;
       }
-      const { cells, hit } = compassAt(x, y, {
-        plotId,
-        r: el?.getBoundingClientRect(),
-        middle: 'Add to this plot',
-        side: (edge) => `New plot ${edge === 'top' ? 'above' : edge === 'bottom' ? 'below' : `on the ${edge}`}`,
-        tiles,
-        outer: (edge) => `New ${isColumn(edge) ? 'column' : 'row'} at ${edge}`,
-      });
-      this.compass = cells;
+      const cells = cellsFor(plotId ?? null), hit = cellAt(cells, x, y);
+      this.compass = cells.map((c) => ({ ...c, active: c === hit }));
       if (hit?.outer) this.drop = { outer: true, edge: hit.edge };
       else if (plotId) this.drop = hit && hit.edge !== 'center' ? { plotId, edge: hit.edge } : { plotId, edge: 'add' };
       else this.drop = null;

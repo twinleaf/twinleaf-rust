@@ -55,3 +55,11 @@ describe('tabs', () => {
     expect(() => importText('{"format": "twinleaf-plot-layouts", "tabs": []}')).toThrow('no layouts');
   });
 });
+
+describe('a tab read from JSON', () => {
+  it('is refused when its layout names a plot twice', () => {
+    const p = { id: 'p1', kind: 'time', mode: 'overlay', items: [] };
+    const layout = { type: 'split', dir: 'row', ratio: 0.5, a: { type: 'leaf', plotId: 'p1' }, b: { type: 'leaf', plotId: 'p1' } };
+    expect(tabFromJson({ name: 'A', plots: { p1: p }, layout })).toBe(null);
+  });
+});
