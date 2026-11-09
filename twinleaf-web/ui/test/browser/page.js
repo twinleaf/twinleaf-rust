@@ -21,16 +21,25 @@ export const frames = (n = 2) =>
 
 /**
  * A hub with no socket that has announced `signals`, keys as 'stream.column',
- * each a trace of route '/' in volts.
+ * each a trace of route '/' in volts, and, with `rpcs`, a device at '/'
+ * whose RPC table they are, each {name, channel, value}.
  */
-export function stubHub(signals = []) {
+export function stubHub(signals = [], rpcs = []) {
   const hub = new Hub();
   hub.close();
-  hub.text({ type: 'hub', id: 'test', seq: 0 });
+  let seq = 0;
+  hub.text({ type: 'hub', id: 'test', seq });
   signals.forEach((key, id) => {
     const [stream, column] = key.split('.');
-    hub.text({ type: 'trace', seq: id + 1, trace: { id, route: '/', stream, column, units: 'V', rate: 100 } });
+    hub.text({ type: 'trace', seq: ++seq, trace: { id, route: '/', stream, column, units: 'V', rate: 100 } });
   });
+  if (rpcs.length) {
+    hub.text({ type: 'routes', seq: ++seq, mounts: {}, routes: ['/'] });
+    hub.text({ type: 'device', seq: ++seq, route: '/', name: 'test', serial: '1', firmware: '1', presence: 'alive' });
+    const table = rpcs.map(({ name, channel }) => ({ name, channel, type: 'f32', access: ['read', 'write'] }));
+    hub.text({ type: 'table', seq: ++seq, route: '/', rpcs: table });
+    hub.text({ type: 'settings', seq: ++seq, route: '/', values: Object.fromEntries(rpcs.map((p) => [p.name, p.value ?? 0])) });
+  }
   return hub;
 }
 
@@ -38,16 +47,16 @@ export function stubHub(signals = []) {
  * The page with a tab of plots showing `keys`, a list of signal keys per
  * plot, laid out as layout.js preset `preset`, open, `more` empty tabs
  * after it, and nothing saved. Its hub has no socket and has announced the
- * signals `signals`.
+ * signals `signals` and a device with `rpcs`, as `stubHub` takes them.
  */
-export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = []) {
+export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = []) {
   localStorage.clear();
   const ps = keys.map((k) => newPlot('time', 'overlay', k));
   const tab = makeTab('A', { plots: Object.fromEntries(ps.map((p) => [p.id, p])), layout: ps.length ? presets[preset](ps.map((p) => p.id)) : null });
   const ws = new Workspace({ tabs: [tab, ...Array.from({ length: more }, (_, i) => emptyTab(`Layout ${i + 2}`))], activeId: tab.id });
   const history = new History(ws, new Favorites(null));
   const target = document.body.appendChild(document.createElement('div'));
-  const hub = stubHub(signals);
+  const hub = stubHub(signals, rpcs);
   const app = mount(App, { target, context: new Map([['page', { hub, ws, history }]]) });
   await frames();
   return {

@@ -88,6 +88,7 @@
   const selection = new Selection(ws, () => refreshToolbar());
   const drags = new Drags(ws, refreshToolbar, history);
   drags.selection = selection;
+  setContext('selection', selection);
   drags.closePlot = (id) => closePlot(id);
   drags.axisDropAt = (plotId, x, y) => [...registry].find((pv) => pv.plotId === plotId)?.axisDropAt(x, y) ?? null;
   /** The PlotViews on the page, which the frame loop draws. */
@@ -797,7 +798,7 @@
       <SignalList session={hub.session} {drags} onAdd={addSignal} onNewPlot={newPlotWith} />
     </div>
   {:else}
-    {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} />{/key}
+    {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} panel={id} />{/key}
   {/if}
 {/snippet}
 

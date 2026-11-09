@@ -293,3 +293,62 @@ describe('a digit', () => {
     }
   });
 });
+
+describe('property rows', () => {
+  const RPCS = [
+    { name: 'gain', channel: 'setting' },
+    { name: 'offset', channel: 'setting' },
+    { name: 'temp', channel: 'report' },
+  ];
+  /** The row of property `name`, in whichever panel shows it: each name is one panel's here. */
+  const row = (name) => [...document.querySelectorAll('tr[id^=prop-]')].find((tr) => tr.textContent.includes(name));
+  const click = (el, init = {}) => {
+    el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, ...init }));
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0, ...init }));
+  };
+  const picked = () => [...document.querySelectorAll('tr[id^=prop-][aria-selected=true]')].map((tr) => tr.textContent.match(/gain|offset|temp/)?.[0]).sort();
+
+  it('and plots are never chosen together, and a row pick spans panels', async () => {
+    const page = await mountPage(KEYS, 'columns', 0, [], RPCS);
+    try {
+      const [a] = plotIds(page.ws.layout);
+      expect(row('gain'), 'the Settings panel shows its rows').toBeTruthy();
+      page.ws.selected.add(a);
+      flushSync();
+      click(row('gain'));
+      flushSync();
+      expect(page.ws.selected.size).toBe(0);
+      expect(picked()).toEqual(['gain']);
+      click(row('temp'), { ctrlKey: true });
+      flushSync();
+      expect(picked()).toEqual(['gain', 'temp']);
+      click(row('offset'));
+      flushSync();
+      expect(picked()).toEqual(['offset']);
+      const [x, y] = centre(document.querySelector(`.leaf[data-plot="${a}"] .plot-body`));
+      await commands.mouse([['move', x, y], ['down'], ['up']]);
+      flushSync();
+      expect([...page.ws.selected]).toEqual([a]);
+      expect(picked()).toEqual([]);
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('keep the plot keys from acting on any plot', async () => {
+    const page = await mountPage(KEYS, 'columns', 0, [], RPCS);
+    try {
+      const ids = plotIds(page.ws.layout);
+      click(row('gain'));
+      flushSync();
+      row('gain').closest('[role=grid]').focus();
+      for (const key of ['l', 'y', 'k', 'f', 'Delete']) await commands.key(key);
+      flushSync();
+      expect(plotIds(page.ws.layout)).toEqual(ids);
+      for (const id of ids) expect(page.ws.plots[id].legend, id).toBe(false);
+      expect(page.ws.maximized).toBe(null);
+    } finally {
+      page.dispose();
+    }
+  });
+});

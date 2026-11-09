@@ -52,7 +52,8 @@
    * the RPC channels shown, as properties.js names them, every one by
    * default.
    */
-  let { devices, channels = undefined } = $props();
+  /** `panel` names the panel, so its rows' picks are told from another panel's. */
+  let { devices, channels = undefined, panel = 'properties' } = $props();
 
   /** How long a cell shows that a write took, in ms. */
   const OK_MS = 1500;
@@ -190,23 +191,31 @@
     }
   }
 
-  // The rows picked to copy, by name, and the row a Shift pick runs from.
-  let picked = $state(new Set());
+  // The rows picked to copy, by name: this panel's of the page's row pick,
+  // which spans panels. And the row a Shift pick runs from.
+  const selection = getContext('selection');
+  const prefix = `${panel}:`;
+  const picked = $derived(new Set([...(selection?.rows ?? [])].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length))));
+  /** Makes `names` this panel's picked rows, those of other panels kept with `others`, or let go. */
+  function setPicked(names, others = false) {
+    const kept = others ? [...selection.rows].filter((k) => !k.startsWith(prefix)) : [];
+    selection.pickRows([...kept, ...[...names].map((n) => prefix + n)]);
+  }
   let anchor = 0;
-  /** Picks row `i` as a click with `e`'s keys does: alone, a run from the anchor with Shift, added or dropped with Ctrl or ⌘. */
+  /** Picks row `i` as a click with `e`'s keys does: alone, a run from the anchor with Shift, added or dropped with Ctrl or ⌘, in any panel. */
   function pick(i, e) {
     const name = rows[i]?.name;
     if (!name) return;
     if (e.shiftKey) {
       const [a, b] = [Math.min(anchor, i), Math.max(anchor, i)];
-      picked = new Set(rows.slice(a, b + 1).map((r) => r.name));
+      setPicked(rows.slice(a, b + 1).map((r) => r.name));
     } else if (e.ctrlKey || e.metaKey) {
       const next = new Set(picked);
       if (!next.delete(name)) next.add(name);
-      picked = next;
+      setPicked(next, true);
       anchor = i;
     } else {
-      picked = new Set([name]);
+      setPicked([name]);
       anchor = i;
     }
     active = i;
@@ -250,7 +259,7 @@
       return;
     }
     if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
-      picked = new Set(rows.map((r) => r.name));
+      setPicked(rows.map((r) => r.name));
       e.preventDefault();
       e.stopPropagation();
       return;
