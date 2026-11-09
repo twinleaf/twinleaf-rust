@@ -56,6 +56,18 @@ export class Workspace {
   #set(tabs) {
     this.guard?.();
     this.#tabs = frozen(tabs);
+    this.#prune();
+  }
+  /**
+   * Lets go of every plot the selection, the maximized plot and the plot
+   * clicked last name that the open tab no longer has: run whenever the
+   * tabs change, so none of them ever names a plot that is gone.
+   */
+  #prune() {
+    const plots = this.tab?.plots ?? {};
+    for (const id of [...this.selected]) if (!plots[id]) this.selected.delete(id);
+    if (this.maximized !== null && !plots[this.maximized]) this.maximized = null;
+    if (this.focusedId !== null && !plots[this.focusedId]) this.focusedId = null;
   }
   /** The open tab replaced by `fn(tab)`. */
   #edit(fn) {
@@ -66,6 +78,7 @@ export class Workspace {
   /** Puts back `tabs`, as undo and redo do: not an edit. */
   restore(tabs) {
     this.#tabs = frozen(tabs);
+    this.#prune();
   }
 
   /** Every plot id of every tab. */

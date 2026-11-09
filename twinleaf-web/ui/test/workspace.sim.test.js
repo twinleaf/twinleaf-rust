@@ -86,17 +86,17 @@ const always = (ok, ...runs) =>
   );
 
 describe('after any run of edits, undos and redos', () => {
-  // Each run breaks one by a different way of taking the plot away.
-  it.fails('the selection holds only plots of the open tab', () =>
+  // The runs tried first each take the plot away a different way.
+  it('the selection holds only plots of the open tab', () =>
     always((ws, ids) => [...ws.selected].every((i) => ids.has(i)), [{ t: 'select', at: 0 }, { t: 'reset' }]),
   );
-  it.fails('the maximized plot is one of the open tab, or none', () =>
+  it('the maximized plot is one of the open tab, or none', () =>
     always(
       (ws, ids) => ws.maximized === null || ids.has(ws.maximized),
       [{ t: 'split', at: 0, dir: 'row' }, { t: 'maximize', at: 1 }, { t: 'undo' }],
     ),
   );
-  it.fails('the plot clicked last is one of the open tab, or none', () =>
+  it('the plot clicked last is one of the open tab, or none', () =>
     always(
       (ws, ids) => ws.focusedId === null || ids.has(ws.focusedId),
       [{ t: 'split', at: 0, dir: 'row' }, { t: 'close', at: 1 }],
