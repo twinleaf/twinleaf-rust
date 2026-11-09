@@ -242,3 +242,23 @@ describe('the hub', () => {
   });
 
 });
+
+describe('the history a hub holds', () => {
+  const memory = (oldest) => ({ type: 'memory', bytes: 0, budget: 0, seconds: 0, max_age: 0, rate: 0, oldest });
+
+  it('has dropped nothing while each trace starts where it first did, however late that is', () => {
+    const s = new Session('h');
+    s.text(memory({ 0: 997, 1: 990 }));
+    s.text(memory({ 0: 997, 1: 990 }));
+    expect(s.droppedBefore([0, 1])).toBeNull();
+  });
+
+  it('has dropped what was before a trace’s oldest once that is later than it first was, the latest of the traces asked of', () => {
+    const s = new Session('h');
+    s.text(memory({ 0: 997, 1: 990 }));
+    s.text(memory({ 0: 1010, 1: 1020 }));
+    expect(s.droppedBefore([0])).toBe(1010);
+    expect(s.droppedBefore([0, 1])).toBe(1020);
+    expect(s.droppedBefore([2])).toBeNull();
+  });
+});

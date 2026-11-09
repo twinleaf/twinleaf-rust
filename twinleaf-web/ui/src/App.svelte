@@ -11,10 +11,12 @@
   // view command (the toolbar, Space, Ctrl+C, Export, the eraser, pan, zoom,
   // follow, fit y) on every plot shown, and a plot command on none
   // (selection.svelte.js `pageTargets`). Space pauses spectra too; the
-  // toolbar, pan and zoom set time plots only.
+  // toolbar, pan and zoom set time plots only. Each gesture and command
+  // that moves views is a step of the tab's view history
+  // (viewhistory.svelte.js), which each plot's Back and Forward go through.
   import { getContext, onMount, setContext, tick, untrack } from 'svelte';
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
-  import { Views } from './lib/views.js';
+  import { ViewHistory } from './lib/viewhistory.svelte.js';
   import { Drags } from './lib/drag.svelte.js';
   import { Renderer } from './lib/gl.js';
   import { plotIds } from './lib/layout.js';
@@ -84,15 +86,22 @@
   import RiCheck from '@lucide/svelte/icons/check';
   import RiChevron from '@lucide/svelte/icons/chevron-down';
 
-  // The hub, the tabs as the page edits them, their undo and redo, and the
-  // PlotViews on the page, which the frame loop draws, as main.js makes
-  // them: the panels reach the History to make a command one step.
-  const { hub, ws, history, registry } = getContext('page');
+  // The hub, the tabs as the page edits them, their undo and redo, the
+  // PlotViews on the page, which the frame loop draws, and each plot's view,
+  // as main.js makes them: the panels reach the History to make a command
+  // one step.
+  const { hub, ws, history, registry, views } = getContext('page');
   setContext('history', history);
-  const views = new Views(hub, viewChanged);
+  views.onChange = viewChanged;
+  const viewHistory = new ViewHistory(ws, views, { dropped: droppedOf, notice: (text) => toast.warning(text) });
   // What a press, a click, a key or an undo does to the plot selection: the Workspace's.
   const selection = ws.selection;
   selection.changed = () => refreshToolbar();
+  // The toolbar shows the open tab's views: opening another tab shows its.
+  $effect(() => {
+    ws.activeId;
+    untrack(refreshToolbar);
+  });
   const drags = new Drags(ws, refreshToolbar, history);
   setContext('selection', selection);
   // What the panels write to devices and run on them, and its notices
@@ -123,6 +132,8 @@
   });
   // The hub estimates the spectra of the open tab's spectrum plots only.
   $effect(() => hub.showSpectra(ws.spectrumKeys()));
+  // A tab's view history goes once neither the tabs nor an undo or redo hold the tab.
+  $effect(() => viewHistory.prune(history.held().tabs));
   // A new session, or a new decimation, drops every window, so each paused
   // plot reads its own again.
   $effect(() => {
@@ -226,6 +237,11 @@
     else ask.timer = setTimeout(run, wait);
   }
   const tracesOf = (plot) => plot.items.map((i) => hub.session.byKey.get(i.key)).filter(Boolean);
+  /** The time before which the hub has dropped what it held of plot `id`'s signals, or null when it has dropped none. */
+  function droppedOf(id) {
+    const plot = plotAnywhere(id);
+    return plot ? hub.session.droppedBefore(tracesOf(plot).map((t) => t.meta.id)) : null;
+  }
   /** Reads paused plot `id`'s whole captured history once, again only when its signals or its pause change. */
   function requestOverview(id, v) {
     const plot = plotAnywhere(id);
@@ -549,10 +565,11 @@
   });
 
   function setSpan(v) {
-    for (const vw of chosen()) vw.setSpan(v);
+    const vs = chosen();
+    viewHistory.burst('window', vs, () => vs.forEach((vw) => vw.setSpan(v)));
   }
   function followLive() {
-    for (const vw of chosen()) vw.follow(true);
+    viewHistory.step(() => chosen().forEach((vw) => vw.follow(true)));
   }
   /**
    * The toolbar's Live button: pauses every time plot of the tab while all
@@ -560,8 +577,9 @@
    * selected plots alone.
    */
   function toggleLive() {
-    const perf = performance.now();
-    for (const vw of tabViews()) live ? vw.pause(perf) : vw.follow();
+    // Whether to pause, read once: each view that moves sets `live` again.
+    const perf = performance.now(), pause = live;
+    viewHistory.step(() => tabViews().forEach((vw) => (pause ? vw.pause(perf) : vw.follow())));
     refreshToolbar();
   }
   function setDelay(ms) {
@@ -571,7 +589,9 @@
   /** Clears the cursors of plots `ids`, by default the selection's or every plot's, and says whether any were placed. */
   function clearCursors(ids = selection.pageTargets('view')) {
     let had = false;
-    for (const id of ids) had = views.get(id)?.clearCursors() || had;
+    viewHistory.step(() => {
+      for (const id of ids) had = views.get(id)?.clearCursors() || had;
+    });
     return had;
   }
   const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addSignal, newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };
@@ -711,14 +731,14 @@
       splitDown: () => splitPlots(ids, 'col', true),
       maximize: () => (ws.maximized = ids),
       close: () => closePlots(ids, true),
-      fitY: () => registry.forEach((p) => ids.includes(p.plotId) && p.autoscale()),
+      fitY: () => viewHistory.step(() => registry.forEach((p) => ids.includes(p.plotId) && p.autoscale())),
       legend: () => {
         const on = !ws.plots[lead].legend;
         eachPlot(ids, on ? 'Show the legend' : 'Hide the legend', () => ({ legend: on }));
       },
-      follow: () => ids.forEach((id) => views.of(id).follow(true)),
-      pan: () => timeViews(ids).forEach((v) => v.pan((e.shiftKey ? 1 : PAN) * (back ? -1 : 1), perf)),
-      zoom: () => timeViews(ids).forEach((v) => v.zoom(back ? ZOOM : 1 / ZOOM, v.live ? 1 : 0.5, perf)),
+      follow: () => viewHistory.step(() => ids.forEach((id) => views.of(id).follow(true))),
+      pan: () => viewHistory.burst('pan', timeViews(ids), () => timeViews(ids).forEach((v) => v.pan((e.shiftKey ? 1 : PAN) * (back ? -1 : 1), perf))),
+      zoom: () => viewHistory.burst('zoom', timeViews(ids), () => timeViews(ids).forEach((v) => v.zoom(back ? ZOOM : 1 / ZOOM, v.live ? 1 : 0.5, perf))),
     }[action];
     if (!act && !plotPickers.get(lead)?.(action)) return;
     e.preventDefault();
@@ -806,8 +826,8 @@
     // Space pauses the selected plots, or every plot, or has them follow live again.
     e.preventDefault();
     const perf = performance.now(), vs = selection.pageTargets('view').map((id) => views.of(id));
-    if (vs.some((v) => v.live)) for (const v of vs) v.pause(perf);
-    else for (const v of vs) v.follow();
+    const pause = vs.some((v) => v.live);
+    viewHistory.step(() => vs.forEach((v) => (pause ? v.pause(perf) : v.follow())));
   }
 </script>
 
@@ -825,6 +845,7 @@
         {plot}
         {hub}
         view={views.of(id)}
+        {viewHistory}
         targets={() => targetsOf(id)}
         {hover}
         {renderer}
@@ -842,7 +863,7 @@
         onEach={(what, fn) => eachPlot(targetIdsOf(id), what, fn)}
         onKey={plotKey}
         onEdit={(what, patch) => history.group(what, () => ws.setPlot(id, patch))}
-        onView={(patch) => targetIdsOf(id).forEach((i) => ws.plots[i]?.kind === ws.plots[id]?.kind && ws.setView(i, patch))}
+        onView={(patch) => viewHistory.step(() => targetIdsOf(id).forEach((i) => ws.plots[i]?.kind === ws.plots[id]?.kind && ws.setView(i, patch)))}
         targetIds={() => targetIdsOf(id)}
         onStartMove={(e) => drags.startMove(id, e)}
         onSplit={(dir) => splitPlots(targetIdsOf(id), dir)}
@@ -939,7 +960,7 @@
         <Popover.Content class="axis-pop w-auto gap-0 p-1.5" align="start" sideOffset={BAR_OFFSET}>
           <div class="axis-row">
             <span>Window</span>
-            <WindowSlider value={span} onchange={setSpan} widest={hub.liveSeconds()} />
+            <WindowSlider value={span} onchange={setSpan} onstart={() => viewHistory.begin()} onend={() => viewHistory.end()} widest={hub.liveSeconds()} />
           </div>
         </Popover.Content>
       </Popover.Root>

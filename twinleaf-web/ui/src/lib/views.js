@@ -8,11 +8,13 @@ export class Views {
   map = new Map(); // plot id -> View
   /** How far a live view trails the newest samples, in seconds. */
   delay = 0.15;
+  /** Runs with plot `id` whenever its view moves: the page's, which main.js makes the Views before. */
+  onChange = () => {};
 
-  /** `onChange(id)` runs when plot `id`'s view moves. */
+  /** `hub` gives the views the time; `onChange`, if given, is `onChange`. */
   constructor(hub, onChange) {
     this.hub = hub;
-    this.onChange = onChange;
+    if (onChange) this.onChange = onChange;
   }
 
   /** The view of plot `id`, made the first time it is asked for. */

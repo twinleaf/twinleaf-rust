@@ -264,6 +264,8 @@ export class Session {
   levels = $state.raw([]);
   /** The hub's raw history, {bytes, budget, seconds, maxAge, rate}, or null before it says. */
   memory = $state.raw(null);
+  /** The oldest time the hub held of each trace when the session first heard, by trace id: an oldest later than it since is a drop. */
+  firstHeld = {};
 
   traces = new Map(); // trace id -> Trace
   byKey = new Map(); // signal key -> Trace
@@ -341,6 +343,7 @@ export class Session {
         return;
       case 'memory':
         this.memory = { bytes: msg.bytes, budget: msg.budget, seconds: msg.seconds, maxAge: msg.max_age, rate: msg.rate, held: msg.held ?? null, oldest: msg.oldest ?? {} };
+        for (const [id, t] of Object.entries(this.memory.oldest)) this.firstHeld[id] ??= t;
         return;
       case 'routes':
         this.mounts = msg.mounts;
@@ -405,6 +408,20 @@ export class Session {
   // ever drawn blank while a detail window is on its way.
 
   /** The `layer` window, 'detail' or 'overview', of `trace` that plot `plotId` last read, if any. */
+  /**
+   * The time before which the hub has dropped samples it held this session
+   * of traces `ids`, the latest of theirs, or null when it has dropped none:
+   * before its oldest time, a trace that has dropped nothing never had any.
+   */
+  droppedBefore(ids) {
+    let at = null;
+    for (const id of ids) {
+      const oldest = this.memory?.oldest?.[id], first = this.firstHeld[id];
+      if (oldest !== undefined && first !== undefined && oldest > first) at = Math.max(at ?? -Infinity, oldest);
+    }
+    return at;
+  }
+
   windowOf(plotId, layer, trace) {
     return this.windows.get(plotId)?.[layer].get(trace);
   }

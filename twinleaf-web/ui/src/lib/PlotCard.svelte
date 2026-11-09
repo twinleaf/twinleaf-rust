@@ -33,6 +33,8 @@
   import RiDraggable from '@lucide/svelte/icons/grip-vertical';
   import RiSplitH from '@lucide/svelte/icons/columns-2';
   import RiSplitV from '@lucide/svelte/icons/rows-2';
+  import RiBack from '@lucide/svelte/icons/arrow-left';
+  import RiForward from '@lucide/svelte/icons/arrow-right';
   import RiFullscreen from '@lucide/svelte/icons/maximize-2';
   import RiFullscreenExit from '@lucide/svelte/icons/minimize-2';
   import RiClose from '@lucide/svelte/icons/x';
@@ -60,7 +62,7 @@
     targetPlots = () => [plot],
     onFocus, onPress, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
     onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
-    onEach, targetIds = () => [plot.id], onKey,
+    onEach, targetIds = () => [plot.id], onKey, viewHistory,
   } = $props();
 
   /** Runs `fn(pv)` on the PlotView of each plot a command here acts on. */
@@ -68,6 +70,8 @@
     const ids = targetIds();
     for (const p of registry) if (ids.includes(p.plotId)) fn(p);
   };
+  /** Runs `fn`, a command here that moves the views, as one view step, however many plots it moves. */
+  const asStep = (fn) => viewHistory.step(fn);
   /**
    * Runs `fn(pv, axis)` for a command made on this plot's y axis `key`, on
    * the PlotView of each plot the command acts on, `axis` the key of that
@@ -275,7 +279,7 @@
     else {
       boundsError = '';
       // A log axis takes no bound at or below zero, and is left as it is.
-      eachAxis(region.keys[0], (p, axis) => !(p.logY && lo <= 0) && p.setYBounds([axis], lo, hi));
+      asStep(() => eachAxis(region.keys[0], (p, axis) => !(p.logY && lo <= 0) && p.setYBounds([axis], lo, hi)));
       boundsShown = { ...bounds };
       return true;
     }
@@ -304,10 +308,8 @@
     if (e.key === 'Enter' && applyBounds()) axisOpen = false;
   }
 
-  /** Runs `fn(view)` on the view of each plot a command here acts on. */
-  const forTargets = (fn) => {
-    for (const v of targets()) fn(v);
-  };
+  /** Runs `fn(view)` on the view of each plot a command here acts on, as one view step. */
+  const forTargets = (fn) => viewHistory.step(() => targets().forEach(fn));
 
   // The signals menu: every signal the plot does not show, filtered by a
   // substring of its name, and kept open so several can be added at once.
@@ -408,8 +410,9 @@
   let windowSpan = $state(10);
   /** Pauses the plot and the plots linked to it, or has them follow live again. */
   function playPause() {
-    const perf = performance.now();
-    forTargets((v) => (view.live ? v.pause(perf) : v.follow()));
+    // Whether to pause, read once: this plot's own view may be the first to move.
+    const perf = performance.now(), pause = view.live;
+    forTargets((v) => (pause ? v.pause(perf) : v.follow()));
   }
 
   onMount(() => {
@@ -425,7 +428,8 @@
       renderer,
       onFocus,
       onFrequencies: (lo, hi) => onView({ fRange: [lo, hi] }),
-      onFitY: (key) => eachAxis(key, (p, axis) => p.fit([axis])),
+      onFitY: (key) => asStep(() => eachAxis(key, (p, axis) => p.fit([axis]))),
+      viewHistory,
       config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null }),
     });
     registry.add(pv);
@@ -439,6 +443,7 @@
     windowSpan = view.window;
     const unwatch = view.onChange(() => ((streaming = view.live), (windowSpan = view.window)));
     return () => {
+      pv.letGo();
       clearInterval(poll);
       unwatch();
       sizing.disconnect();
@@ -877,8 +882,9 @@
         tabindex={-1}
         onclick={playPause}
       />
-      <IconButton icon={RiSplitH} label="Split right" keys={['|']} class="split" tabindex={-1} onclick={() => onSplit('row')} />
-      <IconButton icon={RiSplitV} label="Split down" keys={['−']} class="split" tabindex={-1} onclick={() => onSplit('col')} />
+      <!-- Back and Forward through the views of the tab's plots (viewhistory.svelte.js). -->
+      <IconButton icon={RiBack} label="Back to the view before" class="view-step" disabled={!viewHistory.canBack} tabindex={-1} onclick={() => viewHistory.back()} />
+      <IconButton icon={RiForward} label="Forward to the view after" class="view-step" disabled={!viewHistory.canForward} tabindex={-1} onclick={() => viewHistory.forward()} />
       <IconButton icon={maximized ? RiFullscreenExit : RiFullscreen} label={maximized ? 'Restore' : 'Maximize'} keys={['F']} class="maximize" tabindex={-1} onclick={() => onMaximize(false)} />
       <IconButton icon={RiClose} label="Close plot" keys={['Delete']} tabindex={-1} onclick={() => onRemove()} />
     </div>
@@ -893,7 +899,7 @@
         {#if plot.kind === 'time'}
           <span class="axis-tools">
             <Tip text={view.live ? 'Pause' : 'Follow live'} keys={['Space']}>
-              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={view.live ? 'Pause' : 'Follow live'} onclick={() => forTargets((v) => (view.live ? v.pause(performance.now()) : v.follow()))}>{#if view.live}<RiPause />{:else}<RiPlay />{/if}</button>{/snippet}
+              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={view.live ? 'Pause' : 'Follow live'} onclick={playPause}>{#if view.live}<RiPause />{:else}<RiPlay />{/if}</button>{/snippet}
             </Tip>
           </span>
         {/if}
@@ -901,7 +907,7 @@
       {#if plot.kind === 'time'}
         <div class="axis-row">
           <span>Window</span>
-          <WindowSlider value={windowSpan} onchange={(s) => forTargets((v) => v.setSpan(s))} widest={hub.liveSeconds()} />
+          <WindowSlider value={windowSpan} onchange={(s) => viewHistory.burst('window', targets(), () => forTargets((v) => v.setSpan(s)))} onstart={() => viewHistory.begin()} onend={() => viewHistory.end()} widest={hub.liveSeconds()} />
         </div>
       {:else}
         <!-- The range as a phrase, low to high, in Hz, with the fit to every bin beside it. -->
@@ -925,13 +931,13 @@
       <div class="axis-row" role="group" aria-label="X cursors">
         <span>Cursors</span>
         <Tip text="Add X1 and X2">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" onclick={() => (eachPv((p) => p.addXCursors()), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" onclick={() => (asStep(() => eachPv((p) => p.addXCursors())), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
         </Tip>
         <Tip text="Zoom to X1–X2" keys={['Ctrl', 'drag']}>
           {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Zoom to the X cursors" onclick={() => (pv?.zoomToCursors(), (xAxisOpen = false))}><RiZoomTo /></button>{/snippet}
         </Tip>
         <Tip text="Clear the X cursors">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear the X cursors" onclick={() => (eachPv((p) => p.clearXCursors()), (xAxisOpen = false))}><RiEraser /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear the X cursors" onclick={() => (asStep(() => eachPv((p) => p.clearXCursors())), (xAxisOpen = false))}><RiEraser /></button>{/snippet}
         </Tip>
       </div>
     </Popover.Content>
@@ -961,7 +967,7 @@
         <span>to</span>
         <input aria-label="Highest value shown" type="text" inputmode="decimal" bind:value={bounds.hi} onkeydown={boundsKey} onblur={applyBounds} />
         <Tip text="Fit to the data" keys={['double-click']}>
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Fit to the data" onclick={() => (eachAxis(region.keys[0], (p, axis) => p.fit([axis])), (axisOpen = false))}><RiFit /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Fit to the data" onclick={() => (asStep(() => eachAxis(region.keys[0], (p, axis) => p.fit([axis]))), (axisOpen = false))}><RiFit /></button>{/snippet}
         </Tip>
       </div>
       {#if plot.kind === 'spectrum'}
@@ -977,10 +983,10 @@
       <div class="axis-row" role="group" aria-label="Y cursors">
         <span>Cursors</span>
         <Tip text="Add Y1 and Y2 on this axis">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (eachAxis(region.keys[0], (p, axis) => p.addYCursors(axis)), (axisOpen = false))}><RiYCursors /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (asStep(() => eachAxis(region.keys[0], (p, axis) => p.addYCursors(axis))), (axisOpen = false))}><RiYCursors /></button>{/snippet}
         </Tip>
         <Tip text="Clear this axis's cursors">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (eachAxis(region.keys[0], (p, axis) => p.clearYCursors(axis)), (axisOpen = false))}><RiEraser /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (asStep(() => eachAxis(region.keys[0], (p, axis) => p.clearYCursors(axis))), (axisOpen = false))}><RiEraser /></button>{/snippet}
         </Tip>
       </div>
       {#if boundsError}<div class="axis-error">{boundsError}</div>{/if}
@@ -1089,8 +1095,8 @@
                   <ContextMenu.Item onSelect={copyReadout}><RiCopy class="menu-icon" />Copy table{@render value(counted((c.x ? 1 + plot.items.length : 0) + c.ys.length, 'row'))}</ContextMenu.Item>
                   {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2{@render span()}</ContextMenu.Item>{/if}
                   <ContextMenu.Separator />
-                  {#if c.x}<ContextMenu.Item onSelect={() => eachPv((p) => p.clearXCursors())}><RiXCursors class="menu-icon" />Clear X cursors{@render value(xFirst())}</ContextMenu.Item>{/if}
-                  {#if c.ys.length}<ContextMenu.Item onSelect={() => eachPv((p) => p.clearYCursors())}><RiYCursors class="menu-icon" />Clear Y cursors{@render value(counted(targetPvs().reduce((n, p) => n + p.yCursorAxes(), 0), 'axis', 'axes'))}</ContextMenu.Item>{/if}
+                  {#if c.x}<ContextMenu.Item onSelect={() => asStep(() => eachPv((p) => p.clearXCursors()))}><RiXCursors class="menu-icon" />Clear X cursors{@render value(xFirst())}</ContextMenu.Item>{/if}
+                  {#if c.ys.length}<ContextMenu.Item onSelect={() => asStep(() => eachPv((p) => p.clearYCursors()))}><RiYCursors class="menu-icon" />Clear Y cursors{@render value(counted(targetPvs().reduce((n, p) => n + p.yCursorAxes(), 0), 'axis', 'axes'))}</ContextMenu.Item>{/if}
                   <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors{@render value(placed())}</ContextMenu.Item>
                 </ContextMenu.Content>
               </ContextMenu.Root>
@@ -1123,8 +1129,8 @@
       {/if}
       <ContextMenu.Label>Cursors</ContextMenu.Label>
       <!-- Cursors are dragged out of the axes; these place a pair in view. -->
-      <ContextMenu.Item onSelect={() => eachPv((p) => p.addXCursors())}><RiXCursors class="menu-icon" />Add X cursors{@render span()}</ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => eachAxis(region.keys?.[0], (p, axis) => p.addYCursors(axis))}><RiYCursors class="menu-icon" />Add Y cursors{@render value(yLands(region.keys?.[0]))}</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => asStep(() => eachPv((p) => p.addXCursors()))}><RiXCursors class="menu-icon" />Add X cursors{@render span()}</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => asStep(() => eachAxis(region.keys?.[0], (p, axis) => p.addYCursors(axis)))}><RiYCursors class="menu-icon" />Add Y cursors{@render value(yLands(region.keys?.[0]))}</ContextMenu.Item>
       <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors{@render value(placed())}</ContextMenu.Item>
       <ContextMenu.Label>Show</ContextMenu.Label>
       <ContextMenu.Sub>

@@ -220,7 +220,7 @@ describe('Y cursors', () => {
   // A plot of one shared y axis, 0 to 10 over a 100 px lane from y = 0.
   const plot = (kind = 'time', view = new View({ now: () => 0 })) => {
     const cfg = { kind };
-    const pv = Object.assign(Object.create(PlotView.prototype), { config: () => cfg, view, log: false });
+    const pv = Object.assign(Object.create(PlotView.prototype), { config: () => cfg, view, viewHistory: { step: (fn) => fn() }, log: false });
     pv.yAxes = [{ key: 'shared', lane: { x: 40, y: 0, w: 200, h: 100 }, range: [0, 10], x0: 0, x1: 40 }];
     return { pv, cfg };
   };
@@ -260,7 +260,7 @@ describe('Y cursors', () => {
 });
 
 describe('A plot’s view', () => {
-  const plot = (cfg, view) => Object.assign(Object.create(PlotView.prototype), { config: () => cfg, view });
+  const plot = (cfg, view) => Object.assign(Object.create(PlotView.prototype), { config: () => cfg, view, viewHistory: { step: (fn) => fn() } });
   it('holds its y ranges, so a plot drawn again with it finds them', () => {
     const view = new View({ now: () => 0 }), cfg = { kind: 'time' };
     plot(cfg, view).setYBounds(['shared'], 1, 2);
@@ -272,6 +272,16 @@ describe('A plot’s view', () => {
     view.pause(0);
     t.spectrum = 'second';
     expect(plot({ kind: 'spectrum' }, view).spectrumOf(t)).toBe('first');
+  });
+  it('fits a time plot’s y at once to what its last frame showed, so a fit is a change made then', () => {
+    const view = new View({ now: () => 0 }), pv = plot({ kind: 'time' }, view);
+    pv.setYBounds(['shared'], 5, 6);
+    pv.extents = new Map([['shared', [-1, 1]]]);
+    pv.fit(['shared']);
+    expect(pv.yBounds('shared')).toEqual([-1.16, 1.16]);
+    pv.setYBounds(['shared'], 5, 6);
+    pv.autoscale();
+    expect(view.state().yRanges).toEqual({ time: { shared: [-1.16, 1.16] } });
   });
   it('clears every cursor in one place, time X cursors with the rest', () => {
     const view = new View({ now: () => 0 });

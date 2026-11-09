@@ -2,11 +2,16 @@
   // The time window's control, in the top bar's popover and a time axis's: a
   // slider along a log scale that settles into a preset's detent near it, and
   // the exact window, to read or type, at its end (window.js).
+  import { onDestroy } from 'svelte';
   import { SPANS } from './constants.js';
   import { nextPreset, positionOf, windowFrom, windowText, windowTyped } from './window.js';
 
-  /** `value` is the window shown, in seconds, `onchange` sets one, and a typed one goes up to `widest`. */
-  let { value, onchange, widest } = $props();
+  /**
+   * `value` is the window shown, in seconds, `onchange` sets one, and a
+   * typed one goes up to `widest`. `onstart` and `onend` run as a drag
+   * of the slider starts and ends, so what it sets on the way is one change.
+   */
+  let { value, onchange, widest, onstart = () => {}, onend = () => {} } = $props();
 
   let track = $state();
   /** The rail's span inside the track, which positions are fractions of. */
@@ -24,10 +29,18 @@
     // The slider owns the press: it neither starts nor extends a text selection, and it takes focus itself.
     e.preventDefault();
     dragging = true;
+    onstart();
     track.setPointerCapture(e.pointerId);
     track.focus();
     onchange(at(e));
   }
+  /** Ends a drag: its release, or the slider going, as its popover closes under it. */
+  function release() {
+    if (!dragging) return;
+    dragging = false;
+    onend();
+  }
+  onDestroy(release);
   /** The arrows step from preset to preset, with Shift by a twentieth. */
   function key(e) {
     const dir = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1 }[e.key];
@@ -58,8 +71,8 @@
     style="--at: {positionOf(value) * 100}%"
     onpointerdown={down}
     onpointermove={(e) => dragging && onchange(at(e))}
-    onpointerup={() => (dragging = false)}
-    onpointercancel={() => (dragging = false)}
+    onpointerup={release}
+    onpointercancel={release}
     onkeydown={key}
   >
     <span class="scale" bind:this={scale}>

@@ -97,6 +97,15 @@ export class History {
     return e.label;
   }
 
+  /** The ids of every tab and every plot the tabs hold, or an undo or a redo would bring back: {tabs, plots}, each a Set. */
+  held() {
+    const tabs = new Set(), plots = new Set();
+    const add = (ts) => ts.forEach((t) => (tabs.add(t.id), Object.keys(t.plots).forEach((id) => plots.add(id))));
+    add(this.ws.tabs);
+    for (const e of [...this.undos, ...this.redos]) (add(e.before.tabs), add(e.after.tabs));
+    return { tabs, plots };
+  }
+
   /** What steps change: the tabs, as the frozen value they are, and the starred names. */
   #read() {
     return { tabs: this.ws.tabs, favorites: [...this.favorites.names].sort() };

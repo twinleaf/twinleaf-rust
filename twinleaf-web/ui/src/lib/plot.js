@@ -433,10 +433,12 @@ export class PlotView {
    * time view, which it draws. `targets` returns
    * the views a gesture on this plot acts on: every selected plot's, when
    * this one is selected, or else its own. `hoverTime` holds the time under the
-   * pointer, which every time plot draws a line at.
+   * pointer, which every time plot draws a line at. `viewHistory` is the
+   * page's ViewHistory: each drag, burst of wheel turns and command here
+   * that moves the views is a step of it.
    */
-  constructor({ body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY }) {
-    Object.assign(this, { body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY });
+  constructor({ body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, viewHistory }) {
+    Object.assign(this, { body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, viewHistory });
     this.zoomBand = null; // [x0, x1] in client px while a Ctrl+drag marks a range to zoom to
     this.ctx = overlay.getContext('2d');
     this.specHover = null;
@@ -529,7 +531,7 @@ export class PlotView {
    * The y range of `key`, given the extent [lo, hi] of what it shows now.
    *
    * With `hold`, as a time plot asks, the range fits that extent once, when
-   * it first has data and again each time `autoscale` asks. Between fits it
+   * it first has data, and again at each `refit`. Between fits it
    * holds, as a scope's vertical scale does, so zooming, panning and a
    * passing burst never rescale it. Without, as a spectrum asks, whose first
    * estimates are rough, it follows the extent, growing at once and
@@ -539,12 +541,8 @@ export class PlotView {
     let st = this.y.get(key);
     if (!st) this.y.set(key, (st = { range: null, auto: true }));
     if (!st.auto && st.range) return st.range;
-    if (!isFinite(lo) || !isFinite(hi)) return st.range ?? [-1, 1];
-    if (lo === hi) {
-      lo -= 0.5;
-      hi += 0.5;
-    }
-    const pad = (hi - lo) * 0.08, want = [lo - pad, hi + pad], cur = st.range;
+    const want = fitted(lo, hi), cur = st.range;
+    if (!want) return st.range ?? [-1, 1];
     if (hold) {
       st.range = want;
       st.auto = false;
@@ -626,12 +624,13 @@ export class PlotView {
     if (!this.view.live && this.view.pausedAt !== null) hi = this.view.pausedAt;
     this.history = lo < hi ? [lo, hi] : null;
     this.view.limits = this.view.live ? null : this.history;
-    // Shared ranges take the union of their traces.
+    // Shared ranges take the union of their traces. A fit fits to what this frame shows.
     const ext = new Map();
     for (const p of plans) {
       const k = this.rangeKey(cfg, p.t), e = ext.get(k) ?? [Infinity, -Infinity];
       ext.set(k, [Math.min(e[0], p.lo), Math.max(e[1], p.hi)]);
     }
+    this.extents = ext;
     const ranges = new Map([...ext].map(([k, [lo, hi]]) => [k, this.yRange(k, lo, hi, true)]));
     plans.forEach((p) => {
       const lane = geo.lanes[this.laneOf(cfg, p.index)];
@@ -1374,10 +1373,10 @@ export class PlotView {
     else for (const v of this.targets()) v.show(a, b, performance.now());
   }
 
-  /** Zooms to the time or frequencies between X1 and X2, when both are placed. */
+  /** Zooms to the time or frequencies between X1 and X2, when both are placed, as one view step. */
   zoomToCursors() {
     const { a, b } = this.markers();
-    if (a !== null && b !== null) this.showRange(Math.min(a, b), Math.max(a, b));
+    if (a !== null && b !== null) this.viewHistory.step(() => this.showRange(Math.min(a, b), Math.max(a, b)));
   }
 
   /** The tab at (x, y) a cursor not yet placed rests as, if any. */
@@ -1437,28 +1436,34 @@ export class PlotView {
     return a ? this.axisScale(a).invert(clientY) : null;
   }
 
-  /** Places X1 and X2 a third of the way in from each side of the view, pausing a time plot, as dragging them out does. */
+  /** Places X1 and X2 a third of the way in from each side of the view, pausing a time plot, as dragging them out does, as one view step. */
   addXCursors() {
     const P = this.geo?.plot;
     if (!P || !this.xd) return;
-    if (this.config().kind === 'time') for (const v of this.targets()) v.pause(performance.now());
-    this.setMarker('a', this.dataAt(P.x + P.w / 3));
-    this.setMarker('b', this.dataAt(P.x + (2 * P.w) / 3));
+    this.viewHistory.step(() => {
+      if (this.config().kind === 'time') for (const v of this.targets()) v.pause(performance.now());
+      this.setMarker('a', this.dataAt(P.x + P.w / 3));
+      this.setMarker('b', this.dataAt(P.x + (2 * P.w) / 3));
+    });
   }
 
-  /** Places Y1 and Y2 a third of the way in from the bottom and top of y axis `key`, or of the first axis. */
+  /** Places Y1 and Y2 a third of the way in from the bottom and top of y axis `key`, or of the first axis, as one view step. */
   addYCursors(key) {
     const a = this.yAxes.find((a) => a.key === key) ?? this.yAxes[0];
     if (!a) return;
     const sy = this.axisScale(a);
-    this.setYCursor(a.key, 'a', sy.invert(a.lane.y + (2 * a.lane.h) / 3));
-    this.setYCursor(a.key, 'b', sy.invert(a.lane.y + a.lane.h / 3));
+    this.viewHistory.step(() => {
+      this.setYCursor(a.key, 'a', sy.invert(a.lane.y + (2 * a.lane.h) / 3));
+      this.setYCursor(a.key, 'b', sy.invert(a.lane.y + a.lane.h / 3));
+    });
   }
 
-  /** Removes X1 and X2. */
+  /** Removes X1 and X2, as one view step. */
   clearXCursors() {
-    this.setMarker('a', null);
-    this.setMarker('b', null);
+    this.viewHistory.step(() => {
+      this.setMarker('a', null);
+      this.setMarker('b', null);
+    });
   }
 
   /** Whether y axis `key` has a Y cursor placed. */
@@ -1467,10 +1472,9 @@ export class PlotView {
     return !!yc && (yc.a !== null || yc.b !== null);
   }
 
-  /** Removes the Y cursors of y axis `key`, or with none, of every y axis. */
+  /** Removes the Y cursors of y axis `key`, or with none, of every y axis, as one view step. */
   clearYCursors(key) {
-    if (key === undefined) this.yCursors.clear();
-    else this.yCursors.delete(key);
+    this.viewHistory.step(() => (key === undefined ? this.yCursors.clear() : this.yCursors.delete(key)));
   }
 
   /** How many cursors are placed: X1 and X2, and each Y1 and Y2 of every kind. */
@@ -1571,22 +1575,37 @@ export class PlotView {
     return this.logY ? range.map((v) => 10 ** v) : [...range];
   }
 
-  /** Sets the y range of `keys` to [lo, hi], in the units the axis shows, to hold until a fit. */
+  /** Sets the y range of `keys` to [lo, hi], in the units the axis shows, to hold until a fit, as one view step. */
   setYBounds(keys, lo, hi) {
-    for (const k of keys) {
-      let st = this.y.get(k);
-      if (!st) this.y.set(k, (st = { range: null, auto: false }));
-      st.auto = false;
-      st.range = this.logY ? [Math.log10(lo), Math.log10(hi)] : [lo, hi];
-    }
+    this.viewHistory.step(() => {
+      for (const k of keys) {
+        let st = this.y.get(k);
+        if (!st) this.y.set(k, (st = { range: null, auto: false }));
+        st.auto = false;
+        st.range = this.logY ? [Math.log10(lo), Math.log10(hi)] : [lo, hi];
+      }
+    });
   }
 
-  /** Fits the y range of `keys` to what they show, on the next frame. */
+  /** Fits the y range of `keys` to what they show, as one view step. */
   fit(keys) {
-    for (const k of keys) {
-      const st = this.y.get(k);
-      if (st) st.auto = true;
-    }
+    this.viewHistory.step(() => {
+      for (const k of keys) {
+        const st = this.y.get(k);
+        if (st) this.refit(k, st);
+      }
+    });
+  }
+
+  /**
+   * Fits `st`, the y range of key `k`: a time plot's at once, to what it
+   * showed at the last frame, or on the next before it has shown any; a
+   * spectrum's to follow what it shows.
+   */
+  refit(k, st) {
+    const e = this.config().kind === 'time' ? this.extents?.get(k) : null, want = e && fitted(...e);
+    if (want) Object.assign(st, { range: want, auto: false });
+    else st.auto = true;
   }
 
   /** The y axis band (x, y) is over, {side, slot, x0, x1, keys}, or null. */
@@ -1648,19 +1667,24 @@ export class PlotView {
         const lane = this.geo?.lanes.find((l) => e.clientY >= l.y && e.clientY <= l.y + l.h) ?? this.geo?.lanes[0];
         if (!lane) return;
         const at = (lane.y + lane.h - e.clientY) / lane.h;
-        for (const k of keys) {
-          const st = this.y.get(k);
-          if (!st?.range) continue;
-          const [a, b] = st.range, v = a + at * (b - a);
-          st.auto = false;
-          st.range = [v - (v - a) * factor, v + (b - v) * factor];
-        }
+        // This plot's y alone, a burst of its own kind.
+        this.viewHistory.burst('zoomY', [this.view], () => {
+          for (const k of keys) {
+            const st = this.y.get(k);
+            if (!st?.range) continue;
+            const [a, b] = st.range, v = a + at * (b - a);
+            st.auto = false;
+            st.range = [v - (v - a) * factor, v + (b - v) * factor];
+          }
+        });
       } else if (isTime()) {
         // Over the time axis a live view zooms about its newest edge and goes
         // on streaming; over the plot it zooms about the pointer, which holds
         // that moment, so it pauses.
-        const axis = onAxis(e);
-        for (const v of this.targets()) v.zoom(factor, axis && v.live ? 1 : fracX(e.clientX), performance.now(), this.liveEdge());
+        const axis = onAxis(e), vs = this.targets();
+        this.viewHistory.burst('zoom', vs, () => {
+          for (const v of vs) v.zoom(factor, axis && v.live ? 1 : fracX(e.clientX), performance.now(), this.liveEdge());
+        });
       }
     }, { passive: false });
     // The band under the plot holds the x axis.
@@ -1676,11 +1700,13 @@ export class PlotView {
     // axis and 'y' on a y axis wait to learn their direction, a pull across
     // the axis into the plot drawing a cursor out of it, as a guide comes off
     // a ruler, and a drag along it seeking ('seek', the time axis only) or
-    // offsetting ('y'); 'plot' pans; 'none' does nothing more.
+    // offsetting ('y'); 'plot' pans; 'none' does nothing more. A drag, from
+    // its press to its release, is one view step.
     el.addEventListener('pointerdown', (e) => {
       this.onFocus?.();
       if (e.button !== 0) return;
       el.setPointerCapture(e.pointerId);
+      this.viewHistory.begin();
       const tab = this.tabAt(e.clientX, e.clientY);
       const ycursor = tab ? null : this.yCursorNear(e.clientX, e.clientY);
       const cursor = tab || ycursor ? null : this.cursorNear(e.clientX);
@@ -1796,15 +1822,17 @@ export class PlotView {
       }
       // A range marked with Ctrl, wider than a slip, zooms to it.
       if (drag?.mode === 'zoom' && this.zoomBand && Math.abs(this.zoomBand[1] - this.zoomBand[0]) >= DRAG_START) this.zoomTo(...this.zoomBand);
-      this.zoomBand = null;
-      drag = null;
-      this.seeking = false;
+      this.letGo();
     });
-    el.addEventListener('pointercancel', () => {
+    /** Ends the drag under way, if any, its view step with it: as its release does, or the pointer lost, or the plot going. */
+    this.letGo = () => {
       this.zoomBand = null;
-      drag = null;
       this.seeking = false;
-    });
+      if (!drag) return;
+      drag = null;
+      this.viewHistory.end();
+    };
+    el.addEventListener('pointercancel', () => this.letGo());
     el.addEventListener('pointerleave', () => {
       this.setMarker('hover', null);
       this.axisHover = null;
@@ -1820,13 +1848,15 @@ export class PlotView {
       if (onAxis(e)) return;
       const band = this.yAxisAt(e.clientX, e.clientY);
       if (band) this.onFitY ? this.onFitY(this.axisTargets(band, e.clientY)[0]) : this.autoscale();
-      else for (const v of this.targets()) v.follow(true);
+      else this.viewHistory.step(() => this.targets().forEach((v) => v.follow(true)));
     });
   }
 
-  /** Fits every y range to what it shows, on the next frame. */
+  /** Fits every y range to what it shows, as one view step. */
   autoscale() {
-    for (const st of this.y.values()) st.auto = true;
+    this.viewHistory.step(() => {
+      for (const [k, st] of this.y) this.refit(k, st);
+    });
   }
 
   /**
@@ -1861,6 +1891,36 @@ const TAB = { w: 22, h: 14 };
 const X_LABEL_GAP = 8;
 /** How far into the plot, in px, a signal dropped beside an axis still joins that side's axes. */
 const AXIS_DROP = 48;
+
+/** A y range fitted to values from `lo` to `hi`, with room above and below, or null when they are not numbers. */
+function fitted(lo, hi) {
+  if (!isFinite(lo) || !isFinite(hi)) return null;
+  if (lo === hi) (lo -= 0.5), (hi += 0.5);
+  const pad = (hi - lo) * 0.08;
+  return [lo - pad, hi + pad];
+}
+
+/** Of `m`, kind -> key -> value, the values `keep` takes, as `copy` gives them, in an object by kind and key in their order. */
+function byKindOf(m, keep, copy) {
+  const out = {};
+  for (const [kind, byKey] of [...m].sort(([a], [b]) => (a < b ? -1 : 1)))
+    for (const [key, v] of [...byKey].sort(([a], [b]) => (a < b ? -1 : 1))) if (keep(v)) (out[kind] ??= {})[key] = copy(v);
+  return out;
+}
+/** The maps, kind -> key -> value, of `o`, an object `byKindOf` gave, each value as `make` makes it. */
+const mapsOf = (o, make) => new Map(Object.entries(o).map(([kind, byKey]) => [kind, new Map(Object.entries(byKey).map(([key, v]) => [key, make(v)]))]));
+
+/**
+ * Whether View states `a` and `b`, as `state` gives them, show the same.
+ * Where a live view's edge was does not count, as it moves with the newest
+ * samples; held spectra count by which they are.
+ */
+export function sameView(a, b) {
+  const plain = ({ spectra, ...s }) => JSON.stringify(s.live ? { ...s, right: null, pausedAt: null } : s);
+  if (plain(a) !== plain(b)) return false;
+  if (!a.spectra || !b.spectra) return !a.spectra === !b.spectra;
+  return a.spectra.size === b.spectra.size && [...a.spectra].every(([t, sp]) => b.spectra.get(t) === sp);
+}
 
 /**
  * What one plot shows: a time plot's x range, live, trailing the newest
@@ -2007,6 +2067,42 @@ export class View {
     this.specCursors = { a: null, b: null };
     this.yCursorsByKind.clear();
     return had;
+  }
+
+  /**
+   * What the view shows, as a value a view history step keeps: live or
+   * paused and where, its span and window, every cursor placed, the y
+   * ranges it holds (one that fits itself to the data is left out), and,
+   * paused, the spectra it holds. `sameView` compares two.
+   */
+  state() {
+    const { live, window, span, right, pausedAt } = this;
+    return {
+      live, window, span, right, pausedAt,
+      cursors: { ...this.cursors },
+      specCursors: { ...this.specCursors },
+      yCursors: byKindOf(this.yCursorsByKind, (c) => c.a !== null || c.b !== null, (c) => ({ a: c.a, b: c.b })),
+      yRanges: byKindOf(this.yByKind, (st) => !st.auto && !!st.range, (st) => [...st.range]),
+      spectra: live ? null : new Map(this.spectra),
+    };
+  }
+
+  /**
+   * Shows `s`, a value `state` gave, again at page time `perf`: a live
+   * one follows the newest samples, and a paused one ends no later than
+   * they do. A y range it does not hold fits itself to the data again.
+   */
+  restore(s, perf) {
+    const newest = this.hub.now(perf) - this.delay;
+    Object.assign(this, { live: s.live, window: s.window, span: s.span, limits: null });
+    if (s.live) this.pausedAt = null;
+    else [this.right, this.pausedAt] = [Math.min(s.right, newest), Math.min(s.pausedAt ?? s.right, newest)];
+    this.cursors = { ...s.cursors };
+    this.specCursors = { ...s.specCursors };
+    this.yCursorsByKind = mapsOf(s.yCursors, (c) => ({ ...c }));
+    this.yByKind = mapsOf(s.yRanges, (range) => ({ range: [...range], auto: false }));
+    this.spectra = new Map(s.spectra ?? []);
+    this.notify();
   }
 
   onChange(fn) {

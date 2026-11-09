@@ -55,10 +55,13 @@ describe('a control that edits', () => {
   it('a chip’s × removes its signal', () =>
     oneStep(/^Remove sine\.sine/, (page) => plotEl(page).querySelector('button[aria-label="Remove sine.sine"]').click()));
 
-  it('a plot’s split button adds a plot beside it', () =>
+  it('a plot’s Split right, in its menu, adds a plot beside it', () =>
     oneStep(/^Split/, async (page) => {
-      await commands.mouse([['move', ...centre(plotEl(page))]]);
-      plotEl(page).querySelector('button[aria-label^="Split"]').click();
+      const body = plotEl(page).querySelector('.plot-body'), [x, y] = centre(body);
+      body.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: x, clientY: y }));
+      flushSync();
+      await frames();
+      [...document.querySelectorAll('[role=menuitem]')].find((m) => m.textContent.trim().startsWith('Split right')).click();
     }));
 
   it('a tab’s duplicate button copies the tab', () =>

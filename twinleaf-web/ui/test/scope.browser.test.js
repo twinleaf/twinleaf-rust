@@ -5,7 +5,8 @@
 // any part of a plot selects that plot first unless it is selected already
 // (round 1 #2), so what its menu does acts on what is selected. A command
 // made on a y axis acts, on each plot, on its axis in the same units, and
-// leaves a plot with none alone.
+// leaves a plot with none alone; whatever plots it changes, it is one view
+// step, which one Back takes back (round 2, View history #6).
 import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
@@ -345,6 +346,18 @@ async function axesPage() {
   await settle();
   return { page, plots: { A: a, B: b, C: c, D: d } };
 }
+/** What every plot of the page shows, as view history steps keep it, in one string. */
+const shows = (page) =>
+  JSON.stringify(plotIds(page.ws.layout).map((id) => {
+    const { spectra, ...s } = page.views.get(id).state();
+    return [s.live ? { ...s, right: null, pausedAt: null } : s, page.ws.plots[id].fRange ?? null];
+  }));
+/** Presses Back in plot `id`'s header, the pointer brought over the plot first so its header shows it. */
+async function back(id) {
+  await commands.mouse([['move', ...centre(leafOf(id))]]);
+  await commands.mouse([['move', ...centre(leafOf(id).querySelector('.plot-head button[aria-label^="Back"]'))], ['down'], ['up']]);
+  await settle();
+}
 /** Every y axis of the page, as [plot name, axis key]. */
 const axesOf = (page, plots) => Object.entries(plots).flatMap(([name, id]) => page.pv(id).yAxes.map((x) => [name, x.key]));
 /** Where y axis `key` of plot `id` is, in client px. */
@@ -413,10 +426,16 @@ describe('a command made on a y axis', () => {
           const axes = axesOf(page, plots);
           expect(axes.length, `every axis drawn: ${axes.join(' ')}`).toBe(5);
           if (prepare) for (const [n, k] of axes) prepare(page.pv(plots[n]), k);
+          await settle();
+          const before = shows(page);
           await act(page, plots[on], key, Object.values(plots));
           await settle();
           const got = axes.filter(([n, k]) => acted(page.pv(plots[n]), k)).map(([n, k]) => `${n}:${k}`);
           expect(got.sort(), `${name} on ${on}:${key}`).toEqual(name.includes('then') ? [] : want);
+          // One step, on however many plots: one Back shows every plot as before. The pair is two steps.
+          await closeAll();
+          for (const _ of name.includes('then') ? [1, 2] : [1]) await back(plots.A);
+          expect(shows(page), `Back after ${name} on ${on}:${key}`).toBe(before);
         } finally {
           page.dispose();
         }

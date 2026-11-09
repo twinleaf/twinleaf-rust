@@ -8,6 +8,7 @@ import { Hub } from '../../src/lib/hub.svelte.js';
 import { Workspace } from '../../src/lib/workspace.svelte.js';
 import { History } from '../../src/lib/history.svelte.js';
 import { Favorites } from '../../src/lib/favorites.svelte.js';
+import { Views } from '../../src/lib/views.js';
 import { presets } from '../../src/lib/layout.js';
 import { emptyTab, makeTab, newPlot } from '../../src/lib/tabs.js';
 import '../../src/app.css';
@@ -100,7 +101,8 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
  * else, as it mounts. What the page asks of /api is refused, as a hub that
  * has gone away refuses it, until the page is disposed of; but with
  * `rowsPerSecond`, /api/rows counts that many rows a second of each
- * signal's window.
+ * signal's window. It returns the page's state, each plot's view and
+ * PlotView among it.
  */
 export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null } = {}) {
   localStorage.clear();
@@ -112,6 +114,7 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
   const target = document.body.appendChild(document.createElement('div'));
   const hub = stubHub(signals, rpcs, routes, units);
   const registry = new Set();
+  const views = new Views(hub);
   const fetched = window.fetch;
   const reply = (body, status = 200) => Promise.resolve(new Response(JSON.stringify(body), { status }));
   window.fetch = (url, init) => {
@@ -123,12 +126,13 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
     }
     return reply({ error: 'no hub in a test' }, 503);
   };
-  const app = mount(App, { target, context: new Map([['page', { hub, ws, history, registry }]]) });
+  const app = mount(App, { target, context: new Map([['page', { hub, ws, history, registry, views }]]) });
   await frames();
   return {
     ws,
     history,
     hub,
+    views,
     /** The PlotView of plot `id` while it is on the page. */
     pv: (id) => [...registry].find((p) => p.plotId === id),
     dispose: () => {
