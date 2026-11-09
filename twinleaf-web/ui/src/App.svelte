@@ -83,9 +83,10 @@
   import { pressOutsideKeepsFocus } from './lib/menus.js';
   import RiChevron from '@lucide/svelte/icons/chevron-down';
 
-  // The hub, the tabs as the page edits them, and their undo and redo, as
-  // main.js makes them: the panels reach the History to make a command one step.
-  const { hub, ws, history } = getContext('page');
+  // The hub, the tabs as the page edits them, their undo and redo, and the
+  // PlotViews on the page, which the frame loop draws, as main.js makes
+  // them: the panels reach the History to make a command one step.
+  const { hub, ws, history, registry } = getContext('page');
   setContext('history', history);
   const views = new Views(hub, viewChanged);
   // What a press, a click, a key or an undo does to the plot selection: the Workspace's.
@@ -107,8 +108,6 @@
   setContext('writes', writes);
   drags.closePlot = (id) => closePlot(id);
   drags.axisDropAt = (plotId, x, y) => [...registry].find((pv) => pv.plotId === plotId)?.axisDropAt(x, y) ?? null;
-  /** The PlotViews on the page, which the frame loop draws. */
-  const registry = new Set();
   /** The time under the pointer, which every time plot marks. */
   const hover = { t: null };
   let renderer = $state();
@@ -455,7 +454,7 @@
    * to a plot by drag there.
    */
   function addSignal(key) {
-    const ids = [...ws.selected].filter((id) => ws.plots[id]);
+    const ids = selection.pageTargets('plot');
     if (ids.length) history.group(ids.length > 1 ? `Add ${key} (${plotsText(ids.length)})` : `Add ${key}`, () => ws.addTo(ids, key));
   }
   /** Moves keyboard focus to plot `id`, once it is on the page. */
@@ -831,8 +830,7 @@
         onEach={(what, fn) => eachPlot(targetIdsOf(id), what, fn)}
         onKey={plotKey}
         onEdit={(what, patch) => history.group(what, () => ws.setPlot(id, patch))}
-        onView={(patch) => ws.setView(id, patch)}
-        onContext={() => selection.pressOn(id)}
+        onView={(patch) => targetIdsOf(id).forEach((i) => ws.plots[i]?.kind === ws.plots[id]?.kind && ws.setView(i, patch))}
         targetIds={() => targetIdsOf(id)}
         onStartMove={(e) => drags.startMove(id, e)}
         onSplit={(dir) => splitPlots(targetIdsOf(id), dir)}

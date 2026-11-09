@@ -1,6 +1,7 @@
 // The whole page, mounted for a browser test with state of its own, and the
 // gestures the tests make on it with the real mouse.
-import { mount, unmount } from 'svelte';
+import { flushSync, mount, unmount } from 'svelte';
+import { expect } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import App from '../../src/App.svelte';
 import { Hub } from '../../src/lib/hub.svelte.js';
@@ -24,12 +25,12 @@ const typed = (text) => (text === 'true' ? true : text === 'false' ? false : tex
 
 /**
  * A hub with no socket that has announced `signals`, keys as 'stream.column',
- * each a trace of route '/' in volts, and, with `rpcs`, a device at each of
- * `routes` whose RPC table they are, each {name, channel, value, type,
- * access, announced}: type f32 and access read and write unless given,
- * `value` one for every device or an array of one per route, and
- * `announced` false for an entry no announcement keeps, which a read
- * answers nothing of.
+ * each a trace of route '/' in volts unless `units`, by key, names others,
+ * and, with `rpcs`, a device at each of `routes` whose RPC table they
+ * are, each {name, channel, value, type, access, announced}: type f32 and
+ * access read and write unless given, `value` one for every device or an
+ * array of one per route, and `announced` false for an entry no
+ * announcement keeps, which a read answers nothing of.
  *
  * Its devices answer calls as the server does (`twinleaf-web/src/devices.rs`
  * `call`): `calls` lists each {name, value, routes}, and `answer(name,
@@ -42,14 +43,14 @@ const typed = (text) => (text === 'true' ? true : text === 'false' ? false : tex
  * device announce new values, as another client's write would, and
  * `presence(route, state)` changes a device's presence.
  */
-export function stubHub(signals = [], rpcs = [], routes = ['/']) {
+export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
   const hub = new Hub();
   hub.close();
   let seq = 0;
   hub.text({ type: 'hub', id: 'test', seq });
   signals.forEach((key, id) => {
     const [stream, column] = key.split('.');
-    hub.text({ type: 'trace', seq: ++seq, trace: { id, route: '/', stream, column, units: 'V', rate: 100 } });
+    hub.text({ type: 'trace', seq: ++seq, trace: { id, route: '/', stream, column, units: units[key] ?? 'V', rate: 100 } });
   });
   const table = rpcs.map(({ name, channel, type = 'f32', access = ['read', 'write'] }) => ({ name, channel, type, access, readable: access.includes('read') }));
   const announced = new Set(rpcs.filter((p) => (p.access ?? ['read', 'write']).includes('read') && p.announced !== false).map((p) => p.name));
@@ -93,12 +94,13 @@ export function stubHub(signals = [], rpcs = [], routes = ['/']) {
 /**
  * The page with a tab of plots showing `keys`, a list of signal keys per
  * plot, laid out as layout.js preset `preset`, open, `more` empty tabs
- * after it. Its hub has no socket and has announced the
- * signals `signals` and a device with `rpcs` at each of `routes`, as
- * `stubHub` takes them. localStorage holds `saved`, by key as JSON, and
- * nothing else, as it mounts.
+ * after it. Its hub has no socket and has announced the signals `signals`
+ * in `units` and a device with `rpcs` at each of `routes`, as `stubHub`
+ * takes them. localStorage holds `saved`, by key as JSON, and nothing
+ * else, as it mounts. What the page asks of /api is refused, as a hub that
+ * has gone away refuses it, until the page is disposed of.
  */
-export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {} } = {}) {
+export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {} } = {}) {
   localStorage.clear();
   for (const [k, v] of Object.entries(saved)) localStorage.setItem(k, JSON.stringify(v));
   const ps = keys.map((k) => newPlot('time', 'overlay', k));
@@ -106,18 +108,71 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
   const ws = new Workspace({ tabs: [tab, ...Array.from({ length: more }, (_, i) => emptyTab(`Layout ${i + 2}`))], activeId: tab.id });
   const history = new History(ws, new Favorites(null));
   const target = document.body.appendChild(document.createElement('div'));
-  const hub = stubHub(signals, rpcs, routes);
-  const app = mount(App, { target, context: new Map([['page', { hub, ws, history }]]) });
+  const hub = stubHub(signals, rpcs, routes, units);
+  const registry = new Set();
+  const fetched = window.fetch;
+  window.fetch = (url, init) => (String(url).startsWith('/api/') ? Promise.resolve(new Response(JSON.stringify({ error: 'no hub in a test' }), { status: 503 })) : fetched(url, init));
+  const app = mount(App, { target, context: new Map([['page', { hub, ws, history, registry }]]) });
   await frames();
   return {
     ws,
     history,
     hub,
+    /** The PlotView of plot `id` while it is on the page. */
+    pv: (id) => [...registry].find((p) => p.plotId === id),
     dispose: () => {
       unmount(app);
       target.remove();
+      window.fetch = fetched;
     },
   };
+}
+
+/**
+ * Gives each of `hub`'s traces `seconds` of samples at 100 Hz up to now, and
+ * a spectrum of 50 bins from 1 Hz to 50 Hz, so each plot draws its axes, its
+ * legend's values and its cursors' readout.
+ */
+export function feed(hub, seconds = 20) {
+  const session = hub.session, perf = performance.now(), traces = [...session.traces.values()];
+  for (const t of traces) {
+    const xs = Float64Array.from({ length: seconds * 100 }, (_, i) => i / 100);
+    const ys = Float32Array.from(xs, (x) => Math.sin(x + t.meta.id));
+    session.apply({ kind: 'points', chunks: [{ id: t.meta.id, level: 0, brk: false, xs, ys }] }, perf);
+  }
+  const f = Float32Array.from({ length: 50 }, (_, i) => i + 1);
+  session.apply({ kind: 'spectra', spectra: traces.map((t) => ({ id: t.meta.id, f, a: f.map((v) => 1 / v), floor: 0.02 })) }, perf);
+  session.tick(perf);
+}
+
+export async function settle(n = 3) {
+  flushSync();
+  await frames(n);
+  flushSync();
+}
+export const leafOf = (id) => document.querySelector(`.leaf[data-plot="${id}"]`);
+
+/** Presses and lets go of the right button at `at`, as a right-click does. */
+export async function rightClick(at) {
+  await commands.mouse([['move', ...at], ['down', 'right'], ['up', 'right']]);
+  await settle();
+}
+/** Clicks the left button at `at`. */
+export async function click(at) {
+  await commands.mouse([['move', ...at], ['down'], ['up']]);
+  await settle();
+}
+
+/** What an open menu, dropdown, popover or list is. */
+export const OPEN = '[data-slot$=-menu-content], [data-slot$=-menu-sub-content], [data-slot=popover-content], [data-slot=select-content]';
+/** Closes whatever menu or popover is open, by Escape, and waits until it has gone. */
+export async function closeAll() {
+  for (let i = 0; i < 5 && document.querySelector(OPEN); i++) {
+    await commands.key('Escape');
+    await wait(150);
+    flushSync();
+  }
+  expect(document.querySelector(OPEN), 'every menu closed').toBe(null);
 }
 
 /**

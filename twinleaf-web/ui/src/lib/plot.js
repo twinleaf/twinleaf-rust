@@ -1419,9 +1419,10 @@ export class PlotView {
     return !!yc && (yc.a !== null || yc.b !== null);
   }
 
-  /** Removes the Y cursors of y axis `key`. */
+  /** Removes the Y cursors of y axis `key`, or with none, of every y axis. */
   clearYCursors(key) {
-    this.yCursors.delete(key);
+    if (key === undefined) this.yCursors.clear();
+    else this.yCursors.delete(key);
   }
 
   /** Removes a spectrum's X cursors and every Y cursor, and says whether any were placed. A time plot's X cursors are its view's. */
@@ -1482,6 +1483,23 @@ export class PlotView {
     const P = this.geo?.plot;
     if (P && y > P.y + P.h && x >= P.x && x <= P.x + P.w) return { kind: 'x' };
     return { kind: 'plot', keys: this.yTargets(y) };
+  }
+
+  /**
+   * The units y axis `key` shows, as its signals' units, each once and in
+   * order, a spectrum's per √Hz; or null while the plot draws no such axis.
+   */
+  axisUnits(key) {
+    const a = this.yAxes.find((a) => a.key === key);
+    if (!a) return null;
+    const spectrum = this.config().kind === 'spectrum';
+    return [...new Set(a.plans.map((p) => (spectrum ? `${p.t.meta.units}/√Hz` : p.t.meta.units)))].sort().join(' ');
+  }
+
+  /** The key of this plot's y axis in `units`, as `axisUnits` names them: signal `key`'s axis when it is one of them, else the first; or null for none. */
+  axisIn(units, key) {
+    const axes = this.yAxes.filter((a) => this.axisUnits(a.key) === units);
+    return (axes.find((a) => a.key === key) ?? axes[0])?.key ?? null;
   }
 
   /** The y range of `key` in the units its axis shows, or null before it has one. */
@@ -1730,14 +1748,16 @@ export class PlotView {
       this.axisHover = null;
       this.hover = null;
     });
-    // A double-click on a y axis fits y, through `onFitY` when the page
-    // gives one, so it fits every plot the gesture acts on. On the plot it
+    // A double-click on a y axis fits it, through `onFitY(key)` when the
+    // page gives one, so it fits that axis on every plot the gesture acts on.
+    // On the plot it
     // follows the newest samples again, from wherever the view was, at the
     // window it had before it paused.
     el.addEventListener('dblclick', (e) => {
       // The time axis seeks; two clicks there do nothing more.
       if (onAxis(e)) return;
-      if (this.yAxisAt(e.clientX, e.clientY)) this.onFitY ? this.onFitY() : this.autoscale();
+      const band = this.yAxisAt(e.clientX, e.clientY);
+      if (band) this.onFitY ? this.onFitY(this.axisTargets(band, e.clientY)[0]) : this.autoscale();
       else for (const v of this.targets()) v.follow(true);
     });
   }

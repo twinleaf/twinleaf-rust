@@ -57,7 +57,7 @@
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
     onFocus, onPress, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
     onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
-    onEach, targetIds = () => [plot.id], onContext, onKey,
+    onEach, targetIds = () => [plot.id], onKey,
   } = $props();
 
   /** Runs `fn(pv)` on the PlotView of each plot a command here acts on. */
@@ -65,6 +65,28 @@
     const ids = targetIds();
     for (const p of registry) if (ids.includes(p.plotId)) fn(p);
   };
+  /**
+   * Runs `fn(pv, axis)` for a command made on this plot's y axis `key`, on
+   * the PlotView of each plot the command acts on, `axis` the key of that
+   * plot's y axis in the same units as this one (PlotView `axisIn`): the
+   * axis of the same signal where it is one of them, else the first, as an
+   * overlay plot's shared axis is. A plot with no axis in those units is
+   * left alone.
+   */
+  const eachAxis = (key, fn) => {
+    const units = key === undefined ? null : pv?.axisUnits(key);
+    if (units === null || units === undefined) return;
+    eachPv((p) => {
+      const axis = p.axisIn(units, key);
+      if (axis !== null) fn(p, axis);
+    });
+  };
+  /** Sets y scale `scale` on each plot a command on this plot's y axis `key` acts on: those with an axis in its units. */
+  function setYScale(key, scale) {
+    const ids = new Set();
+    eachAxis(key, (p) => ids.add(p.plotId));
+    onEach(scale === 'log' ? 'Log density scale' : 'Linear density scale', (p) => (ids.has(p.id) ? { yScale: scale } : null));
+  }
   /** Shows or hides the legend of each plot a command here acts on, all as this plot's turns. */
   const toggleLegend = () => {
     const on = !plot.legend;
@@ -72,7 +94,7 @@
   };
   /** The name list `list` (KINDS, MODES) gives value `v`. */
   const nameIn = (list, v) => list.find((x) => x[0] === v)?.[1] ?? v;
-  /** Sets `field` to `value` on each plot a command here acts on, of this plot's kind; `what` names the step. */
+  /** Sets `field` to `value` on each plot a command here acts on of this plot's kind, as a frequency axis's scale; `what` names the step. */
   const setEach = (what, field, value) => onEach(what, (p) => (p.kind === plot.kind ? { [field]: value } : null));
 
   const session = $derived(hub.session);
@@ -86,9 +108,10 @@
   const slots = $derived(plot.mode === 'independent' ? axisSlots(drawnItems().map((i) => i.key), plot.axisSides) : null);
   /** Whether signal `key` has no axis of its own on an independent plot. */
   const axisless = (key) => !!slots && !slots.left.includes(key) && !slots.right.includes(key);
-  /** Puts signal `key`'s axis on `side`, 'left' or 'right', or hides it with 'none'. */
+  /** Puts signal `key`'s axis on `side`, 'left' or 'right', or hides it with 'none', on each independent plot a command here acts on that shows it. */
   function setSide(key, side) {
-    onEdit(side === 'none' ? `Hide ${key}'s axis` : `${key}'s axis on the ${side}`, { axisSides: { ...plot.axisSides, [key]: side } });
+    const shows = (p) => p.mode === 'independent' && p.items.some((i) => i.key === key);
+    onEach(side === 'none' ? `Hide ${key}'s axis` : `${key}'s axis on the ${side}`, (p) => (shows(p) ? { axisSides: { ...p.axisSides, [key]: side } } : null));
   }
 
   // A right-click shows what it was on: the time axis's window, or the
@@ -165,11 +188,13 @@
       fBoundsError = '';
       const xd = plot.kind === 'spectrum' ? pv?.xd : null;
       fBounds = xd ? { lo: shown(xd[0]), hi: shown(xd[1]) } : { lo: '', hi: '' };
+      fBoundsShown = { ...fBounds };
       return void (xAxisOpen = true);
     }
     boundsError = '';
     const b = region.keys.length ? pv.yBounds(region.keys[0]) : null;
     bounds = b ? { lo: shown(b[0]), hi: shown(b[1]) } : { lo: '', hi: '' };
+    boundsShown = { ...bounds };
     axisOpen = true;
   }
   /** Puts the cursors' readout on the clipboard, as the table shows it. */
@@ -191,15 +216,25 @@
       (error) => toast.error(`Could not copy: ${error.message}`),
     );
   }
-  /** Sets the bounds typed in, and says why it cannot when they do not make a range. Returns whether it set them. */
+  /**
+   * What the popovers' fields showed as they opened, or last set: bounds
+   * left as shown set nothing, so a field that loses focus as its popover
+   * closes leaves every plot as it was.
+   */
+  let boundsShown = { lo: '', hi: '' }, fBoundsShown = { lo: '', hi: '' };
+  const edited = (b, was) => b.lo !== was.lo || b.hi !== was.hi;
+  /** Sets the bounds typed in, and says why it cannot when they do not make a range. Returns whether they hold. */
   function applyBounds() {
+    if (!edited(bounds, boundsShown)) return true;
     const lo = Number(bounds.lo), hi = Number(bounds.hi);
     if (!isFinite(lo) || !isFinite(hi) || bounds.lo.trim() === '' || bounds.hi.trim() === '') boundsError = 'Enter a number in each';
     else if (lo >= hi) boundsError = 'Max must be above min';
     else if (plot.kind === 'spectrum' && plot.yScale !== 'linear' && lo <= 0) boundsError = 'A log axis starts above zero';
     else {
       boundsError = '';
-      pv?.setYBounds(region.keys, lo, hi);
+      // A log axis takes no bound at or below zero, and is left as it is.
+      eachAxis(region.keys[0], (p, axis) => !(p.logY && lo <= 0) && p.setYBounds([axis], lo, hi));
+      boundsShown = { ...bounds };
       return true;
     }
     return false;
@@ -207,8 +242,9 @@
   // A spectrum's frequency range, typed in its x axis's popover.
   let fBounds = $state({ lo: '', hi: '' });
   let fBoundsError = $state('');
-  /** Sets the frequencies typed in, and says why it cannot when they do not make a range. Returns whether it set them. */
+  /** Sets the frequencies typed in, and says why it cannot when they do not make a range. Returns whether they hold. */
   function applyFBounds() {
+    if (!edited(fBounds, fBoundsShown)) return true;
     const lo = Number(fBounds.lo), hi = Number(fBounds.hi);
     if (!isFinite(lo) || !isFinite(hi) || fBounds.lo.trim() === '' || fBounds.hi.trim() === '') fBoundsError = 'Enter a number in each';
     else if (lo >= hi) fBoundsError = 'Max must be above min';
@@ -216,6 +252,7 @@
     else {
       fBoundsError = '';
       onView({ fRange: [lo, hi] });
+      fBoundsShown = { ...fBounds };
       return true;
     }
     return false;
@@ -262,14 +299,15 @@
   // A click, not a drag, on the plot selects it; with Shift it adds the plot
   // to the selection or takes it out, and does nothing else: no pan, and no
   // pick-up from the header. The capture sees the press before the header
-  // or the plot takes it for a move or a pan.
+  // or the plot takes it for a move or a pan. A menu opened anywhere on the
+  // plot, by the right button or the keys, selects it first as a press on
+  // its controls does, so the menu acts on what is selected.
   let pressedAt = null;
   /** The plot's header and controls, a press on which selects the plot first: its grip and its header start the same move. */
   const CONTROLS = '.plot-head, button, [role=button], [role=combobox], input';
   function pressed(e) {
     pressedAt = [e.clientX, e.clientY];
-    // A right-click anywhere on the plot selects it first, so its menu acts on what is selected.
-    if ((e.button === 0 && !e.shiftKey && e.target.closest?.(CONTROLS)) || e.button === 2) onPress?.();
+    if (e.button === 0 && !e.shiftKey && e.target.closest?.(CONTROLS)) onPress?.();
     else onFocus();
   }
   function clicked(e) {
@@ -345,7 +383,7 @@
       renderer,
       onFocus,
       onFrequencies: (lo, hi) => onView({ fRange: [lo, hi] }),
-      onFitY: () => eachPv((p) => p.autoscale()),
+      onFitY: (key) => eachAxis(key, (p, axis) => p.fit([axis])),
       config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null }),
     });
     registry.add(pv);
@@ -651,6 +689,7 @@
   class="plot-card flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border bg-transparent {selected ? 'selected border-primary' : 'border-border'}"
   bind:this={card}
   onpointerdowncapture={pressed}
+  oncontextmenucapture={() => onPress?.()}
   onclick={clicked}
   onfocusin={onFocus}
   onkeydown={plotKey}
@@ -845,7 +884,7 @@
           {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Zoom to the X cursors" onclick={() => (pv?.zoomToCursors(), (xAxisOpen = false))}><RiZoomTo /></button>{/snippet}
         </Tip>
         <Tip text="Clear the X cursors">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear the X cursors" onclick={() => (pv?.clearXCursors(), (xAxisOpen = false))}><RiEraser /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear the X cursors" onclick={() => (eachPv((p) => p.clearXCursors()), (xAxisOpen = false))}><RiEraser /></button>{/snippet}
         </Tip>
       </div>
     </Popover.Content>
@@ -875,15 +914,15 @@
         <span>to</span>
         <input aria-label="Highest value shown" type="text" inputmode="decimal" bind:value={bounds.hi} onkeydown={boundsKey} onblur={applyBounds} />
         <Tip text="Fit to the data" keys={['double-click']}>
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Fit to the data" onclick={() => (pv?.fit(region.keys), (axisOpen = false))}><RiFit /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Fit to the data" onclick={() => (eachAxis(region.keys[0], (p, axis) => p.fit([axis])), (axisOpen = false))}><RiFit /></button>{/snippet}
         </Tip>
       </div>
       {#if plot.kind === 'spectrum'}
         <div class="axis-row" role="group" aria-label="Density scale">
           <span>Scale</span>
           <div class="seg">
-            <button class:on={plot.yScale !== 'linear'} aria-pressed={plot.yScale !== 'linear'} onclick={() => setEach('Log density scale', 'yScale', 'log')}>Log</button>
-            <button class:on={plot.yScale === 'linear'} aria-pressed={plot.yScale === 'linear'} onclick={() => setEach('Linear density scale', 'yScale', 'linear')}>Linear</button>
+            <button class:on={plot.yScale !== 'linear'} aria-pressed={plot.yScale !== 'linear'} onclick={() => setYScale(region.keys[0], 'log')}>Log</button>
+            <button class:on={plot.yScale === 'linear'} aria-pressed={plot.yScale === 'linear'} onclick={() => setYScale(region.keys[0], 'linear')}>Linear</button>
           </div>
         </div>
       {/if}
@@ -891,10 +930,10 @@
       <div class="axis-row" role="group" aria-label="Y cursors">
         <span>Cursors</span>
         <Tip text="Add Y1 and Y2 on this axis">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (eachPv((p) => p.addYCursors(p === pv ? region.keys?.[0] : undefined)), (axisOpen = false))}><RiYCursors /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (eachAxis(region.keys[0], (p, axis) => p.addYCursors(axis)), (axisOpen = false))}><RiYCursors /></button>{/snippet}
         </Tip>
         <Tip text="Clear this axis's cursors">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (pv?.clearYCursors(region.keys?.[0]), (axisOpen = false))}><RiEraser /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (eachAxis(region.keys[0], (p, axis) => p.clearYCursors(axis)), (axisOpen = false))}><RiEraser /></button>{/snippet}
         </Tip>
       </div>
       {#if boundsError}<div class="axis-error">{boundsError}</div>{/if}
@@ -907,7 +946,7 @@
   <ContextMenu.Root bind:open={menuOpen}>
     <ContextMenu.Trigger>
       {#snippet child({ props })}
-        <div {...props} class="plot-body" bind:this={body} oncontextmenucapture={(e) => (onContext?.(), recountCopy(), contextAt(e))}>
+        <div {...props} class="plot-body" bind:this={body} oncontextmenucapture={(e) => (recountCopy(), contextAt(e))}>
           <canvas bind:this={overlay}></canvas>
           <div class="axis-anchor" bind:this={axisAnchor} style="left: {axisAt.x}px; top: {axisAt.y}px"></div>
           <!-- The legend: each signal and its value, one short row apiece,
@@ -1003,8 +1042,8 @@
                   <ContextMenu.Item onSelect={copyReadout}><RiCopy class="menu-icon" />Copy table</ContextMenu.Item>
                   {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2</ContextMenu.Item>{/if}
                   <ContextMenu.Separator />
-                  {#if c.x}<ContextMenu.Item onSelect={() => pv?.clearXCursors()}><RiXCursors class="menu-icon" />Clear X cursors</ContextMenu.Item>{/if}
-                  {#if c.ys.length}<ContextMenu.Item onSelect={() => c.ys.forEach((y) => pv?.clearYCursors(y.key))}><RiYCursors class="menu-icon" />Clear Y cursors</ContextMenu.Item>{/if}
+                  {#if c.x}<ContextMenu.Item onSelect={() => eachPv((p) => p.clearXCursors())}><RiXCursors class="menu-icon" />Clear X cursors</ContextMenu.Item>{/if}
+                  {#if c.ys.length}<ContextMenu.Item onSelect={() => eachPv((p) => p.clearYCursors())}><RiYCursors class="menu-icon" />Clear Y cursors</ContextMenu.Item>{/if}
                   <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors</ContextMenu.Item>
                 </ContextMenu.Content>
               </ContextMenu.Root>
@@ -1042,7 +1081,7 @@
       <ContextMenu.Label class="menu-group">Cursors</ContextMenu.Label>
       <!-- Cursors are dragged out of the axes; these place a pair in view. -->
       <ContextMenu.Item onSelect={() => eachPv((p) => p.addXCursors())}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => eachPv((p) => p.addYCursors(p === pv ? region.keys?.[0] : undefined))}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => eachAxis(region.keys?.[0], (p, axis) => p.addYCursors(axis))}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
       <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors</ContextMenu.Item>
       <ContextMenu.Separator />
       <ContextMenu.Label class="menu-group">Show</ContextMenu.Label>
