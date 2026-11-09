@@ -191,6 +191,9 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .water-caption .short { color: var(--cursor-a); }
 .status-bar kbd { font: 10px var(--font-data); padding: 0 3px; border: 1px solid var(--border); border-radius: 3px; }
 .action-grid { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px; }
+/* An action button picked as a row, and its number among several picked to run. */
+.action-grid button.picked { background: color-mix(in oklch, var(--primary) 12%, transparent); border-color: var(--primary); }
+.action-grid .run-order { display: inline-grid; place-items: center; min-width: 14px; height: 14px; margin-right: 2px; padding: 0 3px; border-radius: 7px; background: var(--primary); color: var(--primary-foreground); font: 600 10px var(--font-data); font-variant-numeric: tabular-nums; }
 .props-empty { padding: 4px; color: var(--muted-foreground); font-size: 12px; }
 
 /* The plot area is see-through: the WebGL layer behind draws it. */
@@ -531,10 +534,13 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .mark { margin-left: 4px; font-weight: 600; color: var(--cursor-a); }
 .mark.warn { color: var(--cursor-a); }
 .mark.bad { color: var(--destructive); }
-.write-bar { display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding-top: 6px; flex: none; font-size: 12px; }
+.write-bar { display: flex; align-items: center; gap: 4px 6px; border-top: 1px solid var(--border); padding-top: 6px; flex: none; font-size: 12px; }
 .write-bar .wname { font-family: var(--font-data); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
 .write-bar .wvalue { flex: 1; min-width: 60px; font-family: var(--font-data); }
-.write-bar .reach { color: var(--muted-foreground); }
+.write-bar .reach { color: var(--muted-foreground); white-space: nowrap; }
+/* Several rows' label stays whole, what they are and their state, and the controls go under it when the panel is narrow. */
+.write-bar.several { flex-wrap: wrap; }
+.write-bar.several .wname { flex: 1 0 auto; }
 
 /* The device writes' notice, drawn as Sonner draws the page's other notices, and the lines under any notice's text. */
 [data-sonner-toast] [data-description] { white-space: pre-line; }

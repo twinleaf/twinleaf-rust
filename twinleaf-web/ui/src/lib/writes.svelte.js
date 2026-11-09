@@ -18,7 +18,7 @@
 // writes to a device. What the notices say is words.js's.
 
 import { SvelteMap } from 'svelte/reactivity';
-import { sameValue } from './session.svelte.js';
+import { sameShown } from './properties.js';
 import * as words from './words.js';
 
 /** How long a write's notice offers Revert, in ms, the pointer off it. */
@@ -29,8 +29,6 @@ export const NOTICE_MS = 5_000;
 export const OK_MS = 1500;
 
 const key = (route, name) => `${route}\u0000${name}`;
-/** Whether value `a`, shown, is value `b`, written: the same, or the same text, as a value sent is text. */
-const same = (a, b) => sameValue(a, b) || (a !== undefined && b !== undefined && String(a) === String(b));
 /** Value `v` as a write sends it. */
 const asText = (v) => (typeof v === 'string' ? v : JSON.stringify(v));
 /** Whether a value is known: an old value that is not has no Revert. */
@@ -296,7 +294,7 @@ export class DeviceWrites {
       if (!this.checked(e.device.route)) left.push({ label, name: e.name, why: 'unchecked' });
       else {
         const now = cells.valueOf(e.device, e.name);
-        if (same(now, e.wrote)) back.push(e);
+        if (sameShown(now, e.wrote)) back.push(e);
         else left.push({ label, name: e.name, now, why: 'changed' });
       }
     }

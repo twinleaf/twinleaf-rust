@@ -49,6 +49,11 @@ export function mergeRows(devices, channels = GROUPS.map(([channel]) => channel)
   return GROUPS.filter(([channel]) => channels.includes(channel)).flatMap(([channel, title]) => rows.filter((r) => (r.rpc.channel ?? null) === channel).map((r) => ({ ...r, group: title })));
 }
 
+/** Whether value `a`, as a cell shows it, is value `b`: the same, or the same text, as a value written is text until its device announces it. */
+export const sameShown = (a, b) => a === b || JSON.stringify(a) === JSON.stringify(b) || (a !== undefined && b !== undefined && String(a) === String(b));
+/** A switch's value as a cell shows it: on for true, off for false, either as written text, else undefined, as nobody knows. */
+export const switchOf = (v) => (v === true || v === 'true' ? 'on' : v === false || v === 'false' ? 'off' : undefined);
+
 /** Whether a panel of `channels` is the Favorites panel, of every starred property. */
 export const isFavorites = (channels) => channels?.length === 1 && channels[0] === 'favorite';
 /** Whether a panel of `channels` shows actions alone, as a row of buttons. */

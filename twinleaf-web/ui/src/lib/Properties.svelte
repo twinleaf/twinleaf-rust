@@ -1,11 +1,13 @@
 <script>
   // The Properties data table: a column per checked device and a row per
   // RPC name, merged and grouped as properties.js says, of the channels a
-  // panel shows, with an edit bar under it for the row the arrows are on
-  // when that row can be written or run. A cell's tooltip holds its whole
-  // value, which the column may cut short.
-  // A panel of actions alone is a row of buttons instead, each running its
-  // action on every checked device that has it.
+  // panel shows, with an edit bar under it for the rows picked, or the row
+  // the arrows are on (editbar.js), under the panel the arrows are in. A
+  // cell's tooltip holds its whole value, which the column may cut short.
+  // A panel of actions alone is a row of buttons instead: a click runs its
+  // action on every checked device that has it, and Ctrl or Shift picks it
+  // as a row, each picked button numbered in the order it runs. Running
+  // several actions asks first, listing them.
   //
   // A cell shows the device's value as the page's DeviceWrites has it
   // (writes.svelte.js): announced, read on request for an entry no
@@ -15,12 +17,13 @@
   // the entry writable, each encoded by that device's own type, shows each
   // device's outcome in its cell, and a notice that offers Revert.
   //
-  // Rows are picked as a sheet's are, to copy: a click picks one, Shift a
-  // run from the last clicked, Ctrl or ⌘ adds or drops one; Shift with the
-  // arrows extends, and Ctrl+A picks every row. Ctrl+C, or Copy in the right-
-  // click menu, copies the picked rows, a property and each device's value
-  // apiece, as a sheet pastes them. A star pins a property to the Favorites
-  // panel, which shows every starred property of the checked devices.
+  // Rows are picked as a sheet's are, to copy and to edit: a click picks
+  // one, Shift the run to it from the row a pick started at, Ctrl or ⌘ adds
+  // or drops one; Shift with the arrows extends, and Ctrl+A picks every row.
+  // Ctrl+C, or Copy in the right-click menu, copies the picked rows, a
+  // property and each device's value apiece, as a sheet pastes them. A star
+  // pins a property to the Favorites panel, which shows every starred
+  // property of the checked devices.
   //
   // Up to MAX_COLUMNS devices get a column each; more share one column,
   // which shows the value they agree on or how many values they differ in.
@@ -34,12 +37,13 @@
   import { Button } from '$lib/components/ui/button/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
   import Tip from './Tip.svelte';
-  import { sameValue } from './session.svelte.js';
-  import { controlOf, deviceLabel, isButtons, isFavorites, mergeRows, panelRows, writersOf } from './properties.js';
+  import { controlOf, deviceLabel, isButtons, isFavorites, mergeRows, panelRows, sameShown, writersOf } from './properties.js';
+  import { editBar, kindOf } from './editbar.js';
   import { writeTables } from './copy.js';
   import { toast } from './toast.svelte.js';
   import * as words from './words.js';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
+  import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
   import RiStar from '@lucide/svelte/icons/star';
   import RiCopy from '@lucide/svelte/icons/clipboard-copy';
 
@@ -75,7 +79,7 @@
   /** Whether the devices that have `row` disagree, a known value beside an unknown one included. */
   function mixed(row) {
     const values = devices.filter((d) => row.entries.has(d.route)).map((d) => valueOf(d, row.name));
-    return values.some((v) => !sameValue(v, values[0]));
+    return values.some((v) => !sameShown(v, values[0]));
   }
   /** The value every device that has `row` agrees on, or undefined. */
   const shared = (row) => (mixed(row) ? undefined : valueOf(devices.find((d) => row.entries.has(d.route)) ?? { route: '', values: new Map() }, row.name));
@@ -119,31 +123,17 @@
 
   // The rows picked, the page's row pick (selection.svelte.js), which spans
   // panels, and the row the arrows are on, the page's one, when it is this
-  // panel's.
+  // panel's, which is read when no announcement keeps it.
   const selection = getContext('selection');
   const prefix = `${panel}:`;
   /** The index of the row the arrows are on, or -1 when it is another panel's or none. */
   const active = $derived(rows.findIndex((r) => prefix + r.name === selection.rowAt));
   const current = $derived(active < 0 ? undefined : rows[active]);
-  // The editor below the table.
-  let draft = $state('');
-  let editor = $state(null);
   let tableEl = $state(null);
-  let lastRow = null;
   $effect(() => {
-    // A new row fills the editor with the value every device agrees on.
     const row = current;
-    if (!row || row.name === lastRow) return;
-    lastRow = row.name;
-    draft = show(shared(row));
-    // Announcements keep only some entries: the rest are read.
-    untrack(() => writes.readMissing(row.name, devices.filter((d) => row.entries.get(d.route)?.readable)));
+    if (row) untrack(() => writes.readMissing(row.name, devices.filter((d) => row.entries.get(d.route)?.readable)));
   });
-
-  /** Writes `text` to `row` on every device a write reaches. */
-  const write = (row, text) => writes.write([{ name: row.name, devices: writersOf(row, devices) }], text, controlOf(row.rpc) === 'toggle');
-  /** Runs action `row` on every device that has it. */
-  const run = (row) => writes.run([row.name], () => writersOf(row, devices));
 
   // The rows picked: this panel's by name, and every panel's, each property
   // once, in page order.
@@ -156,6 +146,57 @@
     const name = rows[i]?.name;
     if (!name) return;
     selection.pickRow(prefix + name, e);
+  }
+
+  // The edit bar: the rows picked, each property once, in the order they
+  // were picked, or the row the arrows are on when none is. It shows under
+  // the panel the arrows are in, and Enter edits its rows there; in another
+  // panel's table, Enter does nothing.
+  const byName = $derived(new Map(mergeRows(devices).map((r) => [r.name, r])));
+  /** Every row picked, each property once, in the order picked. */
+  const pickedRows = $derived([...new Set([...selection.rows].map(nameOf))].map((n) => byName.get(n)).filter(Boolean));
+  const editing = $derived(!current ? [] : pickedRows.length ? pickedRows : [current]);
+  const bar = $derived(editBar(editing, devices, valueOf));
+  /** Whether the bar edits switches, and so writes true or false. */
+  const switching = $derived(bar?.kind === 'switches' || bar?.control === 'toggle');
+  let draft = $state('');
+  let editor = $state(null);
+  let lastEdit = null;
+  $effect(() => {
+    // New rows fill the field with the value every device of every row agrees on.
+    const names = editing.map((r) => r.name).join('\n');
+    if (names === lastEdit) return;
+    lastEdit = names;
+    draft = untrack(() => (bar?.kind === 'values' ? show(bar.shared) : bar?.kind === 'one' ? show(shared(editing[0])) : ''));
+  });
+  /** Writes `text` to every row of the bar, on the devices a write of each reaches. */
+  const writeBar = (text) => writes.write(bar.rows.map((r) => ({ name: r.name, devices: writersOf(r, devices) })), text, switching);
+  /** Runs actions `names` in order, each on every device that has it. */
+  const runNames = (names) => writes.run(names, (n) => (byName.get(n) ? writersOf(byName.get(n), devices) : []));
+  /** The actions waiting on the question running several asks, in order, or null. */
+  let asking = $state(null);
+  /** Runs the bar's actions: one at once, several once the person says so. */
+  function runBar() {
+    const names = bar.rows.map((r) => r.name);
+    if (names.length > 1) asking = names;
+    else runNames(names);
+  }
+  /** Enter on the bar's rows: runs them, turns switches, or goes to the field; on rows of several kinds it says so. */
+  function enter() {
+    if (!bar) return;
+    if (bar.kind === 'kinds') toast(bar.hint);
+    else if (bar.kind === 'actions' || bar.control === 'action') runBar();
+    else if (switching) writeBar(bar.enter);
+    else editor?.focus();
+  }
+  /** Whether the rows picked are several actions, which run in the order picked. */
+  const runList = $derived(pickedRows.length > 1 && pickedRows.every((r) => kindOf(r) === 'action'));
+  /** The number of action `name` among several picked to run, from 1, or null. */
+  const runOrder = (name) => (runList ? pickedRows.findIndex((r) => r.name === name) + 1 || null : null);
+  /** A click on the button of action `row`: it runs, picked alone; with Ctrl, ⌘ or Shift it is picked as a row is, and does not run. */
+  function pillClick(row, e) {
+    selection.pickRow(prefix + row.name, e);
+    if (!(e.ctrlKey || e.metaKey || e.shiftKey)) runNames([row.name]);
   }
   // Pins act on every picked row, or the active one, as one undo step.
   /** The names a pin from the menu acts on: the picked rows', or the active row's. */
@@ -213,22 +254,18 @@
       // The arrows pick the row they move to; with Shift they pick the run to it.
       pick(i, { shiftKey: e.shiftKey });
       tick().then(() => document.getElementById(`prop-${active}`)?.scrollIntoView({ block: 'nearest' }));
-    } else if (e.key === 'Enter' && current) {
-      const control = controlOf(current.rpc);
-      if (control === 'action') run(current);
-      else if (control === 'toggle') write(current, shared(current) ? 'false' : 'true');
-      else editor?.focus();
-    } else return;
+    } else if (e.key === 'Enter') enter();
+    else return;
     e.preventDefault();
     e.stopPropagation();
   }
   function editorKey(e) {
-    if (e.key === 'Enter' && current) {
+    if (e.key === 'Enter' && bar && draft.trim() !== '') {
       e.preventDefault();
-      write(current, draft.trim());
+      writeBar(draft.trim());
     } else if (e.key === 'Escape') {
       e.preventDefault();
-      lastRow = null; // puts the shared value back
+      lastEdit = null; // puts the shared value back
       draft = '';
       tableEl?.focus();
     }
@@ -269,21 +306,24 @@
   <div class="props-empty">{starredOnly ? 'Star a property to pin it here' : 'Nothing here on the checked devices'}</div>
 {:else if buttons}
   <ScrollArea class="props">
-    <div class="action-grid">
+    <div class="action-grid" data-rows>
       {#each rows as row (row.name)}
         {@const reach = writersOf(row, devices)}
         {@const failed = failures(row)}
+        {@const order = runOrder(row.name)}
         <Tip text={failed.length ? failureText(row) : words.runOn(reach.length)}>
           {#snippet children(tip)}
             <Button
               {...tip}
               size="xs"
               variant="outline"
-              class={busy(row) ? 'opacity-60' : failed.length ? 'text-destructive' : ''}
+              class="{busy(row) ? 'opacity-60' : failed.length ? 'text-destructive' : ''} {picked.has(row.name) ? 'picked' : ''}"
               disabled={!reach.length}
-              onclick={() => run(row)}
+              data-name={row.name}
+              aria-pressed={picked.has(row.name)}
+              onclick={(e) => pillClick(row, e)}
             >
-              {row.name}{#if failed.length}<b class="mark bad">✕{devices.length > 1 ? failed.length : ''}</b>{/if}
+              {#if order}<b class="run-order" aria-label="runs {order}">{order}</b>{/if}{row.name}{#if failed.length}<b class="mark bad">✕{devices.length > 1 ? failed.length : ''}</b>{/if}
             </Button>
           {/snippet}
         </Tip>
@@ -366,28 +406,46 @@
 </ContextMenu.Content>
 </ContextMenu.Root>
 
-{#if current && ['action', 'toggle', 'value'].includes(controlOf(current.rpc))}
-  {@const control = controlOf(current.rpc)}
-  {@const reach = writersOf(current, devices)}
-  <div class="write-bar">
-    <span class="wname">{current.name}</span>
-    {#if control === 'action'}
-      <Button size="xs" variant="outline" disabled={!reach.length} onclick={() => run(current)}>{words.runOn(reach.length)}</Button>
-    {:else if control === 'toggle'}
-      <Button size="xs" variant="outline" disabled={!reach.length} onclick={() => write(current, 'true')}>On</Button>
-      <Button size="xs" variant="outline" disabled={!reach.length} onclick={() => write(current, 'false')}>Off</Button>
-      <span class="reach">{reach.length} device{reach.length === 1 ? '' : 's'}</span>
-    {:else if control === 'value'}
+{/if}
+
+{#if bar && !(buttons && bar.rows.length < 2)}
+  {@const n = bar.reach.length}
+  <!-- The bar acts on the rows picked, so a press in it keeps them, as one among the rows does. -->
+  <div class="write-bar" class:several={bar.rows.length > 1} data-rows>
+    <span class="wname" title={bar.label}>{bar.label}</span>
+    {#if bar.kind === 'kinds'}
+      <span class="reach">{bar.hint}</span>
+    {:else if bar.kind === 'actions' || bar.control === 'action'}
+      <Button size="xs" variant="outline" disabled={!n} onclick={runBar}>{bar.rows.length > 1 ? words.runSeveral(bar.rows.length) : words.runOn(n)}</Button>
+    {:else if switching}
+      <Button size="xs" variant="outline" disabled={!n} onclick={() => writeBar('true')}>{words.ON}</Button>
+      <Button size="xs" variant="outline" disabled={!n} onclick={() => writeBar('false')}>{words.OFF}</Button>
+      <span class="reach">{n} device{n === 1 ? '' : 's'}</span>
+    {:else}
+      {@const differ = bar.kind === 'values' ? bar.shared === undefined : mixed(bar.rows[0])}
       <Input
         class="wvalue h-6 text-xs"
         bind:ref={editor}
         bind:value={draft}
-        placeholder={mixed(current) ? '— mixed' : (current.rpc.type ?? '')}
-        aria-label="New value of {current.name}"
+        placeholder={differ ? words.MIXED : (bar.rows[0].rpc.type ?? '')}
+        aria-label="New value of {bar.label}"
         onkeydown={editorKey}
       />
-      <Button size="xs" variant="outline" disabled={!reach.length || draft.trim() === ''} onclick={() => write(current, draft.trim())}>{words.writeTo(reach.length)}</Button>
+      <Button size="xs" variant="outline" disabled={!n || draft.trim() === ''} onclick={() => writeBar(draft.trim())}>{words.writeTo(n)}</Button>
     {/if}
   </div>
 {/if}
-{/if}
+
+<AlertDialog.Root open={!!asking} onOpenChange={(open) => !open && (asking = null)}>
+  <AlertDialog.Content>
+    {@const ask = words.runAsk(asking ?? [], bar?.reach.length ?? 0)}
+    <AlertDialog.Header>
+      <AlertDialog.Title>{ask.title}</AlertDialog.Title>
+      <AlertDialog.Description>{ask.text}</AlertDialog.Description>
+    </AlertDialog.Header>
+    <AlertDialog.Footer>
+      <AlertDialog.Cancel>{ask.cancel}</AlertDialog.Cancel>
+      <AlertDialog.Action onclick={() => (runNames(asking), (asking = null))}>{ask.run}</AlertDialog.Action>
+    </AlertDialog.Footer>
+  </AlertDialog.Content>
+</AlertDialog.Root>

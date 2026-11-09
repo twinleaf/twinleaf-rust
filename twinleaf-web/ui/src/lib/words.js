@@ -7,6 +7,8 @@
 // outcome (writes.svelte.js): {level, text, detail}, `detail` the lines
 // under the text.
 
+import { switchOf } from './properties.js';
+
 /** `items` joined as a sentence lists them: "a", "a and b", "a, b and c", the rest past `most` counted. */
 export function list(items, most = 3) {
   const shown = items.length > most ? [...items.slice(0, most - 1), `${items.length - most + 1} more`] : items;
@@ -18,10 +20,8 @@ export const inOrder = (items) => items.join(', then ');
 const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 /** How a notice names device `d`: by its name, and its route unless it is the device at the root, as "test (/0)". */
 export const device = (d) => (d.route === '/' ? (d.name ?? 'device') : `${d.name ?? 'device'} (${d.route})`);
-/** Whether a value shown of a switch is on: true, or "true" as written. */
-export const isOn = (v) => v === true || v === 'true';
 /** How a value reads in a notice: a switch's as on or off. */
-const valueText = (v, toggle) => (toggle ? (isOn(v) ? 'on' : 'off') : String(v));
+const valueText = (v, toggle) => (toggle ? (switchOf(v) ?? 'unknown') : String(v));
 /** Rows of one kind as a notice names them: the row's name, or "3 switches" or "3 values". */
 const rowsText = (rows, toggle) => (rows.length === 1 ? rows[0] : toggle ? count(rows.length, 'switch', 'switches') : count(rows.length, 'value', 'values'));
 /** What ends a notice's text: " · 3 devices", " · 2 of 3 devices", or nothing for one device that took it. */

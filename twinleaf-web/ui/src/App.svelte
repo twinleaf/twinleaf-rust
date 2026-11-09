@@ -33,7 +33,8 @@
   import Properties from './lib/Properties.svelte';
   import Dock from './lib/Dock.svelte';
   import { Docks, PANELS, SIDES } from './lib/docks.svelte.js';
-  import { byRoute, isButtons, panelRows } from './lib/properties.js';
+  import { byRoute, panelRows } from './lib/properties.js';
+  import { ROWS } from './lib/selection.svelte.js';
   import SignalList from './lib/SignalList.svelte';
   import TabStrip from './lib/TabStrip.svelte';
   import DragOverlay from './lib/DragOverlay.svelte';
@@ -289,11 +290,11 @@
   });
   const checked = $derived([...hub.session.devices.values()].sort(byRoute).filter((d) => !unchecked.has(d.route)));
   // The property rows the page shows, in page order, which a Shift pick runs
-  // along: each open panel of rows of the docks shown, left then right, top
-  // to bottom.
+  // along: each open panel of rows or action buttons of the docks shown,
+  // left then right, top to bottom.
   selection.rowOrder = () =>
     SIDES.filter((side) => docks.shown(side))
-      .flatMap((side) => docks[side].filter((p) => p.open && PANELS[p.id].channels && !isButtons(PANELS[p.id].channels)))
+      .flatMap((side) => docks[side].filter((p) => p.open && PANELS[p.id].channels))
       .flatMap(({ id }) => panelRows(checked, PANELS[id].channels, history.favorites).map((r) => `${id}:${r.name}`));
 
   // Each dock's width, a share of the page, dragged at its edge or moved
@@ -787,9 +788,9 @@
       return stepTab(e.key === ']' ? 1 : -1);
     }
     if (action !== 'pause' && action !== 'escape') {
-      // Every other key is a plot's key, wherever focus is; in a table,
-      // whose rows are what is picked there, none.
-      if (!action && !e.defaultPrevented && !e.target.closest?.('[role=grid]')) plotKey(e);
+      // Every other key is a plot's key, wherever focus is; among property
+      // rows, which are what is picked there, none.
+      if (!action && !e.defaultPrevented && !e.target.closest?.(ROWS)) plotKey(e);
       return;
     }
     if (action === 'escape') return leave();

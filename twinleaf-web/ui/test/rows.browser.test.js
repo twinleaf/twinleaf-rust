@@ -81,7 +81,7 @@ describe('a property row', () => {
     const folds = ['settings', 'reports', 'other', 'diagnostics', 'favorites'];
     const initial = Object.fromEntries(folds.map((id) => [id, isOpen(id)]));
     const favorites = page.history.favorites;
-    const seen = { across: 0, docks: 0, pastFolded: 0, dropped: 0, rightUnpicked: 0, rightPicked: 0, hidden: 0, starredAway: 0, anchorHidden: 0, copy: 0 };
+    const seen = { across: 0, docks: 0, pastFolded: 0, dropped: 0, rightUnpicked: 0, rightPicked: 0, rightButton: 0, buttons: 0, hidden: 0, starredAway: 0, anchorHidden: 0, copy: 0, bar: 0 };
     const hidden = () => !!document.querySelector('.dock-side.right.rail');
     /** Clicks `el` with Shift held, which keeps the selection, and waits for the dock to slide. */
     async function shiftPress(el) {
@@ -200,7 +200,7 @@ describe('a property row', () => {
                 expect(bars.length).toBe(1);
                 expect(panelOf(bars[0])).toBe(at.split(':')[0]);
                 const names = new Set(shownPicks().map(nameOf));
-                if (names.size > 1 && bars[0].matches('.several')) {
+                if (names.size > 1) {
                   const label = bars[0].querySelector('.wname').textContent;
                   expect(label.split(', ').reduce((n, part) => n + parseInt(part, 10), 0), label).toBe(names.size);
                   seen.bar++;
@@ -211,9 +211,9 @@ describe('a property row', () => {
         ),
         {
           numRuns: runs(30),
-          // Each case counted below, whatever the seed: the rows run settings (0 to 3), favorites (4, 5), reports (6, 7) and other (8, 9).
+          // Each case counted below, whatever the seed: the rows run settings (0 to 3), favorites (4, 5), reports (6, 7), the action buttons (8, 9) and other (10, 11).
           examples: [
-            [[{ t: 'click', at: 0 }, { t: 'shift', at: 9 }, { t: 'ctrl', at: 3 }, { t: 'ctrl', at: 3 }, { t: 'right', at: 5 }, { t: 'click', at: 6 }, { t: 'shift', at: 9 }, { t: 'right', at: 0 }]],
+            [[{ t: 'click', at: 0 }, { t: 'shift', at: 11 }, { t: 'ctrl', at: 3 }, { t: 'ctrl', at: 3 }, { t: 'right', at: 5 }, { t: 'click', at: 6 }, { t: 'shift', at: 10 }, { t: 'right', at: 0 }, { t: 'ctrl', at: 8 }, { t: 'right', at: 9 }]],
             [[{ t: 'ctrl', at: 4 }, { t: 'ctrl', at: 2 }, { t: 'ctrl', at: 3 }, { t: 'hide' }, { t: 'right', at: 2 }, { t: 'show' }, { t: 'right', at: 2 }]],
             [[{ t: 'click', at: 4 }, { t: 'star', at: 4 }, { t: 'click', at: 6 }, { t: 'keyfold', panel: 'reports' }, { t: 'shift', at: 8 }]],
           ],

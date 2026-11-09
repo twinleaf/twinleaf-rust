@@ -14,19 +14,20 @@
 // themselves, a menu or popover, and what is marked data-keeps-selection
 // (the window slider, the eraser, File, Commands and the Signals panel). A
 // press with Shift keeps them, to add to them; the wheel is no press; a
-// press in a table of rows lets go of the plots only. A press or right-click
-// on a plot's own header or controls selects it first, unless it is in the
-// selection already, so what it starts acts on what is selected. The
-// keyboard moving to a plot (Tab, 1 to 9, F6) selects it alone, as a click
-// on it does; focus that arrives otherwise, as when a menu gives it back,
-// only makes the plot the one clicked last.
+// press among property rows, a table, a panel's action buttons or the
+// edit bar that acts on the rows picked, lets go of the plots only. A press
+// or right-click on a plot's own header or controls selects it first,
+// unless it is in the selection already, so what it starts acts on what is
+// selected. The keyboard moving to a plot (Tab, 1 to 9, F6) selects it
+// alone, as a click on it does; focus that arrives otherwise, as when a
+// menu gives it back, only makes the plot the one clicked last.
 
 import { SvelteSet } from 'svelte/reactivity';
 
 /** What a press keeps the selection in. */
 export const KEEPS = '.leaf, [data-keeps-selection], [data-slot$=-content], [role=menu], [role=dialog], [role=listbox]';
-/** A table of property rows, a press in which picks rows, so lets go of the plots only. */
-const ROWS = '[role=grid]';
+/** A table of property rows, a panel's action buttons, or the edit bar under them: a press in one picks rows or acts on those picked, so lets go of the plots only. */
+export const ROWS = '[role=grid], [data-rows]';
 /** How long a click on one of several selected plots waits before it narrows the selection to that plot, so a double-click acts on them all. */
 export const DOUBLE_CLICK_MS = 300;
 
