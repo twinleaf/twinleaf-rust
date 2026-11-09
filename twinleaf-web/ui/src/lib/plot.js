@@ -134,6 +134,22 @@ export const LEVEL_FLOOR = 4;
 export const LEVEL_BAND = 1.25;
 
 /**
+ * Range [x0, x1] moved back onto the device pixel grid of a plot `width`
+ * device px wide: its start at the whole multiple of a pixel's time at or
+ * before x0, counted from time zero, its span kept. A live view's range
+ * moves by fractions of a pixel each frame, which samples a fast signal
+ * at a new phase in every column, so columns whose data did not change
+ * flicker. On the grid each frame moves every point by whole pixels, and
+ * such a column draws the same from frame to frame.
+ */
+export function onPixelGrid(x0, x1, width) {
+  const tau = (x1 - x0) / width;
+  if (!(tau > 0) || !Number.isFinite(tau)) return [x0, x1];
+  const start = Math.floor(x0 / tau) * tau;
+  return [start, start + (x1 - x0)];
+}
+
+/**
  * The level of `levels`, finest first, that a plot `width` px wide draws
  * [x0, x1] from, given the level it drew last, `was`: the coarsest with at
  * least LEVEL_FLOOR points a pixel, held within LEVEL_BAND. A level that
@@ -528,7 +544,10 @@ export class PlotView {
   }
 
   drawTime(cfg, traces, geo, body, perf) {
-    const [x0, x1] = this.view.range(this.hub.now(perf));
+    // The range on the device pixel grid, which everything drawn below uses,
+    // so a live plot scrolls by whole pixels and does not flicker.
+    const dpr = this.renderer.dpr ?? (typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1);
+    const [x0, x1] = onPixelGrid(...this.view.range(this.hub.now(perf)), Math.max(1, Math.round(geo.plot.w * dpr)));
     const session = this.hub.session;
     const plans = traces.map((t, index) => {
       // Live, it draws the level of the live points that suits the window.

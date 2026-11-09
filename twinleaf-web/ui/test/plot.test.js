@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Points, Trace } from '../src/lib/session.svelte.js';
-import { axisSlots, blurred, pickLevel, PlotView, rowCounts, timeAxis, View } from '../src/lib/plot.js';
+import { axisSlots, blurred, onPixelGrid, pickLevel, PlotView, rowCounts, timeAxis, View } from '../src/lib/plot.js';
 
 const meta = { id: 0, route: '/', stream: 'sine', column: 'sine', units: 'V', rate: 1000 };
 
@@ -384,5 +384,58 @@ describe('the window a view goes live at', () => {
     expect([v.window, v.span]).toEqual([30, 30]);
     v.follow(true);
     expect(v.span).toBe(30);
+  });
+});
+
+// A live plot moves its points by whole device pixels from frame to frame,
+// so a column whose data did not change draws the same: checked over seeded
+// random ranges at Unix-epoch times, spans from 2 ms to an hour and plots
+// from 100 to 4000 device px wide. A failure names its seed to replay.
+describe('a range on the device pixel grid', () => {
+  /** A seeded generator of numbers in [0, 1). */
+  const random = (seed) => () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+  const cases = (seed, n, f) => {
+    const r = random(seed);
+    for (let i = 0; i < n; i++) {
+      const span = 0.002 * (3600 / 0.002) ** r();
+      const width = Math.round(100 + 3900 * r());
+      const x0 = 1.7e9 + 1e8 * r();
+      f({ span, width, x0, r, i });
+    }
+  };
+  /** How far `v` is from a whole number. */
+  const offWhole = (v) => Math.abs(v - Math.round(v));
+  // Times near the Unix epoch's 1.7e9 s resolve to about 0.24 us, so a pixel
+  // of a 2 ms window can only be placed to that: every check allows a few of
+  // those steps of the time it works at.
+  const step = (t) => 4 * Number.EPSILON * Math.abs(t);
+
+  it('keeps its span and starts less than a pixel before the range', () => {
+    cases(1, 2000, ({ span, width, x0, i }) => {
+      const tau = span / width;
+      const [a, b] = onPixelGrid(x0, x0 + span, width);
+      expect(Math.abs(b - a - span), `case ${i}`).toBeLessThanOrEqual(step(x0));
+      expect(x0 - a, `case ${i}`).toBeGreaterThanOrEqual(-step(x0));
+      expect(x0 - a, `case ${i}`).toBeLessThan(tau + step(x0));
+    });
+  });
+
+  it('moves by whole pixels, and never back, as a live view scrolls', () => {
+    cases(2, 300, ({ span, width, x0, r, i }) => {
+      const tau = span / width;
+      let t = x0, was = onPixelGrid(t, t + span, width)[0];
+      for (let frame = 0; frame < 60; frame++) {
+        t += tau * 3 * r();
+        const now = onPixelGrid(t, t + span, width)[0];
+        expect(now, `case ${i} frame ${frame}`).toBeGreaterThanOrEqual(was);
+        expect(offWhole((now - was) / tau) * tau, `case ${i} frame ${frame}`).toBeLessThanOrEqual(step(t));
+        was = now;
+      }
+    });
+  });
+
+  it('leaves a range it cannot place as it is', () => {
+    expect(onPixelGrid(5, 5, 100)).toEqual([5, 5]);
+    expect(onPixelGrid(0, 10, 0)).toEqual([0, 10]);
   });
 });
