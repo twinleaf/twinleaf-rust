@@ -100,6 +100,57 @@ export const presets = {
   focus: (ids) => (ids.length < 2 ? leaf(ids[0]) : split('row', leaf(ids[0]), chain(ids.slice(1).map(leaf), 'col'), 0.6)),
 };
 
+/** The gap between two tiles, in px; Tiles.svelte sets the page's `--gutter` from it. */
+export const GUTTER = 7;
+
+/**
+ * The box {x, y, w, h} of each plot of `node` laid out in `box`, by plot id,
+ * with `gap` between the two sides of every split: a split gives side a its
+ * ratio of what the gap leaves, and side b the rest. Every coordinate is
+ * linear in the box and the gap, so the page draws a tile at
+ * `rects(node, unit, 0)` of its box plus `rects(node, zero, 1)` gaps.
+ */
+export function rects(node, box, gap = GUTTER, out = new Map()) {
+  if (!node) return out;
+  if (node.type === 'leaf') return out.set(node.plotId, box);
+  const [a, b] = sides(node, box, gap);
+  rects(node.a, a, gap, out);
+  return rects(node.b, b, gap, out);
+}
+
+/** The boxes of split `node`'s two sides in `box`, `gap` between them. */
+function sides(node, { x, y, w, h }, gap) {
+  if (node.dir === 'row') {
+    const wa = (w - gap) * node.ratio;
+    return [{ x, y, w: wa, h }, { x: x + wa + gap, y, w: w - gap - wa, h }];
+  }
+  const ha = (h - gap) * node.ratio;
+  return [{ x, y, w, h: ha }, { x, y: y + ha + gap, w, h: h - gap - ha }];
+}
+
+/**
+ * The gap of every split of `node` laid out in `box`, as {path, dir, ratio,
+ * x, y, w, h, split}: its box, and `split` the split's own. `path` names the
+ * split by the sides taken from the root to it, as 'ab'.
+ */
+export function gutters(node, box, gap = GUTTER, path = '', out = []) {
+  if (!node || node.type === 'leaf') return out;
+  const [a, b] = sides(node, box, gap);
+  const g = node.dir === 'row' ? { x: a.x + a.w, y: box.y, w: gap, h: box.h } : { x: box.x, y: a.y + a.h, w: box.w, h: gap };
+  out.push({ path, dir: node.dir, ratio: node.ratio, ...g, split: box });
+  gutters(node.a, a, gap, path + 'a', out);
+  return gutters(node.b, b, gap, path + 'b', out);
+}
+
+/** The tree with the split at `path` (as `gutters` names it) at `ratio`; the same tree when it is there already. */
+export function setRatio(node, path, ratio) {
+  if (!node || node.type === 'leaf') return node;
+  if (!path) return node.ratio === ratio ? node : { ...node, ratio };
+  const side = path[0];
+  const next = setRatio(node[side], path.slice(1), ratio);
+  return next === node[side] ? node : { ...node, [side]: next };
+}
+
 /**
  * The size {width, height} the leaf showing `plotId` has in a `width` by
  * `height` area, by its splits' ratios, or null when no leaf shows it.

@@ -31,7 +31,7 @@
   import RiMoon from '@lucide/svelte/icons/moon';
   import RiSystem from '@lucide/svelte/icons/monitor';
   import PlotCard from './lib/PlotCard.svelte';
-  import Tile from './lib/Tile.svelte';
+  import Tiles from './lib/Tiles.svelte';
   import Devices from './lib/Devices.svelte';
   import Properties from './lib/Properties.svelte';
   import Dock from './lib/Dock.svelte';
@@ -1022,7 +1022,7 @@
           <div class="tiles" data-focus="plots" tabindex="-1" class:has-max={ws.maximized} class:drop-target={drags.drop?.outer && !drags.drop.edge}>
             {#key ws.activeId}
               {#if ws.layout}
-                <Tile node={ws.layout} leafContent={plotTile} drop={drags.drop} maximized={ws.maximized} lifted={drags.moving?.group} landed={drags.landed} />
+                <Tiles layout={ws.layout} leafContent={plotTile} drop={drags.drop} maximized={ws.maximized} lifted={drags.moving?.group} landed={drags.landed} onResize={(path, ratio) => history.group('Resize', () => ws.setRatio(path, ratio))} />
               {:else}
                 <Tip text="Or drop a signal anywhere here">
                   {#snippet children(tip)}<Button {...tip} class="m-auto" size="sm" variant="outline" onclick={() => newPlotWith([])}><RiAdd />Add a plot</Button>{/snippet}

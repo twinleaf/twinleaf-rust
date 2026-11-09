@@ -3,7 +3,7 @@
 // page does to it. Every plot id is unique across tabs.
 
 import { SvelteSet } from 'svelte/reactivity';
-import { append, plotIds, presets, removePlot, splitBeside } from './layout.js';
+import { append, plotIds, presets, removePlot, setRatio, splitBeside } from './layout.js';
 import { chip, defaultContent, emptyTab, newPlot, remapIds } from './tabs.js';
 
 export class Workspace {
@@ -128,6 +128,11 @@ export class Workspace {
       const plot = this.plots[id];
       if (plot && !plot.items.some((i) => i.key === key)) plot.items.push(chip(key));
     }
+  }
+
+  /** Sets the open tab's split at `path` (as layout.js `gutters` names it) to `ratio`. */
+  setRatio(path, ratio) {
+    this.tab.layout = setRatio(this.layout, path, ratio);
   }
 
   closePlot(id) {

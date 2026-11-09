@@ -1,21 +1,26 @@
-// No component writes to a prop it was given, except through `$bindable`.
-// A write to a prop, or to anything reached through it, makes Svelte read
+// No component assigns to a prop it was given, or to a property reached
+// through it, except through `$bindable`. Such an assignment makes Svelte read
 // that prop through an override the component can set, so the component can
-// stop following what its parent passes; and the parent's state gains a
+// stop following what its parent passes, and gives the parent's state a
 // second writer. Changes go up through a callback or a method instead.
+//
+// What this sees is what the compiler marks: assignments, `++`, `--` and
+// `delete` through the prop's own name. A method that mutates (`push`), an
+// alias, or a function the prop is passed to goes unseen.
 import { describe, expect, it } from 'vitest';
 import { compile } from 'svelte/compiler';
-import { PROPS_IS_BINDABLE, PROPS_IS_UPDATED } from '../node_modules/svelte/src/constants.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
-/** The writes still to move, as `file prop`, each with the step that moves it. */
+/** Svelte's PROPS_IS_UPDATED and PROPS_IS_BINDABLE flags (svelte/src/constants.js). */
+const UPDATED = 1 << 2, BINDABLE = 1 << 3;
+
+/** The writes the page still makes, as `file prop`, each with what it writes. */
 const PENDING = new Map([
-  ['lib/Tile.svelte node', 'tiles drawn from the layout'],
-  ['lib/Dock.svelte docks', 'docks without panes'],
-  ['lib/TabStrip.svelte ws', 'the document written by Workspace only'],
-  ['lib/KindPicker.svelte plot', 'the document written by Workspace only'],
-  ['lib/PlotCard.svelte plot', 'the document written by Workspace only'],
+  ['lib/Dock.svelte docks', 'whether a panel is being dragged'],
+  ['lib/TabStrip.svelte ws', 'the order of the tabs'],
+  ['lib/KindPicker.svelte plot', "the plot's kind and mode"],
+  ['lib/PlotCard.svelte plot', "the plot's signals, axes, scale and frequency range"],
 ]);
 
 const SRC = path.resolve('src');
@@ -25,24 +30,25 @@ const components = (dir) =>
     return e.isDirectory() ? components(p) : e.name.endsWith('.svelte') ? [p] : [];
   });
 
-/** Every `file prop` whose component writes to it without `$bindable`. */
-function writtenProps() {
-  const out = [];
-  for (const file of components(SRC)) {
-    const { code } = compile(fs.readFileSync(file, 'utf8'), { filename: file, generate: 'client' }).js;
-    for (const [, prop, flags] of code.matchAll(/\$\.prop\(\$\$props, '(\w+)', (\d+)/g)) {
-      if (+flags & PROPS_IS_UPDATED && !(+flags & PROPS_IS_BINDABLE)) out.push(`${path.relative(SRC, file).replaceAll('\\', '/')} ${prop}`);
-    }
-  }
-  return out.sort();
+/** The props component `source` writes to without `$bindable`. */
+function written(source, filename) {
+  const { code } = compile(source, { filename, generate: 'client' }).js;
+  return [...code.matchAll(/\$\.prop\(\$\$props, '(\w+)', (\d+)/g)].filter(([, , f]) => +f & UPDATED && !(+f & BINDABLE)).map(([, prop]) => prop);
 }
 
 describe('props', () => {
-  const written = writtenProps();
-  it('are written only through $bindable, or by a write still to move', () => {
-    expect(written.filter((w) => !PENDING.has(w))).toEqual([]);
+  const found = components(SRC).flatMap((file) => written(fs.readFileSync(file, 'utf8'), file).map((prop) => `${path.relative(SRC, file).replaceAll('\\', '/')} ${prop}`));
+
+  it('are found when written, and not when only read or bound', () => {
+    const c = (script) => `<script>${script}</script>`;
+    expect(written(c('let { node } = $props(); const f = () => (node.ratio = 1);'), 'a.svelte')).toEqual(['node']);
+    expect(written(c('let { node } = $props(); const f = () => node.ratio;'), 'b.svelte')).toEqual([]);
+    expect(written(c('let { node = $bindable() } = $props(); const f = () => (node = 1);'), 'c.svelte')).toEqual([]);
   });
-  it('still to move are still written, so the list shrinks as each moves', () => {
-    expect([...PENDING.keys()].filter((w) => !written.includes(w))).toEqual([]);
+  it('are written only through $bindable, or by a write the page still makes', () => {
+    expect(found.filter((w) => !PENDING.has(w))).toEqual([]);
+  });
+  it('the page still writes are still written, so the list shrinks as each goes', () => {
+    expect([...PENDING.keys()].filter((w) => !found.includes(w))).toEqual([]);
   });
 });

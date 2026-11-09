@@ -1,6 +1,7 @@
 // The tiles on screen follow the layout: after any run of handle drags,
-// undos, redos and layout edits, every split shows its two sides at the
-// ratio the layout holds, and every plot of the layout in one tile.
+// undos, redos, layout edits and box resizes, every plot of the layout is
+// in one tile, at the box layout.js `rects` gives it, with a handle for
+// every split.
 import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync, mount, unmount } from 'svelte';
@@ -11,7 +12,7 @@ import TileArea from './browser/TileArea.svelte';
 import { Workspace } from '../src/lib/workspace.svelte.js';
 import { History } from '../src/lib/history.svelte.js';
 import { Favorites } from '../src/lib/favorites.svelte.js';
-import { dock, plotIds, presets } from '../src/lib/layout.js';
+import { GUTTER, dock, gutters, plotIds, presets, rects } from '../src/lib/layout.js';
 import { makeTab, newPlot } from '../src/lib/tabs.js';
 
 const EDGES = ['left', 'right', 'top', 'bottom'];
@@ -37,25 +38,16 @@ function setup() {
   };
 }
 
-/** The box around the tiles of `ids`, from the page. */
-function boxOf(ids) {
-  const rs = ids.map((id) => document.querySelector(`[data-plot="${id}"]`).getBoundingClientRect());
-  const left = Math.min(...rs.map((r) => r.left)), top = Math.min(...rs.map((r) => r.top));
-  return { left, top, width: Math.max(...rs.map((r) => r.right)) - left, height: Math.max(...rs.map((r) => r.bottom)) - top };
-}
-
-/**
- * Every split of `node` whose two sides on screen are not in its order,
- * side a first, or not at its ratio, to within a pixel.
- */
-function misplaced(node, out = []) {
-  if (!node || node.type === 'leaf') return out;
-  const a = boxOf(plotIds(node.a)), b = boxOf(plotIds(node.b));
-  const row = node.dir === 'row';
-  const [sa, sb] = row ? [a.width, b.width] : [a.height, b.height];
-  const inOrder = row ? a.left < b.left : a.top < b.top;
-  if (!inOrder || Math.abs(sa - node.ratio * (sa + sb)) > 1) out.push({ a: plotIds(node.a), dir: node.dir, ratio: node.ratio, shown: sa / (sa + sb), inOrder });
-  return misplaced(node.b, misplaced(node.a, out));
+/** Every plot whose tile on screen is more than a pixel from the box layout.js `rects` gives it. */
+function misplaced(layout) {
+  const r = document.querySelector('.tile-box').getBoundingClientRect();
+  const want = rects(layout, { x: r.left, y: r.top, w: r.width, h: r.height }, GUTTER);
+  const out = [];
+  for (const [id, w] of want) {
+    const got = document.querySelector(`[data-plot="${id}"]`).getBoundingClientRect();
+    if (Math.max(Math.abs(got.left - w.x), Math.abs(got.top - w.y), Math.abs(got.width - w.w), Math.abs(got.height - w.h)) > 1) out.push({ id, want: w, got: { x: got.left, y: got.top, w: got.width, h: got.height } });
+  }
+  return out;
 }
 
 const step = fc.oneof(
@@ -67,6 +59,9 @@ const step = fc.oneof(
   fc.record({ t: fc.constant('box'), w: fc.integer({ min: 500, max: 1100 }), h: fc.integer({ min: 350, max: 800 }) }),
 );
 
+/** How many drags moved a split, over every run: none would make the property vacuous. */
+let resized = 0;
+
 async function run(s, { ws, history }) {
   if (s.t === 'drag') {
     const handles = [...document.querySelectorAll('.tiles [role="separator"]')];
@@ -77,7 +72,9 @@ async function run(s, { ws, history }) {
     const path = [['move', x, y], ['down']];
     for (let k = 1; k <= 4; k++) path.push(['move', x + (dx * k) / 4, y + (dy * k) / 4]);
     path.push(['up']);
+    const was = history.undos.length;
     await commands.mouse(path);
+    if (history.undoLabel === 'Resize' && history.undos.length > was) resized++;
   } else if (s.t === 'undo') history.undo();
   else if (s.t === 'redo') history.redo();
   else if (s.t === 'arrange') history.group('Arrange', () => ws.arrange(s.preset));
@@ -102,6 +99,7 @@ describe('the tiles', () => {
             const ids = plotIds(page.ws.layout);
             expect([...document.querySelectorAll('.tiles [data-plot]')].map((e) => e.dataset.plot).sort()).toEqual([...ids].sort());
             expect(misplaced(page.ws.layout)).toEqual([]);
+            expect(document.querySelectorAll('.tiles [role="separator"]').length).toBe(gutters(page.ws.layout, { x: 0, y: 0, w: 1, h: 1 }).length);
           }
         } finally {
           page.dispose();
@@ -109,11 +107,12 @@ describe('the tiles', () => {
       }),
       { numRuns: Math.ceil(fc.readConfigureGlobal().numRuns / 4) },
     );
+    expect(resized).toBeGreaterThan(0);
   });
 });
 
 describe('a handle drag', () => {
-  it.fails('that its tiles leave in the middle of leaves undo working', async () => {
+  it('that its tiles leave in the middle of leaves undo working', async () => {
     const page = setup();
     await frames();
     page.history.group('Arrange', () => page.ws.arrange('columns'));

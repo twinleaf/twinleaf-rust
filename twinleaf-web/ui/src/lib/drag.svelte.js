@@ -112,6 +112,11 @@ export class Drags {
     this.history = history;
   }
 
+  /** Runs `fn` as one undo step named `label`. */
+  group(label, fn) {
+    return this.history ? this.history.group(label, fn) : fn();
+  }
+
   #landedTimer;
   flash(ids) {
     this.landed = new Set(ids);
@@ -178,9 +183,8 @@ export class Drags {
     const ws = this.ws;
     const [x0, y0] = [e.clientX, e.clientY];
     const group = new Set(ws.selected.has(plotId) && ws.selected.size > 1 ? ws.selected : [plotId]);
-    let lifted = null; // {original, rects, tiles, size} once picked up
+    let lifted = null; // {original, rects, tiles, size, remembers} once picked up
     let shown = null; // the target the preview shows
-    let wasSize; // the plot's remembered size before it was picked up, put back when it lands nowhere
     const targetAt = (x, y) => {
       const under = document.elementsFromPoint(x, y).find((el) => !el.closest('.move-ghost, .compass'));
       const tabEl = under?.closest('[data-tab]');
@@ -254,19 +258,13 @@ export class Drags {
           const rects = new Map(leaves.map((el) => [el.dataset.plot, el.getBoundingClientRect()]));
           const tiles = document.querySelector('.tiles').getBoundingClientRect();
           // A plot remembers the width it has beside another, or the height
-          // it has above or below one, as a share of the layout. A group
-          // remembers nothing and takes half.
-          let size = {};
+          // it has above or below one, as a share of the layout, kept once it
+          // lands (`remembers`). A group remembers nothing and takes half.
           const plot = ws.plots[plotId], r = rects.get(plotId);
-          this.history?.begin(group.size > 1 ? `Move ${group.size} plots` : 'Move plot');
-          wasSize = plot?.dockSize;
-          if (group.size === 1 && plot && r) {
-            const dir = holderDir(ws.tab.layout, plotId);
-            if (dir === 'row') plot.dockSize = { ...plot.dockSize, w: r.width / tiles.width };
-            if (dir === 'col') plot.dockSize = { ...plot.dockSize, h: r.height / tiles.height };
-            size = plot.dockSize ?? {};
-          }
-          lifted = { original: ws.tab.layout, rects, size, tiles };
+          const dir = group.size === 1 && plot && r ? holderDir(ws.tab.layout, plotId) : null;
+          const remembers = dir === 'row' ? { ...plot.dockSize, w: r.width / tiles.width } : dir === 'col' ? { ...plot.dockSize, h: r.height / tiles.height } : null;
+          const size = group.size === 1 ? (remembers ?? plot?.dockSize ?? {}) : {};
+          lifted = { original: ws.tab.layout, rects, size, remembers, tiles };
           ws.maximized = null;
         }
         shown = targetAt(ev.clientX, ev.clientY);
@@ -277,17 +275,18 @@ export class Drags {
         this.compass = null;
         this.preview = null;
         this.moving = null;
-        if (!lifted) return;
-        if (!shown || ev.type === 'pointercancel') {
-          if (ws.plots[plotId]) ws.plots[plotId].dockSize = wasSize;
-        } else if (shown.tabId) {
-          for (const id of group) ws.movePlotToTab(id, shown.tabId);
-          ws.selected.clear();
-        } else {
-          ws.tab.layout = layoutFor(shown);
-          this.flash(group);
-        }
-        this.history?.end();
+        if (!lifted || !shown || ev.type === 'pointercancel') return;
+        // The drop is one step: where the plots land, and the size the plot
+        // moved remembers.
+        const label = group.size > 1 ? `Move ${group.size} plots` : 'Move plot';
+        this.group(label, () => {
+          if (lifted.remembers && ws.plots[plotId]) ws.plots[plotId].dockSize = lifted.remembers;
+          if (shown.tabId) {
+            for (const id of group) ws.movePlotToTab(id, shown.tabId);
+            ws.selected.clear();
+          } else ws.tab.layout = layoutFor(shown);
+        });
+        if (!shown.tabId) this.flash(group);
       },
     );
   }
