@@ -112,9 +112,11 @@ export class Drags {
     this.history = history;
   }
 
+  #landedTimer;
   flash(ids) {
     this.landed = new Set(ids);
-    setTimeout(() => (this.landed = null), LANDED_MS);
+    clearTimeout(this.#landedTimer);
+    this.#landedTimer = setTimeout(() => (this.landed = null), LANDED_MS);
   }
 
   /**
