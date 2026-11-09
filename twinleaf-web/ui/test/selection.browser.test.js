@@ -163,3 +163,28 @@ describe('keyboard focus', () => {
     }
   });
 });
+
+describe('a signal clicked in the Signals list', () => {
+  it('joins every selected plot that does not show it, and with none selected goes nowhere', async () => {
+    const page = await mountPage(KEYS, 'columns', 0, ['vector.x', 'vector.y']);
+    try {
+      const [a, b, c] = plotIds(page.ws.layout);
+      const click = async () => {
+        document.querySelector('.palette [data-key="vector.x"]').click();
+        flushSync();
+        await frames();
+      };
+      const tabs = page.ws.tabs;
+      await click();
+      expect(page.ws.tabs).toBe(tabs);
+      page.ws.selected.add(a);
+      page.ws.selected.add(c);
+      await click();
+      for (const id of [a, c]) expect(page.ws.plots[id].items.map((i) => i.key)).toContain('vector.x');
+      expect(page.ws.plots[b].items.map((i) => i.key)).not.toContain('vector.x');
+      expect(page.history.undos.length).toBe(1);
+    } finally {
+      page.dispose();
+    }
+  });
+});

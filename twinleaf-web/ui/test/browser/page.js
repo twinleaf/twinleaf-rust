@@ -20,22 +20,40 @@ export const frames = (n = 2) =>
   });
 
 /**
+ * A hub with no socket that has announced `signals`, keys as 'stream.column',
+ * each a trace of route '/' in volts.
+ */
+export function stubHub(signals = []) {
+  const hub = new Hub();
+  hub.close();
+  hub.text({ type: 'hub', id: 'test', seq: 0 });
+  signals.forEach((key, id) => {
+    const [stream, column] = key.split('.');
+    hub.text({ type: 'trace', seq: id + 1, trace: { id, route: '/', stream, column, units: 'V', rate: 100 } });
+  });
+  return hub;
+}
+
+/**
  * The page with a tab of plots showing `keys`, a list of signal keys per
  * plot, laid out as layout.js preset `preset`, open, `more` empty tabs
- * after it, and nothing saved.
+ * after it, and nothing saved. Its hub has no socket and has announced the
+ * signals `signals`.
  */
-export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0) {
+export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = []) {
   localStorage.clear();
   const ps = keys.map((k) => newPlot('time', 'overlay', k));
   const tab = makeTab('A', { plots: Object.fromEntries(ps.map((p) => [p.id, p])), layout: ps.length ? presets[preset](ps.map((p) => p.id)) : null });
   const ws = new Workspace({ tabs: [tab, ...Array.from({ length: more }, (_, i) => emptyTab(`Layout ${i + 2}`))], activeId: tab.id });
   const history = new History(ws, new Favorites(null));
   const target = document.body.appendChild(document.createElement('div'));
-  const app = mount(App, { target, context: new Map([['page', { hub: new Hub(), ws, history }]]) });
+  const hub = stubHub(signals);
+  const app = mount(App, { target, context: new Map([['page', { hub, ws, history }]]) });
   await frames();
   return {
     ws,
     history,
+    hub,
     dispose: () => {
       unmount(app);
       target.remove();

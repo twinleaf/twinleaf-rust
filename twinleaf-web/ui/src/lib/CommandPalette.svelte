@@ -5,7 +5,7 @@
   import * as Command from '$lib/components/ui/command/index.js';
   import { ARRANGEMENTS } from './constants.js';
 
-  /** `act` holds the page's actions: toggleDock(side), dockShown(side), addToFocused(key), newPlot(keys), followLive(), clearCursors(), exportTabs(), importTabs(). */
+  /** `act` holds the page's actions: toggleDock(side), dockShown(side), addSignal(key), newPlot(keys), followLive(), clearCursors(), exportTabs(), importTabs(). */
   let { open = $bindable(false), session, ws, act } = $props();
   const history = getContext('history');
 
@@ -22,7 +22,7 @@
     <Command.Empty>Nothing matches.</Command.Empty>
     <Command.Group heading="Add to the highlighted plot">
       {#each session.signals as t (t.key)}
-        <Command.Item value={`add ${t.key}`} onSelect={() => run(() => act.addToFocused(t.key))}>{t.key}</Command.Item>
+        <Command.Item value={`add ${t.key}`} onSelect={() => run(() => act.addSignal(t.key))}>{t.key}</Command.Item>
       {/each}
     </Command.Group>
     <Command.Group heading="New plot with">

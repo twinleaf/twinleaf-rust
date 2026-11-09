@@ -473,13 +473,14 @@
   function newPlotWith(keys) {
     history.group('New plot', () => ws.addPlot(newPlot('time', 'overlay', keys)));
   }
-  /** Adds signal `key` from the Signals list to every selected plot, or else as Workspace.addToFocused does. */
+  /**
+   * Adds signal `key`, from the Signals list or the command palette, to
+   * every selected plot. With none selected it does nothing: a signal goes
+   * to a plot by drag there.
+   */
   function addSignal(key) {
     const ids = [...ws.selected].filter((id) => ws.plots[id]);
-    history.group(ids.length > 1 ? `Add ${key} (${plotsText(ids.length)})` : `Add ${key}`, () => {
-      if (ids.length) ws.addTo(ids, key);
-      else ws.addToFocused(key);
-    });
+    if (ids.length) history.group(ids.length > 1 ? `Add ${key} (${plotsText(ids.length)})` : `Add ${key}`, () => ws.addTo(ids, key));
   }
   /** Moves keyboard focus to plot `id`, once it is on the page. */
   async function focusPlot(id) {
@@ -588,7 +589,7 @@
     for (const pv of registry) if (ids.includes(pv.plotId)) had = pv.clearCursors() || had;
     return had;
   }
-  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addToFocused: (key) => history.group(`Add ${key}`, () => ws.addToFocused(key)), newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };
+  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addSignal, newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };
 
   let paletteOpen = $state(false);
   let keysOpen = $state(false);
@@ -751,8 +752,9 @@
     }
     if (action !== 'pause' && action !== 'escape') {
       // Every other key acts on the plot clicked last, wherever focus is,
-      // or else on the selection, through the first plot of it.
-      if (!action && !e.defaultPrevented) plotKeys.get(ws.focusedId ?? [...ws.selected][0])?.(e);
+      // or else on the selection, through the first plot of it; in a table,
+      // whose rows are what is picked there, on no plot.
+      if (!action && !e.defaultPrevented && !e.target.closest?.('[role=grid]')) plotKeys.get(ws.focusedId ?? [...ws.selected][0])?.(e);
       return;
     }
     if (action === 'escape') return leave();

@@ -65,7 +65,7 @@ export const KEYMAP = [
     title: 'Lists',
     entries: [
       { ...MOVE, keys: ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'] },
-      { show: ['Enter'], keys: ['Enter'], shift: false, action: 'add', what: 'Add to plot' },
+      { show: ['Enter'], keys: ['Enter'], shift: false, action: 'add', what: 'Add to the selected plots' },
       { show: ['Shift', 'Enter'], keys: ['Enter'], shift: true, action: 'newPlot', what: 'New plot with it' },
     ],
   },

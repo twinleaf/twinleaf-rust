@@ -29,15 +29,6 @@ describe('the workspace', () => {
     expect(ws.layout).toBeNull();
   });
 
-  it('adds a signal to the focused plot, or a new plot when the tab has none', () => {
-    const ws = workspace();
-    ws.selectTab(ws.tabs[1].id);
-    ws.addToFocused('sine.sine');
-    expect(plotIds(ws.layout).length).toBe(1);
-    ws.addToFocused('sine.sine');
-    expect(ws.plots[ws.focusedId].items.map((i) => i.key)).toEqual(['sine.sine']);
-  });
-
   it('names the signals the open tab shows as spectra', () => {
     const ws = workspace();
     expect(ws.spectrumKeys().sort()).toEqual(['aux.triangle', 'sine.cosine', 'sine.sine']);

@@ -212,13 +212,6 @@ export class Workspace {
     if (layout !== this.layout) this.#edit((t) => ({ ...t, layout }));
   }
 
-  /** Adds signal `key` to the focused plot, or the first, or a new one when there is none. */
-  addToFocused(key) {
-    const plot = this.plots[this.focusedId] ?? this.plots[plotIds(this.layout)[0]];
-    if (!plot) this.addPlot(newPlot('time', 'overlay', [key]));
-    else this.addTo([plot.id], key);
-  }
-
   /** Adds signal `key` to each plot of `ids` that does not show it. */
   addTo(ids, key) {
     for (const id of ids) {

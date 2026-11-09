@@ -8,12 +8,12 @@
 
 <script>
   // Every signal the hub has, or those the search matches, to drag onto the
-  // tiles or add to the highlighted plot.
+  // tiles or add to the selected plots.
   //
   // The search matches every word typed against the signal's key and units.
   // Its arrows move along the list, as the list's own do once it has focus.
-  // Enter adds the signal to the focused plot, and Shift+Enter gives it a
-  // new one. Dragging a signal out copies it, and nothing drops back in.
+  // A click or Enter adds the signal to the selected plots, and Shift+Enter
+  // gives it a new one. Dragging a signal out copies it, and nothing drops back in.
   import { untrack } from 'svelte';
   import { flip } from 'svelte/animate';
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
@@ -31,7 +31,7 @@
   import { actionFor, stepIn } from './keymap.js';
   import { uid } from './tabs.js';
 
-  /** `drags` is the page's Drags; `onAdd(key)` adds to the focused plot, `onNewPlot(keys)` makes a plot. */
+  /** `drags` is the page's Drags; `onAdd(key)` adds to the selected plots, `onNewPlot(keys)` makes a plot. */
   let { session, drags, onAdd, onNewPlot } = $props();
 
   const FLIP_MS = 150;
