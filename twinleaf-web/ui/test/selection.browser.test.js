@@ -115,7 +115,7 @@ describe('Escape', () => {
       page.ws.maximized = [a];
       page.ws.selected.add(a);
       page.ws.selected.add(b);
-      page.ws.focusedId = a;
+      page.ws.selection.point(a);
       flushSync();
       document.body.focus();
       await commands.key('Escape');
@@ -216,7 +216,7 @@ describe('F from the keys', () => {
       const [a, b, c] = plotIds(page.ws.layout);
       page.ws.selected.add(a);
       page.ws.selected.add(c);
-      page.ws.focusedId = b;
+      page.ws.selection.point(b);
       flushSync();
       document.body.focus();
       await commands.key('f');
@@ -347,6 +347,28 @@ describe('property rows', () => {
       expect(plotIds(page.ws.layout)).toEqual(ids);
       for (const id of ids) expect(page.ws.plots[id].legend, id).toBe(false);
       expect(page.ws.maximized).toBe(null);
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
+describe('a split from the keys', () => {
+  it('with several plots selected keeps every new plot selected, though it moves focus to one', async () => {
+    const page = await mountPage(KEYS, 'columns');
+    try {
+      const ids = plotIds(page.ws.layout);
+      await commands.key('1');
+      flushSync();
+      page.ws.selection.only([ids[0], ids[2]]);
+      flushSync();
+      await commands.key('|');
+      flushSync();
+      await frames();
+      const made = plotIds(page.ws.layout).filter((p) => !ids.includes(p));
+      expect(made.length).toBe(2);
+      expect([...page.ws.selected].sort()).toEqual([...made].sort());
+      expect(made).toContain(document.activeElement.closest('.leaf')?.dataset.plot);
     } finally {
       page.dispose();
     }

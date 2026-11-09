@@ -108,7 +108,7 @@ export class History {
   }
 
   #selection() {
-    return { tab: this.ws.activeId, selected: [...this.ws.selected], focusedId: this.ws.focusedId };
+    return { tab: this.ws.activeId, ...this.ws.selection.snapshot() };
   }
 
   /** Puts `s` back, keeps each plot's view fields as they are now, and opens the tab of `sel` with its plots selected. */
@@ -136,8 +136,6 @@ export class History {
     }
     const tab = this.ws.tabs.some((t) => t.id === sel.tab) ? sel.tab : this.ws.tabs[0].id;
     if (tab !== this.ws.activeId) this.ws.selectTab(tab);
-    this.ws.selected.clear();
-    for (const id of sel.selected) if (this.ws.plots[id]) this.ws.selected.add(id);
-    this.ws.focusedId = this.ws.plots[sel.focusedId] ? sel.focusedId : null;
+    this.ws.selection.restore(sel);
   }
 }

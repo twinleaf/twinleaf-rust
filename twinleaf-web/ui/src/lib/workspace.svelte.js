@@ -8,7 +8,7 @@
 // History, is told of every edit, so an edit made outside an undo step is
 // caught where it is made.
 
-import { SvelteSet } from 'svelte/reactivity';
+import { Selection } from './selection.svelte.js';
 import { append, plotIds, presets, removePlot, setRatio, splitBeside } from './layout.js';
 import { VIEW_FIELDS, chip, defaultContent, emptyTab, newPlot, remapIds } from './tabs.js';
 
@@ -30,12 +30,10 @@ export class Workspace {
   /** The open tab's plots by id, and its layout: each changes only when it does, not with the rest of the tab. */
   plots = $derived(this.tab.plots);
   layout = $derived(this.tab.layout);
-  /** The plot clicked or focused last, in the open tab. */
-  focusedId = $state(null);
   /** The plots that fill the tab, as an array of ids, or null. */
   maximized = $state.raw(null);
-  /** The plots selected in the open tab, by id. */
-  selected = new SvelteSet();
+  /** The plots selected in the open tab, the plot clicked last and the rows picked, and their rules: their only writer. */
+  selection = new Selection((id) => id != null && !!this.plots?.[id]);
   /** The plot last focused in each tab, for coming back to it. */
   lastFocus = new Map();
   /** Told of every edit before it is made: History's check that an undo step holds it. */
@@ -47,6 +45,14 @@ export class Workspace {
     this.activeId = initial.activeId;
   }
 
+  /** The plots selected in the open tab, by id: the Selection's, which alone changes them. */
+  get selected() {
+    return this.selection.plots;
+  }
+  /** The plot clicked or focused last, in the open tab, or null. */
+  get focusedId() {
+    return this.selection.last;
+  }
   /** The tabs, frozen. */
   get tabs() {
     return this.#tabs;
@@ -59,18 +65,17 @@ export class Workspace {
     this.#prune();
   }
   /**
-   * Lets go of every plot the selection, the maximized plot and the plot
+   * Lets go of every plot the selection, the maximized plots and the plot
    * clicked last name that the open tab no longer has: run whenever the
    * tabs change, so none of them ever names a plot that is gone.
    */
   #prune() {
     const plots = this.tab?.plots ?? {};
-    for (const id of [...this.selected]) if (!plots[id]) this.selected.delete(id);
+    this.selection.prune();
     if (this.maximized?.some((id) => !plots[id])) {
       const kept = this.maximized.filter((id) => plots[id]);
       this.maximized = kept.length ? kept : null;
     }
-    if (this.focusedId !== null && !plots[this.focusedId]) this.focusedId = null;
   }
   /** The open tab replaced by `fn(tab)`. */
   #edit(fn) {
@@ -87,6 +92,12 @@ export class Workspace {
   /** Every plot id of every tab. */
   allPlotIds() {
     return this.#tabs.flatMap((t) => plotIds(t.layout));
+  }
+
+  /** The plots of the open tab as they show, in layout order: only the maximized ones while some are. */
+  shownIds() {
+    const ids = plotIds(this.layout);
+    return this.maximized ? ids.filter((id) => this.maximized.includes(id)) : ids;
   }
 
   /** The highlighted plots: the selection, or the plot clicked last, or every plot in the tab. */
@@ -114,8 +125,7 @@ export class Workspace {
     if (this.focusedId) this.lastFocus.set(this.activeId, this.focusedId);
     this.activeId = id;
     this.maximized = null;
-    this.focusedId = null;
-    this.selected.clear();
+    this.selection.clear();
   }
 
   addTab() {
@@ -180,10 +190,10 @@ export class Workspace {
     this.placePlot(p, where ? splitBeside(this.layout, where, p.id, dir) : append(this.layout, p.id));
   }
 
-  /** Adds plot `p` to the open tab, the tab then laid out as `layout`, and focuses it; plots maximized show the rest again, so it shows. */
+  /** Adds plot `p` to the open tab, the tab then laid out as `layout`, and makes it the plot clicked last; plots maximized show the rest again, so it shows. */
   placePlot(p, layout) {
     this.#edit((t) => ({ ...t, plots: { ...t.plots, [p.id]: p }, layout }));
-    this.focusedId = p.id;
+    this.selection.point(p.id);
     this.maximized = null;
   }
 

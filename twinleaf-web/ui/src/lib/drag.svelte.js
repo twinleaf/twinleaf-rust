@@ -7,11 +7,10 @@
 // a drop could go, and the one under the pointer is the target, named
 // beside it.
 
-import { dock, dockOuter, holderDir, leaf, rects } from './layout.js';
+import { dock, dockOuter, holderDir, leaf, rects, restrict } from './layout.js';
 import { OUTER_SHARE, cellAt, moveCells, signalCells } from './moves.js';
 import { chip, newPlot } from './tabs.js';
 import { DRAG_START } from './constants.js';
-import { Selection } from './selection.svelte.js';
 
 const LANDED_MS = 700;
 /** The empty background a box selection starts on, besides what listens for it: a dock, a panel's body, a list's own space below its items. */
@@ -73,8 +72,11 @@ export class Drags {
     this.ws = ws;
     this.changed = changed;
     this.history = history;
-    /** What the drags do to the plot selection: the page's, set by it. */
-    this.selection = new Selection(ws, changed);
+  }
+
+  /** The plot selection, the Workspace's, which the box and a move change. */
+  get selection() {
+    return this.ws.selection;
   }
 
   /** Runs `fn` as one undo step named `label`. */
@@ -93,7 +95,7 @@ export class Drags {
    * A drag that starts on empty background draws a box and selects every
    * plot it touches. Shift adds to the selection. A click there clears it
    * and the plot clicked last, unless it is in what keeps the selection (the
-   * Signals list); Escape clears them anywhere, putting the box away. Empty background is the element listening,
+   * Signals panel); Escape clears them anywhere, putting the box away. Empty background is the element listening,
    * or one of EMPTY: a dock below its panels, a panel's body, or a list
    * below its last item.
    */
@@ -121,10 +123,10 @@ export class Drags {
         const m = { x: Math.min(x0, ev.clientX), y: Math.min(y0, ev.clientY), w: Math.abs(ev.clientX - x0), h: Math.abs(ev.clientY - y0) };
         this.marquee = m;
         // The plots it touches, of those that show: only the maximized ones while some are.
-        const hit = new Set(base), shown = ws.maximized && new Set(ws.maximized);
+        const hit = new Set(base), shown = new Set(ws.shownIds());
         for (const el of document.querySelectorAll('.leaf[data-plot]')) {
           const r = el.getBoundingClientRect();
-          if ((!shown || shown.has(el.dataset.plot)) && r.left < m.x + m.w && r.right > m.x && r.top < m.y + m.h && r.bottom > m.y) hit.add(el.dataset.plot);
+          if (shown.has(el.dataset.plot) && r.left < m.x + m.w && r.right > m.x && r.top < m.y + m.h && r.bottom > m.y) hit.add(el.dataset.plot);
         }
         this.selection.only([...hit], null);
       },
@@ -251,7 +253,8 @@ export class Drags {
     // The cells over each plot, and along the edge, as the layout lays them out when the drag begins.
     const tiles = document.querySelector('.tile-box')?.getBoundingClientRect();
     const box = tiles && { x: tiles.left, y: tiles.top, w: tiles.width, h: tiles.height };
-    const tree = this.ws.layout, cellsOver = new Map();
+    // The layout as it shows: only the maximized plots while some are.
+    const tree = this.ws.maximized ? restrict(this.ws.layout, new Set(this.ws.maximized)) : this.ws.layout, cellsOver = new Map();
     const cellsFor = (plotId) => {
       if (!cellsOver.has(plotId)) cellsOver.set(plotId, signalCells(tree, box, plotId));
       return cellsOver.get(plotId);

@@ -267,7 +267,8 @@
   const CONTROLS = '.plot-head, button, [role=button], [role=combobox], input';
   function pressed(e) {
     pressedAt = [e.clientX, e.clientY];
-    if (e.button === 0 && !e.shiftKey && e.target.closest?.(CONTROLS)) onPress?.();
+    // A right-click anywhere on the plot selects it first, so its menu acts on what is selected.
+    if ((e.button === 0 && !e.shiftKey && e.target.closest?.(CONTROLS)) || e.button === 2) onPress?.();
     else onFocus();
   }
   function clicked(e) {
@@ -683,7 +684,7 @@
     role="toolbar"
     tabindex="-1"
   >
-    <IconButton icon={RiDraggable} label="Drag onto a plot's edge to dock, its middle to swap, or a tab to move" class="grip cursor-grab touch-none text-muted-foreground" tabindex={-1} data-focus-skip onpointerdown={onStartMove} />
+    <IconButton icon={RiDraggable} label="Drag onto a plot's edge to dock, its middle to swap, or a tab to move" class="grip cursor-grab touch-none text-muted-foreground" tabindex={-1} data-focus-skip onpointerdown={(e) => !e.shiftKey && onStartMove(e)} />
     <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} onKind={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, () => ({ kind: v }))} onMode={(v) => onEach(`Layout ${nameIn(MODES, v)}`, () => ({ mode: v }))} />
     <!-- The plot's signals, each with its value at the hover, or its newest
          while live, unless the legend shows the values. Right-clicking them

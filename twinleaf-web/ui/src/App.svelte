@@ -20,7 +20,6 @@
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
   import { actionFor } from './lib/keymap.js';
   import { keepsKey, plotKeys } from './lib/keys.js';
-  import { Selection } from './lib/selection.svelte.js';
   import { api } from './lib/protocol.js';
   import { THEMES, TRACE_WIDTH, prefs } from './lib/prefs.svelte.js';
   import RiSun from '@lucide/svelte/icons/sun';
@@ -84,10 +83,10 @@
   const { hub, ws, history } = getContext('page');
   setContext('history', history);
   const views = new Views(hub, viewChanged);
-  // What a press, a click, a key or focus does to the plot selection.
-  const selection = new Selection(ws, () => refreshToolbar());
+  // What a press, a click, a key or an undo does to the plot selection: the Workspace's.
+  const selection = ws.selection;
+  selection.changed = () => refreshToolbar();
   const drags = new Drags(ws, refreshToolbar, history);
-  drags.selection = selection;
   setContext('selection', selection);
   drags.closePlot = (id) => closePlot(id);
   drags.axisDropAt = (plotId, x, y) => [...registry].find((pv) => pv.plotId === plotId)?.axisDropAt(x, y) ?? null;
@@ -117,13 +116,9 @@
     });
   });
 
-  const targetsOf = (id) => (ws.selected.has(id) ? [...ws.selected] : [id]).map((i) => views.of(i));
-  /**
-   * The plots a command on plot `id` acts on: every selected plot when `id`
-   * is one of them, or else `id` alone. From the keys, which reach the plot
-   * clicked last, it is every selected plot whenever any is selected.
-   */
-  const targetIdsOf = (id, fromKeys = false) => (ws.selected.has(id) || (fromKeys && ws.selected.size) ? [...ws.selected] : [id]).filter((i) => ws.plots[i]);
+  const targetsOf = (id) => selection.targets(id).map((i) => views.of(i));
+  /** The plots a command on plot `id` acts on, as the Selection says, `fromKeys` when the keys gave it. */
+  const targetIdsOf = (id, fromKeys = false) => selection.targets(id, fromKeys);
   const plotsText = (n) => `${n} plot${n === 1 ? '' : 's'}`;
   /**
    * Gives each plot a command on plot `id` acts on the fields `fn(plot)`
@@ -442,7 +437,7 @@
   /** Moves keyboard focus to plot `id`, once it is on the page. */
   async function focusPlot(id) {
     if (!ws.plots[id]) return;
-    ws.focusedId = id;
+    selection.point(id);
     await tick();
     document.querySelector(`.leaf[data-plot="${id}"] .plot-card`)?.focus();
   }
@@ -455,7 +450,8 @@
    * after the last of them, or else the one before the first.
    */
   function closePlots(ids, fromKeys = false) {
-    const order = plotIds(ws.layout);
+    // The plots as they show, so focus goes to one that does.
+    const order = ws.shownIds();
     const at = ids.map((id) => order.indexOf(id)).filter((i) => i >= 0);
     history.group(ids.length > 1 ? `Close ${plotsText(ids.length)}` : 'Close plot', () => {
       for (const id of ids) closePlot(id);
@@ -463,7 +459,7 @@
     if (!fromKeys) return;
     const next = order.slice(Math.max(...at) + 1).find((id) => ws.plots[id]) ?? order.slice(0, Math.min(...at)).findLast((id) => ws.plots[id]);
     if (next) focusPlot(next);
-    else ws.focusedId = null;
+    else selection.point(null);
   }
   /** Goes `by` layout tabs along, wrapping, to the plot last focused there, its first plot, or else its tab. */
   async function stepTab(by) {
@@ -654,6 +650,9 @@
     if (e.key === ' ' && !keepsKey(e)) e.preventDefault();
   }
 
+  /** The plot `el` is in, by id, or null. */
+  const plotAt = (el) => el?.closest?.('.leaf[data-plot]')?.dataset.plot ?? null;
+
   function onKey(e) {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();
@@ -663,12 +662,18 @@
     // Escape, once a menu or a drag has had it, deselects; with nothing
     // selected it goes out a level. It never clears cursors or restores a
     // maximized plot.
-    if (e.key === 'Escape' && !e.defaultPrevented && !keepsKey(e) && (ws.selected.size || ws.focusedId !== null)) {
+    if (e.key === 'Escape' && !e.defaultPrevented && !keepsKey(e) && (ws.selected.size || selection.rows.size)) {
       e.preventDefault();
       return selection.clear();
     }
-    // Tab, the arrows, Enter, Escape and F6 move through the page's tree (focus.js).
-    if (navigate(e)) return;
+    // Tab, the arrows, Enter, Escape and F6 move through the page's tree
+    // (focus.js); a move that brings focus into another plot selects it.
+    const from = plotAt(document.activeElement);
+    if (navigate(e)) {
+      const to = plotAt(document.activeElement);
+      if (to && to !== from && e.key !== 'Escape') selection.arrived(to);
+      return;
+    }
     // What is typed into a field, a menu or dialog's own keys, and the keys
     // that press a button focused from the keyboard stay there (keys.js).
     if (keepsKey(e)) return;
@@ -689,15 +694,15 @@
     // Ctrl+A outside a field selects every plot of the tab, not the page's text.
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
       e.preventDefault();
-      return selection.only(ws.maximized ?? plotIds(ws.layout), null);
+      return selection.only(ws.shownIds(), null);
     }
     const action = actionFor('page', e);
     if (action === 'goToPlot') {
       // The plots as they show: only the maximized ones while some are.
-      const id = (ws.maximized ?? plotIds(ws.layout))[+e.key - 1];
+      const id = ws.shownIds()[+e.key - 1];
       if (!id) return;
       e.preventDefault();
-      selection.only([id]);
+      selection.arrived(id);
       return focusPlot(id);
     }
     if (action === 'help') return void (keysOpen = true);
@@ -745,10 +750,7 @@
         selected={ws.selected.has(id)}
         onSelect={(shift, clicks) => selection.click(id, shift, clicks)}
         maximized={!!ws.maximized?.includes(id)}
-        onFocus={(e) => {
-          selection.focusIn(id, e);
-          refreshToolbar();
-        }}
+        onFocus={() => selection.point(id)}
         onPress={() => selection.pressOn(id)}
         onRemove={(keys) => closePlots(targetIdsOf(id, keys), keys)}
         onEach={(what, fn, keys) => eachPlot(id, what, fn, keys)}
@@ -774,16 +776,16 @@
             for (const i of ids) ws.movePlotToTab(i, tabId);
           });
         }}
-        onClearCursors={() => clearCursors(ws.selected.has(id) ? [...ws.selected] : [id])}
+        onClearCursors={() => clearCursors(targetIdsOf(id))}
         onTraceDragStart={() => drags.traceDragStart()}
         onLandSignal={(item, items) => drags.landSignal(item, items ? id : null, items)}
         otherPlots={plotIds(ws.layout)
           .filter((p) => p !== id)
           .map((p) => ({ id: p, label: ws.plots[p]?.items.map((i) => i.key).join(', ') || 'Empty plot' }))}
         onMoveSignal={(key, to) => moveSignal(id, key, to)}
-        onCheckCopy={() => copyCheck(ws.selected.has(id) ? [...ws.selected] : [id])}
-        onExport={() => openExport(ws.selected.has(id) ? [...ws.selected] : [id])}
-        onCopy={() => copyData(ws.selected.has(id) ? [...ws.selected] : [id]).catch((error) => toast.error(`Could not copy: ${error.message}`))}
+        onCheckCopy={() => copyCheck(targetIdsOf(id))}
+        onExport={() => openExport(targetIdsOf(id))}
+        onCopy={() => copyData(targetIdsOf(id)).catch((error) => toast.error(`Could not copy: ${error.message}`))}
       />
     {/if}
   {/key}

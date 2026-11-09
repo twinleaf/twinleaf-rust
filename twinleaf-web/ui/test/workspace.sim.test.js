@@ -56,7 +56,7 @@ function run(s, { ws, history }) {
   if (s.t === 'split' && id) history.group('Split', () => ws.addPlot(newPlot('time', 'overlay', []), id, s.dir));
   else if (s.t === 'close' && id) history.group('Close', () => ws.closePlot(id));
   else if (s.t === 'maximize' && id) ws.maximized = ws.maximized?.includes(id) ? null : [id];
-  else if (s.t === 'click' && id) ws.focusedId = id;
+  else if (s.t === 'click' && id) ws.selection.point(id);
   else if (s.t === 'select' && id) ws.selected.add(id);
   else if (s.t === 'arrange') history.group('Arrange', () => ws.arrange(s.name));
   else if (s.t === 'dock' && id) history.group('Move', () => ws.setLayout(dock(ws.layout, id, pick(ids, s.to), s.edge)));
