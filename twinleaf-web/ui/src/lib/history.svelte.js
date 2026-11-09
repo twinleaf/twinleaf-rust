@@ -4,10 +4,11 @@
 // as it was.
 //
 // A command that changes several things, as closing every selected plot,
-// runs inside `group`, and a drag runs between `begin` and `end`, so each
-// is one step. Changes made outside any group are steps of their own, and
-// those that come within MERGE_MS of the step before join it, so a change
-// the page makes a moment after a command lands in that command's step.
+// runs inside `group`, and so does the one write that ends a drag, so each
+// is one step. Nothing stays open past the call. Changes made outside any
+// group are steps of their own, and those that come within MERGE_MS of the
+// step before join it, so a change the page makes a moment after a command
+// lands in that command's step.
 //
 // What a view shows, as a spectrum's zoom, is not an edit: it is left out
 // of the snapshot and kept as it is when a step is undone.
@@ -40,8 +41,7 @@ export class History {
   undos = $state([]);
   /** The steps redo goes forward through, the next last. */
   redos = $state([]);
-  #depth = 0;
-  #open = null;
+  #grouping = false;
   #last;
 
   /**
@@ -64,33 +64,25 @@ export class History {
     return this.redos.at(-1)?.label ?? null;
   }
 
-  /** Opens a step named `label`; changes until the matching `end` are part of it. Steps opened inside one are part of the outer. */
-  begin(label) {
-    if (this.#depth++ === 0) this.#open = { label, before: this.#last, selBefore: this.#selection() };
-  }
-
-  /** Closes the step `begin` opened, and keeps it if anything changed. */
-  end() {
-    if (this.#depth === 0) return;
-    if (--this.#depth) return;
-    const open = this.#open;
-    this.#open = null;
-    this.#commit(open.label, open.before, open.selBefore, false);
-  }
-
-  /** Runs `fn` as one step named `label`, and returns what it returns. */
+  /**
+   * Runs `fn` as one step named `label`, kept if it changed anything, and
+   * returns what it returns. A group inside a group is part of the outer.
+   */
   group(label, fn) {
-    this.begin(label);
+    if (this.#grouping) return fn();
+    const before = this.#last, selBefore = this.#selection();
+    this.#grouping = true;
     try {
       return fn();
     } finally {
-      this.end();
+      this.#grouping = false;
+      this.#commit(label, before, selBefore, false);
     }
   }
 
   /** Takes in a change made outside any group: the page calls this whenever the tabs or favorites change. */
   observe() {
-    if (this.#depth) return;
+    if (this.#grouping) return;
     const now = this.#read();
     if (now.key === this.#last.key) return;
     const top = this.undos.at(-1);
@@ -115,7 +107,6 @@ export class History {
   }
 
   #step(from, to, side, sel) {
-    if (this.#depth) return null;
     const e = from.pop();
     if (!e) return null;
     this.#write(e[side], e[sel]);

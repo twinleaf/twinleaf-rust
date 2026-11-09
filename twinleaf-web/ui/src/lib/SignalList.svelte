@@ -67,11 +67,10 @@
   }
   function finalize(e) {
     dragging = false;
-    // Where the drag ended is the page's to say, as the drag library can
-    // count a quick drop as landing back here. A plot that took the signal
-    // has already used the drop, so this opens a plot only for a drop on an
-    // edge or an empty tab.
-    drags.dockTrace(e.detail.info.id.slice('pal:'.length));
+    // A plot that took the signal lands it; a drop the library counts as
+    // back here, or in no zone, lands where the pointer was let go.
+    const { id, trigger } = e.detail.info;
+    if (trigger !== TRIGGERS.DROPPED_INTO_ANOTHER) drags.landSignal({ id, key: id.slice('pal:'.length) });
     refresh();
   }
 

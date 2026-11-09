@@ -21,7 +21,7 @@
   import { Drags } from './lib/drag.svelte.js';
   import { Renderer } from './lib/gl.js';
   import { plotIds } from './lib/layout.js';
-  import { chip, exportText, importText, loadTabs, newPlot, saveTabs } from './lib/tabs.js';
+  import { exportText, importText, loadTabs, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
   import { actionFor } from './lib/keymap.js';
   import { keepsKey, plotKeys } from './lib/keys.js';
@@ -96,6 +96,7 @@
   });
   const views = new Views(hub, viewChanged);
   const drags = new Drags(ws, refreshToolbar, history);
+  drags.closePlot = (id) => closePlot(id);
   drags.axisDropAt = (plotId, x, y) => [...registry].find((pv) => pv.plotId === plotId)?.axisDropAt(x, y) ?? null;
   /** The PlotViews on the page, which the frame loop draws. */
   const registry = new Set();
@@ -670,18 +671,10 @@
     toast.success(`Copied ${rows.toLocaleString()} rows of ${blocks.length} plot${blocks.length === 1 ? '' : 's'}${missing}`);
   }
 
-  /** Moves signal `key` from plot `from` to plot `to`, or to a new plot to its right with null. */
+  /** Moves signal `key` from plot `from` to plot `to`, or to a new plot to its right with null, as a drag would. */
   function moveSignal(from, key, to) {
-    const src = ws.plots[from];
-    if (!src) return;
-    src.items = src.items.filter((i) => i.key !== key);
-    if (to) {
-      const dst = ws.plots[to];
-      if (dst && !dst.items.some((i) => i.key === key)) dst.items.push(chip(key));
-    } else {
-      const p = newPlot(src.kind, 'overlay', [key]);
-      ws.addPlot(p, from, 'row');
-    }
+    const item = ws.plots[from]?.items.find((i) => i.key === key);
+    if (item) drags.moveSignal(item, to ? { plotId: to } : { plotId: from, edge: 'right' });
   }
 
   /**
@@ -814,8 +807,7 @@
         }}
         onClearCursors={() => clearCursors(ws.selected.has(id) ? [...ws.selected] : [id])}
         onTraceDragStart={() => drags.traceDragStart()}
-        onTraceDrop={(key) => drags.dockTrace(key)}
-        onEmptied={() => queueMicrotask(() => closePlot(id))}
+        onLandSignal={(item, items) => drags.landSignal(item, items ? id : null, items)}
         otherPlots={plotIds(ws.layout)
           .filter((p) => p !== id)
           .map((p) => ({ id: p, label: ws.plots[p]?.items.map((i) => i.key).join(', ') || 'Empty plot' }))}

@@ -56,7 +56,7 @@
   let {
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
     onFocus, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
-    onTraceDragStart, onTraceDrop, onEmptied, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
+    onTraceDragStart, onLandSignal, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
     onEach = (what, fn) => fn(plot), targetIds = () => [plot.id], onContext,
   } = $props();
 
@@ -82,7 +82,6 @@
     return t ? colorOf(t) : 'var(--muted-foreground)';
   };
   const unitsOf = (key) => session.trace(key)?.meta.units ?? '';
-  const shownItems = $derived(plot.items.filter((i) => !i[SHADOW]));
   /** An independent plot's axes, {left, right}, each the signal keys from the plot outward. */
   const slots = $derived(plot.mode === 'independent' ? axisSlots(drawnItems().map((i) => i.key), plot.axisSides) : null);
   /** Whether signal `key` has no axis of its own on an independent plot. */
@@ -180,7 +179,7 @@
     const rows = [];
     if (c.x) {
       rows.push([`X ${c.x.v}`, c.x.a, c.x.b, c.x.d, c.x.rate ? `1/Δt ${c.x.rate}` : '']);
-      for (const item of shownItems) {
+      for (const item of plot.items) {
         const r = legend.rows[item.key];
         rows.push([item.key, r?.a ?? '—', r?.b ?? '—', r?.d ?? '—', '']);
       }
@@ -285,7 +284,7 @@
   // A plot too small for its header becomes a monitor, as plot.js's
   // `monitorOf` decides from the traces it draws.
   let size = $state({ width: Infinity, height: Infinity });
-  const monitor = $derived(monitorOf(size, plot.mode, shownItems.filter((i) => session.trace(i.key)).length));
+  const monitor = $derived(monitorOf(size, plot.mode, plot.items.filter((i) => session.trace(i.key)).length));
 
   /**
    * Marks a row of chips that runs past either edge, for the fade there, and
@@ -362,15 +361,15 @@
     };
   });
 
-  // The chips as they were when one was picked up, to go back to when it is
-  // dropped on this same plot: there it is not a move.
+  // While a chip is dragged over the header, the chips it shows, the drag
+  // library's shadow among them; the plot's own stay as they are until the
+  // drop, which the page lands as one step. dragOrigin: this plot's chips as
+  // they were when one of them was picked up.
+  let chips = $state.raw(null);
   let dragOrigin = $state.raw(null);
-  /**
-   * The signals the plot draws and gives axes to: while one of its chips is
-   * being dragged, those it had when the drag began, so a chip picked up
-   * keeps its trace and axis until it lands elsewhere.
-   */
-  const drawnItems = () => (dragOrigin ?? plot.items).filter((i) => !i[SHADOW] && !i.hidden);
+  const zoneItems = $derived(chips ?? plot.items);
+  /** The signals the plot draws and gives axes to. */
+  const drawnItems = () => plot.items.filter((i) => !i.hidden);
   // A chip being dragged is the drag library's shadow in the row it is over,
   // drawn as the chip faded and outlined at the place it would land, the
   // other chips trading places with it as the pointer crosses them. In its
@@ -391,54 +390,33 @@
     const items = e.detail.items;
     const shadows = items.filter((i) => i[SHADOW]);
     const shadow = shadows.find((i) => !i.id.startsWith(HOME)) ?? shadows[0];
-    if (!shadow && dragOrigin) plot.items = dragOrigin.map((i) => (i.id === id ? { ...i, id: HOME + i.id, [SHADOW]: true } : i));
-    else plot.items = items.filter((i) => !i[SHADOW] || i === shadow);
+    // A row the chip only passed over shows the plot's own chips again.
+    if (!shadow) chips = dragOrigin ? dragOrigin.map((i) => (i.id === id ? { ...i, id: HOME + i.id, [SHADOW]: true } : i)) : null;
+    else chips = items.filter((i) => !i[SHADOW] || i === shadow);
   }
-  /** Whether chip `id` was this plot's own when the drag began. */
-  const ownChip = (id) => !!dragOrigin?.some((i) => i.id === id);
+  // A pointer drop ends in one finalize that is not DROPPED_INTO_ANOTHER:
+  // the zone the chip landed in, or the one it came from when it landed in
+  // none. That one lands it, with the chips as dropped when it landed among
+  // them; the zone it left only lets go of what it showed.
   function finalize(e) {
-    // A chip dropped on a plot's edge lands in no zone and returns here, then
-    // goes to the new plot beside that edge. A shadow left in the row is the
-    // place of a chip that landed elsewhere.
-    let items = e.detail.items.filter((i) => !i[SHADOW]);
-    const dropped = items.find((i) => i.id === e.detail.info.id);
-    const docked = dropped && onTraceDrop?.(dropped.key);
-    const origin = dragOrigin;
+    const { trigger, id } = e.detail.info;
+    const items = e.detail.items.filter((i) => !i[SHADOW]);
+    chips = null;
     dragOrigin = null;
-    // Back on this plot, by its body or one of its axes, the chips stay as they were.
-    if (returned || docked?.plotId === plot.id) {
-      returned = false;
-      plot.items = origin ?? items;
-      return;
-    }
-    if (docked) items = items.filter((i) => i !== dropped);
-    // A chip from the signal list keeps the list's id until it gets its own here.
-    else if (dropped?.id.startsWith('pal:')) items = items.map((i) => (i === dropped ? chip(i.key) : i));
-    const seen = new Set();
-    plot.items = items.filter((i) => !seen.has(i.key) && seen.add(i.key));
-    // A plot whose last signal was dragged away, to another plot or a new
-    // one, closes. One emptied with × stays, to be filled again.
-    // Checked once every zone has heard the drop, as this plot's own body may yet take it back.
-    const movedOut = docked || e.detail.info.trigger === TRIGGERS.DROPPED_INTO_ANOTHER;
-    if (movedOut) queueMicrotask(() => !plot.items.length && onEmptied?.());
+    if (trigger === TRIGGERS.DROPPED_INTO_ANOTHER) return;
+    const dropped = items.find((i) => i.id === id);
+    if (dropped) onLandSignal?.(dropped, trigger === TRIGGERS.DROPPED_INTO_ZONE ? items : null);
   }
   // The plot body is a drop target of its own, which shows nothing: a signal
   // dropped there joins the header's chips, or a new plot when on an edge.
   let bodyItems = $state([]);
-  // A chip of this plot's own came back to it, for the header's finalize,
-  // which the drag library sends after the body's, to put the chips back.
-  let returned = false;
   function bodyConsider(e) {
     bodyItems = e.detail.items;
   }
   function bodyFinalize(e) {
     const dropped = e.detail.items.filter((i) => !i[SHADOW]);
     bodyItems = [];
-    for (const item of dropped) {
-      const docked = onTraceDrop?.(item.key);
-      if (ownChip(item.id) && (!docked || docked.plotId === plot.id)) returned = true;
-      else if (!docked) addSignal(item.key);
-    }
+    for (const item of dropped) onLandSignal?.(item, [...plot.items, item]);
   }
   function remove(id) {
     plot.items = plot.items.filter((i) => i.id !== id);
@@ -689,7 +667,7 @@
             aria-label="Signals in this plot"
             aria-activedescendant={zoneFocused && plot.items[active] ? `chip-${plot.items[active].id}` : undefined}
             use:overflowEdges
-            use:dndzone={{ items: plot.items, type: 'trace', flipDurationMs: 0, dropTargetStyle: {}, dropTargetClasses: [], delayTouchStart: true, zoneTabIndex: -1, zoneItemTabIndex: -1, autoAriaDisabled: true, useCursorForDetection: true, morphDisabled: true }}
+            use:dndzone={{ items: zoneItems, type: 'trace', flipDurationMs: 0, dropTargetStyle: {}, dropTargetClasses: [], delayTouchStart: true, zoneTabIndex: -1, zoneItemTabIndex: -1, autoAriaDisabled: true, useCursorForDetection: true, morphDisabled: true }}
             onconsider={consider}
             onfinalize={finalize}
             oncontextmenucapture={(e) => ((signalFilter = ''), (addActive = 0), (menuChip = e.target.closest?.('.trace-chip')?.dataset.key ?? null))}
@@ -697,7 +675,7 @@
             onfocus={(e) => (zoneFocused = e.currentTarget.matches(':focus-visible'))}
             onblur={() => (zoneFocused = false)}
           >
-            {#each plot.items as item, i (item.id)}
+            {#each zoneItems as item, i (item.id)}
               {@const r = legend.rows[item.key]}
               <div id="chip-{item.id}" data-key={item.key} class:hidden-signal={item.hidden} class="trace-chip" class:ghost={item[SHADOW]} class:active={zoneFocused && i === active} class:unscaled={axisless(item.key)} role="option" aria-selected={zoneFocused && i === active} style="--c:{colorFor(item.key)}" title={axisless(item.key) ? 'No axis of its own: drag it beside the plot\'s left or right edge to give it one' : r?.info}>
                 <Swatch key={item.key} />
@@ -923,7 +901,7 @@
                 <ContextMenu.Trigger>
                   {#snippet child({ props })}
                     <div {...props} class="pinned-legend" data-focus-skip role="list" aria-label="Legend: drag to move" style="--x: {at.x}; --y: {at.y}" onpointerdowncapture={(e) => dragOverlay(e, 'legendAt')} oncontextmenucapture={(e) => (legendKey = e.target.closest?.('.row')?.dataset.key ?? null)}>
-                      {#each shownItems as item (item.id)}
+                      {#each plot.items as item (item.id)}
                         <div class="row" role="listitem" data-key={item.key} style="--c:{colorFor(item.key)}" title={item.key}>
                           <Swatch key={item.key} /><span class="name">{item.key}</span><span class="val">{legend.rows[item.key]?.value ?? ''}</span><span class="units">{unitsShown(item.key)}</span>
                           <Tip text="Remove from this plot" keys={['Delete']}>
@@ -977,7 +955,7 @@
                               <td>{c.x.d}</td>
                               {#if extra}<td class="rate">{#if c.x.rate}<span>1/Δ<var>t</var></span> {c.x.rate}{/if}</td>{/if}
                             </tr>
-                            {#each shownItems as item (item.id)}
+                            {#each plot.items as item (item.id)}
                               {@const r = legend.rows[item.key]}
                               <tr>
                                 <th style="--c:{colorFor(item.key)}"><i></i>{item.key}</th>

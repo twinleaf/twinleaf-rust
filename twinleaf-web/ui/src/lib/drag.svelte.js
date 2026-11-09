@@ -19,8 +19,7 @@ const SIDES = { left: [-1, 0], right: [1, 0], top: [0, -1], bottom: [0, 1] };
  * What is moved takes the size it last had that way: docked beside a plot,
  * the width it had when it last stood beside one, and docked above or below,
  * the height it had when it last stood above or below one, each kept as a
- * share of the whole layout (as VS Code keeps its panel's size per
- * position). With none, it takes half of the plot it docks by. Either way,
+ * share of the whole layout. With none, it takes half of the plot it docks by. Either way,
  * within SHARE of that plot.
  */
 const SHARE = [0.2, 0.8];
@@ -98,9 +97,11 @@ export class Drags {
    * join, as {side, rect}, or null: set by the page, which has the plots.
    */
   axisDropAt = null;
-  /** Where the last signal drag ended, {plotId, edge}, read as its drop lands. */
+  /** Where the last signal drag was let go, as `drop` names it, read as its drop lands. */
   traceDrop = null;
   traceDragging = false;
+  /** Closes plot `id`: set by the page, which also lets go of what the plot holds. */
+  closePlot = (id) => this.ws.closePlot(id);
 
   /**
    * `ws` is the Workspace, `changed()` runs when the selection changes, and
@@ -226,7 +227,6 @@ export class Drags {
       const w = isColumn(edge) ? r.width * share : r.width, h = isColumn(edge) ? r.height : r.height * share;
       return { x: edge === 'right' ? r.right - w : r.left, y: edge === 'bottom' ? r.bottom - h : r.top, w, h };
     };
-    /** Where `target` would put what is moved, as a box over the plots, or null. */
     /**
      * The size plot `id` will have once what is moved is out of the layout,
      * which a dock beside it shares: taking a plot out of a split gives its
@@ -234,6 +234,7 @@ export class Drags {
      * what is moved more than it had, a little more at every move.
      */
     const roomOf = (id) => leafSize(removeAll(lifted.original, group), id, lifted.tiles.width, lifted.tiles.height) ?? lifted.rects.get(id);
+    /** Where `target` would put what is moved, as a box over the plots, or null. */
     const previewOf = (target) => {
       if (!target || target.tabId) return null;
       if (target.outer) return { ...part(lifted.tiles, target.edge, shareOf(target.edge, lifted.tiles)), outer: true };
@@ -296,15 +297,13 @@ export class Drags {
    * cell of the plot's compass opens a new plot on that side with it, and an
    * outer cell opens one along that edge of the layout. On an empty tab,
    * anywhere on the tiles opens the tab's first plot. The cell is read at
-   * pointerup, before the drag library finalizes, and the drop goes through
-   * `dockTrace`: from the plot that takes it in its finalize, or from the
-   * signal list when it lands in no zone.
+   * pointerup, before the drag library finalizes, and the drop lands
+   * through `landSignal`.
    */
   traceDragStart() {
     if (this.traceDragging) return;
     this.traceDragging = true;
     this.traceDrop = null;
-    this.history?.begin('Move signal');
     // Over a plot's header the signal joins its chips, and shows no compass.
     const move = (ev) => {
       const [x, y] = [ev.clientX, ev.clientY];
@@ -343,46 +342,72 @@ export class Drags {
     follow(move, (ev) => {
       if (ev.type === 'pointerup') move(ev);
       else this.drop = null;
-      this.traceDrop = this.drop?.edge === 'add' ? null : this.drop;
+      this.traceDrop = this.drop;
       this.drop = null;
       this.compass = null;
       this.preview = null;
       this.traceDragging = false;
-      // The drop lands after the drag library finalizes and dockTrace's
-      // microtask runs, so the step closes a task later, with it inside.
-      setTimeout(() => this.history?.end());
     });
   }
 
   /**
-   * Opens a plot with `key` where the last signal drag ended, beside a
-   * plot's edge or along the layout's, or gives it an axis on an independent
-   * plot's side, if it ended on one. Returns {plotId} of the plot it went
-   * to, or false. The layout changes after the caller's drop handler returns,
-   * since the change replaces the plot that is handling the drop.
+   * Lands a dragged signal, `item` {id, key}, from the finalize of a drop
+   * zone: `into` is the plot whose chips it was dropped among, with `items`
+   * those chips as dropped, or null when the drop is in no plot's chips.
+   * Where the pointer was let go decides where it goes, as the drag library
+   * can name the zone the pointer was over a moment before; the zone's
+   * chips give its place only when they are of that plot. Returns the id of
+   * the plot it went to, or null.
    */
-  dockTrace(key) {
-    if (!this.traceDrop) return false;
-    const { plotId, edge, side } = this.traceDrop;
+  landSignal(item, into = null, items = null) {
+    const drop = this.traceDrop;
     this.traceDrop = null;
+    if (!drop) return null;
+    if (drop.edge !== 'add') return this.moveSignal(item, drop);
+    return this.moveSignal(item, { plotId: drop.plotId, items: into === drop.plotId ? items : null });
+  }
+
+  /**
+   * Moves signal `item` {id, key} as one step, and returns the id of the
+   * plot it went to, or null. `to` is where: {plotId, edge} beside a plot's
+   * edge, or {outer, edge} along the layout's, opens a plot there with it;
+   * {plotId, edge: 'axis', side} joins an independent plot on that side's
+   * axes; and {plotId, items} joins that plot, at its place in `items`, its
+   * chips with it among them, or after the others without them. A chip that
+   * came from a plot leaves it, and a plot whose last signal it was closes;
+   * one emptied with × stays, to be filled again.
+   */
+  moveSignal(item, to) {
     const ws = this.ws;
-    // Beside an independent plot's edge: the signal joins that plot, its axis on that side.
-    if (edge === 'axis') {
-      queueMicrotask(() => {
-        const p = ws.plots[plotId];
-        if (!p) return;
-        if (!p.items.some((i) => i.key === key)) p.items.push(chip(key));
-        p.axisSides = { ...p.axisSides, [key]: side };
-      });
-      return { plotId };
-    }
-    queueMicrotask(() => {
-      const p = newPlot(ws.plots[plotId]?.kind ?? 'time', 'overlay', [key]);
-      ws.tab.plots[p.id] = p;
-      ws.tab.layout = plotId ? dock(ws.layout, p.id, plotId, edge) : dockOuter(ws.layout, leaf(p.id), edge, OUTER_SHARE);
-      ws.focusedId = p.id;
-      this.flash([p.id]);
+    const from = Object.values(ws.plots).find((p) => p.items.some((i) => i.id === item.id));
+    // A chip from the signal list has the list's id until it gets its own.
+    const own = (i) => (i.id.startsWith('pal:') ? chip(i.key) : i);
+    const opens = to.outer || (to.edge && to.edge !== 'axis');
+    /** The plot it goes to, the layout changed to hold it. */
+    const place = () => {
+      if (opens) {
+        const p = newPlot(ws.plots[to.plotId]?.kind ?? 'time', 'overlay', [item.key]);
+        ws.tab.plots[p.id] = p;
+        ws.tab.layout = to.plotId ? dock(ws.layout, p.id, to.plotId, to.edge) : dockOuter(ws.layout, leaf(p.id), to.edge, OUTER_SHARE);
+        ws.focusedId = p.id;
+        return p.id;
+      }
+      const p = ws.plots[to.plotId];
+      if (!p) return null;
+      const seen = new Set();
+      p.items = (to.items ?? [...p.items, item]).map(own).filter((i) => !seen.has(i.key) && seen.add(i.key));
+      if (to.edge === 'axis') p.axisSides = { ...p.axisSides, [item.key]: to.side };
+      return p.id;
+    };
+    const id = this.group('Move signal', () => {
+      const id = place();
+      if (id && from && from.id !== id) {
+        from.items = from.items.filter((i) => i.id !== item.id);
+        if (!from.items.length) this.closePlot(from.id);
+      }
+      return id;
     });
-    return true;
+    if (id && opens) this.flash([id]);
+    return id;
   }
 }

@@ -36,17 +36,28 @@ describe('undo and redo', () => {
     expect(ws.selected.size).toBe(0);
   });
 
-  it('make a drag one step, however many changes it makes', () => {
+  it('make a group one step, however many changes it makes, a group inside it among them', () => {
     const { ws, history } = setup();
-    history.begin('Resize');
-    for (const r of [0.4, 0.3, 0.2]) {
-      ws.layout.ratio = r;
-      history.observe();
-    }
-    history.end();
+    history.group('Resize', () => {
+      for (const r of [0.4, 0.3, 0.2]) {
+        history.group('Inner', () => (ws.layout.ratio = r));
+        history.observe();
+      }
+    });
     expect(history.undos.length).toBe(1);
+    expect(history.undoLabel).toBe('Resize');
     history.undo();
     expect(ws.layout.ratio).toBe(0.5);
+  });
+
+  it('keep nothing open once a group throws', () => {
+    const { ws, history } = setup();
+    expect(() => history.group('Broken', () => {
+      ws.layout.ratio = 0.3;
+      throw new Error('no');
+    })).toThrow('no');
+    history.group('Resize', () => (ws.layout.ratio = 0.2));
+    expect(history.undos.map((s) => s.label)).toEqual(['Broken', 'Resize']);
   });
 
   it('join a change made just after a step to it, and keep later ones apart', () => {
