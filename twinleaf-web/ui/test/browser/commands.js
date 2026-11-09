@@ -4,7 +4,7 @@
 
 /**
  * Moves the real mouse through `steps`, [type, x, y] with type 'move',
- * 'down' or 'up' and x, y in the test frame's CSS px.
+ * 'down' or 'up' and x, y in the test frame's CSS px, or ['wait', ms].
  */
 export async function mouse(ctx, steps) {
   const frame = await ctx.frame();
@@ -17,5 +17,6 @@ export async function mouse(ctx, steps) {
     if (type === 'move') await ctx.page.mouse.move(...at(x, y));
     else if (type === 'down') await ctx.page.mouse.down();
     else if (type === 'up') await ctx.page.mouse.up();
+    else if (type === 'wait') await new Promise((done) => setTimeout(done, x));
   }
 }

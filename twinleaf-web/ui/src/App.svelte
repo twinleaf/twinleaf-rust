@@ -10,18 +10,15 @@
   // The toolbar and Space act on the highlighted plots: the selection, or
   // else the plot clicked last, or else, after a click on empty background,
   // every plot. Space pauses spectra too; the toolbar sets time plots only.
-  import { onMount, setContext, tick, untrack } from 'svelte';
+  import { getContext, onMount, setContext, tick, untrack } from 'svelte';
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
   import { SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
-  import { Hub } from './lib/hub.svelte.js';
-  import { Workspace } from './lib/workspace.svelte.js';
-  import { History } from './lib/history.svelte.js';
   import { favorites } from './lib/favorites.svelte.js';
   import { Views } from './lib/views.js';
   import { Drags } from './lib/drag.svelte.js';
   import { Renderer } from './lib/gl.js';
   import { plotIds } from './lib/layout.js';
-  import { exportText, importText, loadTabs, newPlot, saveTabs } from './lib/tabs.js';
+  import { exportText, importText, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
   import { actionFor } from './lib/keymap.js';
   import { keepsKey, plotKeys } from './lib/keys.js';
@@ -83,11 +80,9 @@
   import { pressOutsideKeepsFocus } from './lib/menus.js';
   import RiChevron from '@lucide/svelte/icons/chevron-down';
 
-  const hub = new Hub();
-  const ws = new Workspace(loadTabs(localStorage));
-  // Undo and redo of the tabs and the starred properties (history.svelte.js),
-  // which the tiles and panels reach to make a drag or a command one step.
-  const history = new History(ws, favorites);
+  // The hub, the tabs as the page edits them, and their undo and redo, as
+  // main.js makes them: the panels reach the History to make a command one step.
+  const { hub, ws, history } = getContext('page');
   setContext('history', history);
   $effect(() => {
     JSON.stringify(ws.tabs);
