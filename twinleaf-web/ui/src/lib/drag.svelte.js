@@ -89,7 +89,8 @@ export class Drags {
   /**
    * A drag that starts on empty background draws a box and selects every
    * plot it touches. Shift adds to the selection. A click there clears it
-   * and the plot clicked last. Empty background is the element listening,
+   * and the plot clicked last, unless it is in what keeps the selection (the
+   * Signals list); Escape clears them anywhere, putting the box away. Empty background is the element listening,
    * or one of EMPTY: a dock below its panels, a panel's body, or a list
    * below its last item.
    */
@@ -99,7 +100,20 @@ export class Drags {
     const base = e.shiftKey ? [...ws.selected] : [];
     const [x0, y0] = [e.clientX, e.clientY];
     let drawn = false;
-    follow(
+    // Escape puts the box away and clears the selection, Shift or not.
+    const key = (ev) => {
+      if (ev.key !== 'Escape') return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      stop();
+      window.removeEventListener('keydown', key, true);
+      this.marquee = null;
+      ws.selected.clear();
+      ws.focusedId = null;
+      this.changed();
+    };
+    window.addEventListener('keydown', key, true);
+    const stop = follow(
       (ev) => {
         if (!drawn && Math.hypot(ev.clientX - x0, ev.clientY - y0) < DRAG_START) return;
         drawn = true;
@@ -114,7 +128,9 @@ export class Drags {
         for (const id of hit) ws.selected.add(id);
       },
       () => {
-        if (!drawn && !e.shiftKey) {
+        window.removeEventListener('keydown', key, true);
+        // A click that draws no box clears the selection, but in what keeps it, as the Signals list.
+        if (!drawn && !e.shiftKey && !e.target.closest?.('[data-keeps-selection]')) {
           ws.selected.clear();
           ws.focusedId = null;
         }

@@ -118,6 +118,7 @@
 <ScrollArea class="palette-scroll">
   <div
     {...props}
+    data-keeps-selection
     oncontextmenucapture={(e) => {
       menuKey = e.target.closest?.('.chip')?.dataset.key ?? null;
       if (!menuKey) e.preventDefault(), e.stopPropagation();

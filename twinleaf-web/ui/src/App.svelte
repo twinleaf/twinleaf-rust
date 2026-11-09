@@ -19,7 +19,7 @@
   import { exportText, importText, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
   import { actionFor } from './lib/keymap.js';
-  import { keepsKey, plotKeys } from './lib/keys.js';
+  import { focusedByKeyboard, keepsKey, plotKeys } from './lib/keys.js';
   import { api } from './lib/protocol.js';
   import { THEMES, TRACE_WIDTH, prefs } from './lib/prefs.svelte.js';
   import RiSun from '@lucide/svelte/icons/sun';
@@ -145,12 +145,13 @@
     refreshToolbar();
   }
   /**
-   * A press on the page's empty background, outside the tiles, clears the
-   * selection and the highlighted plot, as the docks' own background does.
-   * A press on anything that takes input, or inside a popup, keeps them.
+   * A press anywhere clears the selection and the plot clicked last, but in
+   * what works on the plots: the plots themselves, a menu or popover, and
+   * what is marked data-keeps-selection (the window slider, the eraser,
+   * File, Commands and the Signals list). A press with Shift keeps it, to
+   * add to it; scrolling with the wheel is no press.
    */
-  const KEEPS_SELECTION =
-    '.tiles, button, a, input, textarea, select, label, [role=button], [role=option], [role=tab], [role=menuitem], [role=slider], [role=listbox], [role=grid], [role=combobox], [contenteditable], [data-slot$=-content], .dock-head';
+  const KEEPS_SELECTION = '.leaf, [data-keeps-selection], [data-slot$=-content], [role=menu], [role=dialog], [role=listbox]';
   /**
    * The browser's own right-click menu shows only where it has something to
    * offer: in a field, and over text that is selected. Everywhere else a
@@ -163,9 +164,22 @@
   }
   function pressOnBackground(e) {
     if (e.button !== 0 || e.shiftKey || !(e.target instanceof Element) || e.target.closest(KEEPS_SELECTION)) return;
+    deselect();
+  }
+  /** Clears the selection and the plot clicked last. */
+  function deselect() {
     if (!ws.selected.size && ws.focusedId === null) return;
     ws.selected.clear();
     ws.focusedId = null;
+    refreshToolbar();
+  }
+  /** Selects plot `id` alone, unless it is selected already, so a press on its controls acts on it, or on the selection it is in. */
+  function pressOn(id) {
+    if (!ws.selected.has(id)) {
+      ws.selected.clear();
+      ws.selected.add(id);
+    }
+    ws.focusedId = id;
     refreshToolbar();
   }
 
@@ -688,6 +702,13 @@
       paletteOpen = !paletteOpen;
       return;
     }
+    // Escape, once a menu or a drag has had it, deselects; with nothing
+    // selected it goes out a level. It never clears cursors or restores a
+    // maximized plot.
+    if (e.key === 'Escape' && !keepsKey(e) && (ws.selected.size || ws.focusedId !== null)) {
+      e.preventDefault();
+      return deselect();
+    }
     // Tab, the arrows, Enter, Escape and F6 move through the page's tree
     // (focus.js). A plot acts on its own Escape first.
     if (navigate(e, (n) => n.matches('[data-focus=plot]'))) return;
@@ -729,20 +750,12 @@
       return stepTab(e.key === ']' ? 1 : -1);
     }
     if (action !== 'pause' && action !== 'escape') {
-      // Every other key acts on the highlighted plot, wherever focus is.
-      if (!action && !e.defaultPrevented) plotKeys.get(ws.focusedId)?.(e);
+      // Every other key acts on the plot clicked last, wherever focus is,
+      // or else on the selection, through the first plot of it.
+      if (!action && !e.defaultPrevented) plotKeys.get(ws.focusedId ?? [...ws.selected][0])?.(e);
       return;
     }
-    // Escape restores a maximized plot, or else deselects. It leaves cursors be.
-    if (action === 'escape') {
-      if (ws.maximized) ws.maximized = null;
-      else if (ws.selected.size || ws.focusedId !== null) {
-        ws.selected.clear();
-        ws.focusedId = null;
-        refreshToolbar();
-      } else leave();
-      return;
-    }
+    if (action === 'escape') return leave();
     // Space pauses the highlighted plots, or has them follow live again.
     e.preventDefault();
     const perf = performance.now(), vs = ws.highlighted().map((id) => views.of(id));
@@ -753,7 +766,7 @@
 
 <!-- Nothing on the page drags natively: plots, signals and tabs move by
      pointer, and a native drag would only carry a picture of the page. -->
-<svelte:window onkeydown={onKey} onkeyup={onKeyUp} onfocusin={remember} onpointerdown={pressOnBackground} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
+<svelte:window onkeydown={onKey} onkeyup={onKeyUp} onfocusin={remember} onpointerdowncapture={pressOnBackground} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
 <canvas class="gl-layer" bind:this={glCanvas}></canvas>
 
 {#snippet plotTile(id)}
@@ -774,10 +787,13 @@
         selected={ws.selected.has(id)}
         onSelect={(shift, clicks) => select(id, shift, clicks)}
         maximized={ws.maximized === id}
-        onFocus={() => {
-          ws.focusedId = id;
+        onFocus={(e) => {
+          // Focus moved here from the keyboard selects the plot, as a click on it does.
+          if (e && focusedByKeyboard(e.target)) pressOn(id);
+          else ws.focusedId = id;
           refreshToolbar();
         }}
+        onPress={() => pressOn(id)}
         onRemove={(keys) => closePlots(targetIdsOf(id, keys), keys)}
         onEach={(what, fn, keys) => eachPlot(id, what, fn, keys)}
         onEdit={(what, patch) => history.group(what, () => ws.setPlot(id, patch))}
@@ -866,7 +882,7 @@
     <!-- One row: what acts on the plots, then the page's own settings. -->
     <header class="top-bar" data-focus="toolbar" tabindex="-1">
       <span class="brand">Twinleaf Hub</span>
-      <button class="search" onclick={() => (paletteOpen = true)}><RiSearch />Commands{#if prefs.hints}<kbd>Ctrl K</kbd>{/if}</button>
+      <button class="search" data-keeps-selection onclick={() => (paletteOpen = true)}><RiSearch />Commands{#if prefs.hints}<kbd>Ctrl K</kbd>{/if}</button>
       <span class="divider"></span>
       <Tip text={live ? 'Pause every plot' : 'Every plot follows live'}>
         {#snippet children(tip)}
@@ -881,7 +897,7 @@
         <Tip text="The time window the plots show">
           {#snippet children(tip)}
             <Popover.Trigger {...tip}>
-              {#snippet child({ props })}<Button {...props} size="xs" variant="outline" class="window-button" aria-label="Time window">{windowText(span)} s<RiChevron /></Button>{/snippet}
+              {#snippet child({ props })}<Button {...props} size="xs" variant="outline" class="window-button" aria-label="Time window" data-keeps-selection>{windowText(span)} s<RiChevron /></Button>{/snippet}
             </Popover.Trigger>
           {/snippet}
         </Tip>
@@ -892,7 +908,7 @@
           </div>
         </Popover.Content>
       </Popover.Root>
-      <IconButton icon={RiEraser} label="Clear the cursors" keys={['Esc']} onclick={() => clearCursors()} />
+      <IconButton icon={RiEraser} label="Clear the cursors" data-keeps-selection onclick={() => clearCursors()} />
       <DropdownMenu.Root>
         <Tip text="Arrange this tab's plots">
           {#snippet children(tip)}
@@ -916,7 +932,7 @@
         <Tip text="Export or import the tabs">
           {#snippet children(tip)}
             <DropdownMenu.Trigger {...tip}>
-              {#snippet child({ props })}<Button {...props} size="xs" variant="ghost"><RiDownload />File</Button>{/snippet}
+              {#snippet child({ props })}<Button {...props} size="xs" variant="ghost" data-keeps-selection><RiDownload />File</Button>{/snippet}
             </DropdownMenu.Trigger>
           {/snippet}
         </Tip>

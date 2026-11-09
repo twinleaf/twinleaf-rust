@@ -55,7 +55,7 @@
 
   let {
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
-    onFocus, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
+    onFocus, onPress, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
     onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
     onEach, targetIds = () => [plot.id], onContext,
   } = $props();
@@ -262,9 +262,12 @@
   // pick-up from the header. The capture sees the press before the header
   // or the plot takes it for a move or a pan.
   let pressedAt = null;
+  /** The plot's own controls, a press on which selects the plot first. */
+  const CONTROLS = 'button, [role=button], [role=combobox], input';
   function pressed(e) {
     pressedAt = [e.clientX, e.clientY];
-    onFocus();
+    if (e.button === 0 && !e.shiftKey && e.target.closest?.(CONTROLS)) onPress?.();
+    else onFocus();
   }
   function clicked(e) {
     if (!pressedAt || Math.hypot(e.clientX - pressedAt[0], e.clientY - pressedAt[1]) >= DRAG_START) return;
@@ -534,7 +537,8 @@
     // The pointer is held to it, so the drag ends where it was let go, or
     // with nothing kept when the pointer is lost or Escape is pressed.
     const el = e.currentTarget, pointer = e.pointerId;
-    el.setPointerCapture(pointer);
+    // A press made by script has no pointer to hold.
+    if (e.isTrusted) el.setPointerCapture(pointer);
     const move = (ev) => {
       const at = { x: share(ev.clientX - dx - room.l, room.r - room.l - own.width), y: share(ev.clientY - dy - room.t, room.b - room.t - own.height) };
       overlayDrag = { place, at };
@@ -803,7 +807,7 @@
       />
       <IconButton icon={RiSplitH} label="Split right" keys={['|']} class="split" tabindex={-1} onclick={() => onSplit('row')} />
       <IconButton icon={RiSplitV} label="Split down" keys={['−']} class="split" tabindex={-1} onclick={() => onSplit('col')} />
-      <IconButton icon={maximized ? RiFullscreenExit : RiFullscreen} label={maximized ? 'Restore' : 'Maximize'} keys={maximized ? ['F', 'Esc'] : ['F']} class="maximize" tabindex={-1} onclick={onMaximize} />
+      <IconButton icon={maximized ? RiFullscreenExit : RiFullscreen} label={maximized ? 'Restore' : 'Maximize'} keys={['F']} class="maximize" tabindex={-1} onclick={onMaximize} />
       <IconButton icon={RiClose} label="Close plot" keys={['Delete']} tabindex={-1} onclick={() => onRemove()} />
     </div>
   </div>
@@ -1015,7 +1019,7 @@
                   <ContextMenu.Separator />
                   {#if c.x}<ContextMenu.Item onSelect={() => pv?.clearXCursors()}><RiXCursors class="menu-icon" />Clear X cursors</ContextMenu.Item>{/if}
                   {#if c.ys.length}<ContextMenu.Item onSelect={() => c.ys.forEach((y) => pv?.clearYCursors(y.key))}><RiYCursors class="menu-icon" />Clear Y cursors</ContextMenu.Item>{/if}
-                  <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors<ContextMenu.Shortcut><kbd>Esc</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+                  <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors</ContextMenu.Item>
                 </ContextMenu.Content>
               </ContextMenu.Root>
             </div>
@@ -1053,7 +1057,7 @@
       <!-- Cursors are dragged out of the axes; these place a pair in view. -->
       <ContextMenu.Item onSelect={() => eachPv((p) => p.addXCursors())}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
       <ContextMenu.Item onSelect={() => eachPv((p) => p.addYCursors(p === pv ? region.keys?.[0] : undefined))}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
-      <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors<ContextMenu.Shortcut><kbd>Esc</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors</ContextMenu.Item>
       <ContextMenu.Separator />
       <ContextMenu.Label class="menu-group">Show</ContextMenu.Label>
       <ContextMenu.Sub>

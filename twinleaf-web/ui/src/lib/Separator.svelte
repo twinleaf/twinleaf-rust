@@ -24,7 +24,8 @@
     e.preventDefault();
     e.stopPropagation();
     const el = e.currentTarget;
-    el.setPointerCapture(e.pointerId);
+    // A press made by script has no pointer to hold.
+    if (e.isTrusted) el.setPointerCapture(e.pointerId);
     const g = measure(), row = g.dir === 'row';
     // The pointer keeps its place on the gap as the gap moves.
     const at = (ev) => (row ? ev.clientX : ev.clientY);
