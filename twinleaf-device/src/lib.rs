@@ -35,8 +35,9 @@
 //!
 //! Would an app user want to see it? If not, it is a diagnostic. If so, what
 //! is configured is a setting, state a report, what is sampled over time a
-//! stream, and an occurrence a log. The standard table also holds protocol
-//! and actions; [`rpc::Channel`] classifies every entry of it.
+//! stream, and an occurrence a log. A [view](device::View) is a report a host
+//! writes through the setting it is computed from. The standard table also
+//! holds protocol and actions; [`rpc::Channel`] classifies every entry of it.
 
 #![cfg_attr(not(any(test, feature = "sim")), no_std)]
 #![forbid(unsafe_code)]

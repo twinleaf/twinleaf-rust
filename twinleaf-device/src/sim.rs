@@ -442,7 +442,7 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
                 Entry::Setting(cell) => {
                     let _ = cell.reset(&mut Reply::new());
                 }
-                Entry::Diagnostic(_) | Entry::Action(_) => {}
+                Entry::View(_) | Entry::Diagnostic(_) | Entry::Action(_) => {}
             });
         self.streams = self.device.settings().streams();
         self.acquiring = None;

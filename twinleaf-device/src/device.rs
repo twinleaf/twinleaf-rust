@@ -739,15 +739,17 @@ impl<S: Group> Device<S> {
         let mut dirty = false;
         nth(settings, position, &mut |entry| match entry {
             Entry::Setting(cell) => {
-                found = Some(
-                    cell.save(&mut before)
-                        .and_then(|()| cell.rpc(args, out))
-                        .map(|changed| {
-                            if changed == Changed::Changed {
-                                wrote = Some((cell.name(), cell.spec().access));
-                            }
-                        }),
-                );
+                found = Some(stage(cell, args, &mut before, out).map(|staged| wrote = staged));
+            }
+            Entry::View(view) => {
+                let mut request = Reply::new();
+                found = Some(match args {
+                    [] => Ok(()),
+                    _ => view
+                        .put(args, &mut request)
+                        .and_then(|()| stage(view.request(), &request, &mut before, out))
+                        .map(|staged| wrote = staged),
+                });
             }
             Entry::Diagnostic(diagnostic) => {
                 found = Some(match args {
@@ -768,10 +770,12 @@ impl<S: Group> Device<S> {
         if let Some((name, access)) = wrote {
             if let Err(refusal) = settings.check() {
                 let mut restored = Ok(Changed::Unchanged);
-                nth(settings, position, &mut |entry| {
-                    if let Entry::Setting(cell) = entry {
-                        restored = cell.load(&before, &mut Reply::new());
+                nth(settings, position, &mut |entry| match entry {
+                    Entry::Setting(cell) => restored = cell.load(&before, &mut Reply::new()),
+                    Entry::View(view) => {
+                        restored = view.request().load(&before, &mut Reply::new());
                     }
+                    Entry::Diagnostic(_) | Entry::Action(_) => {}
                 });
                 return Some(restored.map_err(Refusal::from).and(Err(refusal)));
             }
@@ -786,6 +790,14 @@ impl<S: Group> Device<S> {
                 events: &mut announcements(&mut *lanes),
             });
             settings.publish();
+        }
+        if found == Some(Ok(())) {
+            nth(settings, position, &mut |entry| {
+                if let Entry::View(view) = entry {
+                    out.clear();
+                    found = Some(view.read(out));
+                }
+            });
         }
         if dirty {
             self.dirty_since = Some(now_ns);
@@ -1062,6 +1074,21 @@ fn write<T: Scalar>(
     Ok(changed)
 }
 
+/// Answer a cell's RPC, keeping what it held in `before`, and name it and its
+/// access if a write moved it.
+fn stage(
+    cell: &mut dyn Cell,
+    args: &[u8],
+    before: &mut Reply,
+    out: &mut Reply,
+) -> Result<Option<(&'static str, Access)>, RpcError> {
+    cell.save(before)?;
+    Ok(match cell.rpc(args, out)? {
+        Changed::Changed => Some((cell.name(), cell.spec().access)),
+        Changed::Unchanged => None,
+    })
+}
+
 /// Count a change and send it as a SETTING packet numbered with the count,
 /// carrying the value as the RPC of `name` replies it.
 fn announce(version: &mut u32, out: &mut impl Sink, name: &str, reply: &[u8]) {
@@ -1170,6 +1197,8 @@ impl<T: Scalar> Group for Setting<T> {
 pub enum Entry<'a> {
     /// A value a host reads and writes; a write is announced.
     Setting(&'a mut dyn Cell),
+    /// A value computed from one of the group's requests, which a write moves; never persisted.
+    View(&'a mut dyn View),
     /// A developer's number, read when asked and never announced.
     Diagnostic(&'a dyn Diagnostic),
     /// Something the device does, which may move several settings.
@@ -1181,6 +1210,7 @@ impl Entry<'_> {
     pub fn spec(&self) -> RpcSpec {
         match self {
             Self::Setting(cell) => cell.spec(),
+            Self::View(view) => view.spec(),
             Self::Diagnostic(diagnostic) => {
                 RpcSpec::prop(diagnostic.name(), diagnostic.kind(), Access::READ).privileged()
             }
@@ -1218,6 +1248,58 @@ impl<T: Scalar> Cell for Setting<T> {
             true => Changed::Unchanged,
             false => Changed::Changed,
         })
+    }
+}
+
+/// A value a group's [`refresh`](Group::refresh) computes from its requests, which a host
+/// writes by moving exactly one of them; [`Writable`] is the typed one.
+pub trait View {
+    /// Its table entry.
+    fn spec(&self) -> RpcSpec;
+
+    /// Encode the value it holds into `out`.
+    fn read(&self, out: &mut Reply) -> Result<(), RpcError>;
+
+    /// The one request a write moves, which the group lists as a setting of its own.
+    fn request(&mut self) -> &mut dyn Cell;
+
+    /// Encode into `out` what a write of `args` gives the request, as the request's RPC takes it.
+    fn put(&self, args: &[u8], out: &mut Reply) -> Result<(), RpcError>;
+}
+
+/// A view that reads what `view` holds, and gives `request` what `put` makes of a written value.
+pub struct Writable<'a, V: Scalar, R: Scalar, P> {
+    view: &'a Setting<V>,
+    request: &'a mut Setting<R>,
+    put: P,
+}
+
+impl<'a, V: Scalar, R: Scalar, P: Fn(V) -> R> Writable<'a, V, R, P> {
+    /// `view`, written through `request`.
+    pub fn new(view: &'a Setting<V>, request: &'a mut Setting<R>, put: P) -> Self {
+        Self { view, request, put }
+    }
+}
+
+impl<V: Scalar, R: Scalar, P: Fn(V) -> R> View for Writable<'_, V, R, P> {
+    fn spec(&self) -> RpcSpec {
+        let spec = RpcSpec::prop(self.view.name(), V::KIND, Access::RW).announced();
+        match Setting::spec(self.request).access.is_privileged() {
+            true => spec.privileged(),
+            false => spec,
+        }
+    }
+
+    fn read(&self, out: &mut Reply) -> Result<(), RpcError> {
+        self.view.get().encode(out)
+    }
+
+    fn request(&mut self) -> &mut dyn Cell {
+        self.request
+    }
+
+    fn put(&self, args: &[u8], out: &mut Reply) -> Result<(), RpcError> {
+        (self.put)(V::decode(args)?).encode(out)
     }
 }
 
@@ -1490,6 +1572,56 @@ mod tests {
         fn publish(&self) {}
     }
 
+    /// A count a host writes directly or through `board.field`, the twice-as-large view of it.
+    struct Coil {
+        counter: Counter,
+        field: Setting<u32>,
+    }
+
+    impl Coil {
+        fn new() -> Self {
+            Self {
+                counter: Counter {
+                    value: Setting::new("board.count", 5).persistent().checked(
+                        |count| match count {
+                            0..=500 => Ok(count),
+                            _ => Err(RpcError::Range),
+                        },
+                    ),
+                },
+                field: Setting::new("board.field", 10).read_only(),
+            }
+        }
+
+        fn harness() -> Harness<Self> {
+            harnessed(opened(
+                identity(),
+                table(Self::new()),
+                Self::new(),
+                PASSWORD,
+            ))
+        }
+    }
+
+    impl Group for Coil {
+        fn entries(&mut self, visit: &mut dyn FnMut(Entry<'_>)) {
+            Group::entries(&mut self.counter, visit);
+            visit(Entry::View(&mut Writable::new(
+                &self.field,
+                &mut self.counter.value,
+                |field: u32| field / 2,
+            )));
+        }
+
+        fn refresh(&mut self, to: &mut Announcer<'_>) {
+            let _ = to.set(&mut self.field, 2 * self.counter.value.get());
+        }
+
+        fn check(&self) -> Result<(), Refusal> {
+            self.counter.check()
+        }
+    }
+
     /// The names a board adds after the standard table.
     const BOARD_NAMES: &[&str] = &[
         "board.first",
@@ -1586,8 +1718,8 @@ mod tests {
     }
 
     /// One device, the streams it describes, and the two lanes.
-    struct Harness {
-        device: Device<Board>,
+    struct Harness<S: Group = Board> {
+        device: Device<S>,
         streams: [DataStream<4>; 1],
         lanes: Both,
         reboot: bool,
@@ -1596,9 +1728,9 @@ mod tests {
         loglevel: LogLevel,
     }
 
-    fn table() -> &'static [RpcSpec] {
+    fn table(mut settings: impl Group) -> &'static [RpcSpec] {
         let mut specs: Vec<RpcSpec> = STANDARD.to_vec();
-        Board::new().entries(&mut |entry| specs.push(entry.spec()));
+        settings.entries(&mut |entry| specs.push(entry.spec()));
         Box::leak(specs.into_boxed_slice())
     }
 
@@ -1642,13 +1774,18 @@ mod tests {
     }
 
     fn harness() -> Harness {
+        harnessed(device(table(Board::new())))
+    }
+
+    /// `device`, describing one stream, on two lanes no one has read.
+    fn harnessed<S: Group>(device: Device<S>) -> Harness<S> {
         let params = Params {
             rate: NonZeroU32::new(10).unwrap(),
             decimation: NonZeroU32::new(4).unwrap(),
             enabled: true,
         };
         Harness {
-            device: device(table()),
+            device,
             streams: [DataStream::new(
                 StreamId::new(1),
                 &AUX,
@@ -1686,7 +1823,7 @@ mod tests {
                 Device::new(
                     identity,
                     SESSION,
-                    table(),
+                    table(Board::new()),
                     Board::new(),
                     PASSWORD,
                     BOOT,
@@ -1713,7 +1850,7 @@ mod tests {
         buf[..len].to_vec()
     }
 
-    impl Harness {
+    impl<S: Group> Harness<S> {
         /// Drive one input, carrying out what comes back the way a platform
         /// does: a name no entry answers is `NotFound`.
         fn drive(&mut self, input: Input<'_>, now_ns: u64) {
@@ -1843,7 +1980,7 @@ mod tests {
     #[test]
     fn hardware_a_platform_does_not_name_is_the_state_error() {
         let mut device = harness();
-        device.device = opened(identity(), table(), Board::new(), PASSWORD);
+        device.device = opened(identity(), table(Board::new()), Board::new(), PASSWORD);
         device.ask("dev.priv", PASSWORD.as_bytes());
         for name in ["dev.uid", "dev.model", "dev.mcu.model", "dev.revision"] {
             assert_eq!(device.ask(name, &[]).error(), RpcError::State, "{name}");
@@ -2113,7 +2250,7 @@ mod tests {
     #[test]
     fn a_device_with_no_password_answers_the_state_error() {
         let mut device = harness();
-        device.device = opened(identity(), table(), Board::new(), "");
+        device.device = opened(identity(), table(Board::new()), Board::new(), "");
         assert_eq!(device.ask("dev.priv", b"895895").error(), RpcError::State);
         assert_eq!(device.ask("dev.priv", &[]).value(), &[0]);
     }
@@ -2732,6 +2869,119 @@ mod tests {
         assert_eq!(device.ask("board.count", &[]).value(), &5u32.to_le_bytes());
     }
 
+    /// A write announces the cell, then the view it moved on the next version, then replies.
+    #[test]
+    fn a_write_announces_the_views_it_moved_ahead_of_the_reply() {
+        let mut device = Coil::harness();
+        let version = device.ask("settings.version", &[]).value().to_vec();
+        let answered = device.ask("board.count", &7u32.to_le_bytes());
+        let types: Vec<_> = answered
+            .views()
+            .iter()
+            .map(|view| view.header.ptype)
+            .collect();
+        assert_eq!(
+            types,
+            [
+                PacketType::SETTING,
+                PacketType::SETTING,
+                PacketType::RPC_REP
+            ]
+        );
+        assert_eq!(
+            answered.announced(),
+            [
+                ("board.count".to_owned(), 7u32.to_le_bytes().to_vec()),
+                ("board.field".to_owned(), 14u32.to_le_bytes().to_vec()),
+            ]
+        );
+        assert_eq!(answered.value(), 7u32.to_le_bytes());
+        let after = u32::from_le_bytes(version.try_into().unwrap()) + 2;
+        assert_eq!(
+            device.ask("settings.version", &[]).value(),
+            after.to_le_bytes()
+        );
+    }
+
+    /// A view reads what refresh computed, and a write moves its request and
+    /// replies with the view the request now gives.
+    #[test]
+    fn a_view_write_moves_its_request_and_replies_with_the_view() {
+        let mut device = Coil::harness();
+        assert_eq!(device.ask("board.field", &[]).value(), 10u32.to_le_bytes());
+        let answered = device.ask("board.field", &41u32.to_le_bytes());
+        assert_eq!(
+            answered.announced(),
+            [
+                ("board.count".to_owned(), 20u32.to_le_bytes().to_vec()),
+                ("board.field".to_owned(), 40u32.to_le_bytes().to_vec()),
+            ]
+        );
+        assert_eq!(answered.value(), 40u32.to_le_bytes());
+        let unchanged = device.ask("board.field", &40u32.to_le_bytes());
+        assert_eq!(unchanged.announced(), []);
+        assert_eq!(unchanged.value(), 40u32.to_le_bytes());
+    }
+
+    /// A view write the group's rule or the request's own check refuses
+    /// leaves the request where it was and announces nothing.
+    #[test]
+    fn a_refused_view_write_changes_nothing() {
+        let mut device = Coil::harness();
+        for field in [400u32, 2000] {
+            let refused = device.ask("board.field", &field.to_le_bytes());
+            assert_eq!(refused.error(), RpcError::Range, "{field}");
+            assert_eq!(refused.announced(), [], "{field}");
+        }
+        assert_eq!(device.ask("board.count", &[]).value(), 5u32.to_le_bytes());
+        assert_eq!(device.ask("board.field", &[]).value(), 10u32.to_le_bytes());
+        assert!(device.tick(BOOT + 2 * AUTOSAVE_INTERVAL).is_none());
+    }
+
+    /// An action announces what it moved, then the views that follow it.
+    #[test]
+    fn an_action_announces_the_views_it_moved() {
+        let mut device = Coil::harness();
+        assert_eq!(
+            device.ask("board.rewind", &[]).announced(),
+            [
+                ("board.count".to_owned(), 0u32.to_le_bytes().to_vec()),
+                ("board.field".to_owned(), 0u32.to_le_bytes().to_vec()),
+            ]
+        );
+    }
+
+    /// A view is listed read-write and announced, privileged as its request
+    /// is, and never saved: its request is.
+    #[test]
+    fn a_view_is_listed_writable_and_saved_only_through_its_request() {
+        let mut device = Coil::harness();
+        let spec = device
+            .table()
+            .iter()
+            .find(|spec| spec.name == "board.field");
+        assert_eq!(spec.unwrap().access, Access::RW | Access::ANNOUNCED);
+        assert!(device.listing().contains(&"board.field".to_string()));
+        let view = Setting::new("board.view", 0u32).read_only();
+        let mut request = Setting::new("board.request", 0u32).privileged();
+        assert!(Writable::new(&view, &mut request, |view: u32| view)
+            .spec()
+            .access
+            .is_privileged());
+
+        device.ask("board.field", &30u32.to_le_bytes());
+        device.ask("dev.conf.save", &[]);
+        let Some((_, Deferred::Flash(FlashOp::ConfSave(image)))) = device.deferred.take() else {
+            panic!("a save carries the image");
+        };
+        let stored: Vec<(&[u8], &[u8])> = conf::entries(&image)
+            .map(|entry| entry.unwrap())
+            .map(|entry| (entry.name, entry.value))
+            .filter(|(name, _)| name.starts_with(b"board."))
+            .collect();
+        assert_eq!(stored, [(&b"board.count"[..], &15u32.to_le_bytes()[..])]);
+    }
+
     /// A move is published to the tasks that read it, and a read is not.
     #[test]
     fn a_move_publishes_the_group_and_a_read_does_not() {
@@ -2766,7 +3016,7 @@ mod tests {
     /// carries the route it arrived on, so the answer goes back down it.
     #[test]
     fn a_name_no_entry_answers_comes_back_to_the_platform_with_its_route() {
-        let mut specs: Vec<RpcSpec> = table().to_vec();
+        let mut specs: Vec<RpcSpec> = table(Board::new()).to_vec();
         specs.push(RpcSpec::std("board.capture", Access::READ));
         let mut device = harness();
         device.device = opened(
@@ -3350,7 +3600,7 @@ mod tests {
             let mut sim = Sim::new(
                 identity,
                 SessionId::new(session),
-                table(),
+                table(Board::new()),
                 Board::new(),
                 PASSWORD,
                 BOOT,
