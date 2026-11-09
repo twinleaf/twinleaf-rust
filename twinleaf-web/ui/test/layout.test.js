@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { append, dock, dockNode, dockOuter, equal, fromJson, gutters, leaf, placeEdge, plotIds, presets, ratio as normal, rects, removeAll, removePlot, restrict, setRatio, split, splitBeside } from '../src/lib/layout.js';
+import { append, dock, dockNode, dockOuter, equal, fromJson, gutters, leaf, plotIds, presets, ratio as normal, rects, removeAll, removePlot, restrict, setRatio, split, splitBeside, swap } from '../src/lib/layout.js';
 
 describe('the layout tree', () => {
   it('lists its plots in reading order', () => {
@@ -18,27 +18,6 @@ describe('the layout tree', () => {
     const tree = dock(split('row', leaf('a'), leaf('b')), 'a', 'b', 'top');
     expect(plotIds(tree)).toEqual(['a', 'b']);
     expect(tree.dir).toBe('col');
-  });
-
-  it('takes the place of another plot as a list reorders: after it from before, before it from after', () => {
-    const take = (root, id, target) => {
-      const order = plotIds(root), rest = removeAll(root, new Set([id]));
-      return plotIds(dockNode(rest, leaf(id), target, placeEdge(root, target, order.indexOf(id) > order.indexOf(target))));
-    };
-    const rows = presets.rows(['a', 'b', 'c']);
-    expect(take(rows, 'a', 'c')).toEqual(['b', 'c', 'a']);
-    expect(take(rows, 'c', 'a')).toEqual(['c', 'a', 'b']);
-    expect(take(rows, 'a', 'b')).toEqual(['b', 'a', 'c']);
-    // Two plots alone in a column reorder within it, though moving one leaves the other alone there.
-    const grid = split('row', leaf('x'), split('col', leaf('a'), leaf('b')));
-    expect(placeEdge(grid, 'a', true)).toBe('top');
-    expect(take(grid, 'b', 'a')).toEqual(['x', 'b', 'a']);
-  });
-
-  it('places along the split that holds the plot, side by side for a plot alone', () => {
-    expect(placeEdge(presets.rows(['a', 'b']), 'b', true)).toBe('top');
-    expect(placeEdge(presets.columns(['a', 'b']), 'b', false)).toBe('right');
-    expect(placeEdge(leaf('a'), 'a', true)).toBe('left');
   });
 
   it('splits beside a plot and appends to the whole', () => {
@@ -173,6 +152,23 @@ describe('equal', () => {
         if (!gs.length) return;
         const g = gs[k % gs.length];
         expect(equal(setRatio(t, g.path, g.ratio > 0.5 ? 0.25 : 0.75), t)).toBe(false);
+      }),
+    );
+  });
+});
+
+describe('swap', () => {
+  it('puts two plots in each other’s boxes, moves no other, keeps every split, and undoes itself', () => {
+    fc.assert(
+      fc.property(anyTree, anyBox, fc.nat(), fc.nat(), (t, box, i, j) => {
+        const all = plotIds(t), a = all[i % all.length], b = all[j % all.length];
+        const s = swap(t, a, b), was = rects(t, box), now = rects(s, box);
+        expect(equal(swap(s, a, b), t)).toBe(true);
+        expect(gutters(s, box).map((g) => [g.path, g.dir, g.ratio])).toEqual(gutters(t, box).map((g) => [g.path, g.dir, g.ratio]));
+        expect(now.get(a)).toEqual(was.get(b));
+        expect(now.get(b)).toEqual(was.get(a));
+        for (const id of all) if (id !== a && id !== b) expect(now.get(id)).toEqual(was.get(id));
+        if (a === b) expect(s).toBe(t);
       }),
     );
   });

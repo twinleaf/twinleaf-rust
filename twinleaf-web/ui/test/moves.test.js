@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { GUTTER, equal, leaf, plotIds, rects, removeAll, split } from '../src/lib/layout.js';
+import { GUTTER, equal, leaf, plotIds, rects, removeAll, split, swap } from '../src/lib/layout.js';
 import { MIN_PLOT, SHARE, SIDES, isColumn, moveCells } from '../src/lib/moves.js';
 
 /** A layout tree of the plots `ids`, splits in either direction at any ratio. */
@@ -66,6 +66,14 @@ describe('the cells a plot move offers', () => {
     everyCell((c, { t, group }) => {
       expect(plotIds(c.next).filter((id) => group.has(id))).toEqual(plotIds(t).filter((id) => group.has(id)));
     });
+  });
+
+  it('swap a plot moved alone with the plot whose middle it is dropped on, and offer a group no middle', () => {
+    everyCell((c, { t, group }) => {
+      if (c.edge !== 'center') return;
+      expect(group.size).toBe(1);
+      expect(equal(c.next, swap(t, [...group][0], c.plotId))).toBe(true);
+    }, 50);
   });
 
   it('include a dock beside every plot whose room holds two plots along that side', () => {

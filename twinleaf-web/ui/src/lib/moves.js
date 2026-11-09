@@ -4,7 +4,9 @@
 // the preview shows is what the drop gives.
 //
 // A cell is offered only where it changes the layout and leaves no plot it
-// shrinks smaller than MIN_PLOT. What is moved takes the size it last had
+// shrinks smaller than MIN_PLOT. A plot dropped alone on another's middle
+// swaps places with it, each taking the other's box. Docked, what is moved
+// takes the size it last had
 // that way: docked beside a plot, the width it had when it last stood beside
 // one, and docked above or below, the height it had when it last stood above
 // or below one, each kept as a share of the layout's box (`size`). With
@@ -12,7 +14,7 @@
 // layout along an outer edge. Either way, within SHARE of that, and within
 // what leaves both sides of the split at least MIN_PLOT along it.
 
-import { GUTTER, dock, dockNode, dockOuter, equal, leaf, placeEdge, plotIds, presets, rects, removeAll, restrict } from './layout.js';
+import { GUTTER, dock, dockNode, dockOuter, equal, leaf, plotIds, presets, rects, removeAll, restrict, swap } from './layout.js';
 
 /** The smallest plot a move may leave, in px. */
 export const MIN_PLOT = { w: 160, h: 100 };
@@ -66,7 +68,7 @@ function around(rs) {
 /**
  * The cells for moving the plots of Set `group` in layout `tree`, laid out
  * in `box` with `gap` between tiles: each {edge, plotId} over a plot (edge
- * 'center' takes its place) or {edge, outer} along the layout's edge, with
+ * 'center' swaps a plot moved alone with it) or {edge, outer} along the layout's edge, with
  * its middle (x, y), where its name goes (lx, ly), its `label`, the layout
  * it makes, `next`, and the box the moved plots take in it, `preview`.
  * `size` {w, h} is what the moved plot remembers, as shares of the box.
@@ -100,15 +102,12 @@ export function moveCells(tree, box, group, size = {}, gap = GUTTER) {
     const f = share(edge, of);
     return f === null ? null : make(f);
   };
-  const reading = plotIds(tree);
-  const first = reading.find((id) => group.has(id));
   for (const [id, r] of shown) {
     if (group.has(id)) continue;
     const places = plotPlaces(r);
-    // Taking a plot's place docks on the edge a list's reorder would pick,
-    // along the split that holds it: before it from after it, else after it.
-    const along = placeEdge(tree, id, reading.indexOf(first) > reading.indexOf(id));
-    offer({ edge: 'center', plotId: id, ...places.center, label: 'Take its place' }, beside(along, room.get(id), (f) => dockNode(rest, moved(along), id, along, f)));
+    // A plot dropped on another's middle swaps places with it, each taking
+    // the other's size; a group docks only.
+    if (group.size === 1) offer({ edge: 'center', plotId: id, ...places.center, label: 'Swap' }, swap(tree, [...group][0], id));
     for (const edge of Object.keys(SIDES)) {
       offer({ edge, plotId: id, ...places[edge], label: `Dock ${edge}` }, beside(edge, room.get(id), (f) => dockNode(rest, moved(edge), id, edge, f)));
     }

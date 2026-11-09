@@ -81,15 +81,12 @@ export function holderDir(node, targetId, dir = null) {
   return holderDir(node.a, targetId, node.dir) ?? holderDir(node.b, targetId, node.dir);
 }
 
-/**
- * The edge of the leaf showing `targetId` that a plot taking its place
- * goes on, as a list's reorder places an item: along the split holding the
- * leaf, before it when `before`, after it otherwise. A leaf alone splits
- * side by side.
- */
-export function placeEdge(root, targetId, before) {
-  const row = (holderDir(root, targetId) ?? 'row') === 'row';
-  return row ? (before ? 'left' : 'right') : before ? 'top' : 'bottom';
+/** The tree with plots `a` and `b` in each other's place, every split as it was; the same tree when they are one. */
+export function swap(node, a, b) {
+  if (!node || a === b) return node;
+  if (node.type === 'leaf') return node.plotId === a ? leaf(b) : node.plotId === b ? leaf(a) : node;
+  const x = swap(node.a, a, b), y = swap(node.b, a, b);
+  return x === node.a && y === node.b ? node : { ...node, a: x, b: y };
 }
 
 /** Splits the leaf showing `targetId`, putting `plotId` after it. */
