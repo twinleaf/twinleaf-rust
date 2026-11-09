@@ -29,7 +29,8 @@ use crate::rpc::{finite, Atomic, Changed, Persisted, Scalar, Setting, Text, UID_
 use crate::storage::conf::{self, Image};
 use crate::Sink;
 
-/// Nanoseconds between heartbeats.
+/// Nanoseconds between heartbeats, and so the longest a setting or report that moved takes
+/// to reach every host at its latest value; a value it held in between may never be sent.
 pub const HEARTBEAT_INTERVAL: u64 = heartbeat::PERIOD.as_nanos() as u64;
 
 /// Nanoseconds a changed configuration waits before it saves itself.
@@ -715,8 +716,8 @@ impl<S: Group> Device<S> {
         Ok(())
     }
 
-    /// Answer the board's own entry at `position`, announcing a write to the
-    /// asking port ahead of its reply. `None` is a position it does not reach.
+    /// Answer the board's own entry at `position`, announcing a write and then the reports it
+    /// moved to the asking port ahead of its reply. `None` is a position it does not reach.
     /// A write the group's rule refuses is taken back before anyone sees it.
     fn entry(
         &mut self,
@@ -779,6 +780,11 @@ impl<S: Group> Device<S> {
             announce(settings_version, &mut announcements(&mut *lanes), name, out);
         }
         if moved {
+            settings.refresh(&mut Announcer {
+                version: settings_version,
+                dirty: &mut dirty,
+                events: &mut announcements(&mut *lanes),
+            });
             settings.publish();
         }
         if dirty {
