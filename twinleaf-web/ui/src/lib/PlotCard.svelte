@@ -57,7 +57,23 @@
     plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [],
     onFocus, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
     onTraceDragStart, onTraceDrop, onEmptied, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
+    onEach = (what, fn) => fn(plot), targetIds = () => [plot.id], onContext,
   } = $props();
+
+  /** Runs `fn(pv)` on the PlotView of each plot a command here acts on; `fromKeys` as the page's targetIds takes it. */
+  const eachPv = (fn, fromKeys = false) => {
+    const ids = targetIds(fromKeys);
+    for (const p of registry) if (ids.includes(p.plotId)) fn(p);
+  };
+  /** Shows or hides the legend of each plot a command here acts on, all as this plot's turns. */
+  const toggleLegend = (fromKeys = false) => {
+    const on = !plot.legend;
+    onEach(on ? 'Show the legend' : 'Hide the legend', (p) => (p.legend = on), fromKeys);
+  };
+  /** The name list `list` (KINDS, MODES) gives value `v`. */
+  const nameIn = (list, v) => list.find((x) => x[0] === v)?.[1] ?? v;
+  /** Sets `field` to `value` on each plot a command here acts on, of this plot's kind; `what` names the step. */
+  const setEach = (what, field, value) => onEach(what, (p) => p.kind === plot.kind && (p[field] = value));
 
   const session = $derived(hub.session);
   /** The signal `key`'s colour, units and rate, once the hub has its trace. */
@@ -297,6 +313,7 @@
       renderer,
       onFocus,
       onFrequencies: (lo, hi) => (plot.fRange = [lo, hi]),
+      onFitY: () => eachPv((p) => p.autoscale()),
       config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null }),
     });
     registry.add(pv);
@@ -450,7 +467,7 @@
   /** Removes every signal and keeps the menu open on its filter, as adding one does, to add others. */
   function removeAll(e) {
     e.preventDefault();
-    plot.items = [];
+    onEach('Remove every signal', (p) => (p.items = []));
     tick().then(() => addInput?.focus());
   }
   /** Gives focus back to the plot when a menu opened from the keys closes. */
@@ -536,8 +553,8 @@
       splitDown: () => onSplit('col', true),
       maximize: onMaximize,
       close: () => onRemove(true),
-      fitY: () => pv?.autoscale(),
-      legend: () => (plot.legend = !plot.legend),
+      fitY: () => eachPv((p) => p.autoscale(), true),
+      legend: () => toggleLegend(true),
       follow: () => forTargets((v) => v.follow(true)),
       pan: time && (() => forTargets((v) => v.pan((e.shiftKey ? 1 : PAN) * (back ? -1 : 1), perf))),
       zoom: time && (() => forTargets((v) => v.zoom(back ? ZOOM : 1 / ZOOM, v.live ? 1 : 0.5, perf))),
@@ -628,7 +645,7 @@
     tabindex="-1"
   >
     <IconButton icon={RiDraggable} label="Drag onto a plot's edge to dock, its middle to swap, or a tab to move" class="grip cursor-grab touch-none text-muted-foreground" tabindex={-1} data-focus-skip onpointerdown={onStartMove} />
-    <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} />
+    <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} onKind={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, (p) => (p.kind = v))} onMode={(v) => onEach(`Layout ${nameIn(MODES, v)}`, (p) => (p.mode = v))} />
     <!-- The plot's signals, each with its value at the hover, or its newest
          while live, unless the legend shows the values. Right-clicking them
          adds or removes signals. -->
@@ -740,7 +757,7 @@
         class={plot.legend ? 'text-primary' : ''}
         aria-pressed={!!plot.legend}
         tabindex={-1}
-        onclick={() => (plot.legend = !plot.legend)}
+        onclick={() => toggleLegend()}
       />
       <IconButton
         icon={streaming ? RiPause : RiPlay}
@@ -790,15 +807,15 @@
         <div class="axis-row" role="group" aria-label="Frequency scale">
           <span>Scale</span>
           <div class="seg">
-            <button class:on={plot.xScale !== 'linear'} aria-pressed={plot.xScale !== 'linear'} onclick={() => (plot.xScale = 'log')}>Log</button>
-            <button class:on={plot.xScale === 'linear'} aria-pressed={plot.xScale === 'linear'} onclick={() => (plot.xScale = 'linear')}>Linear</button>
+            <button class:on={plot.xScale !== 'linear'} aria-pressed={plot.xScale !== 'linear'} onclick={() => setEach('Log frequency scale', 'xScale', 'log')}>Log</button>
+            <button class:on={plot.xScale === 'linear'} aria-pressed={plot.xScale === 'linear'} onclick={() => setEach('Linear frequency scale', 'xScale', 'linear')}>Linear</button>
           </div>
         </div>
       {/if}
       <div class="axis-row" role="group" aria-label="X cursors">
         <span>Cursors</span>
         <Tip text="Add X1 and X2">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" onclick={() => (pv?.addXCursors(), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" onclick={() => (eachPv((p) => p.addXCursors()), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
         </Tip>
         <Tip text="Zoom to X1–X2" keys={['Ctrl', 'drag']}>
           {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Zoom to the X cursors" onclick={() => (pv?.zoomToCursors(), (xAxisOpen = false))}><RiZoomTo /></button>{/snippet}
@@ -850,7 +867,7 @@
       <div class="axis-row" role="group" aria-label="Y cursors">
         <span>Cursors</span>
         <Tip text="Add Y1 and Y2 on this axis">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (pv?.addYCursors(region.keys?.[0]), (axisOpen = false))}><RiYCursors /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (eachPv((p) => p.addYCursors(p === pv ? region.keys?.[0] : undefined)), (axisOpen = false))}><RiYCursors /></button>{/snippet}
         </Tip>
         <Tip text="Clear this axis's cursors">
           {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (pv?.clearYCursors(region.keys?.[0]), (axisOpen = false))}><RiEraser /></button>{/snippet}
@@ -866,7 +883,7 @@
   <ContextMenu.Root bind:open={menuOpen}>
     <ContextMenu.Trigger>
       {#snippet child({ props })}
-        <div {...props} class="plot-body" bind:this={body} oncontextmenucapture={contextAt}>
+        <div {...props} class="plot-body" bind:this={body} oncontextmenucapture={(e) => (onContext?.(), contextAt(e))}>
           <canvas bind:this={overlay}></canvas>
           <div class="axis-anchor" bind:this={axisAnchor} style="left: {axisAt.x}px; top: {axisAt.y}px"></div>
           <!-- The legend: each signal and its value, one short row apiece,
@@ -894,7 +911,7 @@
                   {#if legendKey}
                     {@render signalMenu(legendKey, () => (legendMenuOpen = false))}
                   {:else}
-                    <ContextMenu.Item onSelect={() => (plot.legend = false)}><RiLegend class="menu-icon" />Hide the legend<ContextMenu.Shortcut><kbd>L</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+                    <ContextMenu.Item onSelect={() => onEach('Hide the legend', (p) => (p.legend = false))}><RiLegend class="menu-icon" />Hide the legend<ContextMenu.Shortcut><kbd>L</kbd></ContextMenu.Shortcut></ContextMenu.Item>
                   {/if}
                 </ContextMenu.Content>
               </ContextMenu.Root>
@@ -1000,15 +1017,15 @@
       {/if}
       <ContextMenu.Label class="menu-group">Cursors</ContextMenu.Label>
       <!-- Cursors are dragged out of the axes; these place a pair in view. -->
-      <ContextMenu.Item onSelect={() => pv?.addXCursors()}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => pv?.addYCursors(region.keys?.[0])}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => eachPv((p) => p.addXCursors())}><RiXCursors class="menu-icon" />Add X cursors</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => eachPv((p) => p.addYCursors(p === pv ? region.keys?.[0] : undefined))}><RiYCursors class="menu-icon" />Add Y cursors</ContextMenu.Item>
       <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors<ContextMenu.Shortcut><kbd>Esc</kbd></ContextMenu.Shortcut></ContextMenu.Item>
       <ContextMenu.Separator />
       <ContextMenu.Label class="menu-group">Show</ContextMenu.Label>
       <ContextMenu.Sub>
         <ContextMenu.SubTrigger><RiKind class="menu-icon" />Kind</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
-          <ContextMenu.RadioGroup value={plot.kind} onValueChange={(v) => (plot.kind = v)}>
+          <ContextMenu.RadioGroup value={plot.kind} onValueChange={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, (p) => (p.kind = v))}>
             {#each KINDS as [kind, kl]}<ContextMenu.RadioItem value={kind}>{kl}</ContextMenu.RadioItem>{/each}
           </ContextMenu.RadioGroup>
         </ContextMenu.SubContent>
@@ -1016,7 +1033,7 @@
       <ContextMenu.Sub>
         <ContextMenu.SubTrigger><RiLayout class="menu-icon" />Layout</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
-          <ContextMenu.RadioGroup value={plot.mode} onValueChange={(v) => (plot.mode = v)}>
+          <ContextMenu.RadioGroup value={plot.mode} onValueChange={(v) => onEach(`Layout ${nameIn(MODES, v)}`, (p) => (p.mode = v))}>
             {#each MODES as [mode, ml]}<ContextMenu.RadioItem value={mode}>{ml}</ContextMenu.RadioItem>{/each}
           </ContextMenu.RadioGroup>
         </ContextMenu.SubContent>

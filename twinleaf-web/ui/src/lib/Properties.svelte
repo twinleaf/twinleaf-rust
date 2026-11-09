@@ -28,7 +28,7 @@
   // Each cell reads its own device's value, so one device's change redraws
   // only its cells. The caches here are of one hub, as the parent remounts
   // this for each session.
-  import { tick } from 'svelte';
+  import { getContext, tick } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { getCoreRowModel } from '@tanstack/table-core';
   import { createSvelteTable, FlexRender, renderSnippet } from '$lib/components/ui/data-table/index.js';
@@ -211,6 +211,22 @@
     }
     active = i;
   }
+  // Pins act on every picked row, or the active one, as one undo step.
+  const history = getContext('history');
+  /** The names a pin from the menu acts on: the picked rows', or the active row's. */
+  const pinNames = () => (picked.size ? [...picked] : current ? [current.name] : []);
+  /** Stars `names` when `on`, or takes their stars away, as one step. */
+  function pin(names, on) {
+    const changed = names.filter((n) => favorites.has(n) !== on);
+    if (!changed.length) return;
+    const what = `${on ? 'Pin' : 'Unpin'} ${changed.length > 1 ? `${changed.length} ` : ''}${on ? 'to' : 'from'} Favorites`;
+    history ? history.group(what, () => favorites.pin(changed, on)) : favorites.pin(changed, on);
+  }
+  /** A star clicked on row `name`: on a picked row it sets every picked row as this one turns, on another just this one. */
+  function starClicked(name) {
+    const on = !favorites.has(name);
+    pin(picked.has(name) ? [...picked] : [name], on);
+  }
   /** Copies the picked rows, or the active one: a header of the devices, then each property and its values, as a sheet pastes them. */
   function copyRows() {
     const chosen = rows.filter((r) => picked.has(r.name));
@@ -269,7 +285,7 @@
 
 {#snippet nameCell({ row })}
   {@const starred = favorites.has(row.name)}
-  <button class="star" class:on={starred} tabindex="-1" aria-pressed={starred} aria-label="{starred ? 'Unpin' : 'Pin'} {row.name} {starred ? 'from' : 'to'} Favorites" title={starred ? 'Unpin from Favorites' : 'Pin to Favorites'} onclick={(e) => (e.stopPropagation(), favorites.toggle(row.name))}><RiStar /></button>
+  <button class="star" class:on={starred} tabindex="-1" aria-pressed={starred} aria-label="{starred ? 'Unpin' : 'Pin'} {row.name} {starred ? 'from' : 'to'} Favorites" title={starred ? 'Unpin from Favorites' : 'Pin to Favorites'} onclick={(e) => (e.stopPropagation(), starClicked(row.name))}><RiStar /></button>
   <span class="pname" title="{row.rpc.type ?? 'no type'} · {row.rpc.access.join('/') || 'action'}{row.rpc.persistent ? ' · persistent' : ''}">
     {row.name}{#if mixed(row)}<b class="mark" title="The devices differ">≠</b>{/if}{#if row.differs}<b class="mark warn" title="The devices declare it differently">!</b>{/if}
   </span>
@@ -383,8 +399,16 @@
 </ContextMenu.Trigger>
 <ContextMenu.Content class="menu-icons">
   <ContextMenu.Item onSelect={copyRows}><RiCopy class="menu-icon" />Copy {picked.size > 1 ? `${picked.size} rows` : 'row'}<ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-  {#if current}
-    <ContextMenu.Item onSelect={() => favorites.toggle(current.name)}><RiStar class="menu-icon" />{favorites.has(current.name) ? 'Unpin from Favorites' : 'Pin to Favorites'}</ContextMenu.Item>
+  <!-- A pick some of whose rows are pinned offers both, each for the rows it changes. -->
+  {@const names = pinNames()}
+  {@const toPin = names.filter((n) => !favorites.has(n))}
+  {@const toUnpin = names.filter((n) => favorites.has(n))}
+  {@const count = (list) => (toPin.length && toUnpin.length) || list.length > 1 ? `${list.length} ` : ''}
+  {#if toPin.length}
+    <ContextMenu.Item onSelect={() => pin(toPin, true)}><RiStar class="menu-icon" />Pin {count(toPin)}to Favorites</ContextMenu.Item>
+  {/if}
+  {#if toUnpin.length}
+    <ContextMenu.Item onSelect={() => pin(toUnpin, false)}><RiStar class="menu-icon" />Unpin {count(toUnpin)}from Favorites</ContextMenu.Item>
   {/if}
 </ContextMenu.Content>
 </ContextMenu.Root>

@@ -368,8 +368,8 @@ export class PlotView {
    * this one is selected, or else its own. `hoverTime` holds the time under the
    * pointer, which every time plot draws a line at.
    */
-  constructor({ body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies }) {
-    Object.assign(this, { body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies });
+  constructor({ body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY }) {
+    Object.assign(this, { body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY });
     this.zoomBand = null; // [x0, x1] in client px while a Ctrl+drag marks a range to zoom to
     this.ctx = overlay.getContext('2d');
     this.yByKind = new Map(); // plot kind -> its y ranges, see `y`
@@ -1711,12 +1711,14 @@ export class PlotView {
       this.axisHover = null;
       this.hover = null;
     });
-    // A double-click on a y axis fits y. On the plot it follows the newest
-    // samples again, from wherever the view was.
+    // A double-click on a y axis fits y, through `onFitY` when the page
+    // gives one, so it fits every plot the gesture acts on. On the plot it
+    // follows the newest samples again, from wherever the view was, at the
+    // window it had before it paused.
     el.addEventListener('dblclick', (e) => {
       // The time axis seeks; two clicks there do nothing more.
       if (onAxis(e)) return;
-      if (this.yAxisAt(e.clientX, e.clientY)) this.autoscale();
+      if (this.yAxisAt(e.clientX, e.clientY)) this.onFitY ? this.onFitY() : this.autoscale();
       else for (const v of this.targets()) v.follow(true);
     });
   }

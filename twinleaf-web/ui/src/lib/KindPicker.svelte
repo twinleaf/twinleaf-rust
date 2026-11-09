@@ -20,8 +20,9 @@
    * `plot` is the plot whose `kind` and `mode` these set. `open` is the kind
    * dropdown's, which the parent's K key opens, and `onOpenChange` hears
    * both dropdowns, so the parent can take focus back once neither is open.
+   * `onKind(kind)` and `onMode(mode)` set them, by default on `plot` alone.
    */
-  let { plot, open = $bindable(false), onOpenChange } = $props();
+  let { plot, open = $bindable(false), onOpenChange, onKind = (v) => (plot.kind = v), onMode = (v) => (plot.mode = v) } = $props();
 
   const ICONS = { time: RiTime, spectrum: RiSpectrum, overlay: RiOverlay, independent: RiIndependent, stacked: RiStacked };
   const nameOf = (list, value) => list.find(([v]) => v === value)?.[1] ?? value;
@@ -57,7 +58,7 @@
   {/each}
 {/snippet}
 
-<Select.Root type="single" value={plot.kind} onValueChange={(v) => (plot.kind = v)} bind:open onOpenChange={changed}>
+<Select.Root type="single" value={plot.kind} onValueChange={onKind} bind:open onOpenChange={changed}>
   <Tip text="Kind: {nameOf(KINDS, plot.kind)}" keys={['K']}>
     {#snippet children(tip)}
       {@const Icon = ICONS[plot.kind]}
@@ -68,7 +69,7 @@
   </Tip>
   <Select.Content>{@render items(KINDS)}</Select.Content>
 </Select.Root>
-<Select.Root type="single" value={plot.mode} onValueChange={(v) => (plot.mode = v)} bind:open={layoutOpen} onOpenChange={changed}>
+<Select.Root type="single" value={plot.mode} onValueChange={onMode} bind:open={layoutOpen} onOpenChange={changed}>
   <Tip text="Layout: {nameOf(MODES, plot.mode)}">
     {#snippet children(tip)}
       {@const Icon = ICONS[plot.mode]}

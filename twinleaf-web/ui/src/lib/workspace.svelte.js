@@ -122,6 +122,14 @@ export class Workspace {
     else if (!plot.items.some((i) => i.key === key)) plot.items.push(chip(key));
   }
 
+  /** Adds signal `key` to each plot of `ids` that does not show it. */
+  addTo(ids, key) {
+    for (const id of ids) {
+      const plot = this.plots[id];
+      if (plot && !plot.items.some((i) => i.key === key)) plot.items.push(chip(key));
+    }
+  }
+
   closePlot(id) {
     this.tab.layout = removePlot(this.layout, id);
     delete this.tab.plots[id];

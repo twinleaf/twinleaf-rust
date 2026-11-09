@@ -102,10 +102,14 @@ export class Drags {
   traceDrop = null;
   traceDragging = false;
 
-  /** `ws` is the Workspace; `changed()` runs when the selection changes. */
-  constructor(ws, changed) {
+  /**
+   * `ws` is the Workspace, `changed()` runs when the selection changes, and
+   * `history` is the page's History, which takes each drag as one step.
+   */
+  constructor(ws, changed, history = null) {
     this.ws = ws;
     this.changed = changed;
+    this.history = history;
   }
 
   flash(ids) {
@@ -174,6 +178,7 @@ export class Drags {
     const group = new Set(ws.selected.has(plotId) && ws.selected.size > 1 ? ws.selected : [plotId]);
     let lifted = null; // {original, rects, tiles, size} once picked up
     let shown = null; // the target the preview shows
+    let wasSize; // the plot's remembered size before it was picked up, put back when it lands nowhere
     const targetAt = (x, y) => {
       const under = document.elementsFromPoint(x, y).find((el) => !el.closest('.move-ghost, .compass'));
       const tabEl = under?.closest('[data-tab]');
@@ -251,6 +256,8 @@ export class Drags {
           // remembers nothing and takes half.
           let size = {};
           const plot = ws.plots[plotId], r = rects.get(plotId);
+          this.history?.begin(group.size > 1 ? `Move ${group.size} plots` : 'Move plot');
+          wasSize = plot?.dockSize;
           if (group.size === 1 && plot && r) {
             const dir = holderDir(ws.tab.layout, plotId);
             if (dir === 'row') plot.dockSize = { ...plot.dockSize, w: r.width / tiles.width };
@@ -268,14 +275,17 @@ export class Drags {
         this.compass = null;
         this.preview = null;
         this.moving = null;
-        if (!lifted || !shown || ev.type === 'pointercancel') return;
-        if (shown.tabId) {
+        if (!lifted) return;
+        if (!shown || ev.type === 'pointercancel') {
+          if (ws.plots[plotId]) ws.plots[plotId].dockSize = wasSize;
+        } else if (shown.tabId) {
           for (const id of group) ws.movePlotToTab(id, shown.tabId);
           ws.selected.clear();
         } else {
           ws.tab.layout = layoutFor(shown);
           this.flash(group);
         }
+        this.history?.end();
       },
     );
   }
@@ -293,6 +303,7 @@ export class Drags {
     if (this.traceDragging) return;
     this.traceDragging = true;
     this.traceDrop = null;
+    this.history?.begin('Move signal');
     // Over a plot's header the signal joins its chips, and shows no compass.
     const move = (ev) => {
       const [x, y] = [ev.clientX, ev.clientY];
@@ -336,6 +347,9 @@ export class Drags {
       this.compass = null;
       this.preview = null;
       this.traceDragging = false;
+      // The drop lands after the drag library finalizes and dockTrace's
+      // microtask runs, so the step closes a task later, with it inside.
+      setTimeout(() => this.history?.end());
     });
   }
 

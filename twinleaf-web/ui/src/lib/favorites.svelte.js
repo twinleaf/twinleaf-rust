@@ -27,9 +27,21 @@ export class Favorites {
   toggle(name) {
     const names = new Set(this.names);
     if (!names.delete(name)) names.add(name);
-    this.names = names;
+    this.set(names);
+  }
+
+  /** Stars every name of `names` when `on`, and takes their stars away when not. */
+  pin(names, on) {
+    const next = new Set(this.names);
+    for (const n of names) on ? next.add(n) : next.delete(n);
+    this.set(next);
+  }
+
+  /** Makes `names` the starred names. */
+  set(names) {
+    this.names = new Set(names);
     try {
-      this.storage?.setItem(KEY, JSON.stringify([...names]));
+      this.storage?.setItem(KEY, JSON.stringify([...this.names]));
     } catch {
       // A page that cannot keep them keeps them until it closes.
     }

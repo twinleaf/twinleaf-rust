@@ -10,11 +10,13 @@
   // The toolbar and Space act on the highlighted plots: the selection, or
   // else the plot clicked last, or else, after a click on empty background,
   // every plot. Space pauses spectra too; the toolbar sets time plots only.
-  import { onMount, tick, untrack } from 'svelte';
+  import { onMount, setContext, tick, untrack } from 'svelte';
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
   import { SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import { Hub } from './lib/hub.svelte.js';
   import { Workspace } from './lib/workspace.svelte.js';
+  import { History } from './lib/history.svelte.js';
+  import { favorites } from './lib/favorites.svelte.js';
   import { Views } from './lib/views.js';
   import { Drags } from './lib/drag.svelte.js';
   import { Renderer } from './lib/gl.js';
@@ -83,8 +85,17 @@
 
   const hub = new Hub();
   const ws = new Workspace(loadTabs(localStorage));
+  // Undo and redo of the tabs and the starred properties (history.svelte.js),
+  // which the tiles and panels reach to make a drag or a command one step.
+  const history = new History(ws, favorites);
+  setContext('history', history);
+  $effect(() => {
+    JSON.stringify(ws.tabs);
+    favorites.names;
+    untrack(() => history.observe());
+  });
   const views = new Views(hub, viewChanged);
-  const drags = new Drags(ws, refreshToolbar);
+  const drags = new Drags(ws, refreshToolbar, history);
   drags.axisDropAt = (plotId, x, y) => [...registry].find((pv) => pv.plotId === plotId)?.axisDropAt(x, y) ?? null;
   /** The PlotViews on the page, which the frame loop draws. */
   const registry = new Set();
@@ -113,6 +124,20 @@
   });
 
   const targetsOf = (id) => (ws.selected.has(id) ? [...ws.selected] : [id]).map((i) => views.of(i));
+  /**
+   * The plots a command on plot `id` acts on: every selected plot when `id`
+   * is one of them, or else `id` alone. From the keys, which reach the plot
+   * clicked last, it is every selected plot whenever any is selected.
+   */
+  const targetIdsOf = (id, fromKeys = false) => (ws.selected.has(id) || (fromKeys && ws.selected.size) ? [...ws.selected] : [id]).filter((i) => ws.plots[i]);
+  const plotsText = (n) => `${n} plot${n === 1 ? '' : 's'}`;
+  /** Runs `fn(plot)` on each plot a command on plot `id` acts on, as one step undo names `what`. */
+  function eachPlot(id, what, fn, fromKeys = false) {
+    const ids = targetIdsOf(id, fromKeys);
+    history.group(ids.length > 1 ? `${what} (${plotsText(ids.length)})` : what, () => {
+      for (const i of ids) fn(ws.plots[i]);
+    });
+  }
   /** The views the toolbar acts on: the highlighted time plots', or every time plot's. */
   function chosen() {
     const ids = ws.highlighted().filter((id) => ws.plots[id]?.kind === 'time');
@@ -437,6 +462,14 @@
   function newPlotWith(keys) {
     ws.addPlot(newPlot('time', 'overlay', keys));
   }
+  /** Adds signal `key` from the Signals list to every selected plot, or else as Workspace.addToFocused does. */
+  function addSignal(key) {
+    const ids = [...ws.selected].filter((id) => ws.plots[id]);
+    history.group(ids.length > 1 ? `Add ${key} (${plotsText(ids.length)})` : `Add ${key}`, () => {
+      if (ids.length) ws.addTo(ids, key);
+      else ws.addToFocused(key);
+    });
+  }
   /** Moves keyboard focus to plot `id`, once it is on the page. */
   async function focusPlot(id) {
     if (!ws.plots[id]) return;
@@ -448,11 +481,18 @@
     ws.closePlot(id);
     hub.session.clearWindows(id);
   }
-  /** Closes plot `id` from the keys, and gives focus to the plot after it, or else before it. */
-  function closeFromKeys(id) {
-    const order = plotIds(ws.layout), i = order.indexOf(id);
-    closePlot(id);
-    const next = order[i + 1] ?? order[i - 1];
+  /**
+   * Closes plots `ids` as one step. From the keys, focus goes to the plot
+   * after the last of them, or else the one before the first.
+   */
+  function closePlots(ids, fromKeys = false) {
+    const order = plotIds(ws.layout);
+    const at = ids.map((id) => order.indexOf(id)).filter((i) => i >= 0);
+    history.group(ids.length > 1 ? `Close ${plotsText(ids.length)}` : 'Close plot', () => {
+      for (const id of ids) closePlot(id);
+    });
+    if (!fromKeys) return;
+    const next = order.slice(Math.max(...at) + 1).find((id) => ws.plots[id]) ?? order.slice(0, Math.min(...at)).findLast((id) => ws.plots[id]);
     if (next) focusPlot(next);
     else ws.focusedId = null;
   }
@@ -665,6 +705,14 @@
     // What is typed into a field, a menu or dialog's own keys, and the keys
     // that press a button focused from the keyboard stay there (keys.js).
     if (keepsKey(e)) return;
+    // Ctrl+Z takes the last edit back, and Ctrl+Y or Ctrl+Shift+Z does it again.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && ['z', 'y'].includes(e.key.toLowerCase())) {
+      e.preventDefault();
+      const redo = e.key.toLowerCase() === 'y' || e.shiftKey;
+      const label = redo ? history.redo() : history.undo();
+      if (label) toast(`${redo ? 'Redo' : 'Undo'}: ${label}`);
+      return refreshToolbar();
+    }
     // Ctrl+C with no text selected copies the highlighted plots' data.
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'c' && !String(window.getSelection() ?? '')) {
       e.preventDefault();
@@ -696,12 +744,14 @@
       if (!action && !e.defaultPrevented) plotKeys.get(ws.focusedId)?.(e);
       return;
     }
+    // Escape restores a maximized plot, or else deselects. It leaves cursors be.
     if (action === 'escape') {
       if (ws.maximized) ws.maximized = null;
-      else if (ws.selected.size) {
+      else if (ws.selected.size || ws.focusedId !== null) {
         ws.selected.clear();
+        ws.focusedId = null;
         refreshToolbar();
-      } else if (!clearCursors()) leave();
+      } else leave();
       return;
     }
     // Space pauses the highlighted plots, or has them follow live again.
@@ -737,7 +787,18 @@
           ws.focusedId = id;
           refreshToolbar();
         }}
-        onRemove={(keys) => (keys ? closeFromKeys(id) : closePlot(id))}
+        onRemove={(keys) => closePlots(targetIdsOf(id, keys), keys)}
+        onEach={(what, fn, keys) => eachPlot(id, what, fn, keys)}
+        onContext={() => {
+          // A right-click on a plot outside the selection selects it alone, so the menu acts on what is highlighted.
+          if (!ws.selected.has(id)) {
+            ws.selected.clear();
+            ws.selected.add(id);
+          }
+          ws.focusedId = id;
+          refreshToolbar();
+        }}
+        targetIds={(keys) => targetIdsOf(id, keys)}
         onStartMove={(e) => drags.startMove(id, e)}
         onSplit={(dir, keys) => {
           const p = newPlot('time', 'overlay', []);
@@ -745,7 +806,12 @@
           if (keys) focusPlot(p.id);
         }}
         onMaximize={() => (ws.maximized = ws.maximized === id ? null : id)}
-        onMoveToTab={(tabId) => ws.movePlotToTab(id, tabId)}
+        onMoveToTab={(tabId) => {
+          const ids = targetIdsOf(id);
+          history.group(`Move ${plotsText(ids.length)} to ${ws.tabs.find((t) => t.id === tabId)?.name ?? 'a tab'}`, () => {
+            for (const i of ids) ws.movePlotToTab(i, tabId);
+          });
+        }}
         onClearCursors={() => clearCursors(ws.selected.has(id) ? [...ws.selected] : [id])}
         onTraceDragStart={() => drags.traceDragStart()}
         onTraceDrop={(key) => drags.dockTrace(key)}
@@ -766,7 +832,7 @@
   {#if id === 'devices'}
     <Devices session={hub.session} {unchecked} />
   {:else if id === 'signals'}
-    <SignalList session={hub.session} {drags} onAdd={(key) => ws.addToFocused(key)} onNewPlot={newPlotWith} />
+    <SignalList session={hub.session} {drags} onAdd={addSignal} onNewPlot={newPlotWith} />
   {:else}
     {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} />{/key}
   {/if}
