@@ -14,7 +14,8 @@
 // shown live follows the newest samples again. One shown paused holds
 // where it was, ending no later than the newest samples; a time plot's
 // whose start the hub has dropped since starts at the oldest time it
-// holds, and a notice says so.
+// holds, and a notice says so. A plot an undo brings back shows its view
+// by the same rule (`returned`).
 //
 // Each tab has its own steps, which go when the tab is gone for good
 // (`prune`). A drag, from its press to its release (`begin`, `end`), is one
@@ -145,6 +146,16 @@ export class ViewHistory {
   /** Shows again what the step Back went back past last moved, of those that move a plot shown; says whether there was one. */
   forward() {
     return this.#go('forwards', 'backs', 'after');
+  }
+
+  /**
+   * Plots `ids` are in the tabs again, as an undo brings back a plot closed:
+   * each of the open tab's shows its view again by the rule Back shows one
+   * by, as the hub, holding nothing for a plot that is gone, may have dropped
+   * where it starts.
+   */
+  returned(ids) {
+    this.#show(this.#read(ids.filter((id) => this.ws.plots[id])));
   }
 
   /** Lets go of the steps of every tab not in `tabs`, a Set of tab ids: those the tabs or an undo or redo hold. */

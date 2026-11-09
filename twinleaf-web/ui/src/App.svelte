@@ -124,16 +124,25 @@
   let glCanvas;
 
   $effect(() => saveTabs(localStorage, ws.tabs, ws.activeId));
-  // A plot that leaves every tab takes its view with it, so a paused view
-  // of a closed plot never holds points.
+  // A plot keeps its view while an undo or a redo can bring it back, and a
+  // tab its view history, each going once none can. A closed plot comes back
+  // showing what it showed, by the rule Back shows a view by, as the hub may
+  // have dropped its history meanwhile; paused, it reads its history again.
+  let placed = new Set();
   $effect(() => {
-    views.prune(new Set(ws.allPlotIds()));
-    untrack(refreshToolbar);
+    const held = history.held(), ids = new Set(ws.allPlotIds());
+    views.prune(held.plots);
+    viewHistory.prune(held.tabs);
+    untrack(() => {
+      const back = [...ids].filter((id) => !placed.has(id));
+      viewHistory.returned(back);
+      for (const id of back) if (views.get(id)?.live === false) requestDetail(id);
+      placed = ids;
+      refreshToolbar();
+    });
   });
   // The hub estimates the spectra of the open tab's spectrum plots only.
   $effect(() => hub.showSpectra(ws.spectrumKeys()));
-  // A tab's view history goes once neither the tabs nor an undo or redo hold the tab.
-  $effect(() => viewHistory.prune(history.held().tabs));
   // A new session, or a new decimation, drops every window, so each paused
   // plot reads its own again.
   $effect(() => {
@@ -201,8 +210,9 @@
     const vs = chosen();
     live = tabViews().every((v) => v.live);
     if (vs.length) span = +vs[0].window.toFixed(3);
-    // A paused spectrum holds the spectrum it shows, not the points.
-    hub.hold(views.anyPaused((id) => plotAnywhere(id)?.kind !== 'spectrum'));
+    // A paused time plot in a tab holds its points: a paused spectrum holds
+    // the spectrum it shows, and a closed plot nothing.
+    hub.hold(views.anyPaused((id) => plotAnywhere(id)?.kind === 'time'));
   }
   // Paused, every pan or zoom asks the server for the plot's view at full
   // resolution, read from its raw buffer, which reaches back as far as the
@@ -497,6 +507,7 @@
   function closePlot(id) {
     ws.closePlot(id);
     hub.session.clearWindows(id);
+    overviewKeys.delete(id);
   }
   /**
    * Closes plots `ids` as one step. From the keys, focus goes to the plot

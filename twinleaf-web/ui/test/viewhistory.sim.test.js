@@ -432,3 +432,45 @@ describe('view history', () => {
     expect(vh.holds(a)).toBe(false);
   });
 });
+
+describe('a plot closed and brought back by undo', () => {
+  /** The page as `setup` makes it, with its edit history, which keeps the views of the plots it holds as the page does. */
+  const page = () => {
+    const p = setup(), history = new History(p.ws, new Favorites(null));
+    const edit = (fn) => (fn(), p.views.prune(history.held().plots));
+    return { ...p, history, edit, ids: Object.keys(p.ws.plots) };
+  };
+
+  it('shows its view as it was, and Back goes on through its steps', () => {
+    const { ws, views, vh, t, history, edit, ids } = page(), v = views.get(ids[0]);
+    vh.step(() => (v.pause(t.ms), (v.cursors = { a: 999, b: null })));
+    const was = v.state();
+    edit(() => history.group('Close plot', () => ws.closePlot(ids[0])));
+    expect(views.get(ids[0]), 'kept while an undo can bring it back').toBe(v);
+    expect(vh.canBack).toBe(false);
+    edit(() => history.undo());
+    vh.returned([ids[0]]);
+    expect(views.get(ids[0]).state()).toEqual(was);
+    expect(vh.back()).toBe(true);
+    expect(v.live).toBe(true);
+    expect(t.notices).toEqual([]);
+  });
+
+  it('starts at the oldest time held, with the notice, when the hub has dropped where it started meanwhile', () => {
+    const { ws, views, vh, t, hub, history, edit, ids } = page(), v = views.get(ids[0]);
+    vh.step(() => v.pause(t.ms));
+    edit(() => history.group('Close plot', () => ws.closePlot(ids[0])));
+    t.ms = (HELD_S + 60) * 1000;
+    edit(() => history.undo());
+    vh.returned([ids[0]]);
+    expect(v.right - v.span).toBeCloseTo(hub.now(t.ms) - HELD_S);
+    expect(t.notices).toEqual([GONE]);
+  });
+
+  it('lets go of its view once no undo or redo can bring it back', () => {
+    const { ws, views, history, edit, ids } = page();
+    edit(() => history.group('Close plot', () => ws.closePlot(ids[0])));
+    for (let i = 0; i < 200; i++) edit(() => history.group('Rename', () => ws.renameTab(ws.tabs[0].id, `A${i}`)));
+    expect(views.get(ids[0])).toBeUndefined();
+  });
+});

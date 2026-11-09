@@ -1,6 +1,7 @@
-// Each time plot's View, by plot id. A View outlives the plot's component,
-// which a tab switch or a layout change remounts, and goes when its plot
-// leaves every tab.
+// Each plot's View, by plot id. A View outlives the plot's component,
+// which a tab switch or a layout change remounts, and outlives the plot
+// while an undo or a redo can bring it back, so the plot comes back as it
+// showed; it goes once none can.
 
 import { View } from './plot.js';
 
@@ -39,7 +40,7 @@ export class Views {
     for (const v of this.map.values()) v.delay = seconds;
   }
 
-  /** Drops the views of plots not in `ids`, a Set of every tab's plot ids. */
+  /** Drops the views of plots not in `ids`, a Set of plot ids: History `held`'s plots, those the tabs or an undo or redo hold. */
   prune(ids) {
     for (const id of [...this.map.keys()]) if (!ids.has(id)) this.map.delete(id);
   }

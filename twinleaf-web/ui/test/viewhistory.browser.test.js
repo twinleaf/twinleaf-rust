@@ -12,14 +12,18 @@
 // Pause on a selection, Y cursors, a spectrum's pan, cursors and y zoom,
 // tabs and a plot moved between them, a maximized plot, and a plot that
 // leaves the page mid-drag. Under 480 px Back and Forward go, as the split
-// buttons did.
+// buttons did. A plot closed and brought back by Ctrl+Z (#7) shows its view
+// as it was, holding no history while it is gone and reading it again once
+// back, and Back goes on through its steps; when the hub has dropped where
+// its view starts meanwhile, it starts at the oldest time held, with the
+// notice, as Back's views do.
 import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, frames, mountPage, wait } from './browser/page.js';
 import { plotIds } from '../src/lib/layout.js';
-import { IDLE_MS } from '../src/lib/viewhistory.svelte.js';
+import { GONE, IDLE_MS } from '../src/lib/viewhistory.svelte.js';
 
 const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine']];
 
@@ -439,6 +443,68 @@ describe('view history on the page, each kind of gesture', () => {
       expect(p.views.get(id).live).toBe(true);
       await press(id, 'Back');
       expect(one(p, id), 'Back past Follow live to the drag').toBe(dragged);
+    } finally {
+      p.dispose();
+    }
+  });
+});
+
+describe('a plot closed and brought back by Ctrl+Z', () => {
+  it('shows its view as it was, and Back goes on through its steps', async () => {
+    let checked = 0;
+    await fc.assert(
+      fc.asyncProperty(fc.nat(), fc.constantFrom('wheel', 'drag', 'addX'), async (k, how) => {
+        const p = await page();
+        try {
+          const ids = plotIds(p.ws.layout), id = ids[k % ids.length], start = shown(p);
+          const [x, y] = centre(bodyOf(id));
+          if (how === 'wheel') await commands.mouse([['move', x, y], ['wheel', 0, -120], ['wait', 40], ['wheel', 0, -120]]);
+          else if (how === 'drag') await dragOn(id, 120);
+          else await pickFromMenu(id, 'Add X cursors');
+          await frames();
+          const was = one(p, id);
+          expect(JSON.parse(was).live, 'the gesture paused it').toBe(false);
+          await press(id, 'Close plot');
+          expect(p.ws.plots[id], 'closed').toBeUndefined();
+          expect(p.hub.holding, 'a closed plot holds no history').toBe(false);
+          const read = [];
+          p.hub.session.fetchWindow = (plot, what) => read.push([plot, what]);
+          await commands.key('Control+z');
+          flushSync();
+          await frames();
+          expect(p.ws.plots[id], 'back').toBeDefined();
+          expect(one(p, id), 'its view').toBe(was);
+          expect(p.hub.holding, 'paused again, it holds its history').toBe(true);
+          // A plot reads its detail at most every 100 ms.
+          await wait(150);
+          expect(read, 'and reads it again').toContainEqual([id, 'detail']);
+          await press(ids[(k + 1) % ids.length], 'Back');
+          expect(shown(p), 'Back past the gesture').toBe(start);
+          checked++;
+        } finally {
+          p.dispose();
+        }
+      }),
+      { numRuns: Math.max(6, Math.ceil(fc.readConfigureGlobal().numRuns / 10)) },
+    );
+    expect(checked).toBeGreaterThan(0);
+  }, 300_000);
+
+  it('starts at the oldest time held, with the notice, when the hub dropped where it started while it was gone', async () => {
+    const p = await page();
+    try {
+      const id = plotIds(p.ws.layout)[0], memory = (oldest) => p.hub.text({ type: 'memory', bytes: 0, budget: 0, seconds: 0, max_age: 0, rate: 0, oldest: { 0: oldest } });
+      memory(900);
+      await dragOn(id, 120);
+      const v = p.views.get(id), start = v.right - v.span;
+      await press(id, 'Close plot');
+      memory(start + 1);
+      await commands.key('Control+z');
+      flushSync();
+      await frames();
+      expect(v.right - v.span).toBeCloseTo(start + 1);
+      expect(v.right).toBeLessThanOrEqual(p.hub.now(performance.now()));
+      expect(document.body.textContent).toContain(GONE);
     } finally {
       p.dispose();
     }
