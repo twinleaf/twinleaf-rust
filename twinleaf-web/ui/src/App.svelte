@@ -12,7 +12,6 @@
   // every plot. Space pauses spectra too; the toolbar sets time plots only.
   import { getContext, onMount, setContext, tick, untrack } from 'svelte';
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
-  import { SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import { favorites } from './lib/favorites.svelte.js';
   import { Views } from './lib/views.js';
   import { Drags } from './lib/drag.svelte.js';
@@ -766,7 +765,7 @@
         {hover}
         {renderer}
         {registry}
-        otherTabs={ws.tabs.filter((t) => t.id !== ws.activeId && !t[SHADOW])}
+        otherTabs={ws.tabs.filter((t) => t.id !== ws.activeId)}
         focused={ws.focusedId === id}
         selected={ws.selected.has(id)}
         onSelect={(shift, clicks) => select(id, shift, clicks)}
@@ -1005,7 +1004,7 @@
       {@render dockHandle('left')}
       <Resizable.Pane id="tiles" order={2} defaultSize={100 - startSize('left') - startSize('right')} class="flex min-h-0 min-w-0">
         <main class="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5">
-          <TabStrip {ws} {drags} onClose={closeTab} />
+          <TabStrip {ws} {drags} onClose={closeTab} onReorder={(ids) => history.group('Move tab', () => ws.orderTabs(ids))} />
           <div class="tiles" data-focus="plots" tabindex="-1" class:has-max={ws.maximized} class:drop-target={drags.drop?.outer && !drags.drop.edge}>
             {#key ws.activeId}
               {#if ws.layout}

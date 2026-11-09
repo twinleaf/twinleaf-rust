@@ -18,7 +18,6 @@ const UPDATED = 1 << 2, BINDABLE = 1 << 3;
 /** The writes the page still makes, as `file prop`, each with what it writes. */
 const PENDING = new Map([
   ['lib/Dock.svelte docks', 'whether a panel is being dragged'],
-  ['lib/TabStrip.svelte ws', 'the order of the tabs'],
   ['lib/KindPicker.svelte plot', "the plot's kind and mode"],
   ['lib/PlotCard.svelte plot', "the plot's signals, axes, scale and frequency range"],
 ]);

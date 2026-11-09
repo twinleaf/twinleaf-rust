@@ -14,8 +14,11 @@
   import { actionFor } from './keymap.js';
   import { prefs } from './prefs.svelte.js';
 
-  /** `onClose(t)` closes tab `t`, asking first when it has plots. */
-  let { ws, drags, onClose } = $props();
+  /**
+   * `onClose(t)` closes tab `t`, asking first when it has plots;
+   * `onReorder(ids)` puts the tabs in the order of `ids`.
+   */
+  let { ws, drags, onClose, onReorder } = $props();
 
   const FLIP_MS = 150;
   let renaming = $state(null);
@@ -52,7 +55,15 @@
     e.preventDefault();
     e.stopPropagation();
   }
-  const reorder = (e) => (ws.tabs = e.detail.items);
+  // While a tab is dragged, the strip shows the drag library's order, its
+  // placeholder among the tabs; the tabs themselves change once, at the drop.
+  let dragged = $state.raw(null);
+  const shown = $derived(dragged ?? ws.tabs);
+  const consider = (e) => (dragged = e.detail.items);
+  function finalize(e) {
+    dragged = null;
+    onReorder(e.detail.items.map((t) => t.id));
+  }
 </script>
 
 <div class="flex cursor-crosshair flex-wrap items-center gap-1.5" role="group" aria-label="Layout tabs" data-focus="tabs" tabindex="-1" onpointerdown={(e) => drags.startMarquee(e)}>
@@ -64,11 +75,11 @@
     tabindex="-1"
     data-focus="tablist"
     data-focus-own
-    use:dndzone={{ items: ws.tabs, type: 'tab', flipDurationMs: FLIP_MS, dropTargetStyle: {}, delayTouchStart: true, zoneTabIndex: -1, zoneItemTabIndex: -1, autoAriaDisabled: true }}
-    onconsider={reorder}
-    onfinalize={reorder}
+    use:dndzone={{ items: shown, type: 'tab', flipDurationMs: FLIP_MS, dropTargetStyle: {}, delayTouchStart: true, zoneTabIndex: -1, zoneItemTabIndex: -1, autoAriaDisabled: true }}
+    onconsider={consider}
+    onfinalize={finalize}
   >
-    {#each ws.tabs as t (t.id)}
+    {#each shown as t (t.id)}
       <div class="tab-slot" animate:flip={{ duration: FLIP_MS }}>
         <ContextMenu.Root>
           <ContextMenu.Trigger>

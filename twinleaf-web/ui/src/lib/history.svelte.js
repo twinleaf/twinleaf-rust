@@ -13,8 +13,6 @@
 // What a view shows, as a spectrum's zoom, is not an edit: it is left out
 // of the snapshot and kept as it is when a step is undone.
 
-import { SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
-
 /** How soon after a step a change made outside any group joins it, in ms. */
 export const MERGE_MS = 400;
 /** How many steps undo keeps. */
@@ -23,15 +21,13 @@ const DEPTH = 200;
 /** Plot fields that are what a view shows, not what was edited. */
 const VIEW_FIELDS = new Set(['fRange']);
 /**
- * The tabs as a snapshot: view fields left out, the placeholders a drag
- * shows where a tab or signal would land left out, and split ratios to a
- * thousandth, so a pane's own rounding is no edit.
+ * The tabs as a snapshot: view fields left out, and split ratios to a
+ * thousandth, so a gap moved by less than that is no edit.
  */
 function snapshotTabs(tabs) {
   return JSON.stringify(tabs, (k, v) => {
     if (VIEW_FIELDS.has(k)) return undefined;
     if (k === 'ratio' && typeof v === 'number') return Math.round(v * 1000) / 1000;
-    if (Array.isArray(v)) return v.filter((x) => !x?.[SHADOW]);
     return v;
   });
 }

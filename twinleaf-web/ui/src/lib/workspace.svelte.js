@@ -89,6 +89,13 @@ export class Workspace {
     if (this.activeId === t.id) this.selectTab(this.tabs[Math.max(0, i - 1)].id);
   }
 
+  /** Puts the tabs in the order of `ids`, each tab's id once. */
+  orderTabs(ids) {
+    const byId = new Map(this.tabs.map((t) => [t.id, t]));
+    const next = ids.map((id) => byId.get(id)).filter(Boolean);
+    if (next.length === this.tabs.length && next.some((t, i) => t !== this.tabs[i])) this.tabs = next;
+  }
+
   /** Adds `added` tabs after the others and opens the first. */
   addTabs(added) {
     this.tabs.push(...added);
