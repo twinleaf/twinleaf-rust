@@ -43,6 +43,11 @@
     if (name.trim()) history.group('Rename tab', () => ws.renameTab(t.id, name.trim()));
     renaming = null;
   }
+  /**
+   * The keys of tab `t`, heard on the way down, before the drag library's
+   * listener on the tab's slot, which would take Space and Enter for a
+   * keyboard drag; the tabs move by pointer and by their keys here.
+   */
   function tabKey(e, t) {
     if (e.target !== e.currentTarget) return;
     const all = [...e.currentTarget.closest('[role=tablist]').querySelectorAll('[role=tab]')];
@@ -97,7 +102,7 @@
                 tabindex={t.id === ws.activeId ? 0 : -1}
                 aria-selected={t.id === ws.activeId}
                 onclick={() => ws.selectTab(t.id)}
-                onkeydown={(e) => tabKey(e, t)}
+                onkeydowncapture={(e) => tabKey(e, t)}
                 ondblclick={() => startRename(t.id)}
               >
                 {#if renaming === t.id}

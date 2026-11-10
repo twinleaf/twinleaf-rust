@@ -10,6 +10,10 @@
 // - The Live button pauses every plot, and Space after it has them follow.
 // - Space on a dock header the keyboard moved to folds its panel, and a
 //   header dragged moves its panel.
+// - Space or Enter on an item of a drag zone (a tab, a plot's chip, a signal
+//   of the Signals list, a dock's panel header) starts no keyboard drag of
+//   the drag library's, and after a click on the item the page hears the
+//   key (class 2).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
@@ -309,4 +313,67 @@ describe('a dock header', () => {
       page.dispose();
     }
   });
+});
+
+/** Each drag zone's items, what a click lands on, and where the keys reach for one: the item, or the zone it is an option of. */
+const ZONES = {
+  tab: { items: () => [...document.querySelectorAll('[role=tablist] [data-tab]')], click: (el) => el.querySelector('span'), reach: (el) => el },
+  chip: { items: () => [...document.querySelectorAll('.tiles .trace-zone .trace-chip')], click: (el) => el.querySelector('.name') ?? el, reach: (el) => el.closest('.trace-zone') },
+  signal: { items: () => [...document.querySelectorAll('.palette [data-key]')], click: (el) => el.querySelector('.sig-key') ?? el, reach: (el) => el.closest('.palette') },
+  'dock header': { items: () => [...document.querySelectorAll('.dock-head')], click: (el) => el.querySelector('.dock-title') ?? el, reach: (el) => el },
+};
+
+/**
+ * Space or Enter on an item of `zones`, clicked or reached from the keys:
+ * no keyboard drag starts, and after a click the page hears the key.
+ * Returns the zones and ways tried.
+ */
+async function ownKeys(zones) {
+  const seen = new Set();
+  await fc.assert(
+    fc.asyncProperty(fc.constantFrom(...zones), fc.nat(), fc.constantFrom('Space', 'Enter'), fc.constantFrom('click', 'keys'), async (zone, i, key, how) => {
+      const page = await mountPage([['sine.sine', 'sine.cosine'], ['aux.triangle']], 'columns', 1, ['vector.x', 'vector.y', 'vector.z']);
+      const drags = [], heard = [];
+      // A drag's start is told to its zone, a consider event that does not bubble: seen on the way down.
+      const consider = (e) => e.detail?.info?.source === 'keyboard' && e.detail.info.trigger === 'dragStarted' && drags.push(zone);
+      const hear = (e) => heard.push(e.key);
+      window.addEventListener('consider', consider, true);
+      window.addEventListener('keydown', hear);
+      try {
+        const items = ZONES[zone].items();
+        expect(items.length, zone).toBeGreaterThan(0);
+        const el = items[i % items.length];
+        // The page has the keys first: a press on an item takes no focus of its own.
+        await focusPage();
+        if (how === 'click') await commands.mouse([['move', ...centre(ZONES[zone].click(el))], ['down'], ['up']]);
+        else {
+          // A key pressed first, so the focus that follows is the keyboard's.
+          await commands.key('Shift');
+          ZONES[zone].reach(el).focus();
+        }
+        await frames();
+        heard.length = 0;
+        await commands.key(key);
+        await frames();
+        expect(drags, `${how}, ${key} on a ${zone}: a keyboard drag`).toEqual([]);
+        if (how === 'click') expect(heard, `${key} after a click on a ${zone}: heard by the page`).toEqual([key === 'Space' ? ' ' : key]);
+        seen.add(`${zone}:${how}`);
+      } finally {
+        window.removeEventListener('consider', consider, true);
+        window.removeEventListener('keydown', hear);
+        // A drag left running ends with the page.
+        await commands.key('Escape');
+        page.dispose();
+      }
+    }),
+    { numRuns: Math.max(24, Math.ceil(fc.readConfigureGlobal().numRuns / 3)), examples: zones.flatMap((z) => [[z, 0, 'Space', 'click'], [z, 1, 'Enter', 'click'], [z, 0, 'Space', 'keys']]) },
+  );
+  return seen;
+}
+
+describe('Space or Enter on a drag zone’s item', () => {
+  it('starts no keyboard drag, and after a click the page hears it: a tab, a chip, a signal, a dock header', async () => {
+    const seen = await ownKeys(Object.keys(ZONES));
+    expect(seen.size).toBe(8);
+  }, 600_000);
 });
