@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import fc from 'fast-check';
 import { Points, Trace } from '../src/lib/session.svelte.js';
 import { axisSlots, blurred, onPixelGrid, pickLevel, PlotView, rowCounts, timeAxis, View } from '../src/lib/plot.js';
 
@@ -476,4 +477,89 @@ describe('a range on the device pixel grid', () => {
     expect(onPixelGrid(5, 5, 100)).toEqual([5, 5]);
     expect(onPixelGrid(0, 10, 0)).toEqual([0, 10]);
   });
+});
+
+// A live time plot drawn frame after frame, as its draw hands it to the GPU:
+// the range each lane is set to and the points drawn in it, filled into
+// device columns as the GPU fills them, each column the least and greatest
+// value drawn in it. A fast signal, zoomed out so a column holds many
+// points, scrolls by fractions of a pixel a frame; every column whose points
+// did not change draws the same from frame to frame, moved by whole columns.
+describe('a live plot drawn frame after frame', () => {
+  /** A plot `cssWidth` px wide at `dpr` drawing `trace`, live over `span` s, as its draw sees the page. */
+  function plotOf(trace, span, cssWidth, dpr) {
+    const drawn = { lane: null, draws: [] };
+    const renderer = {
+      dpr,
+      ring: () => ({ base: 0 }),
+      lane: (rect, base, x0, x1) => ((drawn.lane = { x0, x1, width: Math.round(rect.w * dpr) }), true),
+      drawTrace: (src, ring, a0, a1) => drawn.draws.push({ src, a0, a1 }),
+    };
+    const hub = { now: () => hub.t, t: 0, session: { windowOf: () => undefined, memory: null } };
+    const view = new View(hub);
+    view.span = span;
+    view.delay = 0;
+    const plot = { x: 0, y: 0, w: cssWidth, h: 100 }, cfg = { kind: 'time', mode: 'overlay' };
+    const pv = new PlotView({ body: document.createElement('div'), overlay: document.createElement('canvas'), config: () => cfg, hub, view, targets: () => [view], hoverTime: { t: null }, plotId: 'p', renderer });
+    // The overlay's axes, labels and readouts are drawn on a 2D canvas, which jsdom has none of; the traces are what the GPU gets.
+    pv.drawOverlay = () => {};
+    /** The device columns drawn at device time `t`, by column from time zero: each [least, greatest]. */
+    const frame = (t) => {
+      hub.t = t;
+      drawn.draws = [];
+      pv.drawTime(cfg, [trace], { plot, lanes: [plot] }, plot, 0);
+      const { x0, x1, width } = drawn.lane, tau = (x1 - x0) / width, first = Math.round(x0 / tau);
+      const columns = new Map();
+      for (const { src, a0, a1 } of drawn.draws) {
+        for (let i = a0; i < a1; i++) {
+          const p = Math.floor(((src.xAt(i) - x0) / (x1 - x0)) * width);
+          // The columns at either edge are cut off by the lane; the rest are whole.
+          if (p < 1 || p >= width - 1) continue;
+          const c = columns.get(first + p), y = src.yAt(i);
+          columns.set(first + p, c ? [Math.min(c[0], y), Math.max(c[1], y)] : [y, y]);
+        }
+      }
+      return columns;
+    };
+    return frame;
+  }
+
+  it('draws every column whose points did not change the same, moved by whole columns', () => {
+    // jsdom draws nothing: a trace's colour, read off a canvas, is black.
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({ fillRect() {}, getImageData: () => ({ data: [0, 0, 0, 255] }) });
+    let compared = 0;
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 120, max: 600 }),
+        fc.constantFrom(1, 1.25, 1.5, 2),
+        fc.integer({ min: 4, max: 24 }),
+        fc.array(fc.double({ min: 0.05, max: 3, noNaN: true }), { minLength: 5, maxLength: 12 }),
+        fc.integer({ min: 1, max: 2 ** 31 - 1 }),
+        (cssWidth, dpr, perColumn, moves, seed) => {
+          // Noise at an uneven rate, perColumn points a column: no column of it draws like the next.
+          const width = Math.round(cssWidth * dpr), span = 4, rate = (perColumn * width) / span + Math.PI;
+          let s = seed;
+          const noise = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+          const xs = Float64Array.from({ length: Math.ceil(rate * 8) }, (_, i) => i / rate);
+          const trace = new Trace(meta);
+          trace.push(xs, Float32Array.from(xs, () => noise()), false);
+          const frame = plotOf(trace, span, cssWidth, dpr);
+          let t = 6, was = frame(t);
+          for (const move of moves) {
+            t += (move * span) / width;
+            const now = frame(t);
+            for (const [c, v] of now) {
+              if (!was.has(c)) continue;
+              expect(v, `column ${c} at ${t}`).toEqual(was.get(c));
+              compared++;
+            }
+            was = now;
+          }
+        },
+      ),
+      { numRuns: Math.ceil(fc.readConfigureGlobal().numRuns / 4) },
+    );
+    expect(compared).toBeGreaterThan(1000);
+    vi.restoreAllMocks();
+  }, 120_000);
 });
