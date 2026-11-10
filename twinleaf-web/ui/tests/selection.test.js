@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, focusPage, frames, mountPage, pickItem, plotMenu, pressKey, withExamples } from './harness/page.js';
+import { centre, focusPage, frames, mountPage, pickItem, plotMenu, pressKey, wait, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine']];
@@ -282,7 +282,7 @@ describe('a click on one of several selected plots', () => {
       const [x, y] = centre(document.querySelector(`.leaf[data-plot="${ids[0]}"] .plot-body`));
       await commands.mouse([['move', x, y], ['down'], ['up']]);
       await pressKey('Escape');
-      await new Promise((done) => setTimeout(done, 400));
+      await wait(400);
       flushSync();
       expect(page.ws.selected.size).toBe(0);
     } finally {

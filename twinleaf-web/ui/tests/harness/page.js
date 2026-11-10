@@ -1,5 +1,16 @@
 // The whole page, mounted for a browser test with state of its own, and the
 // gestures the tests make on it with the real mouse.
+//
+// The page's time is the test's. A page is mounted on a virtual clock
+// (src/lib/clock.js) unless it asks for the real one: its time, its frames
+// and its timers move only as `frames`, `settle`, `wait` and `until` step
+// them, by the same amounts on any machine, so nothing the page times
+// depends on how fast the test ran. The browser itself stays real: layout,
+// its observers, CSS transitions and the timers inside libraries (menus and
+// tooltips, the drag library, toasts). Each step of `frames` therefore runs
+// inside one frame of the browser's own, where the page's frame callbacks
+// run on a real page, and a test waits for what a library times with
+// `until`, on what the page shows and not for a duration.
 import { withY } from '../../src/lib/cursors.js';
 import { flushSync, mount, unmount } from 'svelte';
 import fc from 'fast-check';
@@ -14,15 +25,72 @@ import { Views } from '../../src/lib/views.js';
 import { presets } from '../../src/lib/layout.js';
 import { emptyTab, loadTabs, makeTab, newPlot } from '../../src/lib/tabs.js';
 import { api } from '../../src/lib/protocol.js';
+import * as clock from '../../src/lib/clock.js';
 import '../../src/app.css';
 import '../../src/plot.css';
 
-export const wait = (ms) => new Promise((done) => setTimeout(done, ms));
-export const frames = (n = 2) =>
-  new Promise((done) => {
-    const next = (k) => (k ? requestAnimationFrame(() => next(k - 1)) : done());
-    next(n);
-  });
+/** The virtual clock of the page mounted; null while none is, or while it is on the real clock. */
+let virtual = null;
+
+/** One frame of the browser's own, `step` run in it where a page's frame callbacks run. */
+const turn = (step) => new Promise((done) => requestAnimationFrame(() => (step?.(), done())));
+
+/**
+ * Lets `n` frames pass. On the virtual clock each is one frame of the
+ * browser's with one of the page's run inside it: the page's time moves on
+ * by clock.js FRAME_MS, its timers due by then run, then its frame
+ * callbacks. On the real clock, the browser's frames alone.
+ */
+export async function frames(n = 2) {
+  for (let i = 0; i < n; i++) await turn(() => virtual?.nextFrame());
+}
+
+/**
+ * Notes `read()` at every frame of the browser's, whatever clock the page
+ * is on, until the function it returns is called, which gives each
+ * different value noted, in order: what a person would have seen change.
+ */
+export function watchFrames(read) {
+  const noted = [];
+  let on = true;
+  const note = () => {
+    if (!on) return;
+    const seen = read();
+    if (noted.at(-1) !== seen) noted.push(seen);
+    requestAnimationFrame(note);
+  };
+  note();
+  return () => ((on = false), noted);
+}
+
+/** Waits until `read()` has been the same for `n` frames of the browser's running, as once a slide or a fade is over; false when it never is within `tries` frames. */
+export async function rested(read, n = 6, tries = 600) {
+  let last = read(), same = 0;
+  for (let i = 0; i < tries && same < n; i++) {
+    await turn();
+    const seen = read();
+    same = seen === last ? same + 1 : 0;
+    last = seen;
+  }
+  return same >= n;
+}
+
+/**
+ * Lets `ms` of the page's time pass. On the virtual clock the page lives
+ * through them at once, frame by frame, its timers in their order; then the
+ * browser has one frame of its own, with none of the page's, to lay out
+ * and deliver what that set off. No real time is waited out, so this waits
+ * for nothing a library or a CSS transition times: `until` does. On the
+ * real clock it waits `ms`.
+ */
+export async function wait(ms) {
+  if (!virtual) return new Promise((done) => setTimeout(done, ms));
+  const whole = Math.floor(ms / clock.FRAME_MS);
+  virtual.frames(whole);
+  virtual.advance(ms - whole * clock.FRAME_MS);
+  flushSync();
+  await turn();
+}
 
 /** A value typed into a write as the stub's devices take it: a bool, a number, or the text. */
 const typed = (text) => (text === 'true' ? true : text === 'false' ? false : text !== '' && !isNaN(+text) ? +text : text);
@@ -105,10 +173,15 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
  * a page loaded again reads them. What the page asks of /api is refused, as a hub that
  * has gone away refuses it, until the page is disposed of; but with
  * `rowsPerSecond`, /api/rows counts that many rows a second of each
- * signal's window. It returns the page's state, each plot's view and
- * PlotView among it.
+ * signal's window. Its clock is virtual, stepped by `frames`, `settle`,
+ * `wait` and `until`, until it is disposed of; with `realClock`, the
+ * browser's own, as the smoke tests of real time mount it. It returns the
+ * page's state, each plot's view and PlotView among it.
  */
-export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null, fromSaved = false } = {}) {
+export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null, fromSaved = false, realClock = false } = {}) {
+  virtual?.end();
+  virtual = realClock ? null : clock.virtual();
+  const mine = virtual;
   localStorage.clear();
   for (const [k, v] of Object.entries(saved)) localStorage.setItem(k, JSON.stringify(v));
   const ps = keys.map((k) => newPlot('time', 'overlay', k));
@@ -143,6 +216,8 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
       unmount(app);
       target.remove();
       window.fetch = fetched;
+      mine?.end();
+      if (virtual === mine) virtual = null;
     },
   };
 }
@@ -153,7 +228,7 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
  * legend's values and its cursors' readout.
  */
 export function feed(hub, seconds = 20) {
-  const session = hub.session, perf = performance.now(), traces = [...session.traces.values()];
+  const session = hub.session, perf = clock.now(), traces = [...session.traces.values()];
   for (const t of traces) {
     const xs = Float64Array.from({ length: seconds * 100 }, (_, i) => i / 100);
     const ys = Float32Array.from(xs, (x) => Math.sin(x + t.meta.id));
@@ -210,9 +285,9 @@ export const OPEN = '[data-slot$=-menu-content], [data-slot$=-menu-sub-content],
 /** Closes whatever menu or popover is open, by Escape, and waits until it has gone. */
 export async function closeAll() {
   for (let i = 0; i < 5 && document.querySelector(OPEN); i++) {
+    const open = document.querySelectorAll(OPEN).length;
     await pressKey('Escape');
-    await wait(150);
-    flushSync();
+    await until(() => document.querySelectorAll(OPEN).length < open, 500);
   }
   expect(document.querySelector(OPEN), 'every menu closed').toBe(null);
 }
@@ -280,13 +355,16 @@ export const glide = (from, to, n = 4) => Array.from({ length: n }, (_, k) => ['
  */
 export const withExamples = (examples) => ({ examples, numRuns: examples.length + fc.readConfigureGlobal().numRuns });
 
-/** Waits, a frame at a time, until `ready()` holds or `ms` have passed; says whether it holds. */
+/**
+ * Steps a frame at a time until `ready()` holds, or the frames of `ms` have
+ * passed; says whether it holds. It counts frames and reads no clock, so a
+ * slow machine has as many steps as a fast one.
+ */
 export async function until(ready, ms = 5000) {
-  const end = performance.now() + ms;
-  for (;;) {
+  for (let left = Math.ceil(ms / clock.FRAME_MS); ; left--) {
     flushSync();
     if (ready()) return true;
-    if (performance.now() > end) return false;
+    if (left <= 0) return false;
     await frames(1);
   }
 }

@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 import { editCursors, feed, mountPage, settle, wait, withExamples } from './harness/page.js';
+import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const SIGNALS = ['sine.sine', 'aux.triangle'];
@@ -31,7 +32,7 @@ describe('a plot’s cursors, as drawn', () => {
         page.ws.setPlot(ids[2], { mode: 'stacked' });
         page.ws.setPlot(ids[3], { kind: 'spectrum' });
       });
-      for (const id of ids) page.views.get(id).pause(performance.now());
+      for (const id of ids) page.views.get(id).pause(clock.now());
       await wait(300);
       await settle();
       await fc.assert(

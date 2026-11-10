@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { feed, frames, leafOf, mountPage, turnWheel, withExamples } from './harness/page.js';
+import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { GONE } from '../src/lib/viewhistory.svelte.js';
 
@@ -45,7 +46,7 @@ describe('a paused plot, zoomed all the way out', () => {
           memory({ 0: a, 1: b });
           flushSync();
           await frames();
-          view.pause(performance.now());
+          view.pause(clock.now());
           turnWheel(page, id, 400, { n: ALL_THE_WAY });
           expect(view.live).toBe(false);
           const left = view.right - view.span, held = Math.min(a, b);
@@ -68,7 +69,7 @@ describe('a paused plot, zoomed all the way out', () => {
       for (const beyond of [2, 0.3, 0, -0.6, -8]) {
         view.follow(true);
         await frames();
-        const at = performance.now(), history = page.hub.now(at) - view.delay - 10 - beyond;
+        const at = clock.now(), history = page.hub.now(at) - view.delay - 10 - beyond;
         memory({ 0: 10, 1: 10 }, history);
         view.pause(at);
         turnWheel(page, id, 400, { n: ALL_THE_WAY });
@@ -88,7 +89,7 @@ describe('a paused plot, zoomed all the way out', () => {
       for (const beyond of [2, 1, 0]) {
         view.follow(true);
         await frames();
-        const at = performance.now(), history = page.hub.now(at) - view.delay - 10 - beyond;
+        const at = clock.now(), history = page.hub.now(at) - view.delay - 10 - beyond;
         memory({ 0: 10, 1: 10 }, history);
         view.pause(at);
         const paused = view.pausedAt;
@@ -107,7 +108,7 @@ describe('a paused plot, zoomed all the way out', () => {
         expect(view.pausedAt).toBe(paused);
         // Live again, it shows what the hub holds within the setting as it is.
         view.follow(true);
-        expect(view.oldest(performance.now()), 'live, History a day').toBeCloseTo(10, 6);
+        expect(view.oldest(clock.now()), 'live, History a day').toBeCloseTo(10, 6);
       }
     } finally {
       page.dispose();
@@ -125,7 +126,7 @@ describe('a paused plot, zoomed all the way out', () => {
       view.follow(true);
       await frames();
       // The hub holds from 10 s on, a second more than its History setting before the pause.
-      const at = performance.now(), history = page.hub.now(at) - view.delay - 11;
+      const at = clock.now(), history = page.hub.now(at) - view.delay - 11;
       memory({ 0: 10, 1: 10 }, history);
       view.pause(at);
       turnWheel(page, id, 400, { n: ALL_THE_WAY });
@@ -159,7 +160,7 @@ describe('a paused plot, zoomed all the way out', () => {
       for (const beyond of [1, -8]) {
         view.follow(true);
         await frames();
-        const at = performance.now();
+        const at = clock.now();
         memory({ 0: 10, 1: 10 });
         memory({ 0: 12, 1: 30 }, page.hub.now(at) - view.delay - 12 - beyond);
         view.pause(at);

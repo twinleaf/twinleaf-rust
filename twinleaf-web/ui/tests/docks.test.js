@@ -9,7 +9,7 @@ import fc from 'fast-check';
 import { afterAll, describe, expect, it } from 'vitest';
 import { page as browser, commands } from 'vitest/browser';
 import { PANELS } from '../src/lib/docks.svelte.js';
-import { centre, clickOn, mountPage, pickItem, pressKey, rightClick, settle, typeInto, until, wait, withExamples } from './harness/page.js';
+import { centre, clickOn, mountPage, pickItem, pressKey, rightClick, rested, settle, typeInto, until, wait, watchFrames, withExamples } from './harness/page.js';
 
 const LIST = '[data-slot=scroll-area-viewport]';
 const BAR = '[data-slot=scroll-area-scrollbar]';
@@ -433,19 +433,6 @@ describe('a click on a panel’s header', () => {
     const frame = frameOf(side), r = frame.getBoundingClientRect();
     return `${frame.className} / ${frame.querySelector('.dock-side').className} / from ${Math.round(r.left)} px, ${Math.round(r.width)} px wide`;
   };
-  /** Notes `read()` at every frame until the function it returns is called, which gives each different value noted, in order. */
-  function watch(read) {
-    const noted = [];
-    let on = true;
-    const note = () => {
-      if (!on) return;
-      const now = read();
-      if (noted.at(-1) !== now) noted.push(now);
-      requestAnimationFrame(note);
-    };
-    note();
-    return () => ((on = false), noted);
-  }
   /** How far the pointer moves between press and release, in px: not at all, and short of a drag along one axis and along both. */
   const MOVES = [[0, 0], [2, 0], [2, 2]];
   /** Where across a header's width a click lands, as a share of it: near its left end, its middle, near its right end. */
@@ -478,7 +465,9 @@ describe('a click on a panel’s header', () => {
               const said = `a click on ${title}, ${Math.round(across * 100)}% across its header, moving ${dx}, ${dy} px, with the ${other} dock ${other === hidden ? 'hidden' : 'shown'}`;
               await commands.mouse([['move', ...at]]);
               await settle();
-              const stop = watch(() => `the ${side} dock: ${stateOf(side)}; the ${other} dock: ${stateOf(other)}`);
+              const stand = () => `the ${side} dock: ${stateOf(side)}; the ${other} dock: ${stateOf(other)}`;
+              expect(await rested(stand), `${said}: the docks are at rest before it`).toBe(true);
+              const stop = watchFrames(stand);
               await commands.mouse([['down'], ['wait', 50], ['move', at[0] + dx, at[1] + dy], ['wait', 80], ['up'], ['wait', 80]]);
               await settle(6);
               const stood = stop();

@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
-import { centre, mountPage, pressKey, wait, withExamples } from './harness/page.js';
+import { centre, mountPage, pressKey, until, wait, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { toast } from '../src/lib/toast.svelte.js';
 import { closeAll, menuPage, plotArea, settle } from './harness/menus.js';
@@ -67,11 +67,22 @@ const TARGETS = {
 };
 const KEYS = ['Escape', 'Tab', 'Enter', 'Space', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
 
+/**
+ * Lets `ms` of the page's time pass, then waits until no layer is on its
+ * way out, and the page has drawn. A layer that closes stays on the page,
+ * closed, while its library fades it, which takes real time.
+ */
+async function rest(ms = 150) {
+  await wait(ms);
+  await until(() => [...document.querySelectorAll(LAYER)].every(isOpen), 1000);
+  await settle();
+}
+
 /** Closes every layer open, a dialog too, by Escape, and waits until they have gone. */
 async function closeLayers() {
   for (let i = 0; i < 6 && document.querySelector(LAYER); i++) {
     await pressKey('Escape');
-    await wait(150);
+    await rest();
   }
   await closeAll();
   expect(document.querySelector(LAYER), 'every layer closed').toBe(null);
@@ -117,8 +128,7 @@ describe('the page’s popup layers', () => {
         try {
           for (let i = 0; i < steps.length; i++) {
             await take(page, steps[i]);
-            await wait(120);
-            await settle();
+            await rest(120);
             check(JSON.stringify(steps.slice(0, i + 1)));
             seen.add(openLayers().length);
           }
@@ -158,8 +168,7 @@ describe('a layer the keys go on from', () => {
           if (menu) await pressAt(plotArea(page, page.ids[1]), 'right');
           for (let i = 0; i < keys.length; i++) {
             await pressKey(keys[i]);
-            await wait(150);
-            await settle();
+            await rest();
             if (openLayers().length) continue;
             const at = document.activeElement;
             expect(at && at !== document.body && at.isConnected, `focus after ${keys.slice(0, i + 1)}: ${at?.tagName}`).toBe(true);
@@ -190,8 +199,7 @@ describe('the confirmation before running several actions', () => {
       expect(run, 'the edit bar offers to run both').toBeTruthy();
       // A click, as the edit bar's own tests make: a real press on the bar lets go of the rows picked.
       run.click();
-      await wait(150);
-      await settle();
+      await rest();
       expect(document.querySelector('[role=alertdialog]'), 'it asks first').toBeTruthy();
       check('the confirmation');
       expect(openLayers().map((l) => l.dataset.slot)).toEqual(['alert-dialog-content']);
@@ -200,8 +208,7 @@ describe('the confirmation before running several actions', () => {
       check('a hover over Display settings');
       // The palette, opened over it, takes its place.
       await pressKey('Control+k');
-      await wait(150);
-      await settle();
+      await rest();
       check('the palette');
       expect(openLayers().map((l) => l.dataset.slot)).toEqual(['dialog-content']);
       await closeLayers();
@@ -209,8 +216,7 @@ describe('the confirmation before running several actions', () => {
       await pressAt(plotArea({ pv: page.pv, ids: plotIds(page.ws.layout) }, plotIds(page.ws.layout)[0]), 'right');
       await settle();
       toast('A notice');
-      await wait(150);
-      await settle();
+      await rest();
       expect(openLayers().map((l) => l.dataset.slot)).toEqual(['context-menu-content']);
     } finally {
       page.dispose();

@@ -19,6 +19,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { frames, HISTORY_HEADROOM, holdHistory, leafOf, mountPage, settle, turnWheel, wait, withExamples } from './harness/page.js';
+import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { WINDOW_LIMITS, windowText } from '../src/lib/window.js';
 import { GONE } from '../src/lib/viewhistory.svelte.js';
@@ -67,7 +68,7 @@ describe('a plot on a hub that holds hours', () => {
   /** The plot on a hub holding `h`, paused: what the hub holds, and where the plot paused. */
   async function paused(h) {
     const hub = await live(h);
-    view.pause(performance.now());
+    view.pause(clock.now());
     return { ...hub, at: view.pausedAt };
   }
   /** Clicks the plot's header button whose label starts `label`, as it stands once the page has taken in what came before. */
@@ -122,7 +123,7 @@ describe('a plot on a hub that holds hours', () => {
           expect(oldest, 'the hub holds all of it').toBeLessThanOrEqual(left);
         } else expect(view.span, 'as wide as what the hub holds, or its window').toBeCloseTo(Math.max(10, right - oldest), 6);
         // Paused there, it shows the same.
-        view.pause(performance.now());
+        view.pause(clock.now());
         turnWheel(page, id, 400, { n: 3 });
         if (h.fill.full || right - oldest >= 10) expect(view.range(now)).toEqual([left, right]);
       }),

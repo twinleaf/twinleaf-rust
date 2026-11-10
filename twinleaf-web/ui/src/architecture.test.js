@@ -25,7 +25,9 @@
 //
 // The clock (clock.js) is the one reader of the time: no other module reads
 // the browser's time, asks it for a frame or sets a timer, so a test that
-// puts the clock in virtual mode holds all of the page's time.
+// puts the clock in virtual mode holds all of the page's time. A page test
+// reads the time from the clock and lets it pass through its harness
+// (tests/harness/page.js), which alone waits real time.
 import { describe, expect, it } from 'vitest';
 import { compile, parse } from 'svelte/compiler';
 import fs from 'node:fs';
@@ -181,6 +183,8 @@ describe('a key', () => {
 const CLOCK = 'lib/clock.js';
 /** A read of the time, a frame or a timer asked of the browser, or one called off. */
 const TIMED = /\bperformance\s*\.\s*now\b|\bDate\s*\.\s*now\b|\bnew\s+Date\b\s*(\(\s*\)|(?![\s(]))|\b(request|cancel)AnimationFrame\b|\b(set|clear)(Timeout|Interval)\b/;
+/** The files of tests/ that touch the browser's time: the harness's real frames and waits, and the mouse command's rests. */
+const HARNESS_TIMED = ['harness/page.js', 'harness/commands.js'];
 
 describe('the time', () => {
   /** The lines of `source` that match TIMED, comments left out, numbered from 1. */
@@ -195,6 +199,15 @@ describe('the time', () => {
     const found = sources(SRC)
       .filter((file) => rel(file) !== CLOCK)
       .flatMap((file) => timed(fs.readFileSync(file, 'utf8')).map((n) => `${rel(file)}:${n}`));
+    expect(found).toEqual([]);
+  });
+  it('of a page test is the page’s: only the harness waits real time or asks the browser for a frame', () => {
+    const TESTS = path.resolve('tests');
+    const found = fs
+      .readdirSync(TESTS, { recursive: true })
+      .map((name) => name.replaceAll('\\', '/'))
+      .filter((name) => /\.(js|svelte)$/.test(name) && !HARNESS_TIMED.includes(name))
+      .flatMap((name) => timed(fs.readFileSync(path.join(TESTS, name), 'utf8')).map((n) => `tests/${name}:${n}`));
     expect(found).toEqual([]);
   });
 });

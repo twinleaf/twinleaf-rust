@@ -15,6 +15,7 @@ import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, closeAll, editCursors, feed, leafOf, mountPage, pressKey, rightClick, settle, wait, withExamples, withYPair } from './harness/page.js';
+import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { SAVE_KEY } from '../src/lib/tabs.js';
 
@@ -218,7 +219,7 @@ const COMMANDS = {
   'a double-click, which follows live': {
     cursors: true,
     // Every plot paused with X1 and X2 placed: following live removes them.
-    prepare: (page) => (timeCursors(page), eachPv(page, (pv) => pv.view.pause(performance.now()))),
+    prepare: (page) => (timeCursors(page), eachPv(page, (pv) => pv.view.pause(clock.now()))),
     act: async (page, id) => (await dblclick(spots(page, id)['the plot area, clear of the readout']), await wait(50)),
     acted: (page, id) => !page.ws.plots[id].cursors?.x && page.views.get(id).live,
   },

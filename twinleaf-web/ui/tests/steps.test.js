@@ -12,6 +12,7 @@ import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, drag, dropped, editCursors, feed, focusPage, frames, glide, leafOf, mountPage, pickItem, plotMenu, pressKey, settle, until, withExamples } from './harness/page.js';
+import * as clock from '../src/lib/clock.js';
 import { xOf, yOf } from '../src/lib/cursors.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
@@ -127,7 +128,7 @@ async function still(id) {
 async function heldPlot(page, a) {
   feed(page.hub);
   const id = plotIds(page.ws.layout)[a % 4];
-  page.views.get(id).pause(performance.now());
+  page.views.get(id).pause(clock.now());
   await still(id);
   const pv = page.pv(id);
   return { id, pv, P: pv.geo.plot };

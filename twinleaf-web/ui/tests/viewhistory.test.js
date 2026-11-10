@@ -19,11 +19,17 @@
 // its view starts meanwhile, it starts at the oldest time held, with the
 // notice, as Back's views do. A kind switch is an edit and a view step:
 // Back crosses it and goes on, whatever undo and redo do between.
+//
+// The page's clock is virtual (harness page.js): a rest is `wait`, of the
+// page's time, and a burst's turns are dispatched 40 ms of it apart
+// (`wheel`), so which turns make one step depends on no machine's speed.
+// Drags, presses and keys are the real mouse and keyboard.
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, frames, mountPage, pickItem, plotMenu, pressKey, until, wait } from './harness/page.js';
+import { centre, frames, mountPage, pickItem, plotMenu, pressKey, turnWheel, until, wait } from './harness/page.js';
+import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { GONE, IDLE_MS } from '../src/lib/viewhistory.svelte.js';
 
@@ -73,6 +79,20 @@ async function pickFromMenu(id, label) {
   [...document.querySelectorAll('[role=menuitem]')].find((m) => m.textContent.trim().startsWith(label)).click();
   flushSync();
   await frames();
+}
+
+/**
+ * Turns the wheel over plot `id` of page `p` by each of `turns` px, 40 ms of
+ * the page's time apart, at fraction `at` across its plot area, the pointer
+ * brought there first, with Shift held when `shift`.
+ */
+async function wheel(p, id, turns, { at = 0.5, shift = false } = {}) {
+  const P = p.pv(id).geo.plot;
+  await commands.mouse([['move', Math.round(P.x + at * P.w), Math.round(P.y + P.h / 2)]]);
+  for (const [i, dy] of turns.entries()) {
+    if (i) await wait(40);
+    turnWheel(p, id, dy, { at, shift });
+  }
 }
 
 const gesture = fc.oneof(
@@ -162,14 +182,15 @@ describe('view history on the page', () => {
               // A drag that rests longer than a burst's idle midway is still one step.
               const [x, y] = centre(bodyOf(id));
               const half = [['move', x + g.dx / 4, y], ['move', x + g.dx / 2, y]];
-              await commands.mouse([['move', x, y], ['down'], ...half, ...(g.rest ? [['wait', IDLE_MS + 200]] : []), ['move', x + (3 * g.dx) / 4, y], ['move', x + g.dx, y], ['up']]);
+              await commands.mouse([['move', x, y], ['down'], ...half]);
+              if (g.rest) await wait(IDLE_MS + 200);
+              await commands.mouse([['move', x + (3 * g.dx) / 4, y], ['move', x + g.dx, y], ['up']]);
               await frames();
               if (moved('drag') && g.rest) count.rested++;
             } else if (g.t === 'wheel') {
               // The last burst has rested by now, so this one is a step of its own.
               await wait(IDLE_MS + 100);
-              const [x, y] = centre(bodyOf(id));
-              await commands.mouse([['move', x, y], ...g.turns.flatMap((dy) => [['wheel', 0, dy], ['wait', 40]])]);
+              await wheel(p, id, g.turns);
               await frames();
               if (moved('wheel') && g.turns.length > 1) count.bursts++;
             } else if (g.t === 'follow') {
@@ -224,7 +245,9 @@ describe('view history on the page', () => {
       const track = document.querySelector('[role=slider][aria-label="Time window"]');
       const r = track.getBoundingClientRect(), y = r.top + r.height / 2;
       const along = (f) => r.left + f * r.width;
-      await commands.mouse([['move', along(0.2), y], ['down'], ['move', along(0.35), y], ['move', along(0.5), y], ['wait', IDLE_MS + 200], ['move', along(0.65), y], ['move', along(0.8), y], ['up']]);
+      await commands.mouse([['move', along(0.2), y], ['down'], ['move', along(0.35), y], ['move', along(0.5), y]]);
+      await wait(IDLE_MS + 200);
+      await commands.mouse([['move', along(0.65), y], ['move', along(0.8), y], ['up']]);
       const dragged = shown(p);
       expect(dragged).not.toBe(start);
       // Every plot's window moved: none was selected, so the slider set them all.
@@ -379,8 +402,8 @@ describe('view history on the page, each kind of gesture', () => {
       await pickFromMenu(id, 'Add X cursors');
       const placed = p.ws.plots[id].cursors;
       expect(placed?.f?.a, 'X cursors on the spectrum').toEqual(expect.any(Number));
-      const [, y] = centre(bodyOf(id)), yAxis = bodyOf(id).getBoundingClientRect().left + 10;
-      await commands.mouse([['move', yAxis, y], ['wheel', 0, -120], ['wait', 40], ['wheel', 0, -120]]);
+      const P = p.pv(id).geo.plot, yAxis = bodyOf(id).getBoundingClientRect().left + 10;
+      await wheel(p, id, [-120, -120], { at: (yAxis - P.x) / P.w });
       await frames();
       expect(Object.keys(p.views.get(id).state().yRanges), 'the y zoom').not.toEqual([]);
       await press(id, 'Back');
@@ -402,16 +425,16 @@ describe('view history on the page, each kind of gesture', () => {
       p.hub.session.byKey.get(KEYS[0][0]).spectrum = { f, a: f.map((x) => 1 / x), floor: null };
       flushSync();
       await frames(3);
-      const pv = p.pv(id), P = pv.geo.plot, at = [P.x + P.w * 0.7, P.y + P.h / 2], under = pv.dataAt(at[0]);
+      const pv = p.pv(id), P = pv.geo.plot, x = Math.round(P.x + P.w * 0.7), under = pv.dataAt(x);
       expect(p.ws.plots[id].fRange ?? null).toBeNull();
-      await commands.mouse([['move', ...at], ['wheel', 0, -240], ['wait', 40], ['wheel', 0, -240]]);
+      await wheel(p, id, [-240, -240], { at: 0.7 });
       await frames(3);
       const [lo, hi] = p.ws.plots[id].fRange;
       expect([lo > 1, hi < 200], 'narrower at both ends').toEqual([true, true]);
-      expect(Math.abs(pv.pxOf(under) - at[0]), 'the frequency under the pointer stays there').toBeLessThan(1.5);
+      expect(Math.abs(pv.pxOf(under) - x), 'the frequency under the pointer stays there').toBeLessThan(1.5);
       // With Shift it zooms y, as over a time plot, and the frequencies stay.
       await wait(IDLE_MS + 100);
-      await commands.mouse([['hold', 'Shift'], ['wheel', 0, -120], ['let go', 'Shift']]);
+      await wheel(p, id, [-120], { at: 0.7, shift: true });
       await frames(3);
       expect(p.ws.plots[id].fRange).toEqual([lo, hi]);
       expect(Object.keys(p.views.get(id).state().yRanges)).not.toEqual([]);
@@ -496,8 +519,7 @@ describe('a plot closed and brought back by Ctrl+Z', () => {
         const p = await page();
         try {
           const ids = plotIds(p.ws.layout), id = ids[k % ids.length], start = shown(p);
-          const [x, y] = centre(bodyOf(id));
-          if (how === 'wheel') await commands.mouse([['move', x, y], ['wheel', 0, -120], ['wait', 40], ['wheel', 0, -120]]);
+          if (how === 'wheel') await wheel(p, id, [-120, -120]);
           else if (how === 'drag') await dragOn(id, 120);
           else await pickFromMenu(id, 'Add X cursors');
           await frames();
@@ -541,7 +563,7 @@ describe('a plot closed and brought back by Ctrl+Z', () => {
       flushSync();
       await frames();
       expect(v.right - v.span).toBeCloseTo(start + 1);
-      expect(v.right).toBeLessThanOrEqual(p.hub.now(performance.now()));
+      expect(v.right).toBeLessThanOrEqual(p.hub.now(clock.now()));
       expect(document.body.textContent).toContain(GONE);
     } finally {
       p.dispose();
