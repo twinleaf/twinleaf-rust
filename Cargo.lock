@@ -4188,6 +4188,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "log",
+ "proptest",
  "rust-embed",
  "serde",
  "serde_json",

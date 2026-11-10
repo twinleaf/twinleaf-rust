@@ -266,6 +266,12 @@ pub struct Run {
     metadata: StreamMetadataSnapshot,
     /// Completed chunks in row order. The coalescer holds the rows after them.
     chunks: VecDeque<SampleBatch>,
+    /// The logical position of each chunk's first row, chunk by chunk, so a
+    /// read finds the chunk of a row or a time by bisection.
+    starts: VecDeque<u64>,
+    /// The logical position of the first row the coalescer holds, where the
+    /// completed chunks end.
+    tail_start: u64,
     /// The arrival number of each chunk's first row, chunk by chunk.
     arrived: VecDeque<u64>,
     /// The arrival number of the first row the coalescer holds.
@@ -310,6 +316,8 @@ impl Run {
             boundaries: VecDeque::new(),
             metadata: batch.metadata().clone(),
             chunks: VecDeque::new(),
+            starts: VecDeque::new(),
+            tail_start: 0,
             arrived: VecDeque::new(),
             tail_arrived: arrival,
             coalescer: BatchCoalescer::new(Some(target)),
@@ -330,6 +338,7 @@ impl Run {
     /// chunk of its own.
     fn frozen(&self) -> Run {
         let mut chunks = self.chunks.clone();
+        let mut starts = self.starts.clone();
         let mut arrived = self.arrived.clone();
         let buffered = self.coalescer.buffered_len();
         if buffered > 0 {
@@ -338,6 +347,7 @@ impl Run {
                     .buffered_rows(0..buffered)
                     .expect("a nonempty buffered tail"),
             );
+            starts.push_back(self.tail_start);
             arrived.push_back(self.tail_arrived);
         }
         Run {
@@ -346,6 +356,8 @@ impl Run {
             boundaries: self.boundaries.clone(),
             metadata: self.metadata.clone(),
             chunks,
+            starts,
+            tail_start: self.next_row,
             arrived,
             tail_arrived: self.tail_arrived,
             coalescer: BatchCoalescer::new(None),
@@ -406,6 +418,8 @@ impl Run {
     /// with the tail's first row, and any after it with batch `arrival`.
     fn take_completed_chunks(&mut self, arrival: u64) {
         while let Some(chunk) = self.coalescer.next_completed_batch() {
+            self.starts.push_back(self.tail_start);
+            self.tail_start += chunk.len() as u64;
             self.chunks.push_back(chunk);
             self.arrived.push_back(self.tail_arrived);
             self.tail_arrived = arrival;
@@ -438,9 +452,11 @@ impl Run {
             let dropped = excess.min(front.len());
             if dropped == front.len() {
                 self.chunks.pop_front();
+                self.starts.pop_front();
                 self.arrived.pop_front();
             } else {
                 *front = front.slice(dropped..front.len());
+                self.starts[0] += dropped as u64;
             }
             self.rows -= dropped;
             excess -= dropped;
@@ -454,6 +470,7 @@ impl Run {
         let Some(chunk) = self.chunks.pop_front() else {
             return;
         };
+        self.starts.pop_front();
         self.arrived.pop_front();
         self.rows -= chunk.len();
         self.forget_dropped_boundaries();
@@ -495,29 +512,31 @@ impl Run {
         if first >= last {
             return Vec::new();
         }
-        let start = (first - retained.start) as usize;
-        let end = (last - retained.start) as usize;
-
+        // The rows of `first..last` a batch of `len` rows from row `at` holds.
+        let within = |at: u64, len: usize| {
+            let from = first.max(at) - at;
+            let to = last.min(at + len as u64).saturating_sub(at);
+            (from < to).then_some(from as usize..to as usize)
+        };
         let mut spans = Vec::new();
-        let mut offset = 0;
-        for batch in &self.chunks {
-            let from = start.max(offset);
-            let to = end.min(offset + batch.len());
-            if from < to {
-                spans.push(batch.slice(from - offset..to - offset));
+        // The chunk that holds `first` is the last to start at or before it.
+        let holder = self.starts.partition_point(|&at| at <= first);
+        let chunks = self.chunks.range(holder.saturating_sub(1)..);
+        let starts = self.starts.range(holder.saturating_sub(1)..);
+        for (batch, &at) in chunks.zip(starts) {
+            if at >= last {
+                break;
             }
-            offset += batch.len();
+            if let Some(rows) = within(at, batch.len()) {
+                spans.push(batch.slice(rows));
+            }
         }
-        let buffered = self.coalescer.buffered_len();
-        if buffered > 0 {
-            let (from, to) = (start.max(offset), end.min(offset + buffered));
-            if from < to {
-                spans.push(
-                    self.coalescer
-                        .buffered_rows(from - offset..to - offset)
-                        .expect("a nonempty buffered tail"),
-                );
-            }
+        if let Some(rows) = within(self.tail_start, self.coalescer.buffered_len()) {
+            spans.push(
+                self.coalescer
+                    .buffered_rows(rows)
+                    .expect("a nonempty buffered tail"),
+            );
         }
         spans
     }
@@ -580,24 +599,24 @@ impl Run {
     /// `time`, or after it when `strictly`, or the end of the retained rows.
     fn first_row_at_or_after(&self, time: f64, strictly: bool) -> u64 {
         let before = |t: f64| if strictly { t <= time } else { t < time };
-        let mut row = self.retained_rows().start;
-        for chunk in &self.chunks {
-            let stamps = chunk.timestamps();
-            if stamps.last().is_some_and(|&t| before(t)) {
-                row += stamps.len() as u64;
-                continue;
-            }
-            return row + stamps.partition_point(|&t| before(t)) as u64;
+        // Time never moves backward, so the chunks that end before `time`
+        // come first.
+        let ended = self
+            .chunks
+            .partition_point(|chunk| chunk.timestamps().last().is_some_and(|&t| before(t)));
+        if let Some(chunk) = self.chunks.get(ended) {
+            let within = chunk.timestamps().partition_point(|&t| before(t));
+            return self.starts[ended] + within as u64;
         }
         let buffered = self.coalescer.buffered_len();
-        if buffered > 0 {
-            let tail = self
-                .coalescer
-                .buffered_rows(0..buffered)
-                .expect("a nonempty buffered tail");
-            row += tail.timestamps().partition_point(|&t| before(t)) as u64;
+        if buffered == 0 {
+            return self.tail_start;
         }
-        row
+        let tail = self
+            .coalescer
+            .buffered_rows(0..buffered)
+            .expect("a nonempty buffered tail");
+        self.tail_start + tail.timestamps().partition_point(|&t| before(t)) as u64
     }
 
     /// Returns when this run last received a batch through
@@ -1452,5 +1471,50 @@ mod tests {
             buffer.run(&fx.stream_key).unwrap().retained_rows(),
             249..300
         );
+    }
+
+    /// A read by rows or by time finds exactly its rows among many chunks,
+    /// the first of them cut by eviction, in the buffer and in a frozen copy
+    /// of it.
+    #[test]
+    fn a_read_finds_its_rows_among_the_chunks() {
+        // At 1 Hz from time zero, row n holds n and stands at n + 1 s. A
+        // capacity of 4096 rows makes chunks of 256.
+        let fx = test_fixture(&[DataType::F64]);
+        let mut buffer = Buffer::new(4096);
+        buffer.set_max_age(Some(2500.0));
+        for start in (0..3000).step_by(100) {
+            fx.push_floats(&mut buffer, 1, start..start + 100);
+        }
+        let frozen = buffer.frozen();
+        for buffer in [&buffer, &frozen] {
+            let run = buffer.run(&fx.stream_key).unwrap();
+            assert_eq!(run.retained_rows(), 499..3000);
+            let held = |rows: Range<u64>| -> Vec<f64> {
+                let column = |batch: SampleBatch| -> Vec<f64> {
+                    batch
+                        .column(ColumnId::new(0))
+                        .unwrap()
+                        .to_f64()
+                        .into_owned()
+                };
+                run.rows(rows).into_iter().flat_map(column).collect()
+            };
+            for from in (0..3200).step_by(97) {
+                for len in [0, 1, 255, 256, 257, 1000] {
+                    let want: Vec<f64> = (from.max(499)..(from + len).min(3000))
+                        .map(|n| n as f64)
+                        .collect();
+                    assert_eq!(held(from..from + len), want, "rows {from}..{}", from + len);
+                    // Times half a second off the rows', and the rows' own.
+                    for off in [0.0, 0.5] {
+                        let (t0, t1) = (from as f64 + off, (from + len) as f64 + off);
+                        let first = (t0.ceil() as u64).saturating_sub(1).clamp(499, 3000);
+                        let end = (t1.floor() as u64).clamp(first, 3000);
+                        assert_eq!(run.rows_between(t0, t1), first..end, "times {t0}..={t1}");
+                    }
+                }
+            }
+        }
     }
 }

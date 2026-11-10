@@ -14,6 +14,7 @@
 //!
 //! What a page hears, and what it may ask, is in `protocol`, and the binary
 //! frames of points and spectra are in `wire`. The hub is in `hub`, the
+//! decimations a paused view's windows are read from in `pyramid`, the
 //! devices and their RPCs in `devices`, the routes in `routes`, and the
 //! checks every request passes in `guard`.
 
@@ -25,6 +26,7 @@ mod feed;
 mod guard;
 mod hub;
 mod protocol;
+mod pyramid;
 mod routes;
 mod wire;
 

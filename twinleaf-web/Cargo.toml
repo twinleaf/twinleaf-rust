@@ -33,3 +33,4 @@ hdf5 = ["twinleaf/hdf5"]
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.47", features = ["rt", "macros"] }
+proptest = "1"

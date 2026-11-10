@@ -107,7 +107,7 @@ an Error. What a device made of a call is data in the reply, not a refusal.
 | `POST /api/mount` | opens devices in place of the hub's |
 | `POST /api/pps` | the decimation every page shares |
 | `POST /api/history` | the raw history the hub keeps: `{seconds, bytes}`, a span of each stream's time and a budget across every stream |
-| `GET /api/window` | raw rows of one trace of a named hub, for a paused plot |
+| `GET /api/window` | one trace of a named hub between two times, at about two points a pixel of `width`, for a paused plot |
 
 ## The page (`twinleaf-web/ui/src`)
 
@@ -154,9 +154,14 @@ canvas and its WebGL layer.
    base near the newest point), and draws one instanced quad per segment,
    split at breaks. Axes, cursors and readouts go on a 2D canvas above, the
    time axis counting from the session's first point (`t0`).
-5. Paused, a plot asks `/api/window` (with the hub id) for the raw rows of
-   its view, and draws those where they cover it. A spectrum plot draws the
-   newest spectrum, or the one it showed when it paused.
+5. Paused, a plot asks `/api/window` (with the hub id) for its view, and
+   draws the reply where it covers it. The reply is the raw rows, decimated
+   when they are more than two a pixel, and from 128 rows a point on the
+   points of a level of the trace's `Pyramid` (`pyramid.rs`): FPCS
+   decimations of every row the history holds, at ratios that double, kept
+   as the rows come. So a window costs by its width, whatever its span
+   (`Hub::window`). A spectrum plot draws the newest spectrum, or the one it
+   showed when it paused.
 
 ### A write to two devices
 

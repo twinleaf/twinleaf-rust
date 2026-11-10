@@ -268,11 +268,11 @@ async fn window(
     if live.id != args.hub {
         return Err(Refusal::new(StatusCode::CONFLICT, "that hub has retired"));
     }
-    let gathered = live
-        .gather(args.id, args.t0, args.t1)
+    let read = live
+        .window(args.id, args.t0, args.t1, args.width.min(8192))
         .await?
         .ok_or_else(no_such_trace)?;
-    let window = blocking(move || gathered.window(args.width.min(8192))).await?;
+    let window = blocking(move || read.window()).await?;
     Ok(Json(window).into_response())
 }
 
