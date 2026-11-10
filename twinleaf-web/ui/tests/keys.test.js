@@ -4,10 +4,13 @@
 // - Escape belongs first to a drag or a resize under way, which it cancels;
 //   then to an open menu, popover or dialog, which closes, or to a field,
 //   which keeps it; then it leaves a maximized view, the selection kept;
-//   then it deselects; then it goes out a level. It never changes a cursor,
-//   a layout or the undo history, and a tooltip takes it from none of them
-//   (the user's verdicts, round 2 Selection #17 and #18, and the follow-up
-//   of 2026-11-09).
+//   then it deselects; then it goes out a level. That is its order wherever
+//   focus is: a list in the page, a plot's signals or the Signals list,
+//   keeps the other keys pressed in it and not Escape, and no part of the
+//   page takes Escape before the maximized view does but a drag and what is
+//   open over it. It never changes a cursor, a layout or the undo history,
+//   and a tooltip takes it from none of them (the user's verdicts, round 2
+//   Selection #17 and #18, and the follow-up of 2026-11-09).
 // - What is typed in a field is the field's: no claimant takes it.
 // - A Space the page takes, to pause, presses nothing as it is let go,
 //   whatever button a click left focus on; a Space on a button the keyboard
@@ -20,6 +23,7 @@ import { OPEN, centre, clickOn, editCursors, emptySpots, feed, focusPage, frames
 import { plotIds } from '../src/lib/layout.js';
 import { cursorOf, page as tree } from '../src/lib/focus.js';
 import { ORDER, lastKey } from '../src/lib/keyrouter.js';
+import { actionFor } from '../src/lib/keymap.js';
 
 const KEYS = [['sine.sine', 'sine.cosine'], ['aux.triangle'], ['aux.sawtooth']];
 const SIGNALS = ['vector.x', 'vector.y'];
@@ -37,8 +41,8 @@ afterEach(() => vi.restoreAllMocks());
 const FOCUSABLE = 'button, input, select, textarea, a[href], [tabindex]';
 /** An open menu, popover, list or dialog, whose keys are its own. */
 const POPUP = '[role=menu], [role=dialog], [role=alertdialog], [data-slot$=-content]';
-/** What keeps the keys typed into it. */
-const FIELD = 'input, textarea, select, [contenteditable], [role=listbox]';
+/** What keeps the keys typed into it, Escape among them. */
+const FIELD = 'input, textarea, select, [contenteditable]';
 
 /** Every place on the page a key can be pressed now: each element that can take focus and shows. */
 function places() {
@@ -60,7 +64,6 @@ function owner(page, drag) {
   const el = document.activeElement;
   if (drag) return 'drag';
   if (el.closest(POPUP)) return null;
-  if (el.matches('.trace-zone')) return 'signals';
   const n = cursorOf(el), out = n && tree.parent(n) ? 'navigation' : null;
   if (el.closest(FIELD)) return out;
   if (page.ws.maximized) return 'restore';
@@ -142,7 +145,6 @@ describe('Escape', () => {
               else if (want === 'deselect') expect(now, said).toEqual({ max: null, plots: [], rows: [] });
               else expect(now, said).toEqual({ max: before.max, plots: before.plots, rows: before.rows });
               if (want === 'navigation') expect(cursorOf(document.activeElement), `${said}: focus`).toBe(tree.parent(cursorOf(before.focus)));
-              if (want === 'signals') expect(document.activeElement.matches('.plot-card'), `${said}: focus`).toBe(true);
               if (popup) await until(() => !popup.isConnected || popup.dataset.state === 'closed', 2000);
               seen.add(popup ? 'popup' : (want ?? 'no one'));
               where.add(name);
@@ -169,11 +171,46 @@ describe('Escape', () => {
     expect(where.size).toBeGreaterThan(5);
   }, 600_000);
 
-  it('has its owners in that order in the router', () => {
+  it('leaves the maximized view, then deselects, then goes out a level, with focus in a list of the page: a plot’s signals, the Signals list', async () => {
+    const LISTS = { 'a plot’s signals': (id) => leafOf(id).querySelector('.trace-zone'), 'the Signals list': () => document.querySelector('.dock-panel .palette') };
+    for (const [name, list] of Object.entries(LISTS)) {
+      const page = await mountPage(KEYS, 'columns', 1, [...KEYS.flat(), ...SIGNALS], RPCS);
+      try {
+        feed(page.hub);
+        await focusPage();
+        const id = plotIds(page.ws.layout)[0], el = list(id);
+        page.ws.selection.only([id]);
+        page.ws.maximize([id]);
+        await settle();
+        el.focus();
+        await settle();
+        expect(document.activeElement, `${name} has focus`).toBe(el);
+        const steps = [];
+        for (let press = 0; press < 3; press++) {
+          await pressKey('Escape');
+          flushSync();
+          await frames();
+          steps.push({ by: lastKey().by, maximized: !!page.ws.maximized, selected: page.ws.selected.size, focus: document.activeElement === el ? 'the list' : document.activeElement === tree.parent(el) ? 'the level above' : named(document.activeElement) });
+        }
+        expect(steps, `three Escapes in ${name}, in a maximized view of a selected plot`).toEqual([
+          { by: 'restore', maximized: false, selected: 1, focus: 'the list' },
+          { by: 'deselect', maximized: false, selected: 0, focus: 'the list' },
+          { by: 'navigation', maximized: false, selected: 0, focus: 'the level above' },
+        ]);
+      } finally {
+        page.dispose();
+      }
+    }
+  }, 60_000);
+
+  it('has its owners in that order in the router, and none before the element but a drag and an open menu', () => {
     const at = (id) => ORDER.findIndex((o) => o.id === id);
-    const order = ['drag', 'menu', 'signals', 'element', 'restore', 'deselect', 'navigation'];
+    const order = ['drag', 'menu', 'element', 'restore', 'deselect', 'navigation'];
     expect(order.map(at)).toEqual([...order.map(at)].sort((a, b) => a - b));
     expect(order.map(at).every((i) => i >= 0)).toBe(true);
+    // A claimant with a place is offered Escape only where the keymap gives that place the key.
+    const offered = ORDER.slice(0, at('element')).filter((o) => !o.place || actionFor(o.place, { key: 'Escape' }));
+    expect(offered.map((o) => o.id)).toEqual(['drag', 'menu']);
   });
 });
 

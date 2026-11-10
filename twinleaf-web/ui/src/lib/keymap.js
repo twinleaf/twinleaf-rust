@@ -55,7 +55,7 @@ export const KEYMAP = [
     entries: [
       { ...MOVE, keys: ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'] },
       { show: ['Delete'], keys: ['Delete', 'Backspace'], action: 'remove', what: 'Remove signal' },
-      { show: ['Esc'], keys: ['Escape', 'Enter'], action: 'leave', what: 'Back to plot' },
+      { keys: ['Enter'], action: 'leave' },
     ],
   },
   {

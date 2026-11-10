@@ -34,10 +34,12 @@
 //
 // So Escape belongs first to a drag, then to an open menu, popover or
 // dialog, which closes, or a field, which keeps it; then it leaves the
-// maximized view; then it deselects; then it goes out a level. A tooltip
-// that closes on it takes it from none of them: what a layer over the page
-// does with a key it hears at the document is not the element's doing. It
-// never clears cursors.
+// maximized view; then it deselects; then it goes out a level. That is its
+// order wherever focus is: the keymap gives Escape to no place before the
+// element but the drag's, and a list in the page keeps the other keys
+// pressed in it and not Escape (keys.js). A tooltip that closes on it takes
+// it from none of them: what a layer over the page does with a key it hears
+// at the document is not the element's doing. It never clears cursors.
 //
 // The claimants before the element hear the key on its way down to it, and
 // a key one of them takes never reaches the element: not the menu, and not

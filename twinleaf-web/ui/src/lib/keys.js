@@ -2,7 +2,11 @@
 // on wherever focus is.
 //
 // What is typed into a field, and an open menu, list or dialog's own keys,
-// stay there. A button keeps the keys that press it, Enter and Space, only
+// stay there. A list in the page, a plot's signals or the Signals list,
+// keeps every key pressed in it but Escape, which has nothing of the list's
+// to close and so is the page's: it leaves a maximized view, deselects, and
+// only then goes out of the list (keyrouter.js).
+// A button keeps the keys that press it, Enter and Space, only
 // when the keyboard moved focus to it. A button focused by a click keeps
 // none, so Space still pauses. The browser's :focus-visible cannot tell
 // them apart here: it turns on for a clicked button at the first key, before
@@ -11,8 +15,10 @@
 // header, or anywhere else, never takes the plots' keys away: which plots
 // they act on is the page's state, not the browser's focus.
 
-/** What keeps every key pressed in it. */
-const TYPING = 'input, textarea, select, [contenteditable], [role=combobox][aria-expanded=true], [role=menu], [role=menuitem], [role=listbox], [role=dialog], [data-slot=select-content]';
+/** What keeps every key pressed in it: a field, and what is open over the page. */
+const TYPING = 'input, textarea, select, [contenteditable], [role=combobox][aria-expanded=true], [role=menu], [role=menuitem], [role=dialog], [data-slot=select-content]';
+/** A list, which keeps every key pressed in it but Escape. */
+const LIST = '[role=listbox]';
 /** What keeps the keys that press it. */
 const PRESSABLE = 'button, a, [role=button], [role=tab], [role=radio], [role=checkbox], [role=switch], [role=slider]';
 const PRESS = ['Enter', ' '];
@@ -39,6 +45,7 @@ export function keyPressed() {
 export function keepsKey(e, at = e.target) {
   if (!(at instanceof Element)) return false;
   if (at.closest(TYPING)) return true;
+  if (at.closest(LIST)) return e.key !== 'Escape';
   if (!PRESS.includes(e.key)) return false;
   const pressable = at.closest(PRESSABLE);
   return !!pressable && keyboardFocused.has(pressable);
