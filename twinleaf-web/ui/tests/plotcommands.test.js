@@ -17,6 +17,7 @@ import fc from 'fast-check';
 import { centre, feed, focusPage, frames, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, showing, until, wait, withExamples } from './harness/page.js';
 import { GUTTER, plotIds, rects, restrict } from '../src/lib/layout.js';
 import { api } from '../src/lib/protocol.js';
+import { COMMANDS } from '../src/lib/commands.js';
 
 const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine'], ['aux.sawtooth']];
 
@@ -97,20 +98,21 @@ describe('a plot’s own command', () => {
 });
 
 /**
- * Keys of each scope, each with `acted(page, before, lead)`: the plots it
- * acted on, as the page shows them, `before` the plots before it and
- * `lead` the plot a picker should open on. Split's are counted instead.
+ * Keys of each scope, as the command table gives it, each with
+ * `acted(page, before, lead)`: the plots it acted on, as the page shows
+ * them, `before` the plots before it and `lead` the plot a picker should
+ * open on. Split's are counted instead.
  */
 const KEYED = {
-  Delete: { scope: 'plot', acted: (page, before) => before.filter((id) => !page.ws.plots[id]) },
-  f: { scope: 'plot' },
-  '|': { scope: 'plot' },
-  _: { scope: 'plot' },
-  l: { scope: 'plot', acted: (page, before) => before.filter((id) => page.ws.plots[id].legend) },
-  k: { scope: 'plot', acted: () => picking() },
-  a: { scope: 'plot', acted: () => picking() },
-  ArrowLeft: { scope: 'view', acted: (page, before) => before.filter((id) => paused(id) && page.ws.plots[id].kind === 'time') },
-  ' ': { scope: 'view', acted: (page, before) => before.filter(paused) },
+  Delete: { acted: (page, before) => before.filter((id) => !page.ws.plots[id]) },
+  f: {},
+  '|': {},
+  _: {},
+  l: { acted: (page, before) => before.filter((id) => page.ws.plots[id].legend) },
+  k: { acted: () => picking() },
+  a: { acted: () => picking() },
+  ArrowLeft: { acted: (page, before) => before.filter((id) => paused(id) && page.ws.plots[id].kind === 'time') },
+  ' ': { acted: (page, before) => before.filter(paused) },
 };
 /** Whether plot `id` is paused, as its header's button says. */
 const paused = (id) => !!document.querySelector(`.leaf[data-plot="${id}"] button[aria-label="Follow live"]`);
@@ -148,7 +150,7 @@ describe('a key', () => {
             await pressKey(key === ' ' ? 'Space' : key);
             flushSync();
             await frames();
-            const { scope, acted } = KEYED[key];
+            const { acted } = KEYED[key], { scope } = COMMANDS.find((c) => c.keys?.includes(key));
             const want = picked.length ? picked : scope === 'view' ? shown : [];
             const last = into ?? picked[0];
             const lead = want.includes(last) ? last : want[0];

@@ -12,6 +12,11 @@
 //
 // State that one module owns is written nowhere else (OWNED): a line outside
 // the owner that matches its `writes` fails.
+//
+// A menu row that shows a key is a command's, drawn by CommandItem from the
+// command table (commands.js), so its key is the key that runs it: no other
+// component writes a `<kbd>` into a menu row, but the rows of commands the
+// table does not hold yet (OWN_KEYS).
 import { describe, expect, it } from 'vitest';
 import { compile } from 'svelte/compiler';
 import fs from 'node:fs';
@@ -70,6 +75,30 @@ describe('props', () => {
   });
   it('the page still writes are still written, so the list shrinks as each goes', () => {
     expect([...PENDING.keys()].filter((w) => !found.includes(w))).toEqual([]);
+  });
+});
+
+/** The menu rows that still write their own keys, as `file keys`, each with the row. */
+const OWN_KEYS = new Map([
+  ['lib/PlotCard.svelte Delete', 'a signal’s Remove'],
+  ['lib/SignalList.svelte Enter', 'the Signals list’s Add to plot'],
+  ['lib/SignalList.svelte ⇧ Enter', 'the Signals list’s New plot'],
+  ['lib/TabStrip.svelte F2', 'a tab’s Rename'],
+  ['lib/Properties.svelte Ctrl C', 'the property rows’ Copy'],
+]);
+
+describe('a menu row’s key', () => {
+  const found = sources(SRC)
+    .filter((file) => file.endsWith('.svelte') && rel(file) !== 'lib/CommandItem.svelte' && !rel(file).startsWith('lib/components/ui/'))
+    .flatMap((file) => fs.readFileSync(file, 'utf8').split('\n').map((line) => [rel(file), line]))
+    .filter(([, line]) => /\.Item\b.*<kbd>/.test(line))
+    .map(([file, line]) => `${file} ${[...line.matchAll(/<kbd>([^<]*)<\/kbd>/g)].map((m) => m[1]).join(' ')}`);
+
+  it('is drawn by CommandItem from the command table, or by a row of a command the table does not hold yet', () => {
+    expect(found.filter((row) => !OWN_KEYS.has(row))).toEqual([]);
+  });
+  it('the rows still to move still write their own, so the list shrinks as each goes', () => {
+    expect([...OWN_KEYS.keys()].filter((row) => !found.includes(row))).toEqual([]);
   });
 });
 
