@@ -6,9 +6,12 @@
 // another tag or a tick label, every tag is inside the plot area, and each stub is in the
 // axis's gutter beside the plot, short of the tick labels, so the line can
 // be set against a tick. And where the tabs of the Y cursors not yet placed
-// rest: at the foot of each y axis, in plots of every height.
+// rest: at the foot of each y axis, in plots of every height. And two X
+// cursors close together: their tags on their outer sides, each against
+// its own line, at every separation, in either order and at the plot's edges.
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
+import { flushSync } from 'svelte';
 import { commands } from 'vitest/browser';
 import { editCursors, feed, frames, leafOf, mountPage, settle, until, wait, withExamples } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
@@ -153,5 +156,157 @@ describe('the tabs Y cursors are dragged out of', () => {
       }
     }
     for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(3);
+  }, 600_000);
+});
+
+describe('two X cursors close together', () => {
+  const NAMES = ['X1', 'X2'];
+  /** How near, in px, the tags of two cursors come before they part, and how much further before they come back. */
+  const NEAR = 4, HELD = 6;
+  /** The page with one plot of `kind`, paused, and `put(a, b)`, which places X1 and X2 at client x `a` and `b` and gives what the plot then draws of each. */
+  async function mounted(kind) {
+    const page = await mountPage([SIGNALS], 'grid', 0, SIGNALS);
+    feed(page.hub);
+    const id = plotIds(page.ws.layout)[0];
+    page.history.group('Prepare', () => page.ws.setPlot(id, { kind, readoutAt: { x: 0.5, y: 0.5 } }));
+    page.views.get(id).pause(clock.now());
+    await wait(300);
+    await settle(6);
+    const pv = page.pv(id);
+    const put = (a, b) => {
+      editCursors(page, id, () => ({ [kind === 'spectrum' ? 'f' : 'x']: { a: pv.dataAt(a), b: pv.dataAt(b) } }));
+      flushSync();
+      pv.draw(clock.now());
+      const tags = pv.pressable.filter((p) => p.part === 'tag' && p.kind === 'x');
+      const of = (name) => {
+        const mine = tags.filter((t) => t.name === name);
+        return { cursor: name, at: mine[0]?.at, name: mine.find((t) => NAMES.includes(t.text)), value: mine.find((t) => !NAMES.includes(t.text)) };
+      };
+      return { a: of('a'), b: of('b'), all: pv.pressable.filter((p) => p.part === 'tag'), P: pv.geo.plot };
+    };
+    return { page, pv, put };
+  }
+  /** Which side of its line a tag is on: 'left' or 'right' of it, or 'on' it. */
+  const side = (tag, at) => (tag.x + tag.w <= at + 1 ? 'left' : tag.x >= at - 1 ? 'right' : 'on');
+  /** The cursor on the left and the one on the right, X1 the left one where they meet. */
+  const ordered = ({ a, b }) => (a.at <= b.at ? [a, b] : [b, a]);
+  const KINDS = ['time', 'spectrum'];
+
+  it('have their tags on their outer sides, each against its own line and clear of the other, at every separation and in either order', async () => {
+    const count = { apart: 0, together: 0, namesApart: 0 };
+    for (const kind of KINDS) {
+      const { page, pv, put } = await mounted(kind);
+      try {
+        const P = pv.geo.plot;
+        for (const base of [0.5, 0.4])
+          for (const order of [1, -1])
+            for (let sep = 0; sep <= 200; sep++) {
+              const x = Math.round(P.x + base * P.w), drawn = put(x, x + order * sep), [l, r] = ordered(drawn);
+              const d = r.at - l.at, where = `${kind}: X1 at ${drawn.a.at} and X2 at ${drawn.b.at}`;
+              drawn.all.forEach((s, i) => drawn.all.slice(i + 1).forEach((t) => expect(overlap(s, t), `${where}: ${s.text} at ${[s.x, s.y]} over ${t.text} at ${[t.x, t.y]}`).toBe(false)));
+              for (const c of [l, r])
+                for (const tag of [c.name, c.value]) expect(c.at >= tag.x - 3 && c.at <= tag.x + tag.w + 3, `${where}: ${tag.text} at ${tag.x}, ${tag.w} wide, is against its line at ${c.at}`).toBe(true);
+              // Each kind of tag keeps its row: the values at the top of the plot and the names at its foot.
+              expect([l.value.y, l.name.y], `${where}: the rows of the tags`).toEqual([r.value.y, r.name.y]);
+              // The values part before the left one's tag, right of its line, would come within NEAR px of the right one's.
+              const need = l.value.w + NEAR;
+              if (d < need) {
+                expect([side(l.value, l.at), side(r.value, r.at)], `${where}: the values, ${d} px apart`).toEqual(['left', 'right']);
+                count.apart++;
+              } else if (d > need + HELD + 1) {
+                expect([side(l.value, l.at), side(r.value, r.at)], `${where}: the values, ${d} px apart`).toEqual(['right', 'right']);
+                count.together++;
+              }
+              // The names, centred on their lines, part likewise.
+              if (d < l.name.w + NEAR) {
+                expect([side(l.name, l.at), side(r.name, r.at)], `${where}: the names, ${d} px apart`).toEqual(['left', 'right']);
+                count.namesApart++;
+              } else if (d > l.name.w + NEAR + HELD + 1) expect([side(l.name, l.at), side(r.name, r.at)], `${where}: the names, ${d} px apart`).toEqual(['on', 'on']);
+            }
+      } finally {
+        page.dispose();
+      }
+    }
+    for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(100);
+  }, 600_000);
+
+  it('keep their tags inside the plot at its edges, each against its own line and clear of the other', async () => {
+    for (const kind of KINDS) {
+      const { page, pv, put } = await mounted(kind);
+      try {
+        const P = pv.geo.plot;
+        for (const [x, order] of [[P.x + 1, 1], [P.x + 20, 1], [P.x + 20, -1], [P.x + P.w - 1, -1], [P.x + P.w - 20, -1], [P.x + P.w - 20, 1]])
+          for (let sep = 0; sep <= 200; sep++) {
+            const b = Math.round(x) + order * sep;
+            if (b < P.x + 1 || b > P.x + P.w - 1) continue;
+            const drawn = put(Math.round(x), b), where = `${kind}: X1 at ${drawn.a.at} and X2 at ${drawn.b.at}, the plot from ${P.x} to ${P.x + P.w}`;
+            drawn.all.forEach((s, i) => drawn.all.slice(i + 1).forEach((t) => expect(overlap(s, t), `${where}: ${s.text} at ${[s.x, s.y]} over ${t.text} at ${[t.x, t.y]}`).toBe(false)));
+            for (const c of [drawn.a, drawn.b])
+              for (const tag of [c.name, c.value]) {
+                expect(tag.x >= P.x - 0.5 && tag.x + tag.w <= P.x + P.w + 0.5, `${where}: ${tag.text} at ${tag.x}, ${tag.w} wide, is inside the plot`).toBe(true);
+                // A value is beside its line; a name held in at the plot's edge is as near its line as the edge lets it be.
+                if (tag === c.value) expect(c.at >= tag.x - 3 && c.at <= tag.x + tag.w + 3, `${where}: ${tag.text} at ${tag.x}, ${tag.w} wide, is against its line at ${c.at}`).toBe(true);
+              }
+          }
+      } finally {
+        page.dispose();
+      }
+    }
+  }, 600_000);
+
+  it('change the side of each tag once at most as the other comes near, once as they cross and once as it leaves, a pixel at a time, and never for a single pixel', async () => {
+    for (const kind of KINDS) {
+      const { page, pv, put } = await mounted(kind);
+      try {
+        const P = pv.geo.plot, mid = Math.round(P.x + P.w / 2);
+        // X2 across X1 and X1 across X2, each from the left and from the right.
+        for (const moving of ['b', 'a'])
+          for (const dir of [1, -1]) {
+            const runs = { 'a value': [], 'a name': [], 'b value': [], 'b name': [] };
+            for (let k = -200; k <= 200; k++) {
+              const x = mid + dir * k, drawn = moving === 'b' ? put(mid, x) : put(x, mid);
+              for (const c of [drawn.a, drawn.b])
+                for (const what of ['value', 'name']) {
+                  const seen = side(c[what], c.at), list = runs[`${c.cursor} ${what}`];
+                  if (list.at(-1)?.[0] === seen) list.at(-1)[1]++;
+                  else list.push([seen, 1, k]);
+                }
+            }
+            for (const [what, list] of Object.entries(runs)) {
+              const said = `${kind}, ${moving} moving ${dir > 0 ? 'right' : 'left'} across the other: the sides of ${what}, ${JSON.stringify(list)}`;
+              // Each run is [side, px it lasts, where it starts]: one change at most before they meet, one after, and the swap where they cross.
+              expect(list.length, said).toBeLessThanOrEqual(4);
+              expect(Math.max(list.filter((r) => r[2] > -200 && r[2] < 0).length, list.filter((r) => r[2] > 1).length), said).toBeLessThanOrEqual(1);
+              expect(list.slice(1, -1).every((r) => r[1] > 1), said).toBe(true);
+            }
+            // The one that moves is on the left, then on the right, so its value's tag changes sides as it crosses.
+            expect(runs[`${moving} value`].length, `${kind}, ${moving} moving: its value's tag changes sides`).toBeGreaterThan(1);
+          }
+      } finally {
+        page.dispose();
+      }
+    }
+  }, 600_000);
+
+  it('keep the sides of their tags while one is moved back and forth about the distance where they part', async () => {
+    for (const kind of KINDS) {
+      const { page, pv, put } = await mounted(kind);
+      try {
+        const P = pv.geo.plot, mid = Math.round(P.x + P.w / 2), w = Math.floor(put(mid, mid + 300).a.value.w);
+        const sides = (d) => {
+          const drawn = put(mid, mid + d);
+          return [side(drawn.a.value, drawn.a.at), side(drawn.b.value, drawn.b.at)].join(' ');
+        };
+        // From far apart to a few px short of parting and back, again and again: side by side throughout.
+        const beside = Array.from({ length: 12 }, (_, i) => sides(w + (i % 2 ? 12 : 7)));
+        expect(new Set(beside), `${kind}: never nearer than parts them`).toEqual(new Set(['right right']));
+        // Once parted, out to the same few px short and back: on their outer sides throughout.
+        const parted = Array.from({ length: 12 }, (_, i) => sides(w + (i % 2 ? 7 : 1)));
+        expect(new Set(parted), `${kind}: parted, and never far enough to come back`).toEqual(new Set(['left right']));
+        expect(sides(w + 14), `${kind}: far enough to come back`).toBe('right right');
+      } finally {
+        page.dispose();
+      }
+    }
   }, 600_000);
 });

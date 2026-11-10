@@ -508,6 +508,7 @@ export class PlotView {
      *   hover's tip.
      */
     this.pressable = [];
+    this.tagsParted = {}; // the pairs of tags that are on their outer sides, by pair, see `parted`
     this.tagsPlaced = [];
     this.tickLabels = []; // the box of each tick label, {x, y, w, h} in client px, as last drawn
     this.cursorStubs = []; // each cursor line's run past the plot's edge into the axis, {x0, y0, x1, y1}
@@ -1337,7 +1338,9 @@ export class PlotView {
    * takes the press there.
    *
    * X1 and X2 are lines through every lane, named just above the x axis,
-   * their place at the top of the plot; Y1 and Y2 lines across their
+   * their place at the top of the plot beside the line, and where the tags
+   * of the two would come near each other, each on its line's outer side;
+   * Y1 and Y2 lines across their
    * axis's lane, named just inside it beside the axis, their level next to
    * the name; the span between a pair shaded. Every tag is inside the plot,
    * so none covers a tick label, and each line runs on CURSOR_STUB px past
@@ -1393,20 +1396,43 @@ export class PlotView {
         ctx.fillRect(a.lane.x, t, a.lane.w, b - t);
       }
     }
-    const xTagY = P.y + P.h - TAB.h / 2 - 1;
+    const xTagY = P.y + P.h - TAB.h / 2 - 1, xValueY = P.y + TAB.h / 2 + 2;
     const within = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    // The X cursors in view, each with its tags where they sit with the other cursor away: its name
+    // centred on its line, held inside the plot, and its value right of the line, or left of it at the plot's right edge.
+    const seen = ['a', 'b'].filter((name) => inView(marks[name])).map((name) => {
+      const px = Math.round(sx(marks[name])) + 0.5, text = fx(marks[name]), flip = px + ctx.measureText(text).width + 10 > P.x + P.w;
+      return { name, px, text, nameTag: tag(within(px, P.x + TAB.w / 2, P.x + P.w - TAB.w / 2), xTagY, xName[name]), valueTag: tag(flip ? px - 2 : px + 2, xValueY, text, flip ? 'right' : 'left') };
+    });
+    // Two whose tags would come near each other have them on their outer sides, the left cursor's left of its
+    // line and the right one's right of its, whichever of X1 and X2 each is, so each stays against its own line.
+    // Staying inside the plot comes first: a value with no room on its outer side stays where it sits alone, and
+    // a name is held in at the edge. Tags that still meet there are laid in rows (`laid`).
+    if (seen.length === 2) {
+      const [l, r] = seen[0].px <= seen[1].px ? seen : [seen[1], seen[0]];
+      if (this.parted('x value', l.valueTag, r.valueTag)) {
+        const left = tag(l.px - 2, xValueY, l.text, 'right'), right = tag(r.px + 2, xValueY, r.text, 'left');
+        if (left.x >= P.x) l.valueTag = left;
+        if (right.x + right.w <= P.x + P.w) r.valueTag = right;
+      }
+      if (this.parted('x name', l.nameTag, r.nameTag)) {
+        const left = tag(l.px, xTagY, xName[l.name], 'right'), right = tag(r.px, xTagY, xName[r.name], 'left');
+        const held = (b) => ({ ...b, x: within(b.x, Math.ceil(P.x), Math.floor(P.x + P.w - b.w)) });
+        [l.nameTag, r.nameTag] = [held(left), held(right)];
+      }
+    } else this.tagsParted = {};
     for (const name of ['a', 'b']) {
       const v = marks[name];
       if (v === null) continue;
       const cursor = { kind: 'x', name, fill: color[name] };
-      if (inView(v)) {
-        const px = Math.round(sx(v)) + 0.5;
+      const c = seen.find((s) => s.name === name);
+      if (c) {
+        const px = c.px;
         const runs = [...this.geo.lanes.map((lane) => [px, lane.y, px, lane.y + lane.h]), [px, P.y + P.h, px, P.y + P.h + CURSOR_STUB]];
         lines.push({ part: 'line', ...cursor, at: px, runs, x: px - CURSOR_GRAB, y: P.y, w: 2 * CURSOR_GRAB, h: P.h + CURSOR_STUB });
         this.cursorStubs.push({ x0: px, y0: P.y + P.h, x1: px, y1: P.y + P.h + CURSOR_STUB });
-        tags.push({ part: 'tag', ...cursor, at: px, ...laid(tag(within(px, P.x + TAB.w / 2, P.x + P.w - TAB.w / 2), xTagY, xName[name]), -ROW) });
-        const text = fx(v), right = px + ctx.measureText(text).width + 10 > P.x + P.w;
-        tags.push({ part: 'tag', ...cursor, at: px, ...laid(tag(right ? px - 2 : px + 2, P.y + TAB.h / 2 + 2, text, right ? 'right' : 'left'), ROW) });
+        tags.push({ part: 'tag', ...cursor, at: px, ...laid(c.nameTag, -ROW) });
+        tags.push({ part: 'tag', ...cursor, at: px, ...laid(c.valueTag, ROW) });
       } else {
         const step = name === 'b' ? TAB.w + 10 : 0;
         const box = v < xd[0] ? tag(P.x + TAB.w / 2 + 4 + step, xTagY, `‹${xName[name]}`) : tag(P.x + P.w - TAB.w / 2 - 4 - step, xTagY, `${xName[name]}›`);
@@ -1539,6 +1565,18 @@ export class PlotView {
    */
   pressAt(x, y, parts = null) {
     return this.pressable.findLast((p) => !p.through && (!parts || parts.includes(p.part)) && x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h) ?? null;
+  }
+
+  /**
+   * Whether a pair of tags, `key` naming the pair, part to their outer
+   * sides, given the boxes `a` and `b` they have side by side: once those
+   * come within TAG_NEAR px of each other along x, and from then until they
+   * are TAG_HELD px further apart, so a pair held at the distance where
+   * they part does not change sides back and forth.
+   */
+  parted(key, a, b) {
+    const gap = Math.max(a.x, b.x) - Math.min(a.x + a.w, b.x + b.w);
+    return (this.tagsParted[key] = gap < TAG_NEAR + (this.tagsParted[key] ? TAG_HELD : 0));
   }
 
   /**
@@ -2035,6 +2073,8 @@ const SEEK_BAR = 4, SEEK_MIN = 2;
  * from the plot beside it and further below it.
  */
 const CURSOR_STUB = 4;
+/** How near, in px, the tags of two cursors come before they part to their outer sides, and how much further apart they are before they come back. */
+const TAG_NEAR = 4, TAG_HELD = 6;
 /** Whether boxes `a` and `b`, each {x, y, w, h}, overlap. */
 const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
 /** How far to either side of a cursor's line, in px, a press still lands on it. */
