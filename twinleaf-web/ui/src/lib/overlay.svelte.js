@@ -85,8 +85,10 @@ const FADE_MS = 400;
  * commands act on, live, while it is open; the press that closes it can
  * change that, and the menu would show the new words as it fades. So each
  * menu the press is outside of is hidden, and a copy of it as it reads now
- * fades in its place. The menu itself is untouched: opened again before it
- * has gone, or left open by the press, it shows again.
+ * fades in its place. The menu itself is untouched, and shows again where
+ * the press did not end it: opened again before it has gone; left open by
+ * a right-click on what it is the menu of, which moves it there; or left
+ * open by any other press, once the copy has faded.
  */
 function freezeMenus(target) {
   // A press in a menu or a submenu is no press outside.
@@ -96,7 +98,16 @@ function freezeMenus(target) {
     else if (el.dataset.state === 'open' && el.dataset.frozen === undefined) fadeCopy(el);
   }
 }
-if (typeof window !== 'undefined') window.addEventListener('pointerdown', (e) => e.target instanceof Element && freezeMenus(e.target), true);
+if (typeof window !== 'undefined') {
+  window.addEventListener('pointerdown', (e) => e.target instanceof Element && freezeMenus(e.target), true);
+  // A right-click opens a menu, or moves the open menu of what it is on,
+  // which closes nothing: a frame on, a menu still open is where it opens,
+  // and shows there.
+  window.addEventListener('contextmenu', () => frozen.size && clock.frame(() => [...frozen.values()].forEach((opened) => opened())), true);
+}
+
+/** The menus hidden behind a fading copy, each with what shows it again if the press that hid it left it open. */
+const frozen = new Map();
 
 function fadeCopy(el) {
   const copy = el.cloneNode(true);
@@ -107,28 +118,30 @@ function fadeCopy(el) {
   // Hidden by an attribute of its own (plot.css): the menu's style is its library's to write.
   el.dataset.frozen = '';
   el.after(copy);
-  // The copy goes when its fade ends. The menu stays hidden until it opens
-  // again, if it does before it has left the page.
-  const copyGone = () => (clock.cancel(timer), copy.remove());
   let closed = false;
+  /** Shows the menu again, its copy gone. */
+  const show = () => {
+    watch.disconnect();
+    clock.cancel(timer);
+    copy.remove();
+    frozen.delete(el);
+    delete el.dataset.frozen;
+  };
+  /** Whether the press left the menu open: it has not closed since. */
+  const stayed = () => !closed && el.dataset.state === 'open';
+  // A menu that closes stays hidden until it has left the page, or opens again before then.
   const watch = new MutationObserver(() => {
     const again = closed && el.dataset.state === 'open';
     if (el.dataset.state === 'closed') closed = true;
-    if (el.isConnected && !again) return;
-    watch.disconnect();
-    copyGone();
-    delete el.dataset.frozen;
+    if (!el.isConnected || again) show();
   });
   watch.observe(el, { attributes: true, attributeFilter: ['data-state'] });
   watch.observe(el.parentNode, { childList: true });
-  copy.addEventListener('animationend', copyGone, { once: true });
-  // A press that closed nothing leaves the menu open: it shows again.
-  const timer = clock.after(FADE_MS, () => {
-    copyGone();
-    if (closed || el.dataset.state !== 'open') return;
-    watch.disconnect();
-    delete el.dataset.frozen;
-  });
+  // The copy goes when its fade ends, and a menu the press left open shows again.
+  const faded = () => (stayed() ? show() : copy.remove());
+  copy.addEventListener('animationend', faded, { once: true });
+  const timer = clock.after(FADE_MS, faded);
+  frozen.set(el, () => (stayed() || !el.isConnected) && show());
 }
 
 /**
