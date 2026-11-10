@@ -177,6 +177,8 @@ const reducedMotion = typeof matchMedia === 'undefined' ? null : matchMedia('(pr
  * line by under half a pixel at the switch from this many.
  */
 export const LEVEL_FLOOR = 4;
+/** How far short of its full history the hub may hold, in seconds, and a paused view still reach the full length. */
+export const HISTORY_SLACK = 2;
 /**
  * How far past the floor a coarser level must reach before a plot moves to
  * it, as a factor. A plot then moves back to the finer level only once the
@@ -640,11 +642,17 @@ export class PlotView {
     // time the hub holds of its signals, or, until the hub has said, the
     // oldest point the page has, to the newest point; or, paused, to the
     // moment it paused, the end of what it captured. A paused view stays
-    // within it.
+    // within it. Once the hub holds its full history, give or take what it
+    // trimmed around the pause, a paused view's widest is that history's
+    // length exactly, so it reads as the History setting does.
     let lo = Infinity, hi = -Infinity;
     for (const t of traces) for (const l of t.levels) if (l.length) [lo, hi] = [Math.min(lo, l.xAt(l.absStart)), Math.max(hi, l.xAt(l.absEnd - 1))];
     lo = this.hub.session.oldestHeld(traces.map((t) => t.meta.id)) ?? lo;
-    if (!this.view.live && this.view.pausedAt !== null) hi = this.view.pausedAt;
+    if (!this.view.live && this.view.pausedAt !== null) {
+      hi = this.view.pausedAt;
+      const full = hi - (this.hub.session.memory?.maxAge || Infinity);
+      if (lo <= full + HISTORY_SLACK) lo = full;
+    }
     this.history = lo < hi ? [lo, hi] : null;
     this.view.limits = this.view.live ? null : this.history;
     // Shared ranges take the union of their traces. A fit fits to what this frame shows.
