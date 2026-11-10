@@ -55,6 +55,14 @@ const LEVELS: usize = 6;
 /// at most this many bytes across every stream.
 const RAW_SECONDS: f64 = 600.0;
 const RAW_BYTES: usize = 1_000_000_000;
+/// How far behind the hub's newest sample a page's view may be, in seconds,
+/// and still reach the whole History setting before it: the buffer keeps
+/// this much more of each stream than the setting. A page's view ends at its
+/// clock less its display delay, at most 0.5 s, and its clock may trail the
+/// newest sample by 0.5 s before it is set at once; the rest is for a pause's
+/// hold to arrive, by when the buffer has dropped that much more. A view
+/// further behind finds the oldest of the setting's span already dropped.
+const HISTORY_HEADROOM: f64 = 2.0;
 /// The share of the history budget the history held for paused plots keeps.
 const HELD_SHARE: f64 = 0.5;
 /// How often pending points go out.
@@ -451,7 +459,7 @@ impl Hub {
         Hub {
             buffer: {
                 let mut buffer = Buffer::with_budget(RAW_BYTES);
-                buffer.set_max_age(Some(RAW_SECONDS));
+                buffer.set_max_age(Some(RAW_SECONDS + HISTORY_HEADROOM));
                 buffer
             },
             traces: Vec::new(),
@@ -767,24 +775,30 @@ impl Hub {
         Message::Memory {
             bytes: self.buffer.bytes() as u64,
             budget: self.budget.unwrap_or(0) as u64,
-            seconds: if seconds.is_finite() { seconds } else { 0.0 },
-            max_age: self.buffer.max_age().unwrap_or(0.0),
+            // The setting and what is held of it: the headroom is not history a page counts.
+            seconds: if seconds.is_finite() {
+                seconds.min(self.history_seconds)
+            } else {
+                0.0
+            },
+            max_age: self.history_seconds,
             rate,
             held,
             oldest,
         }
     }
 
-    /// Sets the raw history the buffer keeps, dropping what no longer fits
-    /// at once, and the most each level of the decimation keeps, and tells
-    /// every page.
+    /// Sets the raw history the buffer keeps, `seconds` and
+    /// HISTORY_HEADROOM more of each stream within `bytes`, dropping what no
+    /// longer fits at once, and the most each level of the decimation keeps,
+    /// and tells every page.
     fn set_history(&mut self, seconds: f64, bytes: usize) {
         self.history_seconds = seconds;
         for trace in &mut self.traces {
             trace.live.op_mut().set_retention(HISTORY_SECONDS, seconds);
         }
         self.feed.message(&self.config());
-        self.buffer.set_max_age(Some(seconds));
+        self.buffer.set_max_age(Some(seconds + HISTORY_HEADROOM));
         self.budget = Some(bytes);
         let held_budget = self.held_budget();
         if let Some(held) = &mut self.held {
@@ -1223,6 +1237,46 @@ mod tests {
             panic!("memory is a memory message")
         };
         assert_eq!(oldest.get(&0), Some(&0.01));
+    }
+
+    #[test]
+    fn the_history_reaches_the_setting_before_any_view_within_the_headroom() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        hub.set_history(10.0, RAW_BYTES);
+        // At 100 Hz, row n stands at (n + 1) / 100 s: the newest at 30 s.
+        for batch in samples(&mut parser, 0, 3000) {
+            hub.ingest(&batch);
+        }
+        let said = |hub: &Hub| {
+            let Message::Memory {
+                oldest,
+                max_age,
+                seconds,
+                ..
+            } = hub.memory()
+            else {
+                panic!("memory is a memory message")
+            };
+            (oldest[&0], max_age, seconds)
+        };
+        let (oldest, max_age, seconds) = said(&hub);
+        // A view that ends the headroom behind the newest sample still has
+        // the whole setting before it, and no view has more than a row
+        // beyond that.
+        let view = 30.0 - HISTORY_HEADROOM;
+        assert!(oldest <= view - 10.0 + 1e-9, "oldest {oldest}");
+        assert!(oldest > view - 10.0 - 0.011, "oldest {oldest}");
+        // The message says the setting, not what the buffer keeps beyond it.
+        assert_eq!((max_age, seconds), (10.0, 10.0));
+        // The history a pause holds begins where the buffer did, and stays.
+        hub.hold(7, true);
+        for batch in samples(&mut parser, 3000, 1000) {
+            hub.ingest(&batch);
+        }
+        assert_eq!(said(&hub), (oldest, 10.0, 10.0));
+        hub.hold(7, false);
+        assert!(said(&hub).0 > oldest, "let go, the buffer has moved on");
     }
 
     #[test]
