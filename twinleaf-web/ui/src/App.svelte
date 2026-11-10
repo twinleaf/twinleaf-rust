@@ -414,8 +414,22 @@
   /** A rail's width in px: one holding panels has its show button; an empty one is a strip to drop on, wider while a panel is dragged. */
   const RAIL_PX = { panels: 26, empty: 8, awaiting: 56 };
   const railPx = (side) => (docks.dragging ? RAIL_PX.awaiting : docks[side].length ? RAIL_PX.panels : RAIL_PX.empty);
-  /** Each side's rail as a share of the panes' room, the size its pane collapses to. */
-  const railPct = $derived({ left: paneRoom ? (railPx('left') / paneRoom) * 100 : 0, right: paneRoom ? (railPx('right') / paneRoom) * 100 : 0 });
+  /** A side's rail as a share of the panes' room, the size its pane collapses to. */
+  const railShare = (side) => (paneRoom ? (railPx(side) / paneRoom) * 100 : 0);
+  const railLeft = $derived(railShare('left')), railRight = $derived(railShare('right'));
+  /**
+   * Each side's rail share. Each is a number of its own, so a pane, which
+   * lays the panes out anew when told the size it collapses to, is told only
+   * when that size changes, not whenever a panel folds or moves.
+   */
+  const railPct = {
+    get left() {
+      return railLeft;
+    },
+    get right() {
+      return railRight;
+    },
+  };
   /**
    * The size `side`'s pane starts at, its width or its rail's while hidden.
    * Read once as the panes mount: a hide or a show after that is a slide.

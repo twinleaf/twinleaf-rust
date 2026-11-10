@@ -420,3 +420,78 @@ describe('what a dock shows', () => {
     expect([...looks.keys()].length, `one look for every scroll bar, of ${[...looks].map(([look, where]) => `${look} (${where})`).join('; ')}`).toBe(1);
   }, 180_000);
 });
+
+// A press on a header that lets go where it pressed, or within a couple of
+// px, is a click, which folds the panel and does nothing else: no drag is
+// under way, so neither dock's frame changes, whether a dock is shown or
+// hidden, by its classes or by where it is at any frame.
+describe('a click on a panel’s header', () => {
+  const SIDES = ['left', 'right'];
+  const frameOf = (side) => document.querySelector(`.dock-frame.${side}`);
+  /** How the frame of dock `side` stands: its classes, its dock's, and where it is, in px. */
+  const stateOf = (side) => {
+    const frame = frameOf(side), r = frame.getBoundingClientRect();
+    return `${frame.className} / ${frame.querySelector('.dock-side').className} / from ${Math.round(r.left)} px, ${Math.round(r.width)} px wide`;
+  };
+  /** Notes `read()` at every frame until the function it returns is called, which gives each different value noted, in order. */
+  function watch(read) {
+    const noted = [];
+    let on = true;
+    const note = () => {
+      if (!on) return;
+      const now = read();
+      if (noted.at(-1) !== now) noted.push(now);
+      requestAnimationFrame(note);
+    };
+    note();
+    return () => ((on = false), noted);
+  }
+  /** How far the pointer moves between press and release, in px: not at all, and short of a drag along one axis and along both. */
+  const MOVES = [[0, 0], [2, 0], [2, 2]];
+  /** Where across a header's width a click lands, as a share of it: near its left end, its middle, near its right end. */
+  const ACROSS = [0.04, 0.5, 0.96];
+
+  it('folds the panel and changes neither dock’s frame at any frame, the other dock shown or hidden, from every header of each dock, anywhere across it', async () => {
+    await browser.viewport(1200, 900);
+    let clicks = 0;
+    for (const hidden of [null, ...SIDES]) {
+      const page = await mountPage([['s0.x']], 'columns', 0, signals(3), tableOf({ setting: 3, report: 3, action: 2, other: 2 }));
+      try {
+        await settle(6);
+        if (hidden) {
+          await clickOn(frameOf(hidden).querySelector('button[aria-label^="Hide the"]'));
+          expect(await until(() => frameOf(hidden).classList.contains('rail')), `the ${hidden} dock is its rail`).toBe(true);
+          await settle(6);
+        }
+        for (const side of SIDES.filter((s) => s !== hidden)) {
+          const other = SIDES.find((s) => s !== side);
+          const titles = [...frameOf(side).querySelectorAll('.dock-panel')].map(titleOf);
+          expect(titles.length, `panels in the ${side} dock`).toBeGreaterThan(1);
+          for (const [i, title] of titles.entries()) {
+            for (const [k, across] of ACROSS.entries()) {
+              const [dx, dy] = MOVES[(i + k) % MOVES.length];
+              const panel = () => document.querySelector(`.dock-panel[aria-label="${title}"]`);
+              const head = panel().querySelector('.dock-head');
+              head.scrollIntoView({ block: 'nearest' });
+              await settle();
+              const r = head.getBoundingClientRect(), at = [r.left + across * r.width, r.top + r.height / 2], was = panel().classList.contains('open');
+              const said = `a click on ${title}, ${Math.round(across * 100)}% across its header, moving ${dx}, ${dy} px, with the ${other} dock ${other === hidden ? 'hidden' : 'shown'}`;
+              await commands.mouse([['move', ...at]]);
+              await settle();
+              const stop = watch(() => `the ${side} dock: ${stateOf(side)}; the ${other} dock: ${stateOf(other)}`);
+              await commands.mouse([['down'], ['wait', 50], ['move', at[0] + dx, at[1] + dy], ['wait', 80], ['up'], ['wait', 80]]);
+              await settle(6);
+              const stood = stop();
+              expect(stood, `${said}: how the docks' frames stood, frame by frame`).toEqual(stood.slice(0, 1));
+              expect(panel().classList.contains('open'), `${said}: the panel is open`).toBe(!was);
+              clicks++;
+            }
+          }
+        }
+      } finally {
+        page.dispose();
+      }
+    }
+    expect(clicks).toBeGreaterThan(40);
+  }, 180_000);
+});
