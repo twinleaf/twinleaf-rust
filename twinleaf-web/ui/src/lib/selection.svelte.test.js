@@ -5,11 +5,14 @@
 // that is gone; plots and rows are never chosen together; only a click
 // on one of several selected plots leaves anything to happen later; and the
 // plots a command acts on are what its origin and scope say.
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 import { DOUBLE_CLICK_MS, Selection } from './selection.svelte.js';
+import * as clock from './clock.js';
 
-afterEach(() => vi.useRealTimers());
+/** The virtual clock a test runs on. */
+let time = null;
+afterEach(() => time?.end());
 
 const IDS = ['a', 'b', 'c', 'd'];
 const ROWS = ['s:gain', 's:offset', 'r:temp'];
@@ -43,7 +46,7 @@ describe('the Selection, against a model of it', () => {
   it('chooses what the rules say after every act, names no plot that is gone, and leaves nothing for later but a narrowing click', () => {
     fc.assert(
       fc.property(fc.array(act, { minLength: 1, maxLength: 30 }), (acts) => {
-        vi.useFakeTimers();
+        time = clock.virtual();
         const plots = new Set(IDS);
         const s = new Selection((id) => plots.has(id), () => [...plots]);
         // The rows on the page; a row goes as its device's property does.
@@ -118,7 +121,7 @@ describe('the Selection, against a model of it', () => {
             expect(s.pageTargets(a.scope).sort()).toEqual((was.size ? [...was] : a.scope === 'view' ? [...ctrlA.plots] : []).sort());
           } else if (a.t === 'wait') {
             const before = state();
-            vi.advanceTimersByTime(a.ms);
+            time.advance(a.ms);
             if (narrowing && a.ms > DOUBLE_CLICK_MS) {
               expect([...s.plots]).toEqual([narrowing]);
               narrowing = null;
@@ -129,7 +132,7 @@ describe('the Selection, against a model of it', () => {
           expect(s.plots.size && s.rows.size).toBeFalsy();
         }
         document.body.replaceChildren();
-        vi.useRealTimers();
+        time.end();
       }),
       {
         examples: [

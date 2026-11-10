@@ -10,12 +10,17 @@
 // value written, with their old values, and names the ones it left. The
 // devices answer as the server does: a device that refuses refuses the
 // whole call, and the others are skipped.
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 import { Session } from './session.svelte.js';
 import { DeviceWrites, NOTICE_MS, REVERT_MS } from './writes.svelte.js';
+import * as clock from './clock.js';
 
-afterEach(() => vi.useRealTimers());
+/** The virtual clock a test runs on. */
+let time = null;
+/** Waits until what every promise resolved so far set off has run. */
+const settled = () => new Promise((done) => setImmediate(done));
+afterEach(() => time?.end());
 
 const ROUTES = ['/0', '/1', '/2'];
 /** The rows, each with the values written to it. `mode` is one no device announces. */
@@ -91,7 +96,7 @@ describe('device writes, against a model of them', () => {
     const seen = { offered: 0, several: 0, reverted: 0, changed: 0, unchecked: 0, unknownOld: 0, inFlightOld: 0, superseded: 0, lateRevert: 0, expired: 0, keptByHover: 0, offByPresence: 0, offByHub: 0, refused: 0, runRefused: 0 };
     await fc.assert(
       fc.asyncProperty(fc.array(act, { minLength: 1, maxLength: 25 }), async (acts) => {
-        vi.useFakeTimers();
+        time = clock.virtual();
         const start = Object.fromEntries(ROUTES.map((r) => [r, { gain: 1, level: 1, enable: false }]));
         const hub = fakeHub(session(start));
         const checked = new Set(ROUTES);
@@ -129,7 +134,7 @@ describe('device writes, against a model of them', () => {
           const c = waiting.shift();
           if (!c) return;
           hub.release();
-          await vi.advanceTimersByTimeAsync(0);
+          await settled();
           const refused = c.routes.some((r) => c.refusing.has(r));
           for (const route of c.routes) {
             const alive = hub.session.devices.get(route).presence === 'alive';
@@ -216,7 +221,7 @@ describe('device writes, against a model of them', () => {
               begin(op, [...calls.values()]);
               if (!back.length) finished(op);
               await answerQuick(op, quick);
-              await vi.advanceTimersByTimeAsync(0);
+              await settled();
               if (op.left === 0) {
                 await done;
                 const detail = w.notice.detail.join('\n');
@@ -233,7 +238,7 @@ describe('device writes, against a model of them', () => {
             w.hover(a.on);
             hovered = a.on;
           } else if (a.t === 'wait') {
-            vi.advanceTimersByTime(a.ms);
+            time.advance(a.ms);
             if (notice && !hovered) {
               notice.left -= a.ms;
               if (notice.left <= 0) (notice = null), (offer = null), seen.expired++;
@@ -268,13 +273,13 @@ describe('device writes, against a model of them', () => {
               if (ok.length && ok.length < a.devices.length) expect(r.text).toBe(`save failed on ${a.devices.length - ok.length} of ${a.devices.length} devices`);
             }
           }
-          await vi.advanceTimersByTimeAsync(0);
+          await settled();
           expect(!!w.notice, JSON.stringify(a)).toBe(!!notice);
           if (notice) expect(w.notice.revert, JSON.stringify(a)).toBe(notice.revert);
           expect(w.canRevert, JSON.stringify(a)).toBe(!offerOff());
           if (w.notice?.revert && !w.canRevert && offer) expect(w.revertOff).not.toBe(null);
         }
-        vi.useRealTimers();
+        time.end();
       }),
       {
         // Each case counted below, whatever the seed.
@@ -297,7 +302,7 @@ describe('device writes, against a model of them', () => {
   });
 
   it('closes the notice when its time is up, and only then', async () => {
-    vi.useFakeTimers();
+    time = clock.virtual();
     const hub = fakeHub(session(Object.fromEntries(ROUTES.map((r) => [r, { gain: 1 }]))));
     let open = 0, close = 0;
     const w = new DeviceWrites(hub, { open: () => open++, close: () => close++, report: () => {} });
@@ -305,12 +310,12 @@ describe('device writes, against a model of them', () => {
     expect([open, close]).toEqual([1, 0]);
     expect(w.notice.text).toBe('Set gain to 2 (was 1)');
     w.hover(true);
-    vi.advanceTimersByTime(REVERT_MS * 3);
+    time.advance(REVERT_MS * 3);
     expect(w.canRevert).toBe(true);
     w.hover(false);
-    vi.advanceTimersByTime(REVERT_MS - 1);
+    time.advance(REVERT_MS - 1);
     expect(close).toBe(0);
-    vi.advanceTimersByTime(1);
+    time.advance(1);
     expect([close, w.notice, w.canRevert]).toEqual([1, null, false]);
     w.closed();
     expect(close).toBe(1);
