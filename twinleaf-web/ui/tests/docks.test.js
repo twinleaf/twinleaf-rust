@@ -9,7 +9,7 @@ import fc from 'fast-check';
 import { afterAll, describe, expect, it } from 'vitest';
 import { page as browser, commands } from 'vitest/browser';
 import { PANELS } from '../src/lib/docks.svelte.js';
-import { centre, clickOn, mountPage, pickItem, rightClick, settle, typeInto, until, wait, withExamples } from './harness/page.js';
+import { centre, clickOn, mountPage, pickItem, pressKey, rightClick, settle, typeInto, until, wait, withExamples } from './harness/page.js';
 
 const LIST = '[data-slot=scroll-area-viewport]';
 const BAR = '[data-slot=scroll-area-scrollbar]';
@@ -231,8 +231,9 @@ describe('the button that hides a dock', () => {
           expect(covered(dock), `${side}, scrolled ${top} px of ${most}: the rows under its hide button`).toEqual([]);
         }
         dock.scrollTop = 0;
-        const head = dock.querySelector('.dock-panel .dock-head');
-        expect(within(buttonOf(dock).getBoundingClientRect(), head.getBoundingClientRect()), `${side}: its hide button is within its first header's row`).toBe(true);
+        // The row is the header's height across its panel's width: the header ends short of the button.
+        const head = dock.querySelector('.dock-panel .dock-head').getBoundingClientRect(), across = dock.querySelector('.dock-panel').getBoundingClientRect();
+        expect(within(buttonOf(dock).getBoundingClientRect(), { left: across.left, right: across.right, top: head.top, bottom: head.bottom }), `${side}: its hide button is within its first header's row`).toBe(true);
         expect(buttonOf(dock).contains(document.elementFromPoint(...centre(buttonOf(dock)))), `${side}: its hide button is what the pointer hits`).toBe(true);
       }
       expect(scrolled, 'docks seen scrolling').toBeGreaterThan(0);
@@ -287,4 +288,135 @@ describe("the filter of a dock's properties", () => {
       page.dispose();
     }
   }, 60_000);
+});
+
+// What a person presses or reads in a dock, found on the page: every
+// control, every run of text, every scroll bar's thumb, and the focus ring
+// around a header. No two of them overlap, however tall the window and
+// wherever the dock is scrolled, and every scroll bar has one look.
+describe('what a dock shows', () => {
+  const PRESSED = 'button, input, a[href], [role=button], [role=checkbox], [role=switch]';
+  const THUMB = '[data-slot=scroll-area-thumb]';
+  /** Box {l, t, r, b} of DOMRect `r`. */
+  const box = (r) => ({ l: r.left, t: r.top, r: r.right, b: r.bottom });
+  const meet = (a, b) => ({ l: Math.max(a.l, b.l), t: Math.max(a.t, b.t), r: Math.min(a.r, b.r), b: Math.min(a.b, b.b) });
+  /** Whether box `a` has more than half a px each way. */
+  const some = (a) => a.r - a.l > 0.5 && a.b - a.t > 0.5;
+  /** The box inside `el` that its contents show in: its padding box, without its own scroll bar. */
+  const inner = (el) => {
+    const r = el.getBoundingClientRect();
+    if (!el.clientWidth && !el.clientHeight) return box(r);
+    return { l: r.left + el.clientLeft, t: r.top + el.clientTop, r: r.left + el.clientLeft + el.clientWidth, b: r.top + el.clientTop + el.clientHeight };
+  };
+  /**
+   * What shows of `at`, the box of something in or of `el`: cut to every
+   * box from `el` up to `dock` that clips or scrolls, and to below the
+   * header of its own table where that header stays put as the rows scroll.
+   */
+  function shown(el, at, dock) {
+    let out = at;
+    for (let a = el; a && a !== dock.parentElement; a = a.parentElement) {
+      const cs = getComputedStyle(a);
+      if (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') out = meet(out, inner(a));
+    }
+    const head = el.closest('table')?.querySelector('thead');
+    if (head && !head.contains(el) && getComputedStyle(head.querySelector('th')).position === 'sticky') out = meet(out, { ...out, t: head.getBoundingClientRect().bottom });
+    return out;
+  }
+  /** `dock`'s own scroll bar, which the browser draws: its `look`, as `lookOf` gives a list's, and the box of its thumb, `at`; null while the dock does not scroll. */
+  function ownBar(dock) {
+    const lane = dock.offsetWidth - dock.clientWidth - dock.clientLeft * 2, most = dock.scrollHeight - dock.clientHeight;
+    if (most <= 0 || lane <= 0) return null;
+    const cs = getComputedStyle(dock, '::-webkit-scrollbar-thumb'), px = (v) => parseFloat(v) || 0;
+    const r = dock.getBoundingClientRect(), left = r.left + dock.clientLeft + dock.clientWidth, top = r.top + dock.clientTop;
+    const width = lane - px(cs.borderLeftWidth) - px(cs.borderRightWidth);
+    // The browser draws the thumb as styled only while the dock leaves the bar's width and colour to that styling.
+    const own = getComputedStyle(dock), styled = own.scrollbarWidth === 'auto' && own.scrollbarColor === 'auto';
+    if (!styled) return { look: { drawn: `as the browser's own, ${own.scrollbarWidth} and ${own.scrollbarColor}` }, at: { l: left, t: top, r: left + lane, b: top + dock.clientHeight } };
+    const length = Math.max((dock.clientHeight / dock.scrollHeight) * dock.clientHeight, lane), y = top + (dock.scrollTop / most) * (dock.clientHeight - length);
+    return {
+      look: { lane, width, inset: px(cs.borderLeftWidth), colour: cs.backgroundColor, round: px(cs.borderTopLeftRadius) >= width / 2 },
+      at: { l: left + px(cs.borderLeftWidth), t: y + px(cs.borderTopWidth), r: left + lane - px(cs.borderRightWidth), b: y + length - px(cs.borderBottomWidth) },
+    };
+  }
+  /** The look of the scroll bar whose thumb is element `thumb`: its lane's and its thumb's widths in px, how far the thumb is in from the lane's left, its colour, and whether its ends are round. */
+  function lookOf(thumb) {
+    const bar = thumb.parentElement.getBoundingClientRect(), t = thumb.getBoundingClientRect(), cs = getComputedStyle(thumb);
+    return { lane: bar.width, width: t.width, inset: t.left - bar.left, colour: cs.backgroundColor, round: parseFloat(cs.borderTopLeftRadius) >= t.width / 2 };
+  }
+  /** Everything pressed or read in `dock` that shows, each {what, el, at}. */
+  function things(dock) {
+    const out = [];
+    const add = (what, el, at) => some(at) && out.push({ what, el, at });
+    for (const el of dock.querySelectorAll(PRESSED)) add(`${el.tagName.toLowerCase()} "${(el.getAttribute('aria-label') ?? el.textContent).trim().slice(0, 30)}"`, el, shown(el, box(el.getBoundingClientRect()), dock));
+    const walk = document.createTreeWalker(dock, NodeFilter.SHOW_TEXT);
+    for (let node; (node = walk.nextNode()); ) {
+      if (!node.data.trim() || getComputedStyle(node.parentElement).visibility === 'hidden') continue;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      add(`text "${node.data.trim().slice(0, 30)}"`, node.parentElement, shown(node.parentElement, box(range.getBoundingClientRect()), dock));
+    }
+    for (const thumb of dock.querySelectorAll(THUMB)) add(`the scroll bar of ${titleOf(thumb.closest('.dock-panel'))}`, thumb, shown(thumb, box(thumb.getBoundingClientRect()), dock));
+    const own = ownBar(dock);
+    if (own) add(`the scroll bar of the ${dock.getAttribute('aria-label')}`, null, own.at);
+    return out;
+  }
+  const related = (a, b) => !!a.el && !!b.el && (a.el.contains(b.el) || b.el.contains(a.el));
+  /** Each pair of `list` that overlaps, of things neither of which is inside the other, as text. */
+  function overlaps(list) {
+    const out = [];
+    list.forEach((a, i) => list.slice(i + 1).forEach((b) => !related(a, b) && some(meet(a.at, b.at)) && out.push(`${a.what} and ${b.what}`)));
+    return out;
+  }
+
+  it('overlaps no two things a person presses or reads, a focused header’s ring among them, at any window height and wherever it is scrolled; and gives every scroll bar one look', async () => {
+    const seen = { scrolled: 0, both: 0, rings: 0 }, looks = new Map();
+    for (const height of [900, 520, 340]) {
+      await browser.viewport(1200, height);
+      const page = await mountPage([['s0.x']], 'columns', 0, signals(30), tableOf({ setting: 14, report: 14, action: 10, other: 6 }), { routes: ['/', '/0', '/1'] });
+      try {
+        await settle(6);
+        // A row picked, so a panel shows its edit bar, and Other unfolded.
+        await clickOn(document.querySelector('.dock-panel[aria-label=Settings] tr[id^=prop-] td'));
+        await clickOn(document.querySelector('.dock-panel[aria-label=Other] .dock-title'));
+        await settle(6);
+        for (const dock of docks()) {
+          const side = `${dock.getAttribute('aria-label')} in a window ${height} px tall`, most = Math.max(0, dock.scrollHeight - dock.clientHeight);
+          if (most > 0) seen.scrolled++;
+          for (const [where, top] of Object.entries({ top: 0, middle: most / 2, bottom: most })) {
+            dock.scrollTop = top;
+            await settle();
+            const all = things(dock);
+            expect(all.length, `${side}: things found`).toBeGreaterThan(8);
+            expect(overlaps(all), `${side}, scrolled to its ${where}: what overlaps`).toEqual([]);
+            const own = ownBar(dock);
+            // A dock that scrolls has a bar in a lane of its own, beside its panels and not over them.
+            expect(most > 0 && !own, `${side}: its scroll bar is drawn over its panels`).toBe(false);
+            if (own) looks.set(JSON.stringify(own.look), `the ${side}`);
+            for (const thumb of dock.querySelectorAll(THUMB)) {
+              if (!some(box(thumb.getBoundingClientRect()))) continue;
+              looks.set(JSON.stringify(lookOf(thumb)), `${titleOf(thumb.closest('.dock-panel'))} in the ${side}`);
+              if (own) seen.both++;
+            }
+          }
+          // Each header with focus from the keys, its ring around it.
+          for (const head of dock.querySelectorAll('.dock-head')) {
+            await pressKey('Shift');
+            head.focus();
+            await settle();
+            const ring = document.querySelector('.focus-ring');
+            expect(ring, `${side}: the ring around ${head.textContent.trim()}`).not.toBe(null);
+            const around = { what: `the ring around ${head.textContent.trim()}`, el: head, at: box(ring.getBoundingClientRect()) };
+            expect(overlaps([around, ...things(dock)]).filter((pair) => pair.startsWith(around.what)), `${side}: what the ring overlaps`).toEqual([]);
+            seen.rings++;
+          }
+          dock.scrollTop = 0;
+        }
+      } finally {
+        page.dispose();
+      }
+    }
+    expect(Object.entries(seen).filter(([, n]) => n < 1).map(([what]) => what), 'not seen: docks scrolled, a list’s bar beside its dock’s, rings').toEqual([]);
+    expect([...looks.keys()].length, `one look for every scroll bar, of ${[...looks].map(([look, where]) => `${look} (${where})`).join('; ')}`).toBe(1);
+  }, 180_000);
 });

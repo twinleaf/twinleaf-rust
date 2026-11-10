@@ -55,7 +55,8 @@ export default defineConfig({
           browser: {
             enabled: true,
             // Edge comes with Windows; elsewhere Playwright's own Chromium.
-            provider: playwright({ launchOptions: process.platform === 'win32' ? { channel: 'msedge' } : {} }),
+            // Scroll bars are drawn, as a person sees them, so a test can measure the room one takes.
+            provider: playwright({ launchOptions: { ...(process.platform === 'win32' ? { channel: 'msedge' } : {}), ignoreDefaultArgs: ['--hide-scrollbars'] } }),
             headless: true,
             viewport: { width: 1200, height: 900 },
             // A property's failure prints its case to replay; a picture adds nothing.

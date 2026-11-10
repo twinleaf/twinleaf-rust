@@ -101,21 +101,39 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 }
 /* The rail's button is placed from the frame, not from the rail in it. */
 .dock-side { position: static; display: flex; flex-direction: column; flex: 1; min-height: 0; }
-.dock { display: flex; flex-direction: column; gap: 4px; min-height: 0; flex: 1; overflow-y: auto; scrollbar-width: thin; }
-.dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: 2px; border-radius: var(--radius); }
+.dock { display: flex; flex-direction: column; gap: 4px; min-height: 0; flex: 1; overflow-y: auto; }
+/* The dock scrolls its panels itself: the box panels are dragged within is
+   the box that holds them all and whose height their shares are of. So its
+   scroll bar is the browser's, given the look of a list's: a 10 px lane of
+   its own beside the panels, never over them, and in it a round thumb of
+   the border's colour, 7 px wide, 2 px in from the lane's left and 1 px
+   from its other sides, with no buttons. An open dock reaches 3 px into
+   its frame's padding on either side, as far as the focus ring stands
+   outside a header, so a header's ring lies within the dock and the bar's
+   lane outside the ring. A list that scrolls inside a dock that scrolls
+   keeps its own bar, inside its panel, the dock's bar outside every panel. */
+.dock-side:not(.rail) .dock { margin: 0 -3px; padding: 0 3px; }
+.dock { scrollbar-width: auto; scrollbar-color: auto; }
+.dock::-webkit-scrollbar { width: 10px; }
+.dock::-webkit-scrollbar-thumb { border: solid transparent; border-width: 1px 1px 1px 2px; border-radius: 9999px; background: var(--border); background-clip: padding-box; }
+@supports not selector(::-webkit-scrollbar) {
+  .dock { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+}
+.dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: -1px; border-radius: var(--radius); }
 /* What a dock holds above its panels, the filter of its properties: the
    panels scroll below it, not under it, and no panel's fold moves it. */
 .dock-top { flex: none; }
 /* Show sits centred across the rail, 8 px below the frame's top. Hide sits
    at the right end of its dock's first panel, in the header's row; it is
    placed from that panel and scrolls with it, so no row of the dock passes
-   under it. The header keeps its own text and grip clear of the button. */
+   under it. That header ends short of the button, with room for the focus
+   ring around it, so neither the header nor its ring is under the button. */
 .dock-button { position: absolute; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
 .dock-button:hover { background: var(--secondary); color: var(--foreground); }
 .dock-button svg { width: 14px; height: 14px; }
 .dock-frame.rail .dock-button { top: 8px; left: 50%; transform: translateX(-50%); }
 .dock-panel > .dock-button { top: 2px; right: 0; }
-.dock-panel:has(> .dock-button) .dock-head { padding-right: 24px; }
+.dock-panel:has(> .dock-button) .dock-head { margin-right: 24px; }
 /* The panels are lists inside a list. A panel is as tall as what it shows
    while its dock has the room. Where the panels do not fit, a panel taller
    than two thirds of the dock's height gives way, down to two thirds: its
@@ -546,7 +564,7 @@ label > [data-slot=checkbox]::after { content: none; }
 .props [data-slot=table-container] { overflow-x: visible; }
 .props-table { outline: none; table-layout: fixed; }
 .props-table th:first-child { width: 50%; }
-.props-table td { overflow: hidden; text-overflow: ellipsis; }
+.props-table th, .props-table td { overflow: hidden; text-overflow: ellipsis; }
 .props-table th, .props-table td { height: auto; padding: 2px 4px; }
 .props-table th { position: sticky; top: 0; background: var(--card); color: var(--muted-foreground); font-size: 11px; z-index: 1; }
 .props-table tr { border-bottom: 0; }
