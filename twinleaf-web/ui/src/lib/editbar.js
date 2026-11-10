@@ -32,7 +32,8 @@ export function kindOf(row) {
  * and by its kind:
  *  - 'one', a row alone: `control` its control, and for a switch, as for
  *    several, `state` and `enter`;
- *  - 'kinds', rows of several kinds, which edits nothing: `hint` says so;
+ *  - 'kinds', rows of several kinds, which edits nothing: `hint` says so,
+ *    and `detail` names the kinds;
  *  - 'switches': `state` On, Off or Mixed, and `enter`, the value Enter
  *    writes: all of them off when every one is on, else all on;
  *  - 'values', of one type: `shared`, the value every device of every row
@@ -49,7 +50,7 @@ export function editBar(rows, devices, valueOf) {
   const distinct = [...new Set(kinds)];
   if (distinct.length > 1) {
     const counts = distinct.map((kind) => ({ kind, n: kinds.filter((k) => k === kind).length }));
-    return { kind: 'kinds', label: words.kinds(counts), hint: words.ONE_KIND, rows, reach };
+    return { kind: 'kinds', label: words.severalKinds(rows.length, distinct.length), detail: words.kinds(counts), hint: words.ONE_KIND, rows, reach };
   }
   const kind = distinct[0];
   if (kind === 'toggle') {

@@ -126,7 +126,9 @@ export const runAsk = (names, devices) => ({
   run: `Run ${names.length}`,
 });
 
-/** The edit bar's label for rows of several kinds, each {kind, n}: "2 switches, 1 value (u8)". */
+/** The edit bar's label for `rows` rows of `kinds` kinds: "5 rows of 4 kinds". */
+export const severalKinds = (rows, kinds) => `${rows} rows of ${kinds} kinds`;
+/** What those rows are, each {kind, n}, for the label's tooltip: "2 switches, 1 value (u8)". */
 export const kinds = (counts) => counts.map(({ kind, n }) => kindCount(kind, n)).join(', ');
 /** `n` rows of kind `kind`: action, toggle, display, or `value:${type}`. */
 function kindCount(kind, n) {

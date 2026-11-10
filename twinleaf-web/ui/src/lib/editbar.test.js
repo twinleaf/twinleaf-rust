@@ -59,8 +59,9 @@ describe('the edit bar', () => {
           seen.kinds++;
           expect(bar.kind).toBe('kinds');
           expect(bar.hint).toBe('Pick one kind to edit');
-          // Each kind counted once, in the order first picked, the counts adding up to the rows.
-          const parts = bar.label.split(', ');
+          // The label is short whatever is picked; its tooltip counts each kind once, in the order first picked, the counts adding up to the rows.
+          expect(bar.label).toBe(`${rows.length} rows of ${distinct.length} kinds`);
+          const parts = bar.detail.split(', ');
           expect(parts.length).toBe(distinct.length);
           expect(parts.reduce((n, p) => n + parseInt(p, 10), 0)).toBe(rows.length);
           return;

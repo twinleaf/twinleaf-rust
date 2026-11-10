@@ -415,7 +415,7 @@
   {@const n = bar.reach.length}
   <!-- The bar acts on the rows picked, so a press in it keeps them, as one among the rows does. -->
   <div class="write-bar" class:several={bar.rows.length > 1} data-rows>
-    <span class="wname" title={bar.label}>{bar.label}</span>
+    <span class="wname" title={bar.detail ?? bar.label}>{bar.label}</span>
     {#if bar.kind === 'kinds'}
       <span class="reach">{bar.hint}</span>
     {:else if bar.kind === 'actions' || bar.control === 'action'}
