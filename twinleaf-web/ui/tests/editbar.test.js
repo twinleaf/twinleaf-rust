@@ -13,7 +13,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { clickOn, frames, mountPage, typeInto, wait } from './harness/page.js';
+import { clickOn, frames, mountPage, typeInto, wait, withExamples } from './harness/page.js';
 import { KEY as DOCKS_KEY, PANELS } from '../src/lib/docks.svelte.js';
 
 const ROUTES = ['/0', '/1'];
@@ -178,9 +178,8 @@ describe('the edit bar on the rows picked', () => {
             else (seen.cancelled++, expect(page.hub.calls).toEqual([]));
           }
         }),
-        {
           // Each kind, whatever the seed: the rows run settings (gain, offset, level, enable, sync), favorites (save, mode), reports, actions and other.
-          examples: [
+          withExamples([
             [[0, 3], 'click', true, 0],
             [[3, 4], 'key', true, 0],
             [[0, 1], 'click', true, 1],
@@ -188,8 +187,7 @@ describe('the edit bar on the rows picked', () => {
             [[9, 10], 'click', false, 0],
             [[2, 6], 'key', true, 0],
             [[8, 5], 'key', true, 0],
-          ],
-        },
+          ]),
       );
       for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
     } finally {
@@ -241,7 +239,7 @@ describe('the edit bar on the rows picked', () => {
           page.dispose();
         }
       }),
-      { examples: [[[true, true, true]], [[false, true, false]]] },
+      withExamples([[[true, true, true]], [[false, true, false]]]),
     );
     for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
   }, 600_000);

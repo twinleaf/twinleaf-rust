@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, focusPage, frames, mountPage, wait } from './harness/page.js';
+import { centre, drag, focusPage, frames, mountPage, wait, withExamples } from './harness/page.js';
 import { GUTTER, dock, gutters, plotIds, rects } from '../src/lib/layout.js';
 import { OUTER_INSET, STEP } from '../src/lib/moves.js';
 
@@ -95,7 +95,7 @@ async function run(s, { ws, history }) {
 }
 
 /** Holds when the tiles show the layout after every step of each run, `runs` tried first. */
-async function tilesFollow(numRuns, ...runs) {
+async function tilesFollow(...runs) {
   await fc.assert(
     fc.asyncProperty(fc.array(step, { minLength: 1, maxLength: 10 }), async (steps) => {
       const page = await setup();
@@ -111,14 +111,13 @@ async function tilesFollow(numRuns, ...runs) {
         page.dispose();
       }
     }),
-    { numRuns, examples: runs.map((r) => [r]) },
+    withExamples(runs.map((r) => [r])),
   );
 }
 
 describe('the tiles', () => {
   it('show the layout after any run of moves, gap drags, undos and edits', async () => {
     await tilesFollow(
-      fc.readConfigureGlobal().numRuns,
       // A layout an undo put back, changed again: the tiles once kept showing the one before.
       [{ t: 'dock', a: 2, b: 1, edge: 'left' }, { t: 'wait' }, { t: 'undo' }, { t: 'dock', a: 0, b: 1, edge: 'bottom' }],
       [{ t: 'move', a: 2, b: 1, cell: 'left' }, { t: 'undo' }, { t: 'move', a: 0, b: 0, cell: 'bottom' }, { t: 'redo' }],

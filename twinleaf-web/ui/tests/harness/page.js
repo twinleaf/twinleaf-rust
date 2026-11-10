@@ -1,6 +1,7 @@
 // The whole page, mounted for a browser test with state of its own, and the
 // gestures the tests make on it with the real mouse.
 import { flushSync, mount, unmount } from 'svelte';
+import fc from 'fast-check';
 import { expect, vi } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import App from '../../src/App.svelte';
@@ -247,6 +248,12 @@ export async function drag(from, to, via = [], rest = 0) {
 
 /** The moves from `from` to `to` in `n` steps, for `commands.mouse`. */
 export const glide = (from, to, n = 4) => Array.from({ length: n }, (_, k) => ['move', from[0] + ((to[0] - from[0]) * (k + 1)) / n, from[1] + ((to[1] - from[1]) * (k + 1)) / n]);
+
+/**
+ * What `fc.assert` takes to try each of `examples` and then its random
+ * cases: the examples count toward a property's cases, so they come on top.
+ */
+export const withExamples = (examples) => ({ examples, numRuns: examples.length + fc.readConfigureGlobal().numRuns });
 
 /** Waits, a frame at a time, until `ready()` holds or `ms` have passed; says whether it holds. */
 export async function until(ready, ms = 5000) {

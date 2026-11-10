@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, closeAll, feed, leafOf, mountPage, rightClick, settle, wait } from './harness/page.js';
+import { centre, closeAll, feed, leafOf, mountPage, rightClick, settle, wait, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const SIGNALS = ['sine.sine', 'aux.triangle'];
@@ -230,10 +230,8 @@ describe('a command made on a plot', () => {
           page.dispose();
         }
       }),
-      {
         // Each command on a plot in a selection of three, and on a plot outside a selection of two.
-        examples: Object.keys(COMMANDS).flatMap((name) => [[[0, 1, 2], 1, name, null], [[0, 1], 3, name, 0]]),
-      },
+        withExamples(Object.keys(COMMANDS).flatMap((name) => [[[0, 1, 2], 1, name, null], [[0, 1], 3, name, 0]])),
     );
     for (const name of Object.keys(COMMANDS)) expect(seen.has(`${name}:many`) && seen.has(`${name}:one`), name).toBe(true);
   }, 600_000);
@@ -264,7 +262,7 @@ describe('a right-click on a plot', () => {
           expect([...page.ws.selected].sort(), `${part} of ${k} by ${mouse ? 'mouse' : 'key'} with ${picks}`).toEqual([...want].sort());
           seen.add(`${part}:${mouse}:${picked.includes(id)}`);
         }),
-        { examples: parts.flatMap((part) => [[[0, 1], 3, part, false], [[0, 1], 3, part, true], [[1, 2], 1, part, false]]) },
+        withExamples(parts.flatMap((part) => [[[0, 1], 3, part, false], [[0, 1], 3, part, true], [[1, 2], 1, part, false]])),
       );
       for (const part of parts) expect(seen.has(`${part}:false:false`) && seen.has(`${part}:true:false`) && seen.has(`${part}:false:true`), part).toBe(true);
     } finally {
@@ -318,7 +316,7 @@ describe('the command palette’s Add to the selected plots', () => {
           }
           seen.add(picked.length ? 'some' : 'none');
         }),
-        { examples: [[[], 'sine.sine'], [[0, 2], 'aux.triangle']] },
+        withExamples([[[], 'sine.sine'], [[0, 2], 'aux.triangle']]),
       );
       expect(seen.size).toBe(2);
     } finally {

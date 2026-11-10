@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, feed, focusPage, frames, leafOf, mountPage, pickItem, plotMenu, quietApi, showing, until, wait } from './harness/page.js';
+import { centre, feed, focusPage, frames, leafOf, mountPage, pickItem, plotMenu, quietApi, showing, until, wait, withExamples } from './harness/page.js';
 import { GUTTER, plotIds, rects, restrict } from '../src/lib/layout.js';
 import { api } from '../src/lib/protocol.js';
 
@@ -170,10 +170,8 @@ describe('a key', () => {
           }
         },
       ),
-      {
         // Each scope with plots selected or none, and focus on the page, on a selected plot or on another; then random runs.
-        examples: ['Delete', ' '].flatMap((key) => [[[1, 2], null], [[1, 2], 1], [[1, 2], 0], [[], null], [[], 0]].map(([picks, focus]) => [null, null, picks, key, focus])),
-      },
+        withExamples(['Delete', ' '].flatMap((key) => [[[1, 2], null], [[1, 2], 1], [[1, 2], 0], [[], null], [[], 0]].map(([picks, focus]) => [null, null, picks, key, focus]))),
     );
     expect(seen.size).toBe(10);
   }, 600_000);
@@ -225,7 +223,7 @@ describe('maximized plots', () => {
           page.dispose();
         }
       }),
-      { examples: [[[0, 1], [{ t: 'close', k: 0 }, { t: 'undo' }, { t: 'redo' }, { t: 'toTab', k: 0 }]]] },
+      withExamples([[[0, 1], [{ t: 'close', k: 0 }, { t: 'undo' }, { t: 'redo' }, { t: 'toTab', k: 0 }]]]),
     );
     expect(pruned).toBeGreaterThan(0);
   }, 600_000);
@@ -318,10 +316,8 @@ describe('the count a plot’s menu shows for a copy', () => {
           vi.restoreAllMocks();
         }
       }),
-      {
         // The menu opens, the plot zooms under it, and the first count comes back after the second.
-        examples: [[[{ t: 'open' }, { t: 'zoom', out: true }, { t: 'answer', k: 1 }, { t: 'answer', k: 0 }], []]],
-      },
+        withExamples([[[{ t: 'open' }, { t: 'zoom', out: true }, { t: 'answer', k: 1 }, { t: 'answer', k: 0 }], []]]),
     );
     expect(checked).toBeGreaterThan(3);
   }, 600_000);

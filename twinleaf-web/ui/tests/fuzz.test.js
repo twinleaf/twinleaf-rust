@@ -49,7 +49,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, quietApi, showing, until } from './harness/page.js';
+import { centre, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, quietApi, showing, until, withExamples } from './harness/page.js';
 import { GUTTER, plotIds, rects, restrict } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
 
@@ -349,8 +349,7 @@ describe('the page, played by random runs of gestures and keys', () => {
   it('holds every invariant after every step', async () => {
     await fc.assert(
       fc.asyncProperty(fc.array(step, { minLength: 3, maxLength: 12 }), (steps) => run(steps, check)),
-      {
-        examples: [
+      withExamples([
           [[{ t: 'key', key: 'Control+a' }, { t: 'move', a: 0, b: 1, cell: 'left', by: 'grip', escape: false }, { t: 'key', key: 'Control+z' }, { t: 'box', k: 0, fx: 0.7, fy: 0.7, shift: false, escape: true }]],
           [[{ t: 'click', at: 'plot', i: 1, mod: null }, { t: 'click', at: 'plot', i: 2, mod: 'shift' }, { t: 'key', key: 'f' }, { t: 'key', key: 'Delete' }, { t: 'key', key: 'Control+z' }]],
           [[{ t: 'click', at: 'row', i: 0, mod: null }, { t: 'click', at: 'row', i: 1, mod: 'ctrl' }, { t: 'right', at: 'plot', i: 0 }, { t: 'click', at: 'menuItem', i: 3, mod: null }, { t: 'chip', a: 0, b: 2, onto: 'bottom' }]],
@@ -359,8 +358,7 @@ describe('the page, played by random runs of gestures and keys', () => {
           [[{ t: 'click', at: 'plot', i: 0, mod: null }, { t: 'key', key: 'f' }, { t: 'key', key: 'Control+a' }, { t: 'key', key: '3' }, { t: 'box', k: 0, fx: 0.9, fy: 0.9, shift: false, escape: false }]],
           // A plot docked beside another, by its grip and by its header.
           [[{ t: 'move', a: 0, b: 0, cell: 'bottom', by: 'grip', escape: false }, { t: 'move', a: 1, b: 1, cell: 'right', by: 'header', escape: false }]],
-        ],
-      },
+        ]),
     );
     // A replay of one failure runs that case alone.
     if (fc.readConfigureGlobal().path !== undefined) return;
@@ -388,13 +386,11 @@ function oneLayer(page, before, s) {
 
 describe('the page’s popup layers, played by random runs of menu presses, hovers and keys', () => {
   it('keep at most one popup layer open, and no tooltip over one (class 9)', async () => {
-    await fc.assert(fc.asyncProperty(fc.array(overlayStep, { minLength: 2, maxLength: 8 }), (steps) => run(steps, oneLayer)), {
-      examples: [
+    await fc.assert(fc.asyncProperty(fc.array(overlayStep, { minLength: 2, maxLength: 8 }), (steps) => run(steps, oneLayer)), withExamples([
         // The pointer resting on Display settings while Layout's menu is open.
         [[{ t: 'across', path: ['layout', 'settings'], press: true, rest: 400 }]],
         // Layout pressed, the pointer over File and back, then File pressed.
         [[{ t: 'across', path: ['layout', 'file', 'layout'], press: true, rest: 60 }, { t: 'click', at: 'file', i: 0, mod: null }]],
-      ],
-    });
+      ]));
   }, 600_000);
 });

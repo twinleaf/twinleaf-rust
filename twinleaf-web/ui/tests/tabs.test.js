@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, dropped, frames, mountPage } from './harness/page.js';
+import { centre, drag, dropped, frames, mountPage, withExamples } from './harness/page.js';
 
 const stripOrder = () => [...document.querySelectorAll('[role=tablist] [data-tab]')].map((e) => e.dataset.tab);
 
@@ -53,10 +53,8 @@ describe('the tab strip', () => {
           page.dispose();
         }
       }),
-      {
         // The first tab dragged behind the second, held, then undone.
-        examples: [[[{ t: 'tab', from: 0, to: 1 }, { t: 'undo' }]]],
-      },
+        withExamples([[[{ t: 'tab', from: 0, to: 1 }, { t: 'undo' }]]]),
     );
     expect(moved).toBeGreaterThan(0);
   }, 600_000);

@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { clickOn, frames, mountPage } from './harness/page.js';
+import { clickOn, frames, mountPage, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { KEY as DOCKS_KEY, PANELS } from '../src/lib/docks.svelte.js';
 
@@ -208,14 +208,12 @@ describe('a property row', () => {
             }
           },
         ),
-        {
           // Each case counted below, whatever the seed: the rows run settings (0 to 3), favorites (4, 5), reports (6, 7), the action buttons (8, 9) and other (10, 11).
-          examples: [
+          withExamples([
             [[{ t: 'click', at: 0 }, { t: 'shift', at: 11 }, { t: 'ctrl', at: 3 }, { t: 'ctrl', at: 3 }, { t: 'right', at: 5 }, { t: 'click', at: 6 }, { t: 'shift', at: 10 }, { t: 'right', at: 0 }, { t: 'ctrl', at: 8 }, { t: 'right', at: 9 }]],
             [[{ t: 'ctrl', at: 4 }, { t: 'ctrl', at: 2 }, { t: 'ctrl', at: 3 }, { t: 'hide' }, { t: 'right', at: 2 }, { t: 'show' }, { t: 'right', at: 2 }]],
             [[{ t: 'click', at: 4 }, { t: 'star', at: 4 }, { t: 'click', at: 6 }, { t: 'keyfold', panel: 'reports' }, { t: 'shift', at: 8 }]],
-          ],
-        },
+          ]),
       );
       for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
     } finally {
@@ -284,7 +282,7 @@ describe('a property row', () => {
           } else expect(page.history.undos.at(-1)).toBe(last);
         }),
         // Each case counted below, whatever the seed.
-        { examples: [[[0, 1], ['gain'], 'menu', 0], [[0, 1], [], 'starPicked', 0], [[0], [], 'starOther', 1]] },
+        withExamples([[[0, 1], ['gain'], 'menu', 0], [[0, 1], [], 'starPicked', 0], [[0], [], 'starOther', 1]]),
       );
       for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
     } finally {
@@ -347,7 +345,7 @@ describe('a key pressed in a table', () => {
           page.dispose();
         }
       }),
-      { examples: [...TABLE, ...PAGE, ...PLOT].map((k) => [k, 3]) },
+      withExamples([...TABLE, ...PAGE, ...PLOT].map((k) => [k, 3])),
     );
     for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
   }, 600_000);

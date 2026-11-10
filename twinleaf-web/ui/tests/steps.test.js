@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, dropped, focusPage, frames, glide, leafOf, mountPage, pickItem, plotMenu, until } from './harness/page.js';
+import { centre, drag, dropped, focusPage, frames, glide, leafOf, mountPage, pickItem, plotMenu, until, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
 
@@ -87,7 +87,7 @@ describe('a command', () => {
         }
       }),
       // Each command first on two selected plots, the first of them its plot; then random runs.
-      { examples: Object.keys(COMMANDS).map((name) => [[0, 1], 0, name]) },
+      withExamples(Object.keys(COMMANDS).map((name) => [[0, 1], 0, name])),
     );
     for (const name of ['Delete', 'l', '|', 'Split right', 'Close plot', 'Kind Spectrum', 'Move to tab', 'Arrange as columns', 'a signal clicked']) expect(made[name], name).toBeGreaterThan(0);
   }, 600_000);
@@ -171,7 +171,7 @@ describe('a drag, press to release,', () => {
           page.dispose();
         }
       }),
-      { examples: Object.keys(DRAGS).flatMap((name) => [[name, 0, 1], [name, 1, 2]]) },
+      withExamples(Object.keys(DRAGS).flatMap((name) => [[name, 0, 1], [name, 1, 2]])),
     );
     for (const name of Object.keys(DRAGS)) expect(made[name], name).toBeGreaterThan(0);
   }, 600_000);
@@ -214,7 +214,7 @@ describe('a pin of property rows', () => {
           page.dispose();
         }
       }),
-      { examples: [[[0, 2], 0, 0]] },
+      withExamples([[[0, 2], 0, 0]]),
     );
   }, 600_000);
 });

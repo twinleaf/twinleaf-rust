@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pickItem, plotMenu, quietApi, until } from './harness/page.js';
+import { centre, drag, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pickItem, plotMenu, quietApi, until, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
 
@@ -181,7 +181,7 @@ describe('Escape during a gesture', () => {
           }
         },
       ),
-      { examples: [['box', [0], 0, 0, 'left', false], ['grip', [0, 1], 0, 0, 'top', true], ['header', [], 1, 1, 'center', false]] },
+      withExamples([['box', [0], 0, 0, 'left', false], ['grip', [0, 1], 0, 0, 'top', true], ['header', [], 1, 1, 'center', false]]),
     );
     expect(kinds.size).toBe(3);
   }, 600_000);
@@ -364,7 +364,7 @@ async function ownKeys(zones) {
         page.dispose();
       }
     }),
-    { examples: zones.flatMap((z) => [[z, 0, 'Space', 'click'], [z, 1, 'Enter', 'click'], [z, 0, 'Space', 'keys']]) },
+    withExamples(zones.flatMap((z) => [[z, 0, 'Space', 'click'], [z, 1, 'Enter', 'click'], [z, 0, 'Space', 'keys']])),
   );
   return seen;
 }

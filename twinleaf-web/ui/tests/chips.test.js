@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, dropped, frames, mountPage } from './harness/page.js';
+import { centre, drag, dropped, frames, mountPage, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
 
@@ -68,10 +68,8 @@ describe('chip rows', () => {
           page.dispose();
         }
       }),
-      {
         // A chip dragged from the top plot through the middle plot's row into its body.
-        examples: [[[{ t: 'chip', a: 0, i: 0, b: 1, onto: 'body' }, { t: 'chip', a: 1, i: 0, b: 1, onto: 'chips' }]]],
-      },
+        withExamples([[[{ t: 'chip', a: 0, i: 0, b: 1, onto: 'body' }, { t: 'chip', a: 1, i: 0, b: 1, onto: 'chips' }]]]),
     );
     expect(moved).toBeGreaterThan(0);
   }, 600_000);

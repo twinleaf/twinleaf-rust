@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import fc from 'fast-check';
-import { centre, mountPage, wait } from './harness/page.js';
+import { centre, mountPage, wait, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { toast } from '../src/lib/toast.svelte.js';
 import { closeAll, menuPage, plotArea, settle } from './harness/menus.js';
@@ -126,17 +126,15 @@ describe('the page’s popup layers', () => {
           page.dispose();
         }
       }),
-      {
         // The reported case: Layout's dropdown and File's both open, a tooltip on top.
-        examples: [
+        withExamples([
           [[{ press: 'Layout' }, { hover: 'File' }]],
           [[{ press: 'Layout' }, { press: 'File' }, { hover: 'Layout' }]],
           [[{ closing: 'Layout', then: 'File' }, { hover: 'Layout' }]],
           [[{ twice: 'Layout' }, { press: 'File' }]],
           [[{ press: 'a plot' }, { press: 'File' }, { hover: 'Layout' }]],
           [[{ press: 'display settings' }, { press: 'the decimation list' }, { press: 'Layout' }]],
-        ],
-      },
+        ]),
     );
     expect(seen.has(1), 'a layer was open').toBe(true);
   }, 900_000);
@@ -168,7 +166,7 @@ describe('a layer the keys go on from', () => {
             closed++;
           }
         }),
-        { examples: [[true, ['Control+k', 'Escape']], [false, ['a', 'Control+k', 'Escape']], [false, ['k', 'Control+k', 'Escape']]] },
+        withExamples([[true, ['Control+k', 'Escape']], [false, ['a', 'Control+k', 'Escape']], [false, ['k', 'Control+k', 'Escape']]]),
       );
       expect(closed, 'steps with every layer closed').toBeGreaterThan(10);
     } finally {
