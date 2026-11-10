@@ -22,6 +22,10 @@
 // The key router (keyrouter.js) is the one listener for keys: no other
 // module listens for a key on the window or an element, and a component
 // hears keys only on a text field, for the field's own editing.
+//
+// The clock (clock.js) is the one reader of the time: no other module reads
+// the browser's time, asks it for a frame or sets a timer, so a test that
+// puts the clock in virtual mode holds all of the page's time.
 import { describe, expect, it } from 'vitest';
 import { compile, parse } from 'svelte/compiler';
 import fs from 'node:fs';
@@ -169,6 +173,28 @@ describe('a key', () => {
       .flatMap(([file, source]) => source.split('\n').map((line, i) => [file, i + 1, line]))
       .filter(([, , line]) => KEY_LISTENED.test(line) && !/^\s*(\/\/|\*)/.test(line))
       .map(([file, n]) => `${file}:${n}`);
+    expect(found).toEqual([]);
+  });
+});
+
+/** The one module that reads the time, asks for a frame or sets a timer. */
+const CLOCK = 'lib/clock.js';
+/** A read of the time, a frame or a timer asked of the browser, or one called off. */
+const TIMED = /\bperformance\s*\.\s*now\b|\bDate\s*\.\s*now\b|\bnew\s+Date\b\s*(\(\s*\)|(?![\s(]))|\b(request|cancel)AnimationFrame\b|\b(set|clear)(Timeout|Interval)\b/;
+
+describe('the time', () => {
+  /** The lines of `source` that match TIMED, comments left out, numbered from 1. */
+  const timed = (source) => source.split('\n').flatMap((line, i) => (TIMED.test(line) && !/^\s*(\/\/|\*)/.test(line) ? [i + 1] : []));
+
+  it('is found where it is read, a frame asked for or a timer set, and not where a date is made of a time', () => {
+    const lines = ['performance.now()', 'Date.now()', 'new Date()', 'new Date', 'requestAnimationFrame(f)', 'cancelAnimationFrame(id)', 'setTimeout(f, 1)', 'clearTimeout(id)', 'setInterval(f, 1)', 'window.clearInterval(id)'];
+    expect(timed(lines.join('\n'))).toEqual(lines.map((_, i) => i + 1));
+    expect(timed(['new Date(whole * 1000)', 'clock.now()', 'clock.after(0, f)', '// setTimeout(f)', 'new DateFormat()'].join('\n'))).toEqual([]);
+  });
+  it('is read, and frames and timers asked for, by the clock alone', () => {
+    const found = sources(SRC)
+      .filter((file) => rel(file) !== CLOCK)
+      .flatMap((file) => timed(fs.readFileSync(file, 'utf8')).map((n) => `${rel(file)}:${n}`));
     expect(found).toEqual([]);
   });
 });

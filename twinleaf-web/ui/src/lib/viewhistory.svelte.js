@@ -47,6 +47,7 @@ import { sameView } from './plot.js';
 import { VIEW_FIELDS } from './tabs.js';
 import { KINDS } from './constants.js';
 import { counted } from './menus.js';
+import * as clock from './clock.js';
 
 /** How long, in ms, wheel turns or keys rest before the next is a step of its own. */
 export const IDLE_MS = 500;
@@ -80,7 +81,7 @@ export class ViewHistory {
    * `now()` is the page time, in ms; `edit(label, fn)` runs `fn` as one
    * edit named `label`, History's `group`.
    */
-  constructor(ws, views, { notice = () => {}, now = () => performance.now(), edit = (label, fn) => fn() } = {}) {
+  constructor(ws, views, { notice = () => {}, now = clock.now, edit = (label, fn) => fn() } = {}) {
     Object.assign(this, { ws, views, notice, now, edit });
   }
 

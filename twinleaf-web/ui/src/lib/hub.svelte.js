@@ -10,6 +10,7 @@
 import { Session } from './session.svelte.js';
 import { api, decodeFrame, holdMessage, spectraMessage } from './protocol.js';
 import { WINDOW_LIMITS } from './window.js';
+import * as clock from './clock.js';
 
 /** How long the page waits before it opens a socket that closed on its own. */
 const RECONNECT_MS = 1000;
@@ -129,7 +130,7 @@ export class Hub {
     ws.onmessage = (ev) => (typeof ev.data === 'string' ? this.text(JSON.parse(ev.data)) : this.binary(ev.data));
     ws.onclose = () => {
       this.connected = false;
-      setTimeout(() => this.connect(), RECONNECT_MS);
+      clock.after(RECONNECT_MS, () => this.connect());
     };
     this.ws = ws;
   }

@@ -53,6 +53,7 @@
   import { stepIn } from './keymap.js';
   import { chip } from './tabs.js';
   import WindowSlider from './WindowSlider.svelte';
+  import * as clock from './clock.js';
 
   let {
     plot, hub, view, targets, hover, renderer, registry, focused, selected, otherTabs = [], tabName = '',
@@ -190,13 +191,13 @@
     // the last one shown meanwhile.
     const offs = targets().map((v) =>
       v.onChange(() => {
-        clearTimeout(timer);
-        timer = setTimeout(ask, RECOUNT_MS);
+        clock.cancel(timer);
+        timer = clock.after(RECOUNT_MS, ask);
       }),
     );
     return () => {
       current = false;
-      clearTimeout(timer);
+      clock.cancel(timer);
       offs.forEach((off) => off());
     };
   });
@@ -390,7 +391,7 @@
   let windowSpan = $state(10);
 
   onMount(() => {
-    const poll = setInterval(() => pv?.legend && (legend = pv.legend), LEGEND_MS);
+    const poll = clock.every(LEGEND_MS, () => pv?.legend && (legend = pv.legend));
     pv = new PlotView({
       body,
       overlay,
@@ -421,7 +422,7 @@
     const unwatch = view.onChange(() => ((streaming = view.live), (windowSpan = view.window)));
     return () => {
       pv.letGo();
-      clearInterval(poll);
+      clock.cancel(poll);
       unwatch();
       sizing.disconnect();
       registry.delete(pv);
@@ -521,7 +522,7 @@
   function kindClosed(open) {
     if (open || !kindFromKeys) return;
     kindFromKeys = false;
-    setTimeout(() => card?.focus());
+    clock.after(0, () => card?.focus());
   }
   let active = $state(0); // the signal the arrows are on, while the signals have focus
   /**

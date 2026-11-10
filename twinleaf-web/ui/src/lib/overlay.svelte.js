@@ -18,6 +18,7 @@
 // layer whose content it is inside, which the content says for what it holds.
 
 import { getContext, onDestroy, setContext, untrack } from 'svelte';
+import * as clock from './clock.js';
 
 const ROOT = Symbol('overlay root');
 const INSIDE = Symbol('overlay inside');
@@ -108,7 +109,7 @@ function fadeCopy(el) {
   el.after(copy);
   // The copy goes when its fade ends. The menu stays hidden until it opens
   // again, if it does before it has left the page.
-  const copyGone = () => (clearTimeout(timer), copy.remove());
+  const copyGone = () => (clock.cancel(timer), copy.remove());
   let closed = false;
   const watch = new MutationObserver(() => {
     const again = closed && el.dataset.state === 'open';
@@ -122,12 +123,12 @@ function fadeCopy(el) {
   watch.observe(el.parentNode, { childList: true });
   copy.addEventListener('animationend', copyGone, { once: true });
   // A press that closed nothing leaves the menu open: it shows again.
-  const timer = setTimeout(() => {
+  const timer = clock.after(FADE_MS, () => {
     copyGone();
     if (closed || el.dataset.state !== 'open') return;
     watch.disconnect();
     delete el.dataset.frozen;
-  }, FADE_MS);
+  });
 }
 
 /**

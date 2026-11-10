@@ -20,6 +20,7 @@
 import { SvelteMap } from 'svelte/reactivity';
 import { sameShown } from './properties.js';
 import * as words from './words.js';
+import * as clock from './clock.js';
 
 /** How long a write's notice offers Revert, in ms, the pointer off it. */
 export const REVERT_MS = 10_000;
@@ -103,7 +104,7 @@ class Cells {
       // A cell shows the outcome of its newest call.
       if (this.outcomes.get(k)?.id !== id) continue;
       this.outcomes.set(k, { state: r.state, error: r.error, id });
-      if (r.state === 'ok') setTimeout(() => this.outcomes.get(k)?.id === id && this.outcomes.delete(k), OK_MS);
+      if (r.state === 'ok') clock.after(OK_MS, () => this.outcomes.get(k)?.id === id && this.outcomes.delete(k));
     }
     return results.map((r) => ({ ...r, name }));
   }
@@ -139,7 +140,7 @@ class TimedNotice {
     if (on === this.#hovered) return;
     this.#hovered = on;
     if (on) {
-      if (this.#timer !== null) this.#left -= Date.now() - this.#since;
+      if (this.#timer !== null) this.#left -= clock.now() - this.#since;
       this.#stop();
     } else this.#start();
   }
@@ -155,11 +156,11 @@ class TimedNotice {
   #start() {
     this.#stop();
     if (this.#hovered || !this.value) return;
-    this.#since = Date.now();
-    this.#timer = setTimeout(() => this.end(true), this.#left);
+    this.#since = clock.now();
+    this.#timer = clock.after(this.#left, () => this.end(true));
   }
   #stop() {
-    clearTimeout(this.#timer);
+    clock.cancel(this.#timer);
     this.#timer = null;
   }
 }

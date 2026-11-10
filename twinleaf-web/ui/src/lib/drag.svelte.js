@@ -12,6 +12,7 @@ import { OUTER_SHARE, cellAt, moveCells, signalCells } from './moves.js';
 import { chip, newPlot } from './tabs.js';
 import { DRAG_START } from './constants.js';
 import { claim } from './keyrouter.js';
+import * as clock from './clock.js';
 
 const LANDED_MS = 700;
 /** The empty background a box selection starts on, besides what listens for it: a dock, a panel's body, a list's own space below its items. */
@@ -88,8 +89,8 @@ export class Drags {
   #landedTimer;
   flash(ids) {
     this.landed = new Set(ids);
-    clearTimeout(this.#landedTimer);
-    this.#landedTimer = setTimeout(() => (this.landed = null), LANDED_MS);
+    clock.cancel(this.#landedTimer);
+    this.#landedTimer = clock.after(LANDED_MS, () => (this.landed = null));
   }
 
   /**

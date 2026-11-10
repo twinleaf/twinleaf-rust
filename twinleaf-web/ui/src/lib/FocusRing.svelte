@@ -23,6 +23,7 @@
   // one that scrolls the target out of view.
   import { onMount } from 'svelte';
   import { focusedByKeyboard } from './keys.js';
+  import * as clock from './clock.js';
 
   /** A menu, whose items are highlighted. */
   const MENU = '[role=menu]';
@@ -115,13 +116,13 @@
     let frame;
     const follow = () => {
       update();
-      frame = requestAnimationFrame(follow);
+      frame = clock.frame(follow);
     };
     follow();
     const events = ['focusin', 'focusout', 'pointerdown'];
     for (const type of events) window.addEventListener(type, update);
     return () => {
-      cancelAnimationFrame(frame);
+      clock.cancel(frame);
       for (const type of events) window.removeEventListener(type, update);
       ring.remove();
     };

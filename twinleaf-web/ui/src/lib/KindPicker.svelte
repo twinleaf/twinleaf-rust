@@ -8,6 +8,7 @@
   // As in a menu bar, ← → move from one open dropdown to the other.
   import { onDestroy, tick } from 'svelte';
   import { claim } from './keyrouter.js';
+  import * as clock from './clock.js';
   import * as Select from '$lib/components/ui/select/index.js';
   import RiTime from '@lucide/svelte/icons/chart-line';
   import RiSpectrum from '@lucide/svelte/icons/audio-lines';
@@ -55,7 +56,7 @@
     }),
   );
   // Heard once the move between dropdowns is done, so a move is not a close.
-  const changed = () => setTimeout(() => onOpenChange?.(open || layoutOpen));
+  const changed = () => clock.after(0, () => onOpenChange?.(open || layoutOpen));
 </script>
 
 {#snippet items(list)}

@@ -17,6 +17,7 @@
   // from the cursor, as the panel dragged is its header too.
   import { onDestroy, tick } from 'svelte';
   import { PAGE, claim } from './keyrouter.js';
+  import * as clock from './clock.js';
   import { flip } from 'svelte/animate';
   import { dragHandleZone, dragHandle, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
@@ -59,10 +60,10 @@
     const had = root?.contains(document.activeElement);
     docks.hide(side, hidden);
     if (!had) return;
-    const until = performance.now() + RAIL_WAIT_MS;
+    const until = clock.now() + RAIL_WAIT_MS;
     const land = () => {
       const now = document.querySelector(hidden ? `.dock-side.${side}.rail` : `.dock-side.${side}:not(.rail)`);
-      if (!now) return void (performance.now() < until && requestAnimationFrame(land));
+      if (!now) return void (clock.now() < until && clock.frame(land));
       const show = hidden && now.querySelector('.dock-button');
       if (show) focusNode(show);
       else if (!enter(now)) focusNode(now);

@@ -11,6 +11,7 @@
 import { SvelteMap } from 'svelte/reactivity';
 import { api, signalKey } from './protocol.js';
 import { colors } from './colors.svelte.js';
+import * as clock from './clock.js';
 
 /** How long a trace keeps its finest points, in seconds of device time, until the hub says. */
 const RETAIN_SECONDS = 120;
@@ -372,7 +373,7 @@ export class Session {
    * this session never heard of, a gap the page fills with a new snapshot.
    * `perfMs` is the page time it arrived.
    */
-  apply(frame, perfMs = performance.now()) {
+  apply(frame, perfMs = clock.now()) {
     if (frame.kind === 'spectra') {
       for (const { id, f, a, floor } of frame.spectra) {
         const t = this.traces.get(id);

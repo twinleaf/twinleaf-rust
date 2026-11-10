@@ -40,6 +40,7 @@
 // 'toolbar'. `svc` is the page's services, as `commands` takes them.
 import { common, counted } from './menus.js';
 import { cursorText } from './plot.js';
+import * as clock from './clock.js';
 import RiSplitH from '@lucide/svelte/icons/columns-2';
 import RiSplitV from '@lucide/svelte/icons/rows-2';
 import RiFullscreen from '@lucide/svelte/icons/maximize-2';
@@ -103,7 +104,7 @@ const rowsText = (n) => (n === null ? 'Counting…' : `${n.toLocaleString()} row
 
 /** Moves the time views of `ctx` as one burst of view steps of `kind`, `fn(view, perf)` each. */
 function burst(ctx, kind, fn) {
-  const perf = performance.now(), views = ctx.plots.map((t) => t.view);
+  const perf = clock.now(), views = ctx.plots.map((t) => t.view);
   ctx.svc.viewHistory.burst(kind, views, () => views.forEach((v) => fn(v, perf)));
 }
 
@@ -172,7 +173,7 @@ export const COMMANDS = [
     run: (ctx) => {
       const live = ctx.on ? ctx.on.view.live : ctx.plots.some((t) => t.view.live);
       if (!live) return void follow(ctx, false);
-      const perf = performance.now();
+      const perf = clock.now();
       ctx.svc.viewHistory.step(() => ctx.plots.forEach((t) => t.view.pause(perf)));
     },
   },
@@ -200,7 +201,7 @@ export const COMMANDS = [
       return d ? { text: d, icon: RiSpan } : null;
     },
     run: (ctx) => {
-      ctx.svc.viewHistory.step(() => pvs(ctx).forEach((p) => p.config().kind === 'time' && p.view.pause(performance.now())));
+      ctx.svc.viewHistory.step(() => pvs(ctx).forEach((p) => p.config().kind === 'time' && p.view.pause(clock.now())));
       editCursors(ctx, 'Add X cursors', pvs(ctx).map((p) => [p]), (p) => p.xCursorsAdded());
     },
   },

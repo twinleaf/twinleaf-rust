@@ -23,6 +23,7 @@
 // menu gives it back, only makes the plot the one clicked last.
 
 import { SvelteSet } from 'svelte/reactivity';
+import * as clock from './clock.js';
 
 /** What a press keeps the selection in. */
 export const KEEPS = '.leaf, [data-keeps-selection], [data-slot$=-content], [role=menu], [role=dialog], [role=listbox]';
@@ -106,7 +107,7 @@ export class Selection {
 
   /** Makes plot `id`, or none, the plot clicked last, the selection as it is. */
   point(id) {
-    clearTimeout(this.#narrowing);
+    clock.cancel(this.#narrowing);
     this.last = id;
   }
 
@@ -126,7 +127,7 @@ export class Selection {
     }
     if (!this.plots.has(id) || this.plots.size === 1) return this.#setPlots([id], id);
     this.point(id);
-    if (clicks === 1) this.#narrowing = setTimeout(() => this.exists(id) && this.#setPlots([id], id), DOUBLE_CLICK_MS);
+    if (clicks === 1) this.#narrowing = clock.after(DOUBLE_CLICK_MS, () => this.exists(id) && this.#setPlots([id], id));
   }
 
   /** Makes `keys` (`${panel}:${name}`) the rows picked, letting go of the plots, and `at` the row the arrows are on. */
@@ -202,7 +203,7 @@ export class Selection {
   }
 
   #setPlots(ids, last) {
-    clearTimeout(this.#narrowing);
+    clock.cancel(this.#narrowing);
     const same = ids.length === this.plots.size && ids.every((id) => this.plots.has(id));
     if (!same) {
       this.plots.clear();

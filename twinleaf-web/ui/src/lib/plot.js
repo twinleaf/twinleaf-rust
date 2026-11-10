@@ -18,6 +18,7 @@ import { prefs } from './prefs.svelte.js';
 import { spanText } from './units.js';
 import { WINDOW_LIMITS, windowText } from './window.js';
 import { placedIn, withX, withY, withoutX, withoutY, xOf, yOf } from './cursors.js';
+import * as clock from './clock.js';
 
 /** A CSS colour as [r, g, b, a] in 0..1, resolved by the browser, so theme tokens work. */
 function cssRgba(css) {
@@ -121,9 +122,9 @@ export function cursorText(kind) {
       at(t, between) {
         const [whole, frac] = split(t, decimals(between));
         const d = new Date(whole * 1000);
-        const clock = `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}${frac ? `.${frac}` : ''}`;
-        const dated = day(t) !== day(Date.now() / 1000) || day(t) !== day(t + between);
-        return dated ? `${d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} ${clock}` : clock;
+        const hms = `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}${frac ? `.${frac}` : ''}`;
+        const dated = day(t) !== day(clock.wall() / 1000) || day(t) !== day(t + between);
+        return dated ? `${d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} ${hms}` : hms;
       },
       span,
     };
@@ -816,7 +817,7 @@ export class PlotView {
     // a zoom keeps the plot live: a wash rising toward the newest edge, under
     // the grid, and a LIVE line on that edge, drawn with the hover, where the
     // zoom anchors. Both fade in and out.
-    const frameAt = performance.now();
+    const frameAt = clock.now();
     const dt = Math.min(100, frameAt - (this.overlayAt ?? frameAt));
     this.overlayAt = frameAt;
     const pointer = this.hover;
@@ -1138,7 +1139,7 @@ export class PlotView {
     // Where a pixel's column holds several points, the hover reads all of
     // them, lowest to highest, as one point there would be any of them.
     const halfPx = spectrum || marks.hover === null ? 0 : (xd[1] - xd[0]) / P.w / 2;
-    const now = performance.now(), held = this.hoverRead;
+    const now = clock.now(), held = this.hoverRead;
     const hold = held && this.hover && held.x === this.hover.x && held.y === this.hover.y && now - held.at < READ_MS;
     // What the numbers say, held between reads; the marker reads anew.
     const reads = hold ? held.reads : new Map();
@@ -1435,7 +1436,7 @@ export class PlotView {
   showRange(a, b) {
     if (a === null || b === null || !(b > a)) return;
     if (this.config().kind === 'spectrum') this.onFrequencies?.(a, b);
-    else for (const v of this.targets()) v.show(a, b, performance.now());
+    else for (const v of this.targets()) v.show(a, b, clock.now());
   }
 
   /** Zooms to the time or frequencies between X1 and X2, when both are placed, as one view step. The cursors stay. */
@@ -1746,7 +1747,7 @@ export class PlotView {
         // that moment, so it pauses.
         const axis = onAxis(e), vs = this.targets();
         this.viewHistory.burst('zoom', vs, () => {
-          for (const v of vs) v.zoom(factor, axis && v.live ? 1 : fracX(e.clientX), performance.now(), this.liveEdge());
+          for (const v of vs) v.zoom(factor, axis && v.live ? 1 : fracX(e.clientX), clock.now(), this.liveEdge());
         });
       } else this.zoomFrequencies(factor, Math.min(1, Math.max(0, fracX(e.clientX))));
     }, { passive: false });
@@ -1782,7 +1783,7 @@ export class PlotView {
       drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: 0, mode, targets, band, cursor: tab?.name ?? ycursor?.name ?? cursor, key: tab?.key ?? ycursor?.key };
       // A time cursor holds a moment the live view would scroll away, so
       // dragging one out pauses the view.
-      if (mode === 'xcursor' && tab && isTime()) for (const v of this.targets()) v.pause(performance.now());
+      if (mode === 'xcursor' && tab && isTime()) for (const v of this.targets()) v.pause(clock.now());
     });
     // Turns an axis drag that has moved off the press into what its
     // direction says, and says whether it is still to decide.
@@ -1804,7 +1805,7 @@ export class PlotView {
         // live view would scroll away, so it pauses the view.
         drag.mode = 'xcursor';
         drag.cursor = pick(this.markers(), (v) => Math.abs(this.pxOf(v) - e.clientX));
-        if (isTime()) for (const v of this.targets()) v.pause(performance.now());
+        if (isTime()) for (const v of this.targets()) v.pause(clock.now());
       } else if (drag.mode === 'axis') {
         if (isTime()) (drag.mode = 'seek'), (this.seeking = true);
         else drag.mode = 'none';
@@ -1852,7 +1853,7 @@ export class PlotView {
       drag.y = e.clientY;
       if (drag.mode === 'zoom') {
         // The range marked holds still under it: a live view pauses as it begins.
-        if (!this.zoomBand && isTime()) for (const v of this.targets()) v.pause(performance.now());
+        if (!this.zoomBand && isTime()) for (const v of this.targets()) v.pause(clock.now());
         const P0 = this.geo.plot;
         this.zoomBand = [drag.x0, Math.min(P0.x + P0.w, Math.max(P0.x, e.clientX))];
       } else if (drag.mode === 'xcursor') {
@@ -1864,7 +1865,7 @@ export class PlotView {
         // history, and stays within it.
         const [lo, hi] = this.history ?? [0, 0];
         for (const v of this.targets()) {
-          v.pan((dx * Math.max(hi - lo, v.span)) / P.w / v.span, performance.now());
+          v.pan((dx * Math.max(hi - lo, v.span)) / P.w / v.span, clock.now());
           v.right = Math.min(hi, Math.max(lo + v.span, v.right));
         }
       } else if (drag.mode === 'y') {
@@ -1872,7 +1873,7 @@ export class PlotView {
       } else if (!isTime()) {
         this.panFrequencies(-dx / P.w);
       } else {
-        for (const v of this.targets()) v.pan(-dx / P.w, performance.now());
+        for (const v of this.targets()) v.pan(-dx / P.w, clock.now());
       }
     });
     el.addEventListener('pointerup', (e) => {

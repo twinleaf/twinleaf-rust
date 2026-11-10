@@ -4,6 +4,8 @@
 // placed there and the response flows straight into it, the page free the
 // while. Elsewhere it downloads as any file does.
 
+import * as clock from './clock.js';
+
 /** What each export format is, for the save dialog. */
 export const FORMATS = {
   csv: { ext: 'csv', mime: 'text/csv', description: 'CSV table' },
@@ -11,7 +13,7 @@ export const FORMATS = {
 };
 
 /** A file name for an export made at `date`: twinleaf-20261108-140501.csv. */
-export function exportName(format, date = new Date()) {
+export function exportName(format, date = new Date(clock.wall())) {
   const two = (n) => String(n).padStart(2, '0');
   const stamp = `${date.getFullYear()}${two(date.getMonth() + 1)}${two(date.getDate())}-${two(date.getHours())}${two(date.getMinutes())}${two(date.getSeconds())}`;
   return `twinleaf-${stamp}.${FORMATS[format].ext}`;

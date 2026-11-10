@@ -88,6 +88,7 @@
   import { counted } from './lib/menus.js';
   import RiCheck from '@lucide/svelte/icons/check';
   import RiChevron from '@lucide/svelte/icons/chevron-down';
+  import * as clock from './lib/clock.js';
 
   // The hub, the tabs as the page edits them, their undo and redo, the
   // PlotViews on the page, which the frame loop draws, and each plot's view,
@@ -262,18 +263,18 @@
     if (!ask) detailAsks.set(id, (ask = { last: 0, timer: null }));
     if (ask.timer) return;
     const run = () => {
-      ask.last = performance.now();
+      ask.last = clock.now();
       ask.timer = null;
       const plot = plotAnywhere(id);
       if (!plot || plot.kind !== 'time' || views.get(id)?.live !== false) return;
-      const [x0, x1] = views.get(id).range(hub.now(performance.now()));
+      const [x0, x1] = views.get(id).range(hub.now(clock.now()));
       // A span either side, so zooming out a few steps or panning stays covered.
       const pad = x1 - x0;
       hub.session.fetchWindow(id, 'detail', tracesOf(plot), x0 - pad, x1 + pad, window.innerWidth * 2);
     };
-    const wait = DETAIL_MS - (performance.now() - ask.last);
+    const wait = DETAIL_MS - (clock.now() - ask.last);
     if (wait <= 0) run();
-    else ask.timer = setTimeout(run, wait);
+    else ask.timer = clock.after(wait, run);
   }
   const tracesOf = (plot) => plot.items.map((i) => hub.session.byKey.get(i.key)).filter(Boolean);
   // Each view reads the oldest time its plot can show from what the hub holds of these.
@@ -313,7 +314,7 @@
     const url = URL.createObjectURL(new Blob([exportText(ws.tabs)], { type: 'application/json' }));
     const a = Object.assign(document.createElement('a'), { href: url, download: 'twinleaf-layouts.json' });
     a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    clock.after(1000, () => URL.revokeObjectURL(url));
   }
   let importInput;
   let importError = $state('');
@@ -491,7 +492,7 @@
         contentSize = { ...contentSize, [side]: kind ? open - 14 : null };
         slide = { ...slide, [side]: kind };
         if (want[side]) railed = { ...railed, [side]: false };
-        clearTimeout(slideDone);
+        clock.cancel(slideDone);
         const ms = kind === 'opening' ? DOCK_SLIDE_MS.opening : DOCK_SLIDE_MS.closing;
         // The slide starts a frame after the panels mount, so the work of
         // mounting them is not the slide's first frame; or after
@@ -504,15 +505,15 @@
           dockGroup?.style.setProperty('--slide-ms', `${ms}ms`);
           dockGroup?.classList.add('sliding');
           pane.resize(target);
-          slideDone = setTimeout(() => {
+          slideDone = clock.after(ms + 50, () => {
             dockGroup?.classList.remove('sliding');
             railed = { left: !docks.shown('left'), right: !docks.shown('right') };
             slide = { left: null, right: null };
             contentSize = { left: null, right: null };
-          }, ms + 50);
+          });
         };
-        requestAnimationFrame(() => requestAnimationFrame(start));
-        setTimeout(start, SLIDE_START_MS);
+        clock.frame(() => clock.frame(start));
+        clock.after(SLIDE_START_MS, start);
       }
       if (paneRoom) settled = true;
     });
@@ -590,15 +591,15 @@
     renderer = new Renderer(glCanvas);
     hub.connect();
     const HUD_MS = 500;
-    let frames = 0, cpu = 0, last = performance.now(), lastBytes = 0, upload = 0, raf;
+    let frames = 0, cpu = 0, last = clock.now(), lastBytes = 0, upload = 0, raf;
     const loop = (perf) => {
-      const start = performance.now();
+      const start = clock.now();
       hub.session.tick(perf);
       renderer.begin();
       for (const pv of registry) pv.draw(perf);
       const st = renderer.stats;
       upload += st.uploadBytes;
-      cpu += performance.now() - start;
+      cpu += clock.now() - start;
       frames++;
       const elapsed = perf - last;
       if (elapsed >= HUD_MS) {
@@ -613,15 +614,15 @@
         };
         frames = 0; cpu = 0; upload = 0; last = perf; lastBytes = hub.bytes;
       }
-      raf = requestAnimationFrame(loop);
+      raf = clock.frame(loop);
     };
-    raf = requestAnimationFrame(loop);
+    raf = clock.frame(loop);
     // A hot reload unmounts the page without leaving it, so the socket, the
     // GPU context and the window reads still to ask go with the copy that
     // made them.
     return () => {
-      cancelAnimationFrame(raf);
-      for (const ask of detailAsks.values()) clearTimeout(ask.timer);
+      clock.cancel(raf);
+      for (const ask of detailAsks.values()) clock.cancel(ask.timer);
       hub.close();
       renderer.dispose();
     };
@@ -638,7 +639,7 @@
    * the same for the selected plots alone.
    */
   function toggleLive() {
-    const ids = ws.timeIds(), perf = performance.now(), pausing = live;
+    const ids = ws.timeIds(), perf = clock.now(), pausing = live;
     viewHistory.step(() => ids.forEach((id) => (pausing ? views.of(id).pause(perf) : views.of(id).follow(false))));
     if (!pausing) cursors.followed(ids);
     refreshToolbar();
@@ -656,7 +657,7 @@
   let exporting = $state(null);
   /** Offers to export the signals of `targets`, plots as commands.js gives them. */
   function openExport(targets) {
-    const session = hub.session, now = hub.now(performance.now());
+    const session = hub.session, now = hub.now(clock.now());
     const plots = targets.filter((t) => t.plot.items.length);
     const traces = [...new Map(plots.flatMap(({ plot }) => plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean)).map((t) => [t.key, t])).values()];
     if (!traces.length) return toast.warning('Nothing to export: the plots show no signals');
@@ -673,7 +674,7 @@
    * holds the window's start, the reason saying which.
    */
   async function copyCheck(targets) {
-    const session = hub.session, now = hub.now(performance.now());
+    const session = hub.session, now = hub.now(clock.now());
     let total = 0, lost = 0;
     for (const { plot, view } of targets) {
       if (!plot.items.length) continue;
@@ -701,7 +702,7 @@
    * holds is copied, and the notice says what is missing.
    */
   async function copyData(targets) {
-    const session = hub.session, now = hub.now(performance.now());
+    const session = hub.session, now = hub.now(clock.now());
     const plots = targets.filter((t) => t.plot.items.length);
     if (!plots.length) return toast.warning('Nothing to copy: the plots show no signals');
     const blocks = [];
