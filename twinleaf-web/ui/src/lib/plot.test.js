@@ -332,7 +332,7 @@ describe('A plot’s view', () => {
   });
   it('holds no cursor: a view’s state says nothing of them, and following live changes none', () => {
     const view = new View({ now: () => 0 });
-    expect(Object.keys(view.state()).sort()).toEqual(['live', 'pausedAt', 'right', 'span', 'spectra', 'window', 'yRanges']);
+    expect(Object.keys(view.state()).sort()).toEqual(['live', 'pausedAt', 'pausedHistory', 'right', 'span', 'spectra', 'window', 'yRanges']);
   });
 });
 

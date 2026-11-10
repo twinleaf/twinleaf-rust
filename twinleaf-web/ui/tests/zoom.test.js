@@ -4,9 +4,11 @@
 // the hub's oldest time, not the page's oldest point. Where the hub holds
 // more of one signal than another, the limit is the longer history's. On a
 // hub that holds its History setting before the pause, the widest view is
-// the setting's length exactly, as the setting reads, and follows the
-// setting as it is changed. Back shows a view within the same limit, so the
-// widest view comes back as it was. The wheel's turns are dispatched with
+// the setting's length exactly, as the setting reads. It keeps the History
+// of its pause: a setting lowered since moves its limit in, and one raised
+// leaves its widest view the length it was, with none of what the hub holds
+// beyond the setting; live again, it is by the setting as it is. Back shows
+// a view within the same limit, so the widest view comes back as it was. The wheel's turns are dispatched with
 // no frame between (harness `turnWheel`): the limit holds from the first
 // turn after a pause, whether or not the plot has drawn since.
 import { describe, expect, it } from 'vitest';
@@ -79,8 +81,46 @@ describe('a paused plot, zoomed all the way out', () => {
     }
   }, 60_000);
 
-  it('follows the History setting changed while it is paused: in to a shorter one, and out to what the hub holds of a longer one', async () => {
+  it('keeps the History of its pause while the setting is changed: in to a shorter one, and no wider than it was for a longer one', async () => {
     const { page, id, view, memory } = await mounted();
+    try {
+      // The hub holds from 10 s on: `beyond` s more than its History setting before the pause, within its headroom.
+      for (const beyond of [2, 1, 0]) {
+        view.follow(true);
+        await frames();
+        const at = performance.now(), history = page.hub.now(at) - view.delay - 10 - beyond;
+        memory({ 0: 10, 1: 10 }, history);
+        view.pause(at);
+        const paused = view.pausedAt;
+        // Raised with the view as it paused: the hub holds for the pause what it held, and the view shows none of the headroom.
+        memory({ 0: 10, 1: 10 }, 3600);
+        turnWheel(page, id, 400, { n: ALL_THE_WAY });
+        expect(view.span, `holding ${beyond} s beyond, History set to an hour`).toBeCloseTo(history, 6);
+        expect(view.right - view.span).toBeCloseTo(10 + beyond, 6);
+        memory({ 0: 10, 1: 10 }, 5);
+        turnWheel(page, id, 400, { n: 3 });
+        expect(view.span, 'History set to 5 s').toBeCloseTo(5, 6);
+        memory({ 0: 10, 1: 10 }, 86400);
+        turnWheel(page, id, 400, { n: ALL_THE_WAY });
+        expect(view.span, 'History set to a day').toBeCloseTo(history, 6);
+        expect(view.right, 'ends at the pause throughout').toBe(paused);
+        expect(view.pausedAt).toBe(paused);
+        // Live again, it shows what the hub holds within the setting as it is.
+        view.follow(true);
+        expect(view.oldest(performance.now()), 'live, History a day').toBeCloseTo(10, 6);
+      }
+    } finally {
+      page.dispose();
+    }
+  }, 60_000);
+
+  it('brought Back paused after it went live, is as wide as the History of that pause, whatever the setting is since', async () => {
+    const { page, id, view, memory } = await mounted();
+    const back = () => {
+      flushSync();
+      leafOf(id).querySelector('.plot-head button[aria-label^="Back"]').click();
+      flushSync();
+    };
     try {
       view.follow(true);
       await frames();
@@ -89,16 +129,19 @@ describe('a paused plot, zoomed all the way out', () => {
       memory({ 0: 10, 1: 10 }, history);
       view.pause(at);
       turnWheel(page, id, 400, { n: ALL_THE_WAY });
-      expect(view.span).toBeCloseTo(history, 6);
-      memory({ 0: 10, 1: 10 }, 5);
-      turnWheel(page, id, 400, { n: 3 });
-      expect(view.span, 'History set to 5 s').toBeCloseTo(5, 6);
-      expect(view.right).toBe(view.pausedAt);
-      // The hub holds for the pause what it held: a longer setting brings no more.
+      const widest = { right: view.right, span: view.span, pausedAt: view.pausedAt };
+      expect(widest.span).toBeCloseTo(history, 6);
+      // Live by the header's button, a step of its own, then the History is raised.
+      flushSync();
+      leafOf(id).querySelector('.plot-head button[aria-label="Follow live"]').click();
+      flushSync();
+      expect(view.live).toBe(true);
       memory({ 0: 10, 1: 10 }, 3600);
+      back();
+      expect({ right: view.right, span: view.span, pausedAt: view.pausedAt }, 'the widest view of that pause').toEqual(widest);
       turnWheel(page, id, 400, { n: ALL_THE_WAY });
-      expect(view.right - view.span, 'History set to an hour').toBeCloseTo(10, 6);
-      expect(view.right).toBe(view.pausedAt);
+      expect(view.span, 'and no wider').toBe(widest.span);
+      expect(document.body.textContent, 'nothing the view showed is gone').not.toContain(GONE);
     } finally {
       page.dispose();
     }

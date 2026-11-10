@@ -2,12 +2,15 @@
 // offers, a minute to a day, at device times up to the Unix epoch's, where a
 // double resolves a quarter of a microsecond:
 // - `oldestShown`, the one rule: the History setting before the view's
-//   time, or the oldest time the hub holds, whichever is later;
+//   time, or the oldest time the hub holds, whichever is later, where a
+//   paused view's setting is the smaller of the one at its pause and the
+//   one now;
 // - a View, live or paused, reads its limits from that rule whenever it is
 //   asked, with the hub's History as it is then; zoomed all the way out it
-//   is as wide as the setting on a hub that holds it; and it comes back by
-//   `restore` where a zoom or a pan left it, unmoved by `startHeld`, which
-//   moves only a view whose start the hub has dropped;
+//   is as wide as the setting on a hub that holds it; paused, it stays that
+//   wide when the setting is raised, through `restore` too; and it comes
+//   back by `restore` where a zoom or a pan left it, unmoved by
+//   `startHeld`, which moves only a view whose start the hub has dropped;
 // - a zoom from the narrowest view to the widest and back about one point
 //   ends where it began;
 // - the time axis's ticks and labels, and the texts that name a span, from
@@ -71,6 +74,27 @@ describe('the oldest time a view can show', () => {
     expect(oldestShown(40, 700, null)).toBe(40);
     expect(oldestShown(40, 700, 0)).toBe(40);
     expect(oldestShown(null, 700, 600)).toBeNull();
+  });
+
+  it('for a paused view, is by the smaller of the History at its pause and the History now: raised, it stays; lowered, it moves in', () => {
+    fc.assert(
+      fc.property(history, history, deviceTime, behind, (h, later, newest, lag) => {
+        // The hub filled History `h` before the pause and holds for the pause what it held then, whatever the setting is since.
+        const time = newest - lag, held = filled(newest, h);
+        const oldest = oldestShown(held, time, later, h);
+        expect(oldest).toBe(time - Math.min(h, later));
+        expect(time - oldest, 'none of the headroom').toBeLessThanOrEqual(h + step(time));
+        // A live view at that time is by the History now, to what the hub holds.
+        expect(oldestShown(held, time, later)).toBe(Math.max(held, time - later));
+      }),
+    );
+  });
+
+  it('for a paused view, is by the History said, at its pause or now, while the hub has not said the other', () => {
+    expect(oldestShown(40, 700, null, 600)).toBe(100);
+    expect(oldestShown(40, 700, 600, null)).toBe(100);
+    expect(oldestShown(40, 700, null, null)).toBe(40);
+    expect(oldestShown(null, 700, 3600, 600)).toBeNull();
   });
 
   it('reads as the History setting does, in the window’s seconds and the capture’s span, at every setting', () => {
@@ -156,19 +180,63 @@ describe('a view on a hub that holds hours', () => {
     );
   });
 
-  it('follows the hub’s History setting while paused: lowered, it moves in; raised, it reaches what the hub holds and no further', () => {
+  it('paused, keeps the History of its pause: lowered since, it moves in; raised, it stays as wide as it was, exactly; live again, it is by the History now', () => {
     fc.assert(
-      fc.property(history, history, deviceTime, behind, (h, later, now, lag) => {
+      fc.property(history, history, deviceTime, fc.double({ min: 0, max: HEADROOM - 0.5, noNaN: true }), (h, later, now, lag) => {
         fc.pre(later !== h);
         const oldest = filled(now + lag, h), v = viewOn(now, { oldest, dropped: true, history: h });
         v.pause(0);
+        const at = v.pausedAt;
+        expect(v.limits()).toEqual([at - h, at]);
         v.hubHolds = { ...v.hubHolds, history: later };
-        const [lo, hi] = v.limits();
-        expect(hi).toBe(v.pausedAt);
-        if (later < h) expect(lo).toBe(v.pausedAt - later);
-        else expect(lo).toBe(oldest);
-        // Raised, the widest view is the History it paused with and what of the headroom the hub held then.
-        expect(hi - lo).toBeLessThanOrEqual(Math.min(h, later) + HEADROOM + step(now));
+        expect(v.limits()).toEqual([at - Math.min(h, later), at]);
+        for (let i = 0; i < 60; i++) v.zoom(2, 0.5, 0);
+        expect(windowText(v.span), 'the widest view reads as the shorter setting').toBe(String(Math.min(h, later)));
+        // Set back, it is as wide as it paused.
+        v.hubHolds = { ...v.hubHolds, history: h };
+        expect(v.limits()).toEqual([at - h, at]);
+        // Live, it has no pause: the History now, to what the hub holds.
+        v.hubHolds = { ...v.hubHolds, history: later };
+        v.follow();
+        expect(v.limits(0)[0]).toBe(Math.max(oldest, v.time(0) - later));
+      }),
+    );
+  });
+
+  it('paused on a hub still filling, starts at what the hub holds whatever the History is set to since, short of the oldest of them', () => {
+    fc.assert(
+      fc.property(history, history, deviceTime, filling, (h, later, now, share) => {
+        const oldest = now - h * share, v = viewOn(now, { oldest, dropped: false, history: h });
+        v.pause(0);
+        v.hubHolds = { ...v.hubHolds, history: later };
+        expect(v.limits()[0]).toBe(Math.max(oldest, v.pausedAt - Math.min(h, later)));
+      }),
+    );
+  });
+
+  it('restored paused, keeps the History of the pause its state was of, whether the view was live or paused again between', () => {
+    fc.assert(
+      fc.property(history, history, deviceTime, fc.boolean(), (h, later, now, again) => {
+        fc.pre(later > h);
+        const v = viewOn(now, { oldest: filled(now, h), dropped: true, history: h });
+        v.pause(0);
+        const at = v.pausedAt, state = v.state();
+        // The History is raised and the clock goes on; the hub holds from where it did.
+        v.follow();
+        v.hubHolds = { ...v.hubHolds, history: later };
+        v.hub.at = now + 5;
+        if (again) v.pause(0);
+        v.restore(state, 0);
+        expect(v.pausedAt).toBe(at);
+        expect(v.limits()).toEqual([at - h, at]);
+        expect(v.startHeld(0), 'nothing it showed is gone').toBe(false);
+        // A view paused after the History was raised shows what the hub holds, the headroom of the old setting with it.
+        v.follow();
+        v.pause(0);
+        expect(v.limits()).toEqual([filled(now, h), now + 5 - v.delay]);
+        // And a live state restored has no pause.
+        v.restore({ ...state, live: true }, 0);
+        expect(v.limits(0)).toEqual([filled(now, h), now + 5 - v.delay]);
       }),
     );
   });

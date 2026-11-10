@@ -187,12 +187,18 @@ export const LEVEL_FLOOR = 4;
  * holds that long: the hub keeps more than the setting by a headroom
  * (twinleaf-web/src/hub.rs HISTORY_HEADROOM), so what it holds reaches the
  * setting before any view no further than that behind its newest sample.
- * It is `oldest` while the hub has said no setting, and null when nothing
- * says what is held. The zoom limit, the history bar, Back and a plot an
- * undo brings back all read it from `View.oldest`.
+ * A paused view is a snapshot of what could be shown at its pause, less
+ * what is dropped since: `atPause`, the History setting at its pause, or
+ * null for a live view, limits it too, so the smaller of the two settings
+ * counts. A setting raised since leaves a paused view as wide as it was,
+ * with none of the headroom, and one lowered since moves its limit in.
+ * It is `oldest` while the hub has said neither setting, and null when
+ * nothing says what is held. The zoom limit, the history bar, Back and a
+ * plot an undo brings back all read it from `View.oldest`.
  */
-export function oldestShown(oldest, time, history) {
-  return oldest === null || !history ? oldest : Math.max(oldest, time - history);
+export function oldestShown(oldest, time, history, atPause = null) {
+  const seconds = Math.min(history || Infinity, atPause || Infinity);
+  return oldest === null || seconds === Infinity ? oldest : Math.max(oldest, time - seconds);
 }
 /**
  * How far past the floor a coarser level must reach before a plot moves to
@@ -1994,7 +2000,7 @@ const mapsOf = (o, make) => new Map(Object.entries(o).map(([kind, byKey]) => [ki
  * samples; held spectra count by which they are.
  */
 export function sameView(a, b) {
-  const plain = ({ spectra, ...s }) => JSON.stringify(s.live ? { ...s, right: null, pausedAt: null } : s);
+  const plain = ({ spectra, ...s }) => JSON.stringify(s.live ? { ...s, right: null, pausedAt: null, pausedHistory: null } : s);
   if (plain(a) !== plain(b)) return false;
   if (!a.spectra || !b.spectra) return !a.spectra === !b.spectra;
   return a.spectra.size === b.spectra.size && [...a.spectra].every(([t, sp]) => b.spectra.get(t) === sp);
@@ -2017,6 +2023,8 @@ export class View {
   delay = 0.15;
   right = 0; // device time of the right edge when paused
   pausedAt = null; // device time it paused at, the end of what it captured
+  /** The hub's History setting when the view paused, in seconds: null while live, or when the hub had said none. `oldestShown` reads it. */
+  pausedHistory = null;
   /** What the hub holds of the plot's signals, as Session `held` gives it. Views sets it for the plot the view is of. */
   held = () => ({ oldest: null, dropped: false, history: null });
   yByKind = new Map(); // plot kind, a spectrum's by y scale -> range key -> {range, auto}: PlotView's `y`
@@ -2044,7 +2052,7 @@ export class View {
   /** The oldest time the view can show at page time `perf`, as `oldestShown` gives it, or null when nothing says. */
   oldest(perf) {
     const { oldest, history } = this.held();
-    return oldestShown(oldest, this.time(perf), history);
+    return oldestShown(oldest, this.time(perf), history, this.pausedHistory);
   }
 
   /**
@@ -2116,6 +2124,7 @@ export class View {
     if (!this.live) return;
     this.right = this.hub.now(perf) - this.delay;
     this.pausedAt = this.right;
+    this.pausedHistory = this.held().history;
     this.live = false;
     this.notify();
   }
@@ -2153,20 +2162,20 @@ export class View {
   follow(restore = false) {
     this.live = true;
     this.span = restore ? this.window : Math.min(this.liveSeconds(), this.span);
-    this.pausedAt = null;
+    this.pausedAt = this.pausedHistory = null;
     this.notify();
   }
 
   /**
    * What the view shows, as a value a view history step keeps: live or
-   * paused and where, its span and window, the y
+   * paused and where, the History setting of its pause, its span and window, the y
    * ranges it holds (one that fits itself to the data is left out), and,
    * paused, the spectra it holds. `sameView` compares two.
    */
   state() {
-    const { live, window, span, right, pausedAt } = this;
+    const { live, window, span, right, pausedAt, pausedHistory } = this;
     return {
-      live, window, span, right, pausedAt,
+      live, window, span, right, pausedAt, pausedHistory,
       yRanges: byKindOf(this.yByKind, (st) => !st.auto && !!st.range, (st) => [...st.range]),
       spectra: live ? null : new Map(this.spectra),
     };
@@ -2175,13 +2184,13 @@ export class View {
   /**
    * Shows `s`, a value `state` gave, again at page time `perf`: a live
    * one follows the newest samples, and a paused one ends no later than
-   * they do. A y range it does not hold fits itself to the data again.
+   * they do, with the History setting of the pause `s` was taken in. A y range it does not hold fits itself to the data again.
    */
   restore(s, perf) {
     const newest = this.hub.now(perf) - this.delay;
     Object.assign(this, { live: s.live, window: s.window, span: s.span });
-    if (s.live) this.pausedAt = null;
-    else [this.right, this.pausedAt] = [Math.min(s.right, newest), Math.min(s.pausedAt ?? s.right, newest)];
+    if (s.live) this.pausedAt = this.pausedHistory = null;
+    else [this.right, this.pausedAt, this.pausedHistory] = [Math.min(s.right, newest), Math.min(s.pausedAt ?? s.right, newest), s.pausedHistory ?? null];
     this.yByKind = mapsOf(s.yRanges, (range) => ({ range: [...range], auto: false }));
     this.spectra = new Map(s.spectra ?? []);
     this.notify();
