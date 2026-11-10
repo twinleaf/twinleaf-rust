@@ -4,8 +4,8 @@
 // step holds, for each plot one gesture moved, what
 // it showed before and after: its View `state` (live or paused and where,
 // its span and window, the y ranges it holds and the spectra a
-// paused spectrum holds) and its view fields (tabs.js VIEW_FIELDS, as a
-// spectrum's frequencies). Back shows the before of every plot of the
+// paused spectrum holds), its view fields (tabs.js VIEW_FIELDS, as a
+// spectrum's frequencies) and its kind, time or spectrum. Back shows the before of every plot of the
 // step still in the tab, so the plots one gesture moved go back together;
 // Forward shows the after.
 //
@@ -28,12 +28,25 @@
 // is no step and leaves Forward as it was; a step made inside another
 // gesture is part of that one.
 //
-// The edit history (history.svelte.js) is apart: an undo never moves a
-// view, and Back never edits, so it never moves a cursor.
+// A plot's kind is the one thing both histories hold. Switching it is an
+// edit, which Ctrl+Z undoes, and it changes what one is looking at, so it
+// is a step here too: Back shows the plot as it was before the switch, its
+// kind with its view, and goes on through the steps before it. The rule
+// that keeps the two from disagreeing: the tab holds the kind, and only
+// edits change it. Back and Forward change a plot's kind by an edit of
+// their own (`edit`), a step undo takes back like the command's; and every
+// change of a plot's kind, by the command, an undo or a redo (`edited`),
+// is a step here, after the one Back is at, in place of those Forward had.
+// So the newest step always ends at the kind the plot has.
+//
+// Otherwise the edit history (history.svelte.js) is apart: an undo never
+// moves a view, and Back makes no other edit, so it never moves a cursor.
 
 import { SvelteMap } from 'svelte/reactivity';
 import { sameView } from './plot.js';
 import { VIEW_FIELDS } from './tabs.js';
+import { KINDS } from './constants.js';
+import { counted } from './menus.js';
 
 /** How long, in ms, wheel turns or keys rest before the next is a step of its own. */
 export const IDLE_MS = 500;
@@ -45,9 +58,9 @@ export const GONE = 'That moment is gone: showing the oldest data held';
 /** The entries of map `m` for `ids`. */
 const only = (m, ids) => new Map(ids.map((id) => [id, m.get(id)]));
 /** Whether plot states `a` and `b`, as `#read` gives them, show the same. */
-const same = (a, b) => sameView(a.view, b.view) && JSON.stringify(a.fields) === JSON.stringify(b.fields);
+const same = (a, b) => a.kind === b.kind && sameView(a.view, b.view) && JSON.stringify(a.fields) === JSON.stringify(b.fields);
 
-/** One tab's steps, each {before, after}: Maps of plot id to {view, fields}. */
+/** One tab's steps, each {before, after}: Maps of plot id to {view, fields, kind}. */
 class Steps {
   /** The steps Back goes through, oldest first. */
   backs = $state.raw([]);
@@ -65,10 +78,11 @@ export class ViewHistory {
    * `ws` is the page's Workspace and `views` its Views. `dropped(id)` is
    * the time before which the hub has dropped what it held of plot `id`'s
    * signals, or null when it has dropped none; `notice(text)` tells the
-   * person; `now()` is the page time, in ms.
+   * person; `now()` is the page time, in ms; `edit(label, fn)` runs `fn`
+   * as one edit named `label`, History's `group`.
    */
-  constructor(ws, views, { dropped = () => null, notice = () => {}, now = () => performance.now() } = {}) {
-    Object.assign(this, { ws, views, dropped, notice, now });
+  constructor(ws, views, { dropped = () => null, notice = () => {}, now = () => performance.now(), edit = (label, fn) => fn() } = {}) {
+    Object.assign(this, { ws, views, dropped, notice, now, edit });
   }
 
   /** Whether Back would change what the open tab shows. */
@@ -160,6 +174,24 @@ export class ViewHistory {
     this.#show(this.#read(ids.filter((id) => this.ws.plots[id])));
   }
 
+  /**
+   * Runs `fn`, an undo or a redo of the edit history, and returns what it
+   * returns. Each plot whose kind it changed has a step for that, in its
+   * tab, which Back crosses as it does the command's.
+   */
+  edited(fn) {
+    this.end();
+    this.#burst = null;
+    const before = this.ws.tabs.map((t) => [t.id, this.#read(Object.keys(t.plots))]);
+    const out = fn();
+    for (const [tab, was] of before) {
+      const plots = this.ws.tabs.find((t) => t.id === tab)?.plots ?? {}, after = this.#read(Object.keys(plots));
+      const switched = [...was.keys()].filter((id) => after.has(id) && after.get(id).kind !== was.get(id).kind);
+      if (switched.length) this.#push(tab, { before: only(was, switched), after: only(after, switched) });
+    }
+    return out;
+  }
+
   /** Lets go of the steps of every tab not in `tabs`, a Set of tab ids: those the tabs or an undo or redo hold. */
   prune(tabs) {
     for (const tab of [...this.#tabs.keys()]) if (!tabs.has(tab)) this.#tabs.delete(tab);
@@ -191,10 +223,19 @@ export class ViewHistory {
     return true;
   }
 
-  /** Shows `states`, by plot id, of the plots in the open tab, with the notice when the hub dropped where one starts. */
+  /** Shows `states`, by plot id, of the plots in the open tab, each as the kind it was, with the notice when the hub dropped where one starts. */
   #show(states) {
+    const here = [...states].filter(([id]) => this.ws.plots[id] && this.views.get(id));
+    // The plots it shows as the other kind are switched by one edit, named as the command's is.
+    const switched = here.filter(([id, s]) => s.kind !== this.ws.plots[id].kind);
+    if (switched.length) {
+      const name = KINDS.find(([kind]) => kind === switched[0][1].kind)?.[1] ?? switched[0][1].kind;
+      this.edit(switched.length > 1 ? `Kind ${name} (${counted(switched.length, 'plot')})` : `Kind ${name}`, () => {
+        for (const [id, s] of switched) this.ws.setPlot(id, { kind: s.kind });
+      });
+    }
     let lost = false;
-    for (const [id, s] of states) if (this.ws.plots[id] && this.views.get(id)) lost = this.#put(id, s) || lost;
+    for (const [id, s] of here) lost = this.#put(id, s) || lost;
     if (lost) this.notice(GONE);
   }
 
@@ -240,12 +281,12 @@ export class ViewHistory {
     return [...this.views.map].filter(([, v]) => targets.includes(v)).map(([id]) => id).sort();
   }
 
-  /** What plots `ids` that have a view show, by id: {view, fields}, its View state and its view fields. */
+  /** What plots `ids` that have a view show, by id: {view, fields, kind}, its View state, its view fields and its kind. */
   #read(ids) {
     const out = new Map();
     for (const id of ids) {
       const v = this.views.get(id), plot = this.ws.tabs.find((t) => t.plots[id])?.plots[id];
-      if (v) out.set(id, { view: v.state(), fields: Object.fromEntries([...VIEW_FIELDS].map((f) => [f, plot?.[f] ?? null])) });
+      if (v && plot) out.set(id, { view: v.state(), fields: Object.fromEntries([...VIEW_FIELDS].map((f) => [f, plot[f] ?? null])), kind: plot.kind });
     }
     return out;
   }

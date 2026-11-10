@@ -95,7 +95,7 @@
   const { hub, ws, history, registry, views } = getContext('page');
   setContext('history', history);
   views.onChange = viewChanged;
-  const viewHistory = new ViewHistory(ws, views, { dropped: droppedOf, notice: (text) => toast.warning(text) });
+  const viewHistory = new ViewHistory(ws, views, { dropped: droppedOf, notice: (text) => toast.warning(text), edit: (label, fn) => history.group(label, fn) });
   // What a press, a click, a key or an undo does to the plot selection: the Workspace's.
   const selection = ws.selection;
   selection.changed = () => refreshToolbar();
@@ -168,12 +168,15 @@
    * one step undo names `what`.
    */
   function eachPlot(ids, what, fn) {
-    history.group(ids.length > 1 ? `${what} (${plotsText(ids.length)})` : what, () => {
-      for (const i of ids) {
-        const patch = fn(ws.plots[i]);
-        if (patch) ws.setPlot(i, patch);
-      }
-    });
+    // A plot's kind is what one is looking at too: switching it is a view step, which Back crosses.
+    viewHistory.step(() =>
+      history.group(ids.length > 1 ? `${what} (${plotsText(ids.length)})` : what, () => {
+        for (const i of ids) {
+          const patch = fn(ws.plots[i]);
+          if (patch) ws.setPlot(i, patch);
+        }
+      }),
+    );
   }
   /** The views the toolbar acts on: those of the time plots it acts on. */
   function chosen() {
@@ -823,7 +826,8 @@
     if ((e.ctrlKey || e.metaKey) && !e.altKey && ['z', 'y'].includes(e.key.toLowerCase())) {
       e.preventDefault();
       const redo = e.key.toLowerCase() === 'y' || e.shiftKey;
-      const label = redo ? history.redo() : history.undo();
+      // A plot's kind an undo or a redo changes is a view step, as the command's is.
+      const label = viewHistory.edited(() => (redo ? history.redo() : history.undo()));
       if (label) toast(`${redo ? 'Redo' : 'Undo'}: ${label}`);
       return refreshToolbar();
     }

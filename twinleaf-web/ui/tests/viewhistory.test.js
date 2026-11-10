@@ -17,12 +17,13 @@
 // as it was, holding no history while it is gone and reading it again once
 // back, and Back goes on through its steps; when the hub has dropped where
 // its view starts meanwhile, it starts at the oldest time held, with the
-// notice, as Back's views do.
+// notice, as Back's views do. A kind switch is an edit and a view step:
+// Back crosses it and goes on, whatever undo and redo do between.
 import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, frames, mountPage, until, wait } from './harness/page.js';
+import { centre, frames, mountPage, pickItem, plotMenu, until, wait } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { GONE, IDLE_MS } from '../src/lib/viewhistory.svelte.js';
 
@@ -511,6 +512,51 @@ describe('a plot closed and brought back by Ctrl+Z', () => {
       expect(v.right - v.span).toBeCloseTo(start + 1);
       expect(v.right).toBeLessThanOrEqual(p.hub.now(performance.now()));
       expect(document.body.textContent).toContain(GONE);
+    } finally {
+      p.dispose();
+    }
+  });
+});
+
+describe('a kind switch', () => {
+  it('is an edit and a view step: Back crosses it and goes on through the time steps before it, and undo and redo never leave the two at odds', async () => {
+    const p = await page();
+    try {
+      const id = plotIds(p.ws.layout)[0], kind = () => p.ws.plots[id].kind;
+      const keys = async (k) => (await until(() => !document.querySelector('[role=menu]')), await commands.key(k), flushSync(), await frames());
+      const start = one(p, id);
+      await dragOn(id, 120);
+      const panned = one(p, id);
+      await plotMenu(id);
+      await pickItem('Kind', 'Spectrum');
+      expect(kind(), 'switched').toBe('spectrum');
+      expect(p.history.undos.at(-1).label).toBe('Kind Spectrum');
+      // Back crosses the switch, by an edit of its own, then goes on through the pan before it.
+      await press(id, 'Back');
+      expect([kind(), one(p, id)], 'Back across the switch').toEqual(['time', panned]);
+      expect(p.history.undos.at(-1).label, 'Back’s kind change is an edit').toBe('Kind Time');
+      await press(id, 'Back');
+      expect([kind(), one(p, id)], 'Back on, past the pan').toEqual(['time', start]);
+      await press(id, 'Forward');
+      await press(id, 'Forward');
+      expect([kind(), one(p, id)], 'Forward, twice').toEqual(['spectrum', panned]);
+      // Ctrl+Z undoes Forward's kind change; that is a step too, so Back shows the spectrum again.
+      await keys('Control+z');
+      expect(kind(), 'undone').toBe('time');
+      expect(button(id, 'Forward').disabled, 'nothing ahead of what an undo showed').toBe(true);
+      await press(id, 'Back');
+      expect(kind(), 'Back from what the undo showed').toBe('spectrum');
+      await press(id, 'Forward');
+      expect(kind()).toBe('time');
+      // Redo: Back's own edit emptied it, so the kind stays, and the two still agree.
+      await keys('Control+y');
+      expect(kind(), 'nothing to redo').toBe('time');
+      await press(id, 'Back');
+      await keys('Control+z');
+      await keys('Control+y');
+      expect(kind(), 'undo, then redo, of Back’s switch').toBe('spectrum');
+      await press(id, 'Back');
+      expect(kind(), 'and Back crosses the redo').toBe('time');
     } finally {
       p.dispose();
     }

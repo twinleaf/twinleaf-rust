@@ -479,3 +479,61 @@ describe('a plot closed and brought back by undo', () => {
     expect(views.get(ids[0])).toBeUndefined();
   });
 });
+
+// A kind switch is an edit, which Ctrl+Z undoes, and a view step, which Back
+// crosses: random runs of switches, pans, another edit, Back, Forward, undo
+// and redo on one plot. The model is the list of what the plot showed, its
+// kind and its view, after each change of either, however made: by the
+// command, by an undo or by a redo. Back shows the entry before and Forward
+// the one after, and the two histories never disagree: the plot's kind is
+// always the edit history's, and always the entry's the model is at.
+describe('a kind switch', () => {
+  const act = fc.constantFrom('switch', 'switch', 'pan', 'legend', 'back', 'back', 'forward', 'undo', 'undo', 'redo');
+  it('is a step Back and Forward cross, going on through the steps before it, whatever undo and redo do between', () => {
+    const count = { crossed: 0, wentOn: 0, undone: 0, redone: 0 };
+    fc.assert(
+      fc.property(fc.array(act, { minLength: 4, maxLength: 24 }), (acts) => {
+        const { ws, views, hub, t } = setup(), id = Object.keys(ws.plots)[0], v = views.get(id);
+        const history = new History(ws, new Favorites(null));
+        const vh = new ViewHistory(ws, views, { now: () => t.ms, edit: (label, fn) => history.group(label, fn) });
+        const seen = () => JSON.stringify([ws.plots[id].kind, v.live, v.live ? null : v.right, v.span]);
+        const line = [seen()];
+        let at = 0;
+        /** A change of what the plot shows is an entry after the one it is at, in place of those Forward had. */
+        const changed = () => {
+          if (seen() === line[at]) return false;
+          line.splice(at + 1, Infinity, seen());
+          at++;
+          return true;
+        };
+        let crossedLast = false;
+        const run = (a) => {
+          t.ms += 1000;
+          if (a === 'switch') vh.step(() => history.group('Kind', () => ws.setPlot(id, { kind: ws.plots[id].kind === 'time' ? 'spectrum' : 'time' })));
+          else if (a === 'pan') vh.step(() => v.pan(-0.1, t.ms));
+          else if (a === 'legend') history.group('Legend', () => ws.setPlot(id, { legend: !ws.plots[id].legend }));
+          else if (a === 'undo' || a === 'redo') vh.edited(() => history[a]());
+          if (a === 'back' || a === 'forward') {
+            const by = a === 'back' ? -1 : 1, can = at + by >= 0 && at + by < line.length;
+            const was = JSON.parse(line[at])[0];
+            expect(vh[a](), a).toBe(can);
+            if (can) at += by;
+            const crossed = can && JSON.parse(line[at])[0] !== was;
+            if (crossed) count.crossed++;
+            // A Back past a step of the view alone, straight after one across a switch.
+            else if (can && a === 'back' && crossedLast) count.wentOn++;
+            crossedLast = crossed && a === 'back';
+          } else if (changed() && (a === 'undo' || a === 'redo')) count[a === 'undo' ? 'undone' : 'redone']++;
+          expect(seen(), `${a}: what the plot shows`).toBe(line[at]);
+          expect([vh.canBack, vh.canForward], `${a}: Back and Forward`).toEqual([at > 0, at < line.length - 1]);
+          // Never past the newest samples, whatever was restored.
+          if (!v.live) expect(v.right).toBeLessThanOrEqual(hub.now(t.ms));
+        };
+        acts.forEach(run);
+        // Then all the way back, through every step made.
+        while (at > 0) run('back');
+      }),
+    );
+    for (const [rule, n] of Object.entries(count)) expect(n, rule).toBeGreaterThan(3);
+  });
+});
