@@ -126,7 +126,9 @@ const DRAGS = {
     const from = ids[a % ids.length], item = page.ws.plots[from].items[0];
     const onto = leafOf(plotIds(page.ws.layout)[b % 4]);
     const to = b % 2 ? centre(onto.querySelector('.trace-zone')) : centre(onto.querySelector('.plot-body'));
-    await drag(centre(document.getElementById(`chip-${item.id}`)), to, [centre(onto.querySelector('.trace-zone'))], 200);
+    // By its left end: in a narrow plot the Add button lies over the rest of a long chip.
+    const chip = document.getElementById(`chip-${item.id}`).getBoundingClientRect();
+    await drag([chip.left + 10, chip.top + chip.height / 2], to, [centre(onto.querySelector('.trace-zone'))], 200);
     await dropped();
   },
   async tab(page, a) {
