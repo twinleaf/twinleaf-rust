@@ -178,15 +178,19 @@ export class Selection {
     return scope === 'view' ? this.all() : [];
   }
 
-  /** What an undo step keeps of the selection. */
+  /** What an undo step keeps of the selection: the plots, the plot clicked last and the rows picked. */
   snapshot() {
-    return { selected: [...this.plots], focusedId: this.last };
+    return { selected: [...this.plots], focusedId: this.last, rows: this.#picks, rowAt: this.#at };
   }
 
-  /** Puts back what `snapshot` gave, less the plots that are gone. */
+  /**
+   * Puts back what `snapshot` gave, less the plots that are gone: its plots,
+   * or else its row picks, of which those the page shows are the rows picked.
+   */
   restore(s) {
     const ids = s.selected.filter((id) => this.exists(id));
-    if (ids.length) this.#setRows([]);
+    this.#setRows(ids.length ? [] : (s.rows ?? []));
+    if (!ids.length && s.rows?.length) this.#at = s.rowAt ?? null;
     this.#setPlots(ids, this.exists(s.focusedId) ? s.focusedId : null);
   }
 

@@ -14,6 +14,7 @@ import { DOUBLE_CLICK_MS, Selection } from '../src/lib/selection.svelte.js';
 afterEach(() => vi.useRealTimers());
 
 const IDS = ['a', 'b', 'c', 'd'];
+const ROWS = ['s:gain', 's:offset', 'r:temp'];
 /** An element a press can land on: on a plot, in a keeper, in a table of rows, or elsewhere. */
 function element(where) {
   const outer = document.createElement('div');
@@ -31,7 +32,8 @@ const act = fc.oneof(
   fc.record({ t: fc.constant('click'), at: fc.nat(), shift: fc.boolean(), clicks: fc.constantFrom(1, 2) }),
   fc.record({ t: fc.constant('arrived'), at: fc.nat() }),
   fc.record({ t: fc.constant('only'), ids: fc.subarray(IDS) }),
-  fc.record({ t: fc.constant('rows'), keys: fc.subarray(['s:gain', 's:offset', 'r:temp']) }),
+  fc.record({ t: fc.constant('rows'), keys: fc.subarray(ROWS) }),
+  fc.record({ t: fc.constant('unrow'), key: fc.constantFrom(...ROWS) }),
   fc.record({ t: fc.constant('snapshot') }),
   fc.record({ t: fc.constant('restore') }),
   fc.record({ t: fc.constant('remove'), at: fc.nat() }),
@@ -46,6 +48,10 @@ describe('the Selection, against a model of it', () => {
         vi.useFakeTimers();
         const plots = new Set(IDS);
         const s = new Selection((id) => plots.has(id), () => [...plots]);
+        // The rows on the page; a row goes as its device's property does.
+        const rows = new Set(ROWS);
+        const show = () => (s.rowOrder = () => [...rows]);
+        show();
         let saved = s.snapshot();
         let narrowing = null; // the plot a click will narrow to, if nothing comes first
         const pick = (k) => [...plots][k % Math.max(1, plots.size)];
@@ -85,13 +91,23 @@ describe('the Selection, against a model of it', () => {
             expect([...s.plots].sort()).toEqual([...ids].sort());
           } else if (a.t === 'rows') {
             s.pickRows(a.keys);
-            expect([...s.rows].sort()).toEqual([...a.keys].sort());
+            expect([...s.rows].sort()).toEqual(a.keys.filter((k) => rows.has(k)).sort());
             expect(s.plots.size).toBe(0);
           } else if (a.t === 'snapshot') saved = s.snapshot();
           else if (a.t === 'restore') {
             s.restore(saved);
-            expect([...s.plots].sort()).toEqual(saved.selected.filter((i) => plots.has(i)).sort());
-          } else if (a.t === 'remove' && id) {
+            const back = saved.selected.filter((i) => plots.has(i));
+            expect([...s.plots].sort()).toEqual(back.sort());
+            // Rows never go with plots: with plots back, none is picked.
+            if (back.length) expect(s.rows.size).toBe(0);
+            // With no plot back, the rows picked come back, those still on the page.
+            else expect([...s.rows].sort()).toEqual(saved.rows.filter((k) => rows.has(k)).sort());
+          } else if (a.t === 'unrow') {
+            // The page shows its rows anew.
+            rows.delete(a.key);
+            show();
+          }
+          else if (a.t === 'remove' && id) {
             plots.delete(id);
             s.prune();
             if (narrowing === id) narrowing = null;
@@ -117,6 +133,14 @@ describe('the Selection, against a model of it', () => {
         document.body.replaceChildren();
         vi.useRealTimers();
       }),
+      {
+        examples: [
+          // A plot that goes between the snapshot and the restore is not selected again.
+          [[{ t: 'only', ids: ['a', 'b'] }, { t: 'snapshot' }, { t: 'remove', at: 0 }, { t: 'restore' }]],
+          // Nor is a row whose property went.
+          [[{ t: 'rows', keys: ['s:gain', 'r:temp'] }, { t: 'snapshot' }, { t: 'unrow', key: 's:gain' }, { t: 'only', ids: ['a'] }, { t: 'restore' }]],
+        ],
+      },
     );
   });
 });
