@@ -110,7 +110,7 @@
                 {#if renaming === t.id}
                   <!-- svelte-ignore a11y_autofocus -->
                   <input
-                    class="w-32 rounded border border-ring bg-background px-1 text-sm outline-none"
+                    class="w-32 rounded border border-input bg-background px-1 text-sm outline-none"
                     value={t.name}
                     autofocus
                     onclick={(e) => e.stopPropagation()}

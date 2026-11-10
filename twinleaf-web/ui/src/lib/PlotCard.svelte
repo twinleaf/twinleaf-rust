@@ -767,7 +767,7 @@
           >
             {#each zoneItems as item, i (item.id)}
               {@const r = legend.rows[item.key]}
-              <div id="chip-{item.id}" data-key={item.key} class:hidden-signal={item.hidden} class="trace-chip" class:ghost={item[SHADOW]} class:active={zoneFocused && i === active} class:unscaled={axisless(item.key)} role="option" aria-selected={zoneFocused && i === active} style="--c:{colorFor(item.key)}" title={axisless(item.key) ? 'No axis of its own: drag it beside the plot\'s left or right edge to give it one' : r?.info}>
+              <div id="chip-{item.id}" data-key={item.key} class:hidden-signal={item.hidden} class="trace-chip" class:ghost={item[SHADOW]} data-menu-for={signalsOpen && menuChip === item.key ? '' : undefined} class:unscaled={axisless(item.key)} role="option" aria-selected={zoneFocused && i === active} style="--c:{colorFor(item.key)}" title={axisless(item.key) ? 'No axis of its own: drag it beside the plot\'s left or right edge to give it one' : r?.info}>
                 <Swatch key={item.key} />
                 <span class="name">{item.key}</span>
                 {#if unitsShown(item.key)}<span class="units">{unitsShown(item.key)}</span>{/if}

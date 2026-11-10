@@ -86,6 +86,8 @@
   let menuKey = $state(null); // the signal a right-click opened the menu for
   let active = $state(0);
   let focused = $state(false);
+  /** Whether the search has focus, where Enter adds the signal the arrows are on. */
+  let searching = $state(false);
   let search = $state(null);
   let list = $state(null);
   /** Shows the row the arrows are on, however the list got focus, and brings it into view. */
@@ -135,8 +137,8 @@
   title="Drag a signal onto the plots, or click it to add it to the selected ones"
   aria-label="Search signals: arrows move, Enter adds to the selected plots, Shift+Enter makes a new one"
   onkeydown={searchKey}
-  onfocus={() => (focused = true)}
-  onblur={() => (focused = false)}
+  onfocus={() => (focused = searching = true)}
+  onblur={() => (focused = searching = false)}
 />
 <!-- A signal's menu: where it goes, its colour, its name. -->
 <ContextMenu.Root bind:open={menuOpen}>
@@ -170,7 +172,8 @@
         id="pal-{item.id}"
         data-key={item.key}
         class="chip"
-        class:active={(focused && i === active) || (menuOpen && item.key === menuKey)}
+        class:chosen={searching && i === active}
+        data-menu-for={menuOpen && item.key === menuKey ? '' : undefined}
         role="option"
         aria-selected={focused && i === active}
         tabindex="-1"
