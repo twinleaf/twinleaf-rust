@@ -2,7 +2,7 @@ import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
-import { key, mouse } from './test/browser/commands.js';
+import { key, mouse } from './tests/harness/commands.js';
 
 /** A count from the environment, `fallback` when unset; anything but a positive integer is refused. */
 function count(name, fallback) {
@@ -23,25 +23,26 @@ export default defineConfig({
   resolve: { alias: { $lib: path.resolve('./src/lib') } },
   test: {
     // FC_RUNS sets how many cases each property tries; FC_SEED and FC_PATH
-    // name a failure to replay. They reach test/setup.js in either project.
+    // name a failure to replay. They reach tests/setup.js in either project.
     provide: { fc: { runs: count('FC_RUNS', 100), seed: process.env.FC_SEED === undefined ? undefined : +process.env.FC_SEED, path: process.env.FC_PATH } },
-    setupFiles: ['test/setup.js'],
-    // Unit tests run Svelte's client runtime in jsdom, where effects run and
-    // state is proxied as on the page; browser tests run in a real browser.
+    setupFiles: ['tests/setup.js'],
+    // A module's own tests sit beside it in src and run Svelte's client
+    // runtime in jsdom, where effects run and state is proxied as on the
+    // page. The tests in tests/ drive the whole page in a real browser.
     projects: [
       {
         extends: true,
         resolve: { conditions: ['browser'] },
-        test: { name: 'unit', environment: 'jsdom', include: ['test/**/*.test.js'], exclude: ['test/**/*.browser.test.js'] },
+        test: { name: 'unit', environment: 'jsdom', include: ['src/**/*.test.js'] },
       },
       {
         extends: true,
         // The page's dependencies are bundled before the first test imports
         // them, so none is found late and reloads the test.
-        optimizeDeps: { entries: ['src/main.js', 'test/**/*.browser.test.js'] },
+        optimizeDeps: { entries: ['src/main.js', 'tests/**/*.test.js'] },
         test: {
           name: 'browser',
-          include: ['test/**/*.browser.test.js'],
+          include: ['tests/**/*.test.js'],
           browser: {
             enabled: true,
             provider: 'playwright',
