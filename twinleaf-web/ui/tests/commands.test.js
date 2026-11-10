@@ -122,8 +122,8 @@ describe('a plot command', () => {
           /** Makes an origin's gesture, `act`, on the selection, and checks that the command ran once on `want`, or with none and not `empty`, not at all. */
           const check = async (origin, want, act) => {
             await closeAll();
-            // The palette, closed, fades out over the page.
-            await until(() => !document.querySelector('[data-slot=dialog-overlay]'), 2000);
+            // The palette, closed, fades out over the page, and takes every press until it has gone.
+            expect(await until(() => !document.querySelector('[data-slot=dialog-overlay]'), 2000), `the palette gone before ${id} from ${origin}`).toBe(true);
             await focusPage();
             page.ws.selection.only(picked);
             document.activeElement?.blur();
@@ -156,14 +156,18 @@ describe('a plot command', () => {
               const item = document.querySelector(`[data-slot=command-item][data-value^="command ${id} "]`);
               // A command with no plots to act on now is not offered.
               expect(!!item, `${id} offered with ${picks} selected`).toBe(fromPage.length > 0);
-              if (!item) return false;
+              // The palette that offers nothing to pick is closed as it was opened, by a key.
+              if (!item) {
+                await pressKey('Escape');
+                return false;
+              }
               item.click();
               await settle();
             });
           }
         }),
-        // Each command on a plot in a selection of two, then random cases.
-        withExamples(COMMANDS.map((c) => [c.id, [0, 3], 0])),
+        // A command the palette does not offer, then one whose first origin is a plot's header; each command on a plot in a selection of two; then random cases.
+        withExamples([['splitRight', [], 0], ['pause', [3], 0], ...COMMANDS.map((c) => [c.id, [0, 3], 0])]),
       );
     } finally {
       restore();
