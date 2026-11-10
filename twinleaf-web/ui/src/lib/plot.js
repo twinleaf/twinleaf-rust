@@ -1303,12 +1303,14 @@ export class PlotView {
    * has the axis, and for WINDOW_SHOWN_MS after the window changes.
    */
   drawWindow(ctx, T, P, historyOpen, frameAt) {
-    if (this.shownSpan !== this.view.span) {
+    // It reads the seconds shown, and shows itself as the span asked of the view changes.
+    const span = this.view.shown(frameAt), asked = this.view.span;
+    if (this.shownSpan !== asked) {
       if (this.shownSpan !== undefined) this.windowUntil = frameAt + WINDOW_SHOWN_MS;
-      this.shownSpan = this.view.span;
+      this.shownSpan = asked;
     }
     if (historyOpen || (this.axisHover === null && !(frameAt < this.windowUntil))) return;
-    const text = `${windowText(this.view.span)} s`, H = 16;
+    const text = `${windowText(span)} s`, H = 16;
     const w = ctx.measureText(text).width + 22, x = P.x + P.w - w, y = P.y + P.h + 3;
     ctx.fillStyle = T.tipBg;
     ctx.fillRect(x, y, w, H);
@@ -2088,7 +2090,7 @@ export class View {
   live = true;
   /** The seconds a live view shows, which the window setting sets. A paused view keeps it to go back to. */
   window = 10;
-  /** The seconds the view shows now. While live it is the window. */
+  /** The seconds asked of the view. Paused, it shows them. Live, they are its window, and it shows as much of them as its limits allow (`shown`). */
   span = 10;
   delay = 0.15;
   right = 0; // device time of the right edge when paused
@@ -2105,9 +2107,45 @@ export class View {
     this.hub = hub;
   }
 
+  // What a view shows lies within its limits, [the oldest time it can show,
+  // its time], however it is set: `fit` is the one clamp. A paused view's
+  // limits stand still, so `keepWithin` holds its span and its right edge
+  // to them as each is set. A live view's limits move with the clock and
+  // widen as a hub fills, so it keeps the span asked of it and shows as
+  // much of that as its limits allow whenever it is read (`shown`,
+  // `range`): on a hub that holds less than its window it shows what is
+  // held, and its window again once the hub holds that much.
+
+  /** `span`, or the width of `limits` when that is less, never under the narrowest span. */
+  static fit(span, limits) {
+    return limits ? Math.min(span, Math.max(WINDOW_LIMITS[0], limits[1] - limits[0])) : span;
+  }
+
+  /** [oldest, newest] of what a view whose time is device time `time` can show, or null when nothing before it can be. */
+  limitsAt(time) {
+    const { oldest, history } = this.held();
+    const from = oldestShown(oldest, time, history, this.pausedHistory);
+    return from !== null && from < time ? [from, time] : null;
+  }
+
+  /** The times the view shows at device time `now`. */
   range(now) {
     const right = this.live ? now - this.delay : this.right;
-    return [right - this.span, right];
+    return [right - (this.live ? View.fit(this.span, this.limitsAt(right)) : this.span), right];
+  }
+
+  /** The seconds the view shows at page time `perf`: its span, within its limits. */
+  shown(perf) {
+    return this.live ? View.fit(this.span, this.limits(perf)) : this.span;
+  }
+
+  /**
+   * The seconds of its window the view can show at page time `perf`: what
+   * the window field and slider read. The window asked for is kept, and
+   * reads again once the limits hold it.
+   */
+  windowShown(perf) {
+    return View.fit(this.window, this.limits(perf));
   }
 
   /**
@@ -2131,8 +2169,7 @@ export class View {
    * stays within it. Null when no time before the view's can be shown.
    */
   limits(perf) {
-    const oldest = this.oldest(perf), time = this.time(perf);
-    return oldest !== null && oldest < time ? [oldest, time] : null;
+    return this.limitsAt(this.time(perf));
   }
 
   /**
@@ -2143,23 +2180,24 @@ export class View {
    * never sends a held history off streaming; going live is the history
    * bar's end, or Follow live. A zoom that leaves the view live sets its
    * window; one that pauses it, or of a paused view, leaves the window as it
-   * was, for going live again. It goes as wide as what the view can show,
-   * and live no wider than the decimation keeps; a live window wider than
-   * what the hub holds yet is not narrowed by zooming out.
+   * was, for going live again. It zooms what the view shows, as wide as
+   * what the view can show, and live no wider than the decimation keeps. A
+   * zoom out of a live view that shows all it can already changes nothing:
+   * its window stays as asked.
    */
   zoom(factor, anchor, perf, edge = LIVE_EDGE) {
     const limits = this.limits(perf), held = limits ? limits[1] - limits[0] : WINDOW_LIMITS[1];
-    const widest = this.live ? Math.max(this.span, Math.min(this.liveSeconds(), held)) : held;
-    const span = Math.min(widest, Math.max(WINDOW_LIMITS[0], this.span * factor));
+    const widest = this.live ? Math.min(this.liveSeconds(), held) : held;
+    const shown = this.shown(perf);
+    const span = Math.min(widest, Math.max(WINDOW_LIMITS[0], shown * factor));
     if (this.live && factor < 1 && anchor < edge) this.pause(perf);
     if (!this.live) {
       // It stays within what has arrived: zooming out past the newest
       // sample widens it into the past instead.
       const at = this.right - (1 - anchor) * this.span;
       this.right = Math.min(this.hub.now(perf) - this.delay, at + (1 - anchor) * span);
-    }
-    this.span = span;
-    if (this.live) this.window = span;
+      this.span = span;
+    } else if (span !== shown) this.window = this.span = span;
     this.keepWithin();
     this.notify();
   }
@@ -2169,12 +2207,16 @@ export class View {
     return this.hub.liveSeconds?.() ?? WINDOW_LIMITS[1];
   }
 
-  /** Keeps a paused view within its limits, the history its plot captured. */
+  /**
+   * Keeps a paused view within its limits, the history its plot captured:
+   * every way of setting a paused view's span or its right edge ends here.
+   * A live view is kept within its own as it is read.
+   */
   keepWithin() {
     const limits = this.live ? null : this.limits();
     if (!limits) return;
     const [lo, hi] = limits;
-    this.span = Math.min(this.span, Math.max(WINDOW_LIMITS[0], hi - lo));
+    this.span = View.fit(this.span, limits);
     this.right = Math.min(hi, Math.max(lo + this.span, this.right));
   }
 
@@ -2189,9 +2231,10 @@ export class View {
     this.notify();
   }
 
-  /** Holds the view where it is; samples keep arriving behind it. */
+  /** Holds the view where it is, at the span it shows; samples keep arriving behind it. */
   pause(perf) {
     if (!this.live) return;
+    this.span = this.shown(perf);
     this.right = this.hub.now(perf) - this.delay;
     this.pausedAt = this.right;
     this.pausedHistory = this.held().history;
@@ -2254,13 +2297,17 @@ export class View {
   /**
    * Shows `s`, a value `state` gave, again at page time `perf`: a live
    * one follows the newest samples, and a paused one ends no later than
-   * they do, with the History setting of the pause `s` was taken in. A y range it does not hold fits itself to the data again.
+   * they do, with the History setting of the pause `s` was taken in, within
+   * its limits. One whose start the hub has dropped is left for `startHeld`
+   * to move, which says that it did. A y range it does not hold fits itself
+   * to the data again.
    */
   restore(s, perf) {
     const newest = this.hub.now(perf) - this.delay;
     Object.assign(this, { live: s.live, window: s.window, span: s.span });
     if (s.live) this.pausedAt = this.pausedHistory = null;
     else [this.right, this.pausedAt, this.pausedHistory] = [Math.min(s.right, newest), Math.min(s.pausedAt ?? s.right, newest), s.pausedHistory ?? null];
+    if (!this.held().dropped) this.keepWithin();
     this.yByKind = mapsOf(s.yRanges, (range) => ({ range: [...range], auto: false }));
     this.spectra = new Map(s.spectra ?? []);
     this.notify();
@@ -2269,19 +2316,18 @@ export class View {
   /**
    * Moves a paused view that starts before the oldest time its plot can
    * show, on a hub that has dropped samples of its signals, later to start
-   * there, ending no later than the newest samples at page time `perf`,
-   * and says whether it did. A view as `keepWithin` leaves it starts no
-   * earlier than that time, so it stays; and a view that starts before the
-   * first sample of a hub that has dropped none stays: nothing it showed is
-   * gone.
+   * there, ending no later than the newest samples at page time `perf` and
+   * within its limits, and says whether it did. A view as `keepWithin`
+   * leaves it starts no earlier than that time, so it stays.
    */
   startHeld(perf) {
     const oldest = this.oldest();
     if (this.live || oldest === null || !this.held().dropped) return false;
-    const newest = this.pausedAt ?? this.right;
+    const newest = this.pausedAt ?? this.right, now = this.hub.now(perf) - this.delay;
     if (this.span <= newest - oldest && this.right >= Math.min(newest, oldest + this.span)) return false;
-    this.right = Math.min(this.hub.now(perf) - this.delay, Math.max(this.right, oldest + this.span));
-    this.pausedAt = Math.max(this.pausedAt ?? this.right, this.right);
+    const span = View.fit(this.span, [oldest, now]), right = Math.min(now, Math.max(this.right, oldest + span));
+    if (span === this.span && right === this.right) return false;
+    Object.assign(this, { span, right, pausedAt: Math.max(this.pausedAt ?? right, right) });
     this.notify();
     return true;
   }

@@ -14,11 +14,16 @@
 // - the wheel, from the narrowest view to the widest and back about the
 //   same point, ends where it began;
 // - however long the span, the page asks the hub for a plot's width of
-//   points, and holds no more.
+//   points, and holds no more;
+// - on a hub a tenth full, half full and full, nothing is drawn before the
+//   oldest time held, live or paused, by the window set, a double-click,
+//   End, Back, Forward or the wheel, and a live plot regains a window wider
+//   than the hub held once the hub holds it.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { frames, HISTORY_HEADROOM, holdHistory, leafOf, mountPage, settle, turnWheel, wait, withExamples } from './harness/page.js';
+import { centre, frames, HISTORY_HEADROOM, holdHistory, leafOf, mountPage, pressKey, settle, turnWheel, until, wait, withExamples } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { WINDOW_LIMITS, windowText } from '../src/lib/window.js';
@@ -238,5 +243,69 @@ describe('a plot on a hub that holds hours', () => {
       // The widest view of a day at 100 rows a second is far more rows than that.
       if (history === 86400) expect(Math.max(...wide.map((a) => a.points))).toBeGreaterThan(width);
     }
+  }, 60_000);
+
+  it('draws nothing before the oldest time held, live or paused, however the view is set, and regains a window a filling hub comes to hold', async () => {
+    const pv = page.pv(id), history = 3600, WINDOW = 3000;
+    /** The seconds drawn a frame on, which start no earlier than the oldest time `hub` holds, to a pixel column. */
+    const drawn = async (hub, what) => {
+      await frames();
+      const { x0, x1 } = pv.drawn;
+      expect(x0, `${what}: drawn from ${x0}, held from ${hub.oldest}`).toBeGreaterThanOrEqual(hub.oldest - (x1 - x0) / pv.geo.plot.w);
+      return x1 - x0;
+    };
+    /** The toolbar's window, as it reads once it has read the views again. */
+    const reads = async () => {
+      await wait(600);
+      flushSync();
+      return document.querySelector('.window-button').textContent.trim();
+    };
+    const zoomIn = () => {
+      turnWheel(page, id, -400, { n: 4, at: 0.3 });
+      expect(view.live, 'a zoom in pauses').toBe(false);
+    };
+    for (const share of [0.1, 0.5, 1]) {
+      const hub = await live({ history, fill: share === 1 ? { full: true } : { full: false, share }, behind: 0, now: 100_000 });
+      const widest = Math.min(history, hub.now - view.delay - hub.oldest), most = Math.min(WINDOW, widest);
+      // The window field and the slider set it.
+      view.setSpan(WINDOW);
+      expect(await drawn(hub, `${share}: the window set`)).toBeCloseTo(most, 6);
+      expect(view.window, 'the window asked for is kept').toBe(WINDOW);
+      expect(await reads(), 'the toolbar reads what is shown').toBe(`${windowText(most)} s`);
+      zoomIn();
+      await drawn(hub, `${share}: zoomed in`);
+      // A double-click on the plot follows live at the window.
+      await commands.mouse([['dblclick', ...centre(leafOf(id).querySelector('.plot-body'))]]);
+      expect(await until(() => view.live), 'a double-click follows live').toBe(true);
+      expect(await drawn(hub, `${share}: a double-click`)).toBeCloseTo(most, 6);
+      expect(view.window).toBe(WINDOW);
+      // So does End.
+      zoomIn();
+      leafOf(id).querySelector('.plot-card').focus();
+      await pressKey('End');
+      expect(await until(() => view.live), 'End follows live').toBe(true);
+      expect(await drawn(hub, `${share}: End`)).toBeCloseTo(most, 6);
+      press('Back');
+      await drawn(hub, `${share}: Back`);
+      press('Forward');
+      expect(await drawn(hub, `${share}: Forward`)).toBeCloseTo(most, 6);
+      // All the way out, live and then paused, is what is held: the History on a full hub.
+      turnWheel(page, id, 400, { n: ALL_THE_WAY, at: 0.99 });
+      expect(view.live).toBe(true);
+      expect(await drawn(hub, `${share}: zoomed out, live`)).toBeCloseTo(widest, 6);
+      view.pause(clock.now());
+      turnWheel(page, id, 400, { n: ALL_THE_WAY });
+      expect(await drawn(hub, `${share}: zoomed out, paused`)).toBeCloseTo(widest, 6);
+      if (share === 1) expect(widest).toBe(history);
+    }
+    // A hub a tenth full fills: the window comes back with no input.
+    const hub = await live({ history, fill: { full: false, share: 0.1 }, behind: 0, now: 100_000 });
+    view.setSpan(1000);
+    const held = hub.now - view.delay - hub.oldest;
+    expect(await drawn(hub, 'a tenth full')).toBeCloseTo(held, 6);
+    expect(await reads()).toBe(`${windowText(held)} s`);
+    const fuller = holdHistory(page, { history, seconds: 2000, now: 100_000 });
+    expect(await drawn(fuller, 'holding the window')).toBeCloseTo(1000, 6);
+    expect(await reads()).toBe(`${windowText(1000)} s`);
   }, 60_000);
 });

@@ -391,7 +391,9 @@
   let windowSpan = $state(10);
 
   onMount(() => {
-    const poll = clock.every(LEGEND_MS, () => pv?.legend && (legend = pv.legend));
+    // The window read is what the view can show of it, which grows as a hub fills.
+    const readWindow = () => (windowSpan = view.windowShown(clock.now()));
+    const poll = clock.every(LEGEND_MS, () => (readWindow(), pv?.legend && (legend = pv.legend)));
     pv = new PlotView({
       body,
       overlay,
@@ -418,8 +420,8 @@
     });
     sizing.observe(card);
     streaming = view.live;
-    windowSpan = view.window;
-    const unwatch = view.onChange(() => ((streaming = view.live), (windowSpan = view.window)));
+    readWindow();
+    const unwatch = view.onChange(() => ((streaming = view.live), readWindow()));
     return () => {
       pv.letGo();
       clock.cancel(poll);

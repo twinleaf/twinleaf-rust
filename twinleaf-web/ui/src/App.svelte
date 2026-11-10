@@ -235,11 +235,15 @@
   const THEME_ICONS = { light: RiSun, dark: RiMoon, system: RiSystem };
   /** Each arrangement's picture in the Layout menu. */
   const ARRANGE_ICONS = { rows: RiRows, columns: RiColumns, grid: RiGridArrange, quadrants: RiQuadrants, focus: RiFocusArrange };
+  /** Reads the toolbar's window: what the first view it acts on can show of its window, which grows as a hub fills. */
+  function readWindow() {
+    const vs = chosen();
+    if (vs.length) span = +vs[0].windowShown(clock.now()).toFixed(3);
+  }
   /** Shows the views' state in the toolbar, and keeps every paused view's points. */
   function refreshToolbar() {
-    const vs = chosen();
     live = tabViews().every((v) => v.live);
-    if (vs.length) span = +vs[0].window.toFixed(3);
+    readWindow();
     // A paused time plot in a tab holds its points: a paused spectrum holds
     // the spectrum it shows, and a closed plot nothing.
     hub.hold(views.anyPaused((id) => plotAnywhere(id)?.kind === 'time'));
@@ -602,6 +606,7 @@
           gpu: renderer.gpu,
         };
         frames = 0; cpu = 0; upload = 0; last = perf; lastBytes = hub.bytes;
+        readWindow();
       }
       raf = clock.frame(loop);
     };

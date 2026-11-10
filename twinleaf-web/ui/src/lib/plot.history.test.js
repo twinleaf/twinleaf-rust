@@ -13,6 +13,10 @@
 //   `startHeld`, which moves only a view whose start the hub has dropped;
 // - a zoom from the narrowest view to the widest and back about one point
 //   ends where it began;
+// - whichever way a view is set, live or paused, on a hub a tenth full, half
+//   full or full, it never starts before the oldest time held, and a live
+//   one with a window wider than a filling hub holds regains it as the hub
+//   fills;
 // - the time axis's ticks and labels, and the texts that name a span, from
 //   2 ms to a day.
 import { describe, expect, it } from 'vitest';
@@ -165,14 +169,18 @@ describe('a view on a hub that holds hours', () => {
     );
   });
 
-  it('goes as wide as what a hub still filling holds, and live keeps a window wider than that', () => {
+  it('goes as wide as what a hub still filling holds, live and paused, and live keeps a window wider than that to show once it is held', () => {
     fc.assert(
       fc.property(history, deviceTime, filling, (h, now, share) => {
         const oldest = now - h * share, v = viewOn(now, { oldest, dropped: false, history: h }, h);
         const held = now - v.delay - oldest;
         for (let i = 0; i < 60; i++) v.zoom(2, 1, 0);
-        expect(v.span).toBe(Math.max(10, held));
+        expect(v.shown(0)).toBe(held);
+        expect(v.windowShown(0)).toBe(held);
+        expect(v.range(now)).toEqual([now - v.delay - held, now - v.delay]);
+        expect(v.window).toBe(Math.max(10, held));
         v.pause(0);
+        expect(v.span).toBe(held);
         for (let i = 0; i < 60; i++) v.zoom(2, 0.5, 0);
         expect(v.span).toBe(held);
         expect(v.right - v.span).toBeCloseTo(oldest, 5);
@@ -288,11 +296,14 @@ describe('a view on a hub that holds hours', () => {
     );
   });
 
-  it('stays, though it starts before the hub’s first sample, while the hub has dropped none', () => {
+  it('pauses at what it shows on a hub that holds less than its window, and put back wider starts at the hub’s first sample, with nothing gone', () => {
     const v = viewOn(1000, { oldest: 997, dropped: false, history: 600 });
     v.pause(0);
     const was = shows(v);
-    expect(v.right - v.span).toBeLessThan(997);
+    expect(v.right - v.span).toBe(997);
+    expect(v.window).toBe(10);
+    // A state of a view ten seconds wide, as one kept from a hub that held more.
+    v.restore({ ...v.state(), span: 10 }, 0);
     expect(v.startHeld(0)).toBe(false);
     expect(shows(v)).toEqual(was);
   });
@@ -331,6 +342,134 @@ describe('a view on a hub that holds hours', () => {
         expect(v.span).toBe(WINDOW_LIMITS[0]);
         // The same moment, to what a double at that time resolves over the turns made.
         expect(Math.abs(v.right - narrowest.right)).toBeLessThanOrEqual(100 * step(now));
+      }),
+    );
+  });
+});
+
+describe('what a view shows, live or paused, on a hub at any fill', () => {
+  /** The share of its History a hub holds: a tenth, a half, or all of it and the headroom. */
+  const fill = fc.constantFrom(0.1, 0.5, 1);
+  /**
+   * A view on a hub with History `h` that holds `share` of it at device
+   * time `now`, and `pass(seconds)`, which lets time go by: the hub fills,
+   * and drops what is older than its History and headroom, but nothing
+   * while the view is paused, as it holds its history for a paused plot.
+   */
+  function hubAt(h, now, share) {
+    const first = share === 1 ? filled(now, h) : now - h * share;
+    const v = viewOn(now, { oldest: first, dropped: share === 1, history: h }, h);
+    const pass = (seconds) => {
+      v.hub.at += seconds;
+      if (!v.live) return;
+      const oldest = Math.max(v.hubHolds.oldest, filled(v.hub.at, h));
+      v.hubHolds = { oldest, dropped: v.hubHolds.dropped || oldest > first, history: h };
+    };
+    return { v, pass };
+  }
+  /** Every way a view is set, sizes as shares of the History. */
+  const way = fc.oneof(
+    // A double-click and End go back to the window; Space goes on at the span shown.
+    fc.record({ t: fc.constant('follow'), restore: fc.boolean() }),
+    fc.record({ t: fc.constant('pause') }),
+    // The window field and the window slider.
+    fc.record({ t: fc.constant('window'), share: fc.double({ min: 0.001, max: 3, noNaN: true }) }),
+    fc.record({ t: fc.constant('zoom'), factor: fc.double({ min: 0.01, max: 100, noNaN: true }), anchor: fc.double({ min: 0, max: 1, noNaN: true }) }),
+    fc.record({ t: fc.constant('pan'), by: fc.double({ min: -3, max: 3, noNaN: true }) }),
+    // A range marked, from before what is held to after now.
+    fc.record({ t: fc.constant('show'), from: fc.double({ min: -2, max: 0.5, noNaN: true }), length: fc.double({ min: 0.001, max: 3, noNaN: true }) }),
+    // Back, Forward and a plot an undo brings back: a state the view was in, or one of a view wider than the History, live or paused.
+    fc.record({ t: fc.constant('back'), k: fc.nat(), wide: fc.boolean(), live: fc.boolean() }),
+    fc.record({ t: fc.constant('time'), share: fc.double({ min: 0, max: 0.6, noNaN: true }) }),
+  );
+  const within = (v, h) => {
+    const at = v.hub.at, tol = 16 * step(at), [left, right] = v.range(at);
+    expect(left, 'starts no earlier than the oldest held').toBeGreaterThanOrEqual(v.hubHolds.oldest - tol);
+    expect(right, 'ends no later than its time').toBeLessThanOrEqual(at - v.delay + tol);
+    expect(right - left, 'no wider than the History').toBeLessThanOrEqual(h + tol);
+  };
+
+  it('never starts before the oldest time held, whichever way it is set, and zoomed all the way out is what is held, the History exactly on a full hub', () => {
+    const seen = { live: 0, paused: 0, follow: 0, back: 0 };
+    fc.assert(
+      fc.property(history, deviceTime, fill, fc.array(way, { maxLength: 16 }), (h, now, share, ways) => {
+        const { v, pass } = hubAt(h, now, share), kept = [v.state()];
+        within(v, h);
+        for (const a of ways) {
+          if (a.t === 'follow') v.follow(a.restore);
+          else if (a.t === 'pause') v.pause(0);
+          else if (a.t === 'window') v.setSpan(a.share * h);
+          else if (a.t === 'zoom') v.zoom(a.factor, a.anchor, 0);
+          else if (a.t === 'pan') v.pan(a.by, 0);
+          else if (a.t === 'show') v.show(v.hub.at + a.from * h, v.hub.at + (a.from + a.length) * h, 0);
+          else if (a.t === 'time') pass(a.share * h);
+          else {
+            const at = v.hub.at - v.delay;
+            const wide = a.live ? { ...kept[0], live: true, window: 5 * h, span: 5 * h } : { ...kept[0], live: false, span: 2 * h, right: at, pausedAt: at, pausedHistory: h };
+            // As the view history puts a view back.
+            v.restore(a.wide ? wide : kept[a.k % kept.length], 0);
+            v.startHeld(0);
+            seen.back++;
+          }
+          if (a.t === 'follow') seen.follow++;
+          kept.push(v.state());
+          within(v, h);
+          seen[v.live ? 'live' : 'paused']++;
+        }
+        // All the way out, by the wheel.
+        for (let i = 0; i < 60; i++) v.zoom(2, v.live ? 1 : 0.5, 0);
+        within(v, h);
+        const [left, right] = v.range(v.hub.at), time = v.time(0), held = time - v.hubHolds.oldest;
+        expect(Math.abs(right - left - Math.min(held, v.pausedHistory ?? h, h)), 'as wide as what is held, or the History').toBeLessThanOrEqual(16 * step(v.hub.at));
+        if (share === 1) expect(Math.abs(right - left - Math.min(v.pausedHistory ?? h, h))).toBeLessThanOrEqual(16 * step(v.hub.at));
+      }),
+      { numRuns: 400 },
+    );
+    for (const k of Object.keys(seen)) expect(seen[k], k).toBeGreaterThan(0);
+  });
+
+  it('following live at a window of 366 s, as a double-click and End do, on a hub that holds 150 s, shows the 150 s and reads so', () => {
+    const v = viewOn(1000, { oldest: 850, dropped: false, history: 3600 }, 3600);
+    v.window = 366;
+    v.pause(0);
+    v.zoom(0.5, 0.3, 0);
+    v.follow(true);
+    expect(v.range(1000)).toEqual([850, 1000 - v.delay]);
+    expect(v.shown(0)).toBe(1000 - v.delay - 850);
+    expect(v.windowShown(0)).toBe(1000 - v.delay - 850);
+    expect(v.window).toBe(366);
+    // Zooming out from there changes nothing, the window least of all.
+    v.zoom(2, 1, 0);
+    expect(v.range(1000)).toEqual([850, 1000 - v.delay]);
+    expect(v.window).toBe(366);
+  });
+
+  it('live, with a window wider than a filling hub holds, shows what is held and regains its window as the hub fills, with no input', () => {
+    fc.assert(
+      fc.property(history, deviceTime, fc.constantFrom(0.1, 0.5), fc.double({ min: 0.05, max: 0.95, noNaN: true }), fc.constantFrom('window', 'double-click', 'back'), (h, now, share, more, by) => {
+        const { v, pass } = hubAt(h, now, share), held = now - v.delay - v.hubHolds.oldest;
+        // A window between what is held and the History.
+        const asked = held + more * (h - held);
+        if (by === 'window') v.setSpan(asked);
+        else if (by === 'double-click') {
+          v.window = asked;
+          v.pause(0);
+          v.follow(true);
+        } else v.restore({ ...v.state(), window: asked, span: asked }, 0);
+        expect(v.live).toBe(true);
+        expect(v.window, 'the window asked for is kept').toBe(asked);
+        const [left, right] = v.range(now);
+        expect(left, 'starts at the oldest held').toBeCloseTo(v.hubHolds.oldest, 6);
+        expect(right).toBe(now - v.delay);
+        // Half the time it takes to hold the window: it shows all that is held, still short of it.
+        pass((asked - held) / 2);
+        expect(v.range(v.hub.at)[0]).toBeCloseTo(v.hubHolds.oldest, 6);
+        // And once the hub holds the window, the window, exactly.
+        pass((asked - held) / 2 + 1);
+        const shown = v.range(v.hub.at);
+        expect(shown[1] - shown[0]).toBe(v.hub.at - v.delay - (v.hub.at - v.delay - asked));
+        expect(shown[0]).toBe(v.hub.at - v.delay - asked);
+        expect(v.window).toBe(asked);
       }),
     );
   });

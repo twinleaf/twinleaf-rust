@@ -158,13 +158,19 @@ describe('view history, against a model of its rules', () => {
           const m = model.get(ws.activeId);
           return { tab: ws.activeId, kind, targets, last: t.ms, at: m.at, base: tabShows(), forwards: m.line.slice(m.at + 1) };
         };
-        /** What showing entry `s` of plot `id` shows: a paused time plot whose start the hub dropped starts at the oldest it holds, never past the newest samples. */
+        /** What showing entry `s` of plot `id` shows: a paused time plot whose start the hub dropped starts at the oldest it holds, no wider than what is held, never past the newest samples. */
         const restored = (id, s) => {
           const v = JSON.parse(s), p = ws.plots[id], d = dropped(), newest = hub.now(t.ms) - views.get(id).delay;
           if (v.live || p.kind !== 'time') return [s, false];
-          let { right, pausedAt } = v, moved = false;
-          if (d !== null && right - v.span < d) (moved = Math.max(right, d + v.span) > right), (right = Math.max(right, d + v.span)), (pausedAt = Math.max(pausedAt, right));
-          return [JSON.stringify({ ...v, right: Math.min(right, newest), pausedAt: Math.min(pausedAt, newest) }), moved];
+          let { span, right, pausedAt } = v, moved = false;
+          right = Math.min(right, newest);
+          pausedAt = Math.min(pausedAt, newest);
+          if (d !== null && right - span < d) {
+            const fits = Math.min(span, newest - d), to = Math.min(newest, Math.max(right, d + fits));
+            moved = fits !== span || to !== right;
+            if (moved) [span, right, pausedAt] = [fits, to, Math.max(pausedAt, to)];
+          }
+          return [JSON.stringify({ ...v, span, right, pausedAt }), moved];
         };
         /** Back or Forward in the model: the plots the gesture of the entry gone past moved, as the entry `by` along shows them. */
         const go = (by) => {
