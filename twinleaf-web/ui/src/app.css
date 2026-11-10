@@ -1,6 +1,8 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn-svelte/tailwind.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -10,10 +12,11 @@
    .dark on the page's root, which prefs.svelte.js sets, the dark. */
 :root {
 	color-scheme: light;
-	/* The system's own faces: SF on a Mac, Segoe on Windows. Numbers that
-	   must line up use the data face. */
-	--font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
-	--font-data: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+	/* The page's own faces, shipped with it, so text is as wide on every
+	   system; the system's stand in until they load. Numbers that must line
+	   up use the data face. */
+	--font-ui: "Geist Variable", -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+	--font-data: "Geist Mono Variable", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
 
 	/* The plot area, drawn on a canvas. A tag is filled with its cursor's
 	   or its trace's colour, and its text is the plot's background. */
