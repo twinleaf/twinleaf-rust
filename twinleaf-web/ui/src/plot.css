@@ -514,6 +514,10 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .device-list [role=list] { display: flex; flex-direction: column; gap: 1px; }
 .device { display: grid; grid-template-columns: auto auto auto 1fr auto; align-items: center; gap: 6px; padding: 2px 4px; border-radius: var(--radius); cursor: default; font-family: var(--font-data); }
 .device:hover { background: var(--accent); }
+/* A checkbox in a label is pressed through the label, so it reaches no
+   further than its own box: reach past a row would be rows out of view to
+   the list that holds it. */
+label > [data-slot=checkbox]::after { content: none; }
 .device .route { color: var(--muted-foreground); }
 .device .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .device .serial { color: var(--muted-foreground); font-size: 11px; }
