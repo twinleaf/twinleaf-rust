@@ -32,7 +32,8 @@
 // | plots and property rows are never chosen together                          |
 // | the step made at most one undo step                                        |
 // | undo then redo gives the same tabs; after a step that made one, the same   |
-// | open tab and selection too                                                 |
+// | open tab and selection too, but after a quick, whose second press may      |
+// | choose again once its first has made the step                              |
 // | the maximized plots are of the tab, and never none: null instead           |
 // | the tiles showing are the maximized plots, or every plot, each where the   |
 // | layout puts it                                                             |
@@ -299,15 +300,22 @@ function check(page, { steps, widths }, s) {
   oneLayer(page, null, s);
   if (!(s.t === 'click' && s.at === 'menuItem') && !(s.t === 'key' && s.key === 'Enter')) expect(dockWidths(), `dock widths, after ${at}`).toEqual(widths);
   // Undo then redo gives back the tabs; after a step that made one, what the step left of the selection too.
+  // A quick is two presses: its second may deselect after its first made the step, as a chip's Remove then Layout.
   if (history.undos.length) {
     const made = history.undos.length > steps;
     if (made) stepped++;
     const tabs = JSON.stringify(ws.tabs), left = chosen(ws);
+    const kept = { tab: ws.activeId, maximized: ws.maximized, selection: ws.selection.snapshot() };
     history.undo();
     history.redo();
     flushSync();
     expect(JSON.stringify(ws.tabs), `undo then redo, after ${at}`).toBe(tabs);
-    if (made) expect(chosen(ws), `the selection after undo then redo, after ${at}`).toBe(left);
+    if (made && s.t !== 'quick') expect(chosen(ws), `the selection after undo then redo, after ${at}`).toBe(left);
+    // The run goes on from what the step left, not from what the redo chose: its tab, its maximized plots and its selection.
+    if (ws.activeId !== kept.tab) ws.selectTab(kept.tab);
+    ws.maximize(kept.maximized);
+    ws.selection.restore(kept.selection);
+    flushSync();
   }
 }
 
@@ -356,6 +364,10 @@ describe('the page, played by random runs of gestures and keys', () => {
           [[{ t: 'toTab', a: 0, b: 1 }, { t: 'gap', i: 0, by: 60 }, { t: 'tabDrag', a: 0 }, { t: 'wheel', i: 0, dy: 120, shift: false }, { t: 'key', key: 'Control+y' }]],
           // Plots maximized, then the keys and a box that select: only what shows.
           [[{ t: 'click', at: 'plot', i: 0, mod: null }, { t: 'key', key: 'f' }, { t: 'key', key: 'Control+a' }, { t: 'key', key: '3' }, { t: 'box', k: 0, fx: 0.9, fy: 0.9, shift: false, escape: false }]],
+          // A plot closed, another maximized, and the close taken back: the plot it brings back stays hidden, and is not selected.
+          [[{ t: 'click', at: 'plot', i: 1, mod: null }, { t: 'key', key: 'Delete' }, { t: 'click', at: 'plot', i: 0, mod: null }, { t: 'key', key: 'f' }, { t: 'key', key: 'Control+z' }]],
+          // A maximized plot's header, pressed at its middle, on its chip's Remove, then Layout pressed, which deselects.
+          [[{ t: 'move', a: 1, b: 0, cell: 'center', by: 'grip', escape: false }, { t: 'key', key: 'f' }, { t: 'quick', a: 'layout', b: 'layout', i: 0 }, { t: 'quick', a: 'header', b: 'layout', i: 0 }]],
           // A plot docked beside another, by its grip and by its header.
           [[{ t: 'move', a: 0, b: 0, cell: 'bottom', by: 'grip', escape: false }, { t: 'move', a: 1, b: 1, cell: 'right', by: 'header', escape: false }]],
         ]),
