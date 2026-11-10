@@ -76,7 +76,30 @@ describe('the cells a plot move offers', () => {
     }, 50);
   });
 
-  it('include a dock beside every plot whose room holds two plots along that side', () => {
+  /**
+   * Whether `box` holds layout `t`: no plot has a negative size, as one has
+   * in a split with less room than its gap. Taking a plot out of a layout
+   * its box holds shrinks no other plot.
+   */
+  const holds = (t, box) => [...rects(t, box).values()].every((r) => r.w >= 0 && r.h >= 0);
+  /** Six plots in splits of a tenth each, in a box too small for them: b, c and d have negative heights. */
+  const CRAMPED = {
+    t: split('col', split('col', split('row', leaf('a'), split('col', leaf('b'), split('col', leaf('c'), leaf('d'), 0.1), 0.1), 0.1), leaf('e'), 0.1), leaf('f'), 0.1),
+    box: { x: 0, y: 0, w: 400, h: 300 },
+  };
+
+  it('offer no dock that shrinks a third plot below the smallest plot, as taking a plot out of a layout its box does not hold does', () => {
+    const { t, box } = CRAMPED;
+    expect(holds(t, box)).toBe(false);
+    // Without d, c has the whole of a split 4.3 px short of its gap, where it had a tenth of it.
+    const [was, is] = [t, removeAll(t, new Set(['d']))].map((layout) => rects(layout, box).get('c').h);
+    expect([was, is].map((h) => Math.round(h * 100) / 100)).toEqual([-1.13, -4.29]);
+    // f has room for two plots side by side, 400 px, and d is offered beside it on no side.
+    expect(rects(t, box).get('f').w - GUTTER).toBeGreaterThan(2 * MIN_PLOT.w);
+    expect(moveCells(t, box, new Set(['d']))).toEqual([]);
+  });
+
+  it('include a dock beside every plot whose room holds two plots along that side, in a layout its box holds', () => {
     /** Whether `moved` stands alone beside `id` on `edge` already. */
     const there = (node, moved, id, edge) => {
       if (!node || node.type === 'leaf') return false;
@@ -85,9 +108,11 @@ describe('the cells a plot move offers', () => {
       if (node.dir === dir && x.plotId === moved && y.plotId === id) return true;
       return there(node.a, moved, id, edge) || there(node.b, moved, id, edge);
     };
-    let checked = 0;
+    let checked = 0, held = 0;
     fc.assert(
       fc.property(anyTree, anyBox, fc.nat(), (t, box, k) => {
+        if (!holds(t, box)) return;
+        held++;
         const all = plotIds(t), moved = all[k % all.length];
         const cells = moveCells(t, box, new Set([moved]));
         for (const [id, r] of rects(removeAll(t, new Set([moved])), box)) {
@@ -100,7 +125,9 @@ describe('the cells a plot move offers', () => {
           }
         }
       }),
+      { examples: [[CRAMPED.t, CRAMPED.box, 3], [split('col', split('row', leaf('a'), leaf('b')), split('row', leaf('c'), leaf('d'))), { x: 0, y: 0, w: 672, h: 800 }, 0]] },
     );
+    expect(held).toBeGreaterThan(50);
     expect(checked).toBeGreaterThan(200);
   });
 
