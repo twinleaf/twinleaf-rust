@@ -1323,9 +1323,13 @@ export class PlotView {
    * the plot's edge into its axis, as a tick mark does, to be set against
    * one. A cursor out of view is named at the edge it lies beyond, with an
    * arrow, by a tag to drag it back into view by. A cursor not yet placed
-   * rests as a tab to drag out, X1 and X2 at the x axis's left end and Y1
-   * and Y2 at the top of each y axis, shown while the pointer is on that
-   * axis; a pull across an axis draws one out too.
+   * rests as a tab to drag out, shown while the pointer is on its axis: X1
+   * and X2 at the x axis's left end, and Y1 with Y2 above it at the foot of
+   * each y axis, at the axis's outer edge, above the time labels and clear
+   * of a header floating over the plot's top. A stacked plot has a pair at
+   * the foot of each lane; a lane with room for one tab alone has that of
+   * the first cursor not placed, and a lane shorter than a tab has none. A
+   * pull across an axis draws a cursor out too.
    */
   drawCursors(ctx, T, P, body, marks, axes, xd, sx, time, xTabsBeside, hoverLane) {
     const color = { a: T.cursorA, b: T.cursorB };
@@ -1425,13 +1429,18 @@ export class PlotView {
       const x = (xTabsBeside ? P.x - 2 * TAB.w - 4 : P.x + 2) + i * (TAB.w + 2);
       tabs.push({ part: 'tab', kind: 'x', name, fill: color[name], text: xName[name], x, y: P.y + P.h + 3, w: TAB.w, h: TAB.h });
     });
+    // The header of a plot too short for one of its own floats over the plot's top, and covers what is under it.
+    const head = this.body.closest('.plot-card.monitor')?.querySelector('.plot-head')?.getBoundingClientRect().bottom ?? -Infinity;
     for (const a of axes) {
       const yc = this.yPair(a.key);
-      ['a', 'b'].forEach((name, i) => {
-        if (yc && yc[name] !== null) return;
-        const x = a.side === 'left' ? a.x1 - TAB.w - 1 : a.x0 + 1;
-        tabs.push({ part: 'tab', kind: 'y', name, key: a.key, axis: a, fill: color[name], text: yName[name], x, y: a.lane.y + 2 + i * (TAB.h + 2), w: TAB.w, h: TAB.h });
-      });
+      const resting = ['a', 'b'].filter((name) => !yc || yc[name] === null);
+      // How many tabs the lane has room for, one above another from its foot, below a floating header.
+      const room = Math.max(0, Math.floor((a.lane.y + a.lane.h - Math.max(a.lane.y, head) - 2) / (TAB.h + 2)));
+      const x = a.side === 'left' ? a.x0 + 2 : a.x1 - TAB.w - 2;
+      for (const name of room >= 2 ? resting : resting.slice(0, room)) {
+        const up = room >= 2 && name === 'b' ? TAB.h + 2 : 0;
+        tabs.push({ part: 'tab', kind: 'y', name, key: a.key, axis: a, fill: color[name], text: yName[name], x, y: a.lane.y + a.lane.h - 2 - TAB.h - up, w: TAB.w, h: TAB.h });
+      }
     }
     this.pressable.push(...lines, ...tags, ...tabs);
     // A tab shows while the pointer is on it, plainly, or on its axis; or on another tab or edge tag of its y axis.
