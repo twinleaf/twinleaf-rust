@@ -413,6 +413,20 @@ export class Session {
    * of traces `ids`, the latest of theirs, or null when it has dropped none:
    * before its oldest time, a trace that has dropped nothing never had any.
    */
+  /**
+   * The oldest time the hub holds of any of traces `ids`, or null while it
+   * has said of none. The page's own points can be older: a coarse level
+   * keeps what the hub has dropped.
+   */
+  oldestHeld(ids) {
+    let at = null;
+    for (const id of ids) {
+      const oldest = this.memory?.oldest?.[id];
+      if (oldest !== undefined) at = Math.min(at ?? Infinity, oldest);
+    }
+    return at;
+  }
+
   droppedBefore(ids) {
     let at = null;
     for (const id of ids) {

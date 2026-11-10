@@ -637,15 +637,13 @@ export class PlotView {
       return { t, src, fromWindow: src !== live, level, a0, a1, lo, hi, index };
     });
     // The history the plot moves through, oldest to newest: from the oldest
-    // time the hub holds of its signals to the newest point, or, paused, to
-    // the moment it paused, the end of what it captured. A paused view stays
+    // time the hub holds of its signals, or, until the hub has said, the
+    // oldest point the page has, to the newest point; or, paused, to the
+    // moment it paused, the end of what it captured. A paused view stays
     // within it.
     let lo = Infinity, hi = -Infinity;
-    const oldest = this.hub.session.memory?.oldest ?? {};
-    for (const t of traces) {
-      for (const l of t.levels) if (l.length) [lo, hi] = [Math.min(lo, l.xAt(l.absStart)), Math.max(hi, l.xAt(l.absEnd - 1))];
-      if (oldest[t.meta.id] !== undefined) lo = Math.min(lo, oldest[t.meta.id]);
-    }
+    for (const t of traces) for (const l of t.levels) if (l.length) [lo, hi] = [Math.min(lo, l.xAt(l.absStart)), Math.max(hi, l.xAt(l.absEnd - 1))];
+    lo = this.hub.session.oldestHeld(traces.map((t) => t.meta.id)) ?? lo;
     if (!this.view.live && this.view.pausedAt !== null) hi = this.view.pausedAt;
     this.history = lo < hi ? [lo, hi] : null;
     this.view.limits = this.view.live ? null : this.history;

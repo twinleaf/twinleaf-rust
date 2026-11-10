@@ -536,7 +536,7 @@ describe('a live plot drawn frame after frame', () => {
       lane: (rect, base, x0, x1) => ((drawn.lane = { x0, x1, width: Math.round(rect.w * dpr) }), true),
       drawTrace: (src, ring, a0, a1) => drawn.draws.push({ src, a0, a1 }),
     };
-    const hub = { now: () => hub.t, t: 0, session: { windowOf: () => undefined, memory: null } };
+    const hub = { now: () => hub.t, t: 0, session: { windowOf: () => undefined, oldestHeld: () => null, memory: null } };
     const view = new View(hub);
     view.span = span;
     view.delay = 0;
