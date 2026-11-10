@@ -12,10 +12,13 @@ export const KEY = 'tl-docks-v1';
 
 /**
  * Every panel, by id. `channels` names the RPC channels a Properties panel
- * shows (null for entries with none). A panel is as tall as what it shows,
- * up to a share of its dock's height that plot.css gives every panel, past
- * which its list scrolls inside it; the dock scrolls the panels that do not
- * fit.
+ * shows (null for entries with none). A panel is as tall as what it shows
+ * while its dock has the room. Where the panels do not fit, a panel taller
+ * than the share of the dock's height that plot.css gives every panel gives
+ * way, down to that share, its list scrolling inside it, and the dock
+ * scrolls the panels that still do not fit. So a list hides rows only where
+ * its dock has no room left, and only a panel past its share, of which a
+ * dock has one at most, changes height with the other panels.
  */
 export const PANELS = {
   devices: { title: 'Devices' },

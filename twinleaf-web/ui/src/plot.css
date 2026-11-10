@@ -112,13 +112,19 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .dock-button svg { width: 14px; height: 14px; }
 .dock-frame.rail .dock-button { right: auto; left: 50%; transform: translateX(-50%); }
 .dock-side > .dock > .dock-panel:first-child .dock-head { padding-right: 26px; }
-/* The panels are lists inside a list. A panel is as tall as what it shows,
-   up to two thirds of its dock's height, whatever the dock's other panels
-   do; past that its list takes what the panel has left and scrolls, with
-   its rows clear of its scroll bar, and the dock scrolls the panels that do
-   not fit. Two thirds, so the tallest panel leaves a third of the dock to
-   show there are others. */
-.dock-panel { display: flex; flex-direction: column; min-height: 0; flex: none; max-height: 66.667%; }
+/* The panels are lists inside a list. A panel is as tall as what it shows
+   while its dock has the room. Where the panels do not fit, a panel taller
+   than two thirds of the dock's height gives way, down to two thirds: its
+   list takes what the panel has left and scrolls, with its rows clear of
+   its scroll bar, and the dock scrolls the panels that still do not fit.
+   So a list hides rows only where its dock has no room left; at most one
+   panel is past two thirds, in the room the others leave; and every other
+   panel keeps its height whatever the rest do. Two thirds, so a panel that
+   has given way leaves a third of the dock to show there are others.
+   A panel shrinks from its content's height, its flex basis, and no
+   further than the lesser of that and the two thirds its `height` states,
+   which `min-height: auto` reads and which sets no height of its own. */
+.dock-panel { display: flex; flex-direction: column; flex: 0 1 content; height: 66.667%; min-height: auto; }
 .dock-body [data-slot=scroll-area] { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
 .dock-body [data-slot=scroll-area-viewport] { flex: 0 1 auto; min-height: 0; height: auto; }
 .dock-body [data-slot=scroll-area]:has(> [data-slot=scroll-area-scrollbar]) > [data-slot=scroll-area-viewport] { padding-right: 10px; }

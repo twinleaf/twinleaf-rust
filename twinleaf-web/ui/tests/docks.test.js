@@ -1,6 +1,9 @@
 // The docks' panels are lists inside a list: a panel is as tall as what it
-// shows up to a greatest height, past which its list scrolls within it, and
-// the dock scrolls the panels that do not fit. The subjects are found on the
+// shows while its dock has the room. Where the panels do not fit, a panel
+// taller than a share of its dock's height gives way, down to that share,
+// its list scrolling within it, and the dock scrolls the panels that still
+// do not fit. So a panel past its share has only the room the others leave,
+// and no list hides rows above empty dock. The subjects are found on the
 // page: every dock, every panel in it and every list in a panel.
 import fc from 'fast-check';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -30,9 +33,15 @@ const tableOf = ({ setting, report, action, other }) => [...rpcs(setting, 'setti
  */
 const OWN = { rows: 'tr, .chip, .device, [data-name]', notices: '.props-empty, .sig-empty, .empty', 'edit bars': '.write-bar', filters: 'input[aria-label^="Filter the properties"]' };
 
+/** The share of its dock's height that `panel` gives way down to, as the stylesheet states it: '66.667%'. */
+const shareOf = (panel) => panel.computedStyleMap().get('height').toString();
+/** That share of the dock of `panel` in px. */
+const sharePx = (panel) => (parseFloat(shareOf(panel)) / 100) * panel.parentElement.clientHeight;
+
 /**
  * What each panel of every dock is, by title: its height in px, whether it
- * is open, and what of its own decides its height, by OWN.
+ * is open, whether it is past its share of the dock, in the room the
+ * others leave, and what of its own decides its height, by OWN.
  */
 const measured = () =>
   Object.fromEntries(
@@ -41,6 +50,7 @@ const measured = () =>
       {
         height: heightOf(panel),
         open: panel.classList.contains('open'),
+        grown: heightOf(panel) > sharePx(panel) + 1,
         own: Object.entries(OWN).map(([what, found]) => `${panel.querySelectorAll(found).length} ${what}`).join(', '),
       },
     ]),
@@ -49,7 +59,7 @@ const measured = () =>
 /**
  * Holds every dock, panel and list to the rule as the page stands; `said`
  * names the case. It counts in `seen` the docks and the lists it found
- * scrolling.
+ * scrolling, and the panels past their share of a dock.
  */
 function expectLists(said, seen) {
   const shares = new Set();
@@ -66,10 +76,12 @@ function expectLists(said, seen) {
     all.forEach((panel, i) => i && expect(panel.getBoundingClientRect().top, `${said}: ${titleOf(panel)} starts below ${titleOf(all[i - 1])}`).toBeGreaterThanOrEqual(all[i - 1].getBoundingClientRect().bottom - 1));
     for (const panel of openOf(dock)) {
       const at = `${said}: ${titleOf(panel)}`;
-      const share = getComputedStyle(panel).maxHeight;
+      const share = shareOf(panel), height = heightOf(panel), grown = height > sharePx(panel) + 1;
       shares.add(share);
-      expect(share, `${at} has a greatest height, a share of its dock's`).toMatch(/%$/);
-      expect(heightOf(panel), `${at} in a dock of ${room} px`).toBeLessThanOrEqual((parseFloat(share) / 100) * room + 1);
+      expect(share, `${at} gives way down to a share of its dock's height`).toMatch(/%$/);
+      // Past its share, a panel has only room the dock has: the dock does not scroll.
+      if (grown) seen.grown++;
+      expect(grown ? dock.scrollHeight - room : 0, `${at}, ${height} px of a dock of ${room} px: px the dock scrolls`).toBeLessThanOrEqual(1);
       // Nothing of the panel is cut off but the rows its lists scroll to.
       for (const box of [panel, panel.querySelector('.dock-body'), ...listsOf(panel).map((l) => l.parentElement)]) {
         expect(box.scrollHeight - box.clientHeight, `${at}: px cut off ${box.className.split(' ')[0] || box.dataset.slot}`).toBeLessThanOrEqual(1);
@@ -80,10 +92,15 @@ function expectLists(said, seen) {
         if (hidden <= 0) continue;
         seen.lists++;
         expect(getComputedStyle(list).overflowY, `${at}: its list scrolls`).toMatch(/auto|scroll/);
+        expect(height, `${at} hides rows only once it has given way to its share, ${sharePx(panel)} px`).toBeGreaterThanOrEqual(sharePx(panel) - 1);
       }
     }
+    // The dock's room is used before a list hides rows.
+    const empty = dock.getBoundingClientRect().top + room - all.at(-1).getBoundingClientRect().bottom;
+    const cut = openOf(dock).filter((panel) => listsOf(panel).some((list) => list.scrollHeight > list.clientHeight));
+    expect(empty > 1 ? cut.map(titleOf) : [], `${said}: the panels with rows out of view above ${empty} px of empty ${dock.getAttribute('aria-label')}`).toEqual([]);
   }
-  expect([...shares].length, `${said}: one greatest height for every panel, of ${[...shares]}`).toBeLessThanOrEqual(1);
+  expect([...shares].length, `${said}: one share for every panel, of ${[...shares]}`).toBeLessThanOrEqual(1);
 }
 
 afterAll(() => browser.viewport(1200, 900));
@@ -133,10 +150,12 @@ describe('a panel in a dock', () => {
     [{ height: 340, rows: { signals: 2, setting: 6, report: 6, action: 6, other: 6 }, steps: [{ fold: 'Diagnostics' }, { fold: 'Other' }, { grow: 'setting', by: 8 }, { fold: 'Settings' }] }],
     // A panel with nothing to show gets its first row, in place of its notice.
     [{ height: 900, rows: { signals: 1, setting: 0, report: 0, action: 0, other: 1 }, steps: [{ grow: 'action', by: 1 }, { grow: 'signals', by: 1 }] }],
+    // The settings outgrow their share above shorter panels, one of which folds; then the reports outgrow theirs too.
+    [{ height: 900, rows: { signals: 2, setting: 14, report: 2, action: 2, other: 0 }, steps: [{ grow: 'setting', by: 12 }, { grow: 'setting', by: 12 }, { fold: 'Reports' }, { fold: 'Reports' }, { grow: 'report', by: 12 }, { grow: 'report', by: 12 }, { grow: 'report', by: 12 }] }],
   ];
 
-  it('keeps its height whatever the other panels do, scrolls its own list, and is reached by scrolling its dock', async () => {
-    const seen = { docks: 0, lists: 0 };
+  it('keeps its height whatever the other panels do unless it is past its share, in the room they leave, scrolls its own list, and is reached by scrolling its dock', async () => {
+    const seen = { docks: 0, lists: 0, grown: 0 };
     await fc.assert(
       fc.asyncProperty(cases, async ({ height, rows, steps }) => {
         await browser.viewport(1200, height);
@@ -163,8 +182,9 @@ describe('a panel in a dock', () => {
             const after = measured();
             for (const [title, was] of Object.entries(before)) {
               const is = after[title];
-              // A panel that the step left as it was: not the one folded, and not one whose own rows changed.
-              if (title === s.fold || !was.open || !is.open || was.own !== is.own) continue;
+              // A panel that the step left as it was: not the one folded, not one whose own rows changed,
+              // and not one past its share, whose height is the room the others leave.
+              if (title === s.fold || !was.open || !is.open || was.own !== is.own || was.grown || is.grown) continue;
               expect(is.height, `${said}: the height of ${title}, with ${is.own}`).toBe(was.height);
             }
             expectLists(said, seen);
@@ -177,5 +197,6 @@ describe('a panel in a dock', () => {
     );
     expect(seen.docks, 'docks seen scrolling').toBeGreaterThan(0);
     expect(seen.lists, 'lists seen scrolling').toBeGreaterThan(0);
+    expect(seen.grown, 'panels seen past their share of a dock').toBeGreaterThan(0);
   }, 600_000);
 });
