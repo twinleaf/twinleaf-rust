@@ -40,6 +40,8 @@ describe('the cursors’ text', () => {
         expect(DATED.test(cursorText('unix').at(t, s)), `${days} d, ${into} s in, ${s} s apart`).toBe(dated);
         seen.add(dated);
       }),
+      // A pair within today, which a random day is one time in forty, and one of yesterday.
+      { examples: [[0, 10, 1], [-1, 100, 5]] },
     );
     expect(seen.size).toBe(2);
   });
