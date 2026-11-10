@@ -361,6 +361,71 @@ export function quietApi(rows = () => Promise.resolve({ count: 0, oldest: null, 
   vi.spyOn(api, 'rows').mockImplementation(rows);
 }
 
+/** The rows a second of each signal a test hub holds, as `stubHub` announces its traces. */
+const RATE = 100;
+/** The seconds each level of a hub's decimation keeps of a history long enough, finest first: each four times the last. */
+const LEVEL_SECONDS = Array.from({ length: 6 }, (_, k) => 120 * 4 ** k);
+/** How much further back than the hub's raw history the page's coarsest points reach, as a share of it. */
+const COARSE_REACH = 0.07;
+/** The seconds a hub keeps of each stream beyond its History setting: twinleaf-web/src/hub.rs HISTORY_HEADROOM. */
+export const HISTORY_HEADROOM = 2;
+
+/**
+ * Has `page`'s hub hold `seconds` of each signal, under a History setting
+ * of `history` seconds, as a hub that has run for hours does, without an
+ * hour of samples being fed. A hub that has filled its history holds the
+ * setting and HISTORY_HEADROOM more, which `seconds` is unless given.
+ * - The page's clock stands at `now`, so a pause holds the same time in
+ *   every run, and the hub's newest sample is `behind` seconds after it:
+ *   how far the page's clock trails the hub.
+ * - The page has each trace's points at every level of the decimation,
+ *   each level a quarter of the rate of the one before over four times the
+ *   span, 12 000 points a level at most, the coarse ones of a hub that has
+ *   dropped samples reaching COARSE_REACH further back than its raw history.
+ * - A `memory` message says the hub holds each signal from `seconds` before
+ *   its newest sample, and, with `dropped`, as a hub that has filled its
+ *   history has, that it held older samples before.
+ * - /api/window answers any range as the server does (twinleaf-web/src/hub.rs
+ *   `window`): the rows it holds within it, decimated to at most twice
+ *   `width` points, at least 64; and /api/rows counts them.
+ * Returns {now, oldest, asked}: `oldest` the oldest time held, and `asked`
+ * each window read so far, as {id, t0, t1, width, points}. The answers are
+ * undone by `vi.restoreAllMocks()`.
+ */
+export function holdHistory(page, { history, seconds = history + HISTORY_HEADROOM, now = 100_000, behind = 0, dropped = seconds >= history } = {}) {
+  const hub = page.hub, session = hub.session, newest = now + behind, oldest = newest - seconds, asked = [];
+  session.now = () => now;
+  const keeps = LEVEL_SECONDS.map((s) => Math.min(s, history * (1 + COARSE_REACH)));
+  hub.text({ type: 'config', pps: RATE, levels: keeps });
+  for (const t of session.traces.values()) {
+    t.clear();
+    keeps.forEach((keep, level) => {
+      const rate = RATE / 4 ** level, n = Math.floor(Math.min(keep, seconds * (dropped ? 1 + COARSE_REACH : 1)) * rate);
+      const xs = Float64Array.from({ length: n }, (_, i) => newest - (n - 1 - i) / rate);
+      session.apply({ kind: 'points', chunks: [{ id: t.meta.id, level, brk: false, xs, ys: Float32Array.from(xs, (x) => Math.sin(x / 7 + t.meta.id)) }] });
+    });
+  }
+  const ids = [...session.traces.keys()];
+  const memory = (at) => hub.text({ type: 'memory', bytes: 0, budget: 0, seconds: Math.min(seconds, history), max_age: history, rate: 0, oldest: Object.fromEntries(ids.map((id) => [id, at])) });
+  // What it held first is what this history says, whatever a history stated before did.
+  session.firstHeld = {};
+  if (dropped) memory(oldest - 1);
+  memory(oldest);
+  /** The times of the rows held within [t0, t1], each `ratio` rows after the last. */
+  const rows = (t0, t1, ratio = 1) => {
+    const a = Math.ceil(Math.max(t0, oldest) * RATE), b = Math.floor(Math.min(t1, newest) * RATE);
+    return { count: Math.max(0, b - a + 1), x: (n) => Float64Array.from({ length: n }, (_, i) => (a + i * ratio) / RATE) };
+  };
+  vi.spyOn(api, 'window').mockImplementation(async ({ id, t0, t1, width }) => {
+    const raw = rows(t0, t1).count, ratio = Math.max(1, Math.ceil(raw / Math.max(64, 2 * width)));
+    const x = rows(t0, t1, ratio).x(Math.ceil(raw / ratio));
+    asked.push({ id, t0, t1, width, points: x.length });
+    return { t0, t1, ratio, chunks: x.length ? [{ x, y: Float32Array.from(x, (v) => Math.sin(v / 7 + id)) }] : [] };
+  });
+  vi.spyOn(api, 'rows').mockImplementation(async ({ t0, t1 }) => ({ count: rows(t0, t1).count, oldest, x: [], y: [] }));
+  return { now, oldest, asked };
+}
+
 /**
  * Turns the wheel over plot `id`'s plot area by `deltaY` px, `n` times, at
  * fraction `at` across it, on the whole pixel nearest, with Shift held when
