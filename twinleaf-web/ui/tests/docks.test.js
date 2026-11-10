@@ -25,9 +25,14 @@ const signals = (n, from = 0) => Array.from({ length: n }, (_, i) => `s${from + 
 const tableOf = ({ setting, report, action, other }) => [...rpcs(setting, 'setting'), ...rpcs(report, 'report', { access: ['read'] }), ...rpcs(action, 'action', { type: null, access: [] }), ...rpcs(other, null)];
 
 /**
+ * What of a panel's own decides its height, each kind counted apart, as an
+ * empty list's notice is not as tall as a row.
+ */
+const OWN = { rows: 'tr, .chip, .device, [data-name]', notices: '.props-empty, .sig-empty, .empty', 'edit bars': '.write-bar', filters: 'input[aria-label^="Filter the properties"]' };
+
+/**
  * What each panel of every dock is, by title: its height in px, whether it
- * is open, and what of its own decides its height, its rows and whether it
- * holds the properties' filter.
+ * is open, and what of its own decides its height, by OWN.
  */
 const measured = () =>
   Object.fromEntries(
@@ -36,7 +41,7 @@ const measured = () =>
       {
         height: heightOf(panel),
         open: panel.classList.contains('open'),
-        own: `${panel.querySelectorAll('tr, .chip, .device, [data-name], .props-empty, .sig-empty, .empty, .write-bar').length} rows${panel.querySelector('input[aria-label^="Filter the properties"]') ? ', the filter' : ''}`,
+        own: Object.entries(OWN).map(([what, found]) => `${panel.querySelectorAll(found).length} ${what}`).join(', '),
       },
     ]),
   );
@@ -126,6 +131,8 @@ describe('a panel in a dock', () => {
     [{ height: 520, rows: { signals: 4, setting: 2, report: 2, action: 2, other: 0 }, steps: [{ grow: 'signals', by: 12 }, { grow: 'signals', by: 12 }, { fold: 'Devices' }, { fold: 'Devices' }] }],
     // Every panel open in a short window, then one above the rest gains rows.
     [{ height: 340, rows: { signals: 2, setting: 6, report: 6, action: 6, other: 6 }, steps: [{ fold: 'Diagnostics' }, { fold: 'Other' }, { grow: 'setting', by: 8 }, { fold: 'Settings' }] }],
+    // A panel with nothing to show gets its first row, in place of its notice.
+    [{ height: 900, rows: { signals: 1, setting: 0, report: 0, action: 0, other: 1 }, steps: [{ grow: 'action', by: 1 }, { grow: 'signals', by: 1 }] }],
   ];
 
   it('keeps its height whatever the other panels do, scrolls its own list, and is reached by scrolling its dock', async () => {
