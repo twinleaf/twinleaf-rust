@@ -15,6 +15,7 @@
   import RiStacked from '@lucide/svelte/icons/rows-3';
   import Tip from './Tip.svelte';
   import { KINDS, MODES } from './constants.js';
+  import { commandOf } from './commands.js';
 
   /**
    * `plot` is the plot whose `kind` and `mode` these show. `open` is the kind
@@ -59,7 +60,7 @@
 {/snippet}
 
 <Select.Root type="single" value={plot.kind} onValueChange={onKind} bind:open onOpenChange={changed}>
-  <Tip text="Kind: {nameOf(KINDS, plot.kind)}" keys={['K']}>
+  <Tip text="Kind: {nameOf(KINDS, plot.kind)}" keys={commandOf('kind').show}>
     {#snippet children(tip)}
       {@const Icon = ICONS[plot.kind]}
       <Select.Trigger {...tip} bind:ref={kindTrigger} size="sm" class="kind-select" tabindex={-1} aria-label="Plot kind: {nameOf(KINDS, plot.kind)}" onkeydown={(e) => open && across(e)}>

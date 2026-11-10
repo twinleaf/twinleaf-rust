@@ -23,7 +23,9 @@
   import { plotIds } from './lib/layout.js';
   import { exportText, importText, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
-  import { actionFor, scopeOf } from './lib/keymap.js';
+  import { actionFor } from './lib/keymap.js';
+  import { commands as plotCommands } from './lib/commands.js';
+  import CommandItem from './lib/CommandItem.svelte';
   import { keepsKey, plotPickers } from './lib/keys.js';
   import { api } from './lib/protocol.js';
   import { THEMES, TRACE_WIDTH, prefs } from './lib/prefs.svelte.js';
@@ -53,7 +55,6 @@
   import ExportDialog from './lib/ExportDialog.svelte';
   import WindowSlider from './lib/WindowSlider.svelte';
   import { windowText } from './lib/window.js';
-  import RiExport from '@lucide/svelte/icons/file-down';
   import StatusBar from './lib/StatusBar.svelte';
   import HistorySettings from './lib/HistorySettings.svelte';
   import CommandPalette from './lib/CommandPalette.svelte';
@@ -157,6 +158,27 @@
     });
   });
 
+  // The plot commands (commands.js), which every menu row, key, button and
+  // the palette run, over the plots of the open tab and what writes them.
+  const commands = plotCommands({
+    targets: (on) => selection.targets(on),
+    pageTargets: (scope) => selection.pageTargets(scope),
+    plotOf: (id) => ({ id, plot: ws.plots[id], view: views.of(id), pv: [...registry].find((p) => p.plotId === id) }),
+    last: () => ws.focusedId,
+    ws,
+    selection,
+    viewHistory,
+    cursors,
+    toast,
+    edit: (ids, what, fn) => eachPlot(ids, what, fn),
+    split: (ids, dir, fromKeys) => splitPlots(ids, dir, fromKeys),
+    close: (ids, fromKeys) => closePlots(ids, fromKeys),
+    copy: (plots) => copyData(plots),
+    copyCheck: (plots) => copyCheck(plots),
+    openExport: (plots) => openExport(plots),
+    picker: (id, action) => !!plotPickers.get(id)?.(action),
+  });
+  setContext('commands', commands);
   const targetsOf = (id) => selection.targets(id).map((i) => views.of(i));
   /** The plots a command made on plot `id` acts on, as the Selection says. */
   const targetIdsOf = (id) => selection.targets(id);
@@ -599,84 +621,56 @@
     viewHistory.burst('window', vs, () => vs.forEach((vw) => vw.setSpan(v)));
   }
   /**
-   * Has plots `ids` follow the newest samples again, as one view step, back
-   * at their windows with `restore`. Their time X cursors, which live would
-   * scroll away, are removed, as one edit, which undo takes back.
-   */
-  function follow(ids, restore = false) {
-    viewHistory.step(() => ids.forEach((id) => views.of(id).follow(restore)));
-    cursors.followed(ids);
-  }
-  /** Pauses plots `ids` where they are, as one view step. */
-  function pause(ids) {
-    const perf = performance.now();
-    viewHistory.step(() => ids.forEach((id) => views.of(id).pause(perf)));
-  }
-  function followLive() {
-    follow(selection.pageTargets('view').filter((id) => ws.plots[id]?.kind === 'time'), true);
-  }
-  /**
    * The toolbar's Live button: pauses every time plot of the tab while all
-   * follow live, or has them all follow live. Space does the same for the
-   * selected plots alone.
+   * follow live, or has them all follow live, as one view step, their time
+   * X cursors, which live would scroll away, removed as one edit. Space does
+   * the same for the selected plots alone.
    */
   function toggleLive() {
-    if (live) pause(ws.timeIds());
-    else follow(ws.timeIds());
+    const ids = ws.timeIds(), perf = performance.now(), pausing = live;
+    viewHistory.step(() => ids.forEach((id) => (pausing ? views.of(id).pause(perf) : views.of(id).follow(false))));
+    if (!pausing) cursors.followed(ids);
     refreshToolbar();
   }
   function setDelay(ms) {
     delayMs = ms;
     views.setDelay(ms / 1000);
   }
-  /** Clears the cursors of plots `ids`, by default the selection's or every plot's, as one edit, and says whether any were placed. */
-  function clearCursors(ids = selection.pageTargets('view')) {
-    return cursors.clear(ids);
-  }
-  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addSignal, newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };
+  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addSignal, newPlot: newPlotWith, exportTabs, importTabs: () => importInput.click() };
 
   let paletteOpen = $state(false);
   let keysOpen = $state(false);
-  /**
-   * Copies the data of plots `ids`, as copy.js lays it out: a time plot's
-   * every raw sample in its visible window, and a spectrum plot's spectra
-   * as it shows them, each signal's density by frequency. Past MAX_COPY_ROWS
-   * it copies nothing and says how many rows that would be; a window whose
-   * start the history no longer holds is copied, and the notice says what is
-   * missing.
-   */
   // The export the dialog offers, or null: plots' signals, the time they
   // show and the time the history holds of them.
   let exporting = $state(null);
-  /** Offers to export the signals of plots `ids`. */
-  function openExport(ids) {
+  /** Offers to export the signals of `targets`, plots as commands.js gives them. */
+  function openExport(targets) {
     const session = hub.session, now = hub.now(performance.now());
-    const plots = ids.map((id) => [id, plotAnywhere(id)]).filter(([, p]) => p?.items.length);
-    const traces = [...new Map(plots.flatMap(([, p]) => p.items.map((i) => session.byKey.get(i.key)).filter(Boolean)).map((t) => [t.key, t])).values()];
+    const plots = targets.filter((t) => t.plot.items.length);
+    const traces = [...new Map(plots.flatMap(({ plot }) => plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean)).map((t) => [t.key, t])).values()];
     if (!traces.length) return toast.warning('Nothing to export: the plots show no signals');
-    const ranges = plots.filter(([, p]) => p.kind === 'time').map(([id]) => views.of(id).range(now));
+    const ranges = plots.filter((t) => t.plot.kind === 'time').map((t) => t.view.range(now));
     const shown = ranges.length ? [Math.min(...ranges.map((r) => r[0])), Math.max(...ranges.map((r) => r[1]))] : null;
     const oldest = Math.min(...traces.map((t) => session.memory?.oldest?.[t.meta.id] ?? Infinity));
     exporting = { hub: session.id, traces, shown, whole: [isFinite(oldest) ? oldest : -Infinity, now] };
   }
 
   /**
-   * What Ctrl+C on plots `ids` would copy, from the hub's count of the rows,
-   * as {state, rows, reason}: 'ok', 'too-many' past what a paste holds, or
-   * 'partial' when history no longer holds the window's start, the reason
-   * saying which.
+   * What Ctrl+C on `targets`, plots as commands.js gives them, would copy,
+   * from the hub's count of the rows, as {state, rows, reason}: 'ok',
+   * 'too-many' past what a paste holds, or 'partial' when history no longer
+   * holds the window's start, the reason saying which.
    */
-  async function copyCheck(ids) {
+  async function copyCheck(targets) {
     const session = hub.session, now = hub.now(performance.now());
     let total = 0, lost = 0;
-    for (const id of ids) {
-      const plot = plotAnywhere(id);
-      if (!plot?.items.length) continue;
+    for (const { plot, view } of targets) {
+      if (!plot.items.length) continue;
       if (plot.kind === 'spectrum') {
         total += Math.max(0, ...plot.items.map((i) => session.byKey.get(i.key)?.spectrum?.f.length ?? 0));
         continue;
       }
-      const [t0, t1] = views.of(id).range(now);
+      const [t0, t1] = view.range(now);
       const traces = plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean);
       const replies = await Promise.all(traces.map((t) => api.rows({ hub: session.id, id: t.meta.id, t0, t1, limit: 0 })));
       total += replies.reduce((n, r) => n + r.count, 0);
@@ -687,15 +681,22 @@
     return { state: 'ok', rows: total };
   }
 
-  async function copyData(ids) {
+  /**
+   * Copies the data of `targets`, plots as commands.js gives them, as
+   * copy.js lays it out: a time plot's every raw sample in its visible
+   * window, and a spectrum plot's spectra as it shows them, each signal's
+   * density by frequency. Past MAX_COPY_ROWS it copies nothing and says how
+   * many rows that would be; a window whose start the history no longer
+   * holds is copied, and the notice says what is missing.
+   */
+  async function copyData(targets) {
     const session = hub.session, now = hub.now(performance.now());
-    const plots = ids.map((id) => [id, plotAnywhere(id)]).filter(([, p]) => p?.items.length);
+    const plots = targets.filter((t) => t.plot.items.length);
     if (!plots.length) return toast.warning('Nothing to copy: the plots show no signals');
     const blocks = [];
     let total = 0, lost = 0;
-    for (const [id, plot] of plots) {
+    for (const { plot, view, pv } of plots) {
       if (plot.kind === 'spectrum') {
-        const pv = [...registry].find((v) => v.plotId === id);
         const traces = plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean);
         const spectra = traces.map((t) => pv?.spectrumOf(t) ?? t.spectrum).map((sp) => sp ?? { f: [], a: [] });
         const table = blockTable(
@@ -706,7 +707,7 @@
         blocks.push({ title: `Spectrum of ${traces.map((t) => t.key).join(', ')}`, ...table });
         continue;
       }
-      const [t0, t1] = views.of(id).range(now);
+      const [t0, t1] = view.range(now);
       const traces = plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean);
       const replies = await Promise.all(traces.map((t) => api.rows({ hub: session.id, id: t.meta.id, t0, t1, limit: MAX_COPY_ROWS })));
       total += replies.reduce((n, r) => n + r.count, 0);
@@ -745,43 +746,15 @@
   /** The plot `el` is in, by id, or null. */
   const plotAt = (el) => el?.closest?.('.leaf[data-plot]')?.dataset.plot ?? null;
 
-  /** How far an arrow pans, as a share of the span, and zooms, as a factor. */
-  const PAN = 0.1, ZOOM = 1.25;
   /**
-   * Acts by plot key `e` (keymap.js, place 'plot'), wherever it was
-   * pressed, on the plots it acts on (selection.svelte.js `pageTargets`).
-   * A picker opens on the plot clicked last when it is one of them, else
-   * on the first. A key with no plots to act on does nothing, and goes on.
+   * Runs the plot command of key `e` (keymap.js, place 'plot'), wherever it
+   * was pressed, on the plots it acts on (commands.js). A key whose command
+   * is not taken, as with no plots to act on, does nothing, and goes on.
    */
   function plotKey(e) {
     const action = actionFor('plot', e);
-    // F leaves the maximized view whatever is selected, as Escape does.
-    if (action === 'maximize' && ws.maximized) {
-      e.preventDefault();
-      ws.maximized = null;
-      return;
-    }
-    const ids = action ? selection.pageTargets(scopeOf(action)) : [];
-    if (!ids.length) return;
-    const perf = performance.now(), back = e.key === 'ArrowLeft' || e.key === 'ArrowDown';
-    const lead = ids.includes(ws.focusedId) ? ws.focusedId : ids[0];
-    const act = {
-      splitRight: () => splitPlots(ids, 'row', true),
-      splitDown: () => splitPlots(ids, 'col', true),
-      maximize: () => (ws.maximized = ids),
-      close: () => closePlots(ids, true),
-      fitY: () => viewHistory.step(() => registry.forEach((p) => ids.includes(p.plotId) && p.autoscale())),
-      legend: () => {
-        const on = !ws.plots[lead].legend;
-        eachPlot(ids, on ? 'Show the legend' : 'Hide the legend', () => ({ legend: on }));
-      },
-      follow: () => follow(ids, true),
-      pan: () => viewHistory.burst('pan', timeViews(ids), () => timeViews(ids).forEach((v) => v.pan((e.shiftKey ? 1 : PAN) * (back ? -1 : 1), perf))),
-      zoom: () => viewHistory.burst('zoom', timeViews(ids), () => timeViews(ids).forEach((v) => v.zoom(back ? ZOOM : 1 / ZOOM, v.live ? 1 : 0.5, perf))),
-    }[action];
-    if (!act && !plotPickers.get(lead)?.(action)) return;
-    e.preventDefault();
-    act?.();
+    const how = { back: e.key === 'ArrowLeft' || e.key === 'ArrowDown', shift: e.shiftKey };
+    if (action && commands.run(action, { from: 'key', how })) e.preventDefault();
   }
   /**
    * Puts an empty plot beside each of plots `ids`, on side `dir` of it, as
@@ -834,7 +807,7 @@
     // Ctrl+C with no text selected copies the data of the selected plots, or of every plot.
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'c' && !String(window.getSelection() ?? '')) {
       e.preventDefault();
-      return void copyData(selection.pageTargets('view')).catch((error) => toast.error(`Could not copy: ${error.message}`));
+      return void commands.run('copyData', { from: 'key' });
     }
     // Ctrl+A outside a field selects every plot of the tab, not the page's text.
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
@@ -865,9 +838,7 @@
     if (action === 'escape') return leave();
     // Space pauses the selected plots, or every plot, or has them follow live again.
     e.preventDefault();
-    const ids = selection.pageTargets('view');
-    if (ids.some((id) => views.of(id).live)) pause(ids);
-    else follow(ids);
+    commands.run('pause', { from: 'key' });
   }
 </script>
 
@@ -888,8 +859,6 @@
         {viewHistory}
         {cursors}
         targets={() => targetsOf(id)}
-        onFollow={(restore) => follow(targetIdsOf(id), restore)}
-        onPause={() => pause(targetIdsOf(id))}
         {hover}
         {renderer}
         {registry}
@@ -899,34 +868,26 @@
         focused={ws.focusedId === id}
         selected={ws.selected.has(id)}
         onSelect={(shift, clicks) => selection.click(id, shift, clicks)}
-        maximized={!!ws.maximized?.includes(id)}
         onFocus={() => selection.point(id)}
         onPress={() => selection.pressOn(id)}
-        onRemove={() => closePlots(targetIdsOf(id))}
         onEach={(what, fn) => eachPlot(targetIdsOf(id), what, fn)}
         onKey={plotKey}
         onEdit={(what, patch) => history.group(what, () => ws.setPlot(id, patch))}
         onView={(patch) => viewHistory.step(() => targetIdsOf(id).forEach((i) => ws.plots[i]?.kind === ws.plots[id]?.kind && ws.setView(i, patch)))}
         targetIds={() => targetIdsOf(id)}
         onStartMove={(e) => drags.startMove(id, e)}
-        onSplit={(dir) => splitPlots(targetIdsOf(id), dir)}
-        onMaximize={() => (ws.maximized = ws.maximized?.includes(id) ? null : targetIdsOf(id))}
         onMoveToTab={(tabId) => {
           const ids = targetIdsOf(id);
           history.group(`Move ${plotsText(ids.length)} to ${ws.tabs.find((t) => t.id === tabId)?.name ?? 'a tab'}`, () => {
             for (const i of ids) ws.movePlotToTab(i, tabId);
           });
         }}
-        onClearCursors={() => clearCursors(targetIdsOf(id))}
         onTraceDragStart={() => drags.traceDragStart()}
         onLandSignal={(item, items) => drags.landSignal(item, items ? id : null, items)}
         otherPlots={plotIds(ws.layout)
           .filter((p) => p !== id)
           .map((p) => ({ id: p, label: labelOf(p) }))}
         onMoveSignal={(key, to) => moveSignal(id, key, to)}
-        onCheckCopy={() => copyCheck(targetIdsOf(id))}
-        onExport={() => openExport(targetIdsOf(id))}
-        onCopy={() => copyData(targetIdsOf(id)).catch((error) => toast.error(`Could not copy: ${error.message}`))}
       />
     {/if}
   {/key}
@@ -1010,7 +971,7 @@
           </div>
         </Popover.Content>
       </Popover.Root>
-      <IconButton icon={RiEraser} label="Clear the cursors" data-keeps-selection onclick={() => clearCursors()} />
+      <IconButton icon={RiEraser} label="Clear the cursors" data-keeps-selection data-command="clearCursors" onclick={() => commands.run('clearCursors', { from: 'toolbar' })} />
       <DropdownMenu.Root>
         <Tip text="Arrange this tab's plots">
           {#snippet children(tip)}
@@ -1044,8 +1005,7 @@
           <DropdownMenu.Item onSelect={exportTabs}><RiDownload class="menu-icon" />Export every tab…<span class="menu-value">{counted(ws.tabs.length, 'tab')}</span></DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => importInput.click()}><RiUpload class="menu-icon" />Import tabs…</DropdownMenu.Item>
           <DropdownMenu.Separator />
-          {@const exports = selection.pageTargets('view').length}
-          <DropdownMenu.Item onSelect={() => openExport(selection.pageTargets('view'))}><RiExport class="menu-icon" />Export data…<span class="menu-value">{selection.plots.size ? `${exports} selected` : plotsText(exports)}</span></DropdownMenu.Item>
+          <CommandItem id="exportData" menu="dropdown" />
         </DropdownMenu.Content>
       </DropdownMenu.Root>
       <input type="file" accept="application/json,.json" hidden bind:this={importInput} onchange={importTabs} />

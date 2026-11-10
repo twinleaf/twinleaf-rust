@@ -441,7 +441,8 @@ export class PlotView {
    * that moves the views is a step of it. `cursors` is the page's
    * CursorEdits, which holds the cursors the plot draws and writes those a
    * drag here moves, on the plots `targetIds` returns: the ids of the plots
-   * of `targets`. `onFollow(restore)` has the page follow live on those.
+   * of `targets`. `onFollow()` has the page follow live on those, back at
+   * the windows they had before they paused.
    */
   constructor({ body, overlay, config, hub, view, targets, targetIds, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors }) {
     Object.assign(this, { body, overlay, config, hub, view, targets, targetIds, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors });
@@ -1917,7 +1918,7 @@ export class PlotView {
       if (onAxis(e)) return;
       const band = this.yAxisAt(e.clientX, e.clientY);
       if (band) this.onFitY ? this.onFitY(this.axisTargets(band, e.clientY)[0]) : this.autoscale();
-      else this.onFollow(true);
+      else this.onFollow();
     });
   }
 

@@ -1,6 +1,8 @@
 // Every key and gesture the page reads, by where focus is. The keys sheet
 // lists this table, and each place's handler finds its action here with
-// `actionFor`, so what the sheet says is what the keys do.
+// `actionFor`, so what the sheet says is what the keys do. A plot's keys,
+// Space and Ctrl+C are plot commands, listed here from their table
+// (commands.js).
 //
 // An entry is {show, on, keys, action, what}: `show` is how the sheet
 // writes the keys, `on` where a gesture is made, `keys` the
@@ -11,6 +13,10 @@
 // of the sheet (`sheet`). A plot's key is a plot command, which with no
 // plot selected does nothing, unless its `scope` is 'view': a view
 // command, which with none selected acts on every plot.
+import { COMMANDS, commandOf } from './commands.js';
+
+/** Plot command `c`'s keys as an entry, its id the action of its keys where it has any. */
+const keysOf = (c) => ({ show: c.show, ...(c.keys && { keys: c.keys, action: c.id }), scope: c.scope, what: c.what });
 
 const digits = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
 const MOVE = { show: ['Arrows', 'Home', 'End'], action: 'move', what: 'Move' };
@@ -26,9 +32,9 @@ export const KEYMAP = [
       { show: ['F6'], what: 'Next region; with Shift, back' },
       { show: ['1–9'], keys: digits, action: 'goToPlot', what: 'Go to plot' },
       { show: ['[', ']'], keys: ['[', ']'], action: 'stepTab', what: 'Previous, next tab' },
-      { show: ['Space'], keys: [' '], action: 'pause', what: 'Pause, or follow live' },
+      keysOf(commandOf('pause')),
       { show: ['Ctrl', 'A'], what: 'Select every plot' },
-      { show: ['Ctrl', 'C'], what: 'Copy data' },
+      keysOf(commandOf('copyData')),
       { show: ['Ctrl', 'Z'], what: 'Undo' },
       { show: ['Ctrl', 'Y'], what: 'Redo; or Ctrl Shift Z' },
       { show: ['Ctrl', 'K'], what: 'Commands' },
@@ -38,20 +44,7 @@ export const KEYMAP = [
   {
     place: 'plot',
     title: 'Plot',
-    entries: [
-      { show: ['A'], keys: ['a', 'A', '+'], action: 'addSignals', what: 'Add signals' },
-      { show: ['Enter'], keys: ['Enter'], action: 'enterSignals', what: 'Into its signals' },
-      { show: ['|'], keys: ['|', '\\'], action: 'splitRight', what: 'Split right' },
-      { show: ['_'], keys: ['-', '_'], action: 'splitDown', what: 'Split down' },
-      { show: ['F'], keys: ['f', 'F'], action: 'maximize', what: 'Maximize, restore' },
-      { show: ['K'], keys: ['k', 'K'], action: 'kind', what: 'Kind and layout' },
-      { show: ['←', '→'], keys: ['ArrowLeft', 'ArrowRight'], action: 'pan', scope: 'view', what: 'Pan; with Shift, a window' },
-      { show: ['↑', '↓'], keys: ['ArrowUp', 'ArrowDown'], action: 'zoom', scope: 'view', what: 'Zoom time' },
-      { show: ['End'], keys: ['End'], action: 'follow', scope: 'view', what: 'Follow live' },
-      { show: ['Y'], keys: ['y', 'Y'], action: 'fitY', scope: 'view', what: 'Fit y' },
-      { show: ['L'], keys: ['l', 'L'], action: 'legend', what: 'Legend' },
-      { show: ['Delete'], keys: ['Delete', 'Backspace'], action: 'close', what: 'Close' },
-    ],
+    entries: COMMANDS.filter((c) => c.keys && !c.place).map(keysOf),
   },
   {
     place: 'signals',
@@ -163,9 +156,9 @@ export function actionFor(place, e) {
   return hit?.action ?? null;
 }
 
-/** Whether plot key action `action` is a 'view' command or a 'plot' command. */
+/** Whether plot command `action` is a 'view' command or a 'plot' command. */
 export function scopeOf(action) {
-  return KEYMAP.find((p) => p.place === 'plot').entries.find((x) => x.action === action)?.scope ?? 'plot';
+  return commandOf(action)?.scope ?? 'plot';
 }
 
 /**

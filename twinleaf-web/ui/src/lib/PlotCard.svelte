@@ -2,7 +2,7 @@
   // One plot of a tab: its header of signals and actions, the plot body the
   // WebGL layer draws behind, and its menus. The drawing is plot.js's
   // PlotView; this is the plot's controls.
-  import { onDestroy, onMount, tick } from 'svelte';
+  import { getContext, onDestroy, onMount, tick } from 'svelte';
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
@@ -27,16 +27,14 @@
   import RiLayout from '@lucide/svelte/icons/layers';
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import IconButton from './IconButton.svelte';
+  import CommandItem from './CommandItem.svelte';
+  import { axesLike, commandOf, xSpan } from './commands.js';
   import KindPicker from './KindPicker.svelte';
   import { keepsKey, plotPickers } from './keys.js';
   import Tip from './Tip.svelte';
   import RiDraggable from '@lucide/svelte/icons/grip-vertical';
-  import RiSplitH from '@lucide/svelte/icons/columns-2';
-  import RiSplitV from '@lucide/svelte/icons/rows-2';
   import RiBack from '@lucide/svelte/icons/arrow-left';
   import RiForward from '@lucide/svelte/icons/arrow-right';
-  import RiFullscreen from '@lucide/svelte/icons/maximize-2';
-  import RiFullscreenExit from '@lucide/svelte/icons/minimize-2';
   import RiClose from '@lucide/svelte/icons/x';
   import RiPause from '@lucide/svelte/icons/pause';
   import RiPlay from '@lucide/svelte/icons/play';
@@ -45,8 +43,6 @@
   import RiXCursors from '@lucide/svelte/icons/separator-vertical';
   import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
   import RiZoomTo from '@lucide/svelte/icons/zoom-in';
-  import RiExport from '@lucide/svelte/icons/file-down';
-  import RiWarn from '@lucide/svelte/icons/triangle-exclamation-point';
   import { PlotView, axisSlots, colorOf, cursorText, monitorOf } from './plot.js';
   import { colors } from './colors.svelte.js';
   import Swatch from './Swatch.svelte';
@@ -58,12 +54,18 @@
   import WindowSlider from './WindowSlider.svelte';
 
   let {
-    plot, hub, view, targets, hover, renderer, registry, focused, selected, maximized, otherTabs = [], tabName = '',
+    plot, hub, view, targets, hover, renderer, registry, focused, selected, otherTabs = [], tabName = '',
     targetPlots = () => [plot],
-    onFocus, onPress, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
-    onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
-    onEach, targetIds = () => [plot.id], onKey, viewHistory, cursors, onFollow, onPause,
+    onFocus, onPress, onSelect, onStartMove, onMoveToTab,
+    onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal,
+    onEach, targetIds = () => [plot.id], onKey, viewHistory, cursors,
   } = $props();
+  /** The plot commands (commands.js): this plot's rows, buttons and keys run them, made on this plot. */
+  const commands = getContext('commands');
+  /** Runs plot command `id` made on this plot from its button, `how` as the command takes it. */
+  const runHere = (id, how) => commands.run(id, { on: plot.id, from: 'button', how });
+  /** How Maximize reads on this plot, for its button. */
+  const maximizeRow = $derived(commands.row('maximize', { on: plot.id }));
 
   /** Runs `fn(pv)` on the PlotView of each plot a command here acts on. */
   const eachPv = (fn) => {
@@ -82,43 +84,21 @@
     each((p, axis) => byId.set(p.plotId, fn(p, axis)));
     cursors.set(what, byId);
   };
-  /** Places X1 and X2 in view on each plot a command here acts on, pausing the time plots, which hold the moment they mark. */
-  function addXCursors() {
-    asStep(() => eachPv((p) => p.config().kind === 'time' && p.view.pause(performance.now())));
-    editCursors('Add X cursors', (p) => p.xCursorsAdded());
-  }
   const clearXCursors = () => editCursors('Clear X cursors', (p) => p.xCursorsCleared());
-  /** Places Y1 and Y2 on the axis of each plot that matches this plot's y axis `key`. */
-  const addYCursors = (key) => editCursors('Add Y cursors', (p, axis) => p.yCursorsAdded(axis), (fn) => eachAxis(key, fn));
   /** Removes the Y cursors of the axis of each plot that matches this plot's y axis `key`, or with no key, of every axis of each plot. */
   const clearYCursors = (key) => editCursors('Clear Y cursors', (p, axis) => p.yCursorsCleared(axis), key === undefined ? eachPv : (fn) => eachAxis(key, fn));
   /**
    * Runs `fn(pv, axis)` for a command made on this plot's y axis `key`, on
    * the PlotView of each plot the command acts on, `axis` the key of that
-   * plot's y axis in the same units as this one (PlotView `axisIn`): the
-   * axis of the same signal where it is one of them, else the first, as an
-   * overlay plot's shared axis is. A plot with no axis in those units is
-   * left alone.
+   * plot's y axis in the same units as this one (commands.js `axesLike`).
    */
-  const eachAxis = (key, fn) => {
-    const units = key === undefined ? null : pv?.axisUnits(key);
-    if (units === null || units === undefined) return;
-    eachPv((p) => {
-      const axis = p.axisIn(units, key);
-      if (axis !== null) fn(p, axis);
-    });
-  };
+  const eachAxis = (key, fn) => axesLike(pv, targetPvs(), key).forEach(([p, axis]) => fn(p, axis));
   /** Sets y scale `scale` on each plot a command on this plot's y axis `key` acts on: those with an axis in its units. */
   function setYScale(key, scale) {
     const ids = new Set();
     eachAxis(key, (p) => ids.add(p.plotId));
     onEach(scale === 'log' ? 'Log density scale' : 'Linear density scale', (p) => (ids.has(p.id) ? { yScale: scale } : null));
   }
-  /** Shows or hides the legend of each plot a command here acts on, all as this plot's turns. */
-  const toggleLegend = () => {
-    const on = !plot.legend;
-    onEach(on ? 'Show the legend' : 'Hide the legend', () => ({ legend: on }));
-  };
   // What the menus' rows say of the plots their commands act on (menus.js):
   // a count over them, a setting they share, or how many they are where a
   // row names plots. Each is read as its menu opens.
@@ -127,15 +107,6 @@
     const ids = targetIds();
     return [...registry].filter((p) => ids.includes(p.plotId));
   };
-  /** How many plots a command here acts on, as a row's value, when more than this one. */
-  const plotsValue = () => (targetIds().length > 1 ? counted(targetIds().length, 'plot') : null);
-  /** The distance between X1 and X2 on the plots a command here acts on that have the pair, or null while none has. */
-  function xSpan() {
-    return common(targetPvs().flatMap((p) => {
-      const { a, b } = p.markers();
-      return a !== null && b !== null ? [cursorText(p.xKind()).span(b - a)] : [];
-    }));
-  }
   /** The first X cursor placed on the plots a command here acts on that have one, named to tell it from its pair, or from the view's width. */
   function xFirst() {
     return common(targetPvs().flatMap((p) => {
@@ -145,17 +116,6 @@
       return [`${a !== null ? 'X1' : 'X2'} ${cursorText(p.xKind()).at(at, between)}`];
     }));
   }
-  /** The signals of the axis Add Y cursors would land on, on each plot it acts on from this plot's y axis `key` (`eachAxis`); null on none, and where each plot has the one axis. */
-  const yLands = (key) => {
-    const names = [];
-    eachAxis(key, (p, axis) => names.push(p.yAxes.length > 1 ? p.axisName(axis) : null));
-    return names.some(Boolean) ? common(names) : null;
-  };
-  /** How many cursors the plots a command here acts on have placed, or null with none. */
-  const placed = () => {
-    const n = targetPvs().reduce((n, p) => n + p.cursorsPlaced(), 0);
-    return n ? `${n} placed` : null;
-  };
   /** The name list `list` (KINDS, MODES) gives value `v`. */
   const nameIn = (list, v) => list.find((x) => x[0] === v)?.[1] ?? v;
   /** Sets `field` to `value` on each plot a command here acts on of this plot's kind, as a frequency axis's scale; `what` names the step. */
@@ -206,7 +166,6 @@
   let copyAsk = $state(0);
   /** What Copy data says while the hub counts the rows. */
   const COUNTING = { state: 'ok', rows: null };
-  const rowsText = (n) => (n === null ? 'Counting…' : `${n.toLocaleString()} row${n === 1 ? '' : 's'}`);
   function recountCopy() {
     if (plot.items.length) copyCheck = COUNTING;
     copyAsk++;
@@ -221,7 +180,7 @@
     let current = true, asked = 0, timer;
     const ask = () => {
       const n = ++asked;
-      onCheckCopy?.().then((check) => current && n === asked && (copyCheck = check), () => current && n === asked && (copyCheck = null));
+      commands.check('copyData', { on: plot.id }).then((check) => current && n === asked && (copyCheck = check), () => current && n === asked && (copyCheck = null));
     };
     copyCheck = COUNTING;
     ask();
@@ -428,11 +387,6 @@
   // Whether the plot's view streams, for its play and pause button, and its window, for the time axis's slider.
   let streaming = $state(true);
   let windowSpan = $state(10);
-  /** Pauses the plot and the plots linked to it, or has them follow live again. */
-  function playPause() {
-    if (view.live) onPause();
-    else onFollow(false);
-  }
 
   onMount(() => {
     const poll = setInterval(() => pv?.legend && (legend = pv.legend), LEGEND_MS);
@@ -444,7 +398,7 @@
       targets,
       targetIds,
       cursors,
-      onFollow,
+      onFollow: () => runHere('follow'),
       hoverTime: hover,
       plotId: plot.id,
       renderer,
@@ -731,7 +685,7 @@
 <!-- A row's value in its trailing column, when it has one. -->
 {#snippet value(text)}{#if text}<span class="menu-value">{text}</span>{/if}{/snippet}
 <!-- The distance between X1 and X2, after a ruler, when a pair is placed. -->
-{#snippet span()}{@const d = xSpan()}{#if d}<span class="menu-value"><RiSpan />{d}</span>{/if}{/snippet}
+{#snippet span()}{@const d = xSpan(targetPvs())}{#if d}<span class="menu-value"><RiSpan />{d}</span>{/if}{/snippet}
 <!-- A signal's own menu, on its chip and on its row of the legend: what
      it shows, how it looks, where it goes. `close` closes the menu it is in. -->
 {#snippet signalMenu(key, close)}
@@ -791,7 +745,7 @@
   <!-- The header picks the plot up from anywhere empty, as a title bar does. -->
   <div
     class="plot-head flex h-7 shrink-0 cursor-grab items-center gap-1.5 border-b bg-card px-1.5"
-    ondblclick={(e) => empty(e) && onMaximize(false)}
+    ondblclick={(e) => empty(e) && runHere('maximize')}
     onpointerdown={(e) => !e.shiftKey && empty(e) && onStartMove(e)}
     role="toolbar"
     tabindex="-1"
@@ -900,30 +854,32 @@
         {/if}
       </ContextMenu.Content>
     </ContextMenu.Root>
-    <IconButton icon={RiAddSignal} label="Add a signal" keys={['A']} class="add-signal" tabindex={-1} onclick={(e) => openAdd(e.currentTarget, false)} />
+    <IconButton icon={RiAddSignal} label="Add a signal" keys={commandOf('addSignals').show} class="add-signal" tabindex={-1} onclick={(e) => openAdd(e.currentTarget, false)} />
     <div class="plot-actions flex shrink-0 items-center">
       <IconButton
         icon={RiLegend}
         label={plot.legend ? 'Hide the legend' : 'Show the legend in the plot'}
-        keys={['L']}
+        keys={commandOf('legend').show}
         class={plot.legend ? 'text-primary' : ''}
         aria-pressed={!!plot.legend}
         tabindex={-1}
-        onclick={() => toggleLegend()}
+        data-command="legend"
+        onclick={() => runHere('legend')}
       />
       <IconButton
         icon={streaming ? RiPause : RiPlay}
         label={streaming ? 'Pause' : 'Follow live'}
-        keys={['Space']}
+        keys={commandOf('pause').show}
         class={streaming ? '' : 'text-primary'}
         tabindex={-1}
-        onclick={playPause}
+        data-command="pause"
+        onclick={() => runHere('pause')}
       />
       <!-- Back and Forward through the views of the tab's plots (viewhistory.svelte.js). -->
       <IconButton icon={RiBack} label="Back to the view before" class="view-step" disabled={!viewHistory.canBack} tabindex={-1} onclick={() => viewHistory.back()} />
       <IconButton icon={RiForward} label="Forward to the view after" class="view-step" disabled={!viewHistory.canForward} tabindex={-1} onclick={() => viewHistory.forward()} />
-      <IconButton icon={maximized ? RiFullscreenExit : RiFullscreen} label={maximized ? 'Restore' : 'Maximize'} keys={['F']} class="maximize" tabindex={-1} onclick={() => onMaximize(false)} />
-      <IconButton icon={RiClose} label="Close plot" keys={['Delete']} tabindex={-1} onclick={() => onRemove()} />
+      <IconButton icon={maximizeRow.icon} label={maximizeRow.label} keys={maximizeRow.show} class="maximize" tabindex={-1} data-command="maximize" onclick={() => runHere('maximize')} />
+      <IconButton icon={RiClose} label="Close plot" keys={commandOf('close').show} tabindex={-1} data-command="close" onclick={() => runHere('close')} />
     </div>
   </div>
 
@@ -935,8 +891,8 @@
         {plot.kind === 'time' ? 'Time' : 'Frequency'}<span class="units">{plot.kind === 'time' ? 's' : 'Hz'}</span>
         {#if plot.kind === 'time'}
           <span class="axis-tools">
-            <Tip text={view.live ? 'Pause' : 'Follow live'} keys={['Space']}>
-              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={view.live ? 'Pause' : 'Follow live'} onclick={playPause}>{#if view.live}<RiPause />{:else}<RiPlay />{/if}</button>{/snippet}
+            <Tip text={view.live ? 'Pause' : 'Follow live'} keys={commandOf('pause').show}>
+              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={view.live ? 'Pause' : 'Follow live'} data-command="pause" onclick={() => runHere('pause')}>{#if view.live}<RiPause />{:else}<RiPlay />{/if}</button>{/snippet}
             </Tip>
           </span>
         {/if}
@@ -968,7 +924,7 @@
       <div class="axis-row" role="group" aria-label="X cursors">
         <span>Cursors</span>
         <Tip text="Add X1 and X2">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" onclick={() => (addXCursors(), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" data-command="addXCursors" onclick={() => (runHere('addXCursors'), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
         </Tip>
         <Tip text="Zoom to X1–X2" keys={['Ctrl', 'drag']}>
           {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Zoom to the X cursors" onclick={() => (pv?.zoomToCursors(), (xAxisOpen = false))}><RiZoomTo /></button>{/snippet}
@@ -1020,7 +976,7 @@
       <div class="axis-row" role="group" aria-label="Y cursors">
         <span>Cursors</span>
         <Tip text="Add Y1 and Y2 on this axis">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (addYCursors(region.keys[0]), (axisOpen = false))}><RiYCursors /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" data-command="addYCursors" onclick={() => (runHere('addYCursors', region.keys[0]), (axisOpen = false))}><RiYCursors /></button>{/snippet}
         </Tip>
         <Tip text="Clear this axis's cursors">
           {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (clearYCursors(region.keys[0]), (axisOpen = false))}><RiEraser /></button>{/snippet}
@@ -1064,7 +1020,7 @@
                   {#if legendKey}
                     {@render signalMenu(legendKey, () => (legendMenuOpen = false))}
                   {:else}
-                    <ContextMenu.Item onSelect={() => onEach('Hide the legend', () => ({ legend: false }))}><RiLegend class="menu-icon" />Hide the legend<ContextMenu.Shortcut><kbd>L</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+                    <CommandItem id="legend" on={plot.id} />
                   {/if}
                 </ContextMenu.Content>
               </ContextMenu.Root>
@@ -1134,7 +1090,7 @@
                   <ContextMenu.Separator />
                   {#if c.x}<ContextMenu.Item onSelect={clearXCursors}><RiXCursors class="menu-icon" />Clear X cursors{@render value(xFirst())}</ContextMenu.Item>{/if}
                   {#if c.ys.length}<ContextMenu.Item onSelect={() => clearYCursors()}><RiYCursors class="menu-icon" />Clear Y cursors{@render value(counted(targetPvs().reduce((n, p) => n + p.yCursorAxes(), 0), 'axis', 'axes'))}</ContextMenu.Item>{/if}
-                  <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors{@render value(placed())}</ContextMenu.Item>
+                  <ContextMenu.Item data-command="clearCursors" onSelect={() => commands.run('clearCursors', { on: plot.id })}><RiEraser class="menu-icon" />Clear all cursors{@render value(commands.row('clearCursors', { on: plot.id }).value)}</ContextMenu.Item>
                 </ContextMenu.Content>
               </ContextMenu.Root>
             </div>
@@ -1157,18 +1113,14 @@
            too much or come back short, from the hub's count of the rows. -->
       {#if plot.items.length}
         <ContextMenu.Label>Data</ContextMenu.Label>
-        <ContextMenu.Item disabled={copyCheck?.state === 'too-many'} onSelect={() => onCopy?.()}>
-          <RiCopy class="menu-icon" />Copy data
-          {#if copyCheck}<span class="menu-value" class:warn={copyCheck.state !== 'ok'} title={copyCheck.reason}>{#if copyCheck.state !== 'ok'}<RiWarn />{/if}{rowsText(copyCheck.rows)}</span>{/if}
-          <ContextMenu.Shortcut><kbd>Ctrl</kbd><kbd>C</kbd></ContextMenu.Shortcut>
-        </ContextMenu.Item>
-        <ContextMenu.Item onSelect={() => onExport?.()}><RiExport class="menu-icon" />Export data…{@render value(plotsValue())}</ContextMenu.Item>
+        <CommandItem id="copyData" on={plot.id} how={copyCheck} />
+        <CommandItem id="exportData" on={plot.id} />
       {/if}
       <ContextMenu.Label>Cursors</ContextMenu.Label>
-      <!-- Cursors are dragged out of the axes; these place a pair in view. -->
-      <ContextMenu.Item onSelect={addXCursors}><RiXCursors class="menu-icon" />Add X cursors{@render span()}</ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => addYCursors(region.keys?.[0])}><RiYCursors class="menu-icon" />Add Y cursors{@render value(yLands(region.keys?.[0]))}</ContextMenu.Item>
-      <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors{@render value(placed())}</ContextMenu.Item>
+      <!-- Cursors are dragged out of the axes; these place a pair in view, Add Y cursors on the axis under the right-click. -->
+      <CommandItem id="addXCursors" on={plot.id} />
+      <CommandItem id="addYCursors" on={plot.id} how={region.keys?.[0]} />
+      <CommandItem id="clearCursors" on={plot.id} />
       <ContextMenu.Label>Show</ContextMenu.Label>
       <ContextMenu.Sub>
         <ContextMenu.SubTrigger><RiKind class="menu-icon" />Kind{@render value(common(targetPlots().map((p) => nameIn(KINDS, p.kind))))}</ContextMenu.SubTrigger>
@@ -1187,9 +1139,9 @@
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
       <ContextMenu.Label>Arrange</ContextMenu.Label>
-      <ContextMenu.Item onSelect={() => onSplit('row')}><RiSplitH class="menu-icon" />Split right<ContextMenu.Shortcut><kbd>|</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => onSplit('col')}><RiSplitV class="menu-icon" />Split down<ContextMenu.Shortcut><kbd>_</kbd></ContextMenu.Shortcut></ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => onMaximize(false)}>{#if maximized}<RiFullscreenExit class="menu-icon" />Restore{:else}<RiFullscreen class="menu-icon" />Maximize{/if}<ContextMenu.Shortcut><kbd>F</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <CommandItem id="splitRight" on={plot.id} />
+      <CommandItem id="splitDown" on={plot.id} />
+      <CommandItem id="maximize" on={plot.id} />
       <ContextMenu.Sub>
         <ContextMenu.SubTrigger disabled={!otherTabs.length}><RiTab class="menu-icon" />Move to tab{@render value(tabName)}</ContextMenu.SubTrigger>
         <ContextMenu.SubContent>
@@ -1197,7 +1149,7 @@
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
       <ContextMenu.Separator />
-      <ContextMenu.Item variant="destructive" onSelect={() => onRemove()}><RiClose class="menu-icon" />Close plot{@render value(plotsValue() ?? counted(plot.items.length, 'signal'))}<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+      <CommandItem id="close" on={plot.id} />
     </ContextMenu.Content>
   </ContextMenu.Root>
 </div>

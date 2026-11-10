@@ -1,13 +1,15 @@
 <script>
   // The command palette, on Ctrl+K or ⌘K: add a signal, open a tab, arrange
-  // the tab, and the toolbar's actions, by typing part of a name.
+  // the tab, the plot commands that have plots to act on now (commands.js),
+  // and the toolbar's actions, by typing part of a name.
   import { getContext } from 'svelte';
   import * as Command from '$lib/components/ui/command/index.js';
   import { ARRANGEMENTS } from './constants.js';
 
-  /** `act` holds the page's actions: toggleDock(side), dockShown(side), addSignal(key), newPlot(keys), followLive(), clearCursors(), exportTabs(), importTabs(). */
+  /** `act` holds the page's actions: toggleDock(side), dockShown(side), addSignal(key), newPlot(keys), exportTabs(), importTabs(). */
   let { open = $bindable(false), session, ws, act } = $props();
   const history = getContext('history');
+  const commands = getContext('commands');
 
   /** Closes the palette, then runs `fn`. */
   function run(fn) {
@@ -48,9 +50,12 @@
         <Command.Item value={`arrange ${label}`} onSelect={() => run(() => history.group(`Arrange as ${label}`, () => ws.arrange(name)))}>Arrange as {label}</Command.Item>
       {/each}
     </Command.Group>
+    <Command.Group heading="Plots">
+      {#each commands.offered() as c (c.id)}
+        <Command.Item value={`command ${c.id} ${c.label}`} onSelect={() => run(() => commands.run(c.id, { from: 'palette' }))}>{c.label}</Command.Item>
+      {/each}
+    </Command.Group>
     <Command.Group heading="View">
-      <Command.Item onSelect={() => run(act.followLive)}>Follow live</Command.Item>
-      <Command.Item onSelect={() => run(act.clearCursors)}>Clear cursors</Command.Item>
       <Command.Item onSelect={() => run(act.exportTabs)}>Export every tab</Command.Item>
       <Command.Item onSelect={() => run(act.importTabs)}>Import tabs</Command.Item>
     </Command.Group>

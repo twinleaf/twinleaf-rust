@@ -170,7 +170,7 @@ export class Selection {
 
   /**
    * The plots a command made from the page or the keys acts on, `scope` its
-   * kind (keymap.js `scopeOf`): the selection; with none, for a 'view'
+   * kind (commands.js): the selection; with none, for a 'view'
    * command every plot shown, as after Ctrl+A, and for a 'plot' command none.
    */
   pageTargets(scope) {
