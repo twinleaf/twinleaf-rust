@@ -91,21 +91,23 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .dock-frame.pinned.left > .dock-side { align-self: flex-start; }
 .docked.narrow .dock-frame.pinned > .dock-side { flex: none; width: auto; height: var(--content); align-self: stretch; }
 .docked.narrow .dock-frame.pinned.right > .dock-side { margin-top: auto; }
-.dock-frame.closing .dock { opacity: 0; transition: opacity calc(var(--slide-ms, 250ms) / 2) linear; }
-.dock-frame.opening .dock { animation: dock-in calc(var(--slide-ms, 300ms) / 2) linear calc(var(--slide-ms, 300ms) / 2) both; }
+.dock-frame.closing :is(.dock, .dock-top) { opacity: 0; transition: opacity calc(var(--slide-ms, 250ms) / 2) linear; }
+.dock-frame.opening :is(.dock, .dock-top) { animation: dock-in calc(var(--slide-ms, 300ms) / 2) linear calc(var(--slide-ms, 300ms) / 2) both; }
 @keyframes dock-in { from { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) {
   .layout.sliding > [data-pane] { transition: none; }
-  .dock-frame.closing .dock { transition: none; }
-  .dock-frame.opening .dock { animation: none; }
+  .dock-frame.closing :is(.dock, .dock-top) { transition: none; }
+  .dock-frame.opening :is(.dock, .dock-top) { animation: none; }
 }
 /* The rail's button is placed from the frame, not from the rail in it. */
 .dock-side { position: static; display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .dock { display: flex; flex-direction: column; gap: 4px; min-height: 0; flex: 1; overflow-y: auto; scrollbar-width: thin; }
 .dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: 2px; border-radius: var(--radius); }
+/* What a dock holds above its panels, the filter of its properties: the
+   panels scroll below it, not under it, and no panel's fold moves it. */
+.dock-top { flex: none; }
 /* Show sits centred across the rail, 8 px below the frame's top. Hide sits
-   at the right end of its dock's first panel, in the header's row and at
-   the same 8 px below the frame's top while the dock is at its top; it is
+   at the right end of its dock's first panel, in the header's row; it is
    placed from that panel and scrolls with it, so no row of the dock passes
    under it. The header keeps its own text and grip clear of the button. */
 .dock-button { position: absolute; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }

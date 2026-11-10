@@ -345,8 +345,8 @@
   const checked = $derived([...hub.session.devices.values()].sort(byRoute).filter((d) => !unchecked.has(d.route)));
   /** The words every property row shown has in its name: one filter for every panel of properties. */
   let propertyFilter = $state('');
-  /** Whether panel `id` is the first open panel of properties in its dock, which holds the filter's field. */
-  const holdsFilter = (id) => SIDES.some((side) => docks[side].find((p) => p.open && PANELS[p.id].channels)?.id === id);
+  /** Whether dock `side` has a panel of properties, open or folded, and so holds the filter's field, above its panels. */
+  const holdsFilter = (side) => docks[side].some((p) => PANELS[p.id].channels);
   // The property rows the page shows, in page order, which a Shift pick runs
   // along: each open panel of rows or action buttons of the docks shown,
   // left then right, top to bottom.
@@ -878,10 +878,13 @@
       <SignalList session={hub.session} {drags} onAdd={addSignal} onRemove={removeSignal} onNewPlot={newPlotWith} {addsTo} />
     </div>
   {:else}
-    {#if holdsFilter(id)}
-      <Input class="mb-1.5 h-7 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows />
-    {/if}
     {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} panel={id} filter={propertyFilter} />{/key}
+  {/if}
+{/snippet}
+
+{#snippet dockTop(side)}
+  {#if holdsFilter(side)}
+    <Input class="mb-1.5 h-7 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows />
   {/if}
 {/snippet}
 
@@ -898,7 +901,7 @@
     style:--content={contentSize[side] !== null ? `${contentSize[side]}px` : null}
     onpointerdown={(e) => drags.startMarquee(e)}
   >
-    <Dock {docks} {side} content={panelBody} railed={railed[side]} />
+    <Dock {docks} {side} content={panelBody} top={dockTop} railed={railed[side]} />
   </aside>
 {/snippet}
 

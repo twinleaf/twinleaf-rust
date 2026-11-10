@@ -9,7 +9,7 @@ import fc from 'fast-check';
 import { afterAll, describe, expect, it } from 'vitest';
 import { page as browser, commands } from 'vitest/browser';
 import { PANELS } from '../src/lib/docks.svelte.js';
-import { centre, clickOn, mountPage, settle, until, wait, withExamples } from './harness/page.js';
+import { centre, clickOn, mountPage, pickItem, rightClick, settle, typeInto, until, wait, withExamples } from './harness/page.js';
 
 const LIST = '[data-slot=scroll-area-viewport]';
 const BAR = '[data-slot=scroll-area-scrollbar]';
@@ -31,7 +31,7 @@ const tableOf = ({ setting, report, action, other }) => [...rpcs(setting, 'setti
  * What of a panel's own decides its height, each kind counted apart, as an
  * empty list's notice is not as tall as a row.
  */
-const OWN = { rows: 'tr, .chip, .device, [data-name]', notices: '.props-empty, .sig-empty, .empty', 'edit bars': '.write-bar', filters: 'input[aria-label^="Filter the properties"]' };
+const OWN = { rows: 'tr, .chip, .device, [data-name]', notices: '.props-empty, .sig-empty, .empty', 'edit bars': '.write-bar' };
 
 /** The share of its dock's height that `panel` gives way down to, as the stylesheet states it: '66.667%'. */
 const shareOf = (panel) => panel.computedStyleMap().get('height').toString();
@@ -239,6 +239,50 @@ describe('the button that hides a dock', () => {
       await clickOn(buttonOf(docks().at(-1)));
       await until(() => docks().length === 1);
       expect(docks().map((dock) => dock.getAttribute('aria-label')), "the docks open after a click on the right one's hide button").toEqual(['Left dock']);
+    } finally {
+      page.dispose();
+    }
+  }, 60_000);
+});
+
+describe("the filter of a dock's properties", () => {
+  const FIELD = 'input[aria-label^="Filter the properties"]';
+  const PROPERTIES = Object.values(PANELS).filter((p) => p.channels).map((p) => p.title);
+  const fieldsOf = (dock) => [...dock.parentElement.querySelectorAll(FIELD)];
+  const placeOf = (el) => (({ left, top, width, height }) => ({ left, top, width, height }))(el.getBoundingClientRect());
+  const panel = (title) => document.querySelector(`.dock-panel[aria-label="${title}"]`);
+  const namesIn = (title) => [...panel(title).querySelectorAll('tr[id^=prop-] .pname, [data-name]')].map((el) => el.textContent.trim());
+
+  it('is one field in each dock with a panel of properties, above its panels, where it stays as they fold, and filters every one', async () => {
+    await browser.viewport(1200, 900);
+    const page = await mountPage([['s0.x']], 'columns', 0, signals(3), tableOf({ setting: 4, report: 4, action: 3, other: 2 }));
+    try {
+      await settle(6);
+      const [left, right] = docks();
+      expect(docks().map((dock) => fieldsOf(dock).length), 'fields in the left dock, of no properties, and the right').toEqual([0, 1]);
+      const field = fieldsOf(right)[0], at = placeOf(field);
+      expect(right.contains(field), 'the field is among the panels, which scroll').toBe(false);
+      expect(field.getBoundingClientRect().bottom, "the field's bottom, above the panels").toBeLessThanOrEqual(right.getBoundingClientRect().top);
+      // Every panel of properties folds in turn, the open ones first, until none is open.
+      const open = () => PROPERTIES.filter((title) => panel(title).classList.contains('open'));
+      for (let title; (title = open()[0]); ) {
+        await clickOn(panel(title).querySelector('.dock-title'));
+        await settle(6);
+        expect(fieldsOf(right), `with ${title} folded: the field`).toEqual([field]);
+        expect(placeOf(field), `with ${title} folded: where the field is`).toEqual(at);
+      }
+      for (const title of ['Settings', 'Reports', 'Actions']) await clickOn(panel(title).querySelector('.dock-title'));
+      await settle(6);
+      expect(placeOf(field), 'with three panels unfolded: where the field is').toEqual(at);
+      await typeInto(field, 'p1');
+      await settle(6);
+      expect(['Settings', 'Reports', 'Actions'].map(namesIn), 'the rows of each panel, filtered by p1').toEqual([['setting.p1'], ['report.p1'], ['action.p1']]);
+      // A panel of properties moved to the other dock brings that dock a field of the same filter.
+      await rightClick(centre(panel('Reports').querySelector('.dock-title')));
+      await pickItem('Move to the left dock');
+      await settle(6);
+      expect(fieldsOf(left).map((f) => f.value), 'what the left dock filters by, holding Reports').toEqual(['p1']);
+      expect(placeOf(field), 'with Reports in the other dock: where the field is').toEqual(at);
     } finally {
       page.dispose();
     }

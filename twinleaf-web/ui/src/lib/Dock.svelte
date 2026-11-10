@@ -40,10 +40,11 @@
 
   /**
    * `docks` is the page's Docks, `side` this dock's, and `content(id)` draws
-   * a panel's body. `railed` draws the rail in the panels' place: the page
-   * says when, as a dock sliding shut keeps its panels until it has.
+   * a panel's body. `top(side)` draws what the dock holds above its panels,
+   * which they scroll below. `railed` draws the rail in the panels' place:
+   * the page says when, as a dock sliding shut keeps its panels until it has.
    */
-  let { docks, side, content, railed } = $props();
+  let { docks, side, content, top = undefined, railed } = $props();
 
   // Panels slide only while one is dragged, so a fold resizes them in place.
   const FLIP_MS = 150;
@@ -143,6 +144,7 @@
       {#snippet children(tip)}<button {...tip} class="dock-button" aria-label="Show the {side} dock"><ShowIcon /></button>{/snippet}
     </Tip>
   {/if}
+  {#if top && !rail}<div class="dock-top">{@render top(side)}</div>{/if}
 <div
   class="dock"
   role="list"
