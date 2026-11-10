@@ -405,9 +405,9 @@
   // tiles beside it in step. Its panels keep the width they have open,
   // `contentSize` in px, pinned to the outer edge and cut off by the moving
   // edge, so they never reflow; shutting, they fade out by the slide's
-  // midpoint, and opening, they fade in after it. The toggle sits at the
-  // frame's top right, as the rail's does: the right dock shrinks into it,
-  // and the left dock's rides its inner edge to the rail's spot.
+  // midpoint, and opening, they fade in after it. The button that hides a
+  // dock is in its first panel and fades with it; the rail's button shows
+  // once the frame is the rail.
   let dockGroup = $state(null);
   /** The room the panes share, in px: the group less its handles. */
   let paneRoom = $state(0);

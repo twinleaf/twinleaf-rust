@@ -1,7 +1,8 @@
 <script>
   // One dock, left or right: its panels in a column, each under a header
   // that drags it, within this dock or to the other, and folds it with its
-  // chevron. A button at the dock's top right hides it. A dock that shows
+  // chevron. A button in the row of its first panel's header hides it, and
+  // scrolls with that header, so it lies over no row. A dock that shows
   // no panels, as it has none or is hidden, is a rail along the page's
   // edge: a panel dropped on it joins the dock's panels, at the end, and
   // shows the dock, and a click on a hidden dock's rail shows it. Only
@@ -124,7 +125,7 @@
   }
 </script>
 
-<!-- The drag zone holds the panels alone, so the buttons sit beside it. -->
+<!-- The drag zone holds the panels alone: the rail's button sits beside it, and the button that hides the dock in its first panel. -->
 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
 <div
   class="dock-side {side}"
@@ -137,18 +138,9 @@
   bind:this={root}
   onclick={() => rail && docks[side].length && setHidden(false)}
 >
-  {#if rail}
-    {#if docks[side].length}
-      <Tip text="Show the {side} dock">
-        {#snippet children(tip)}<button {...tip} class="dock-button" aria-label="Show the {side} dock"><ShowIcon /></button>{/snippet}
-      </Tip>
-    {/if}
-  {:else}
-    <Tip text="Hide the {side} dock">
-      {#snippet children(tip)}
-        <!-- Out of the Tab order, which steps between the panels; the panels' menu and the commands hide the dock too. -->
-        <button {...tip} class="dock-button" aria-label="Hide the {side} dock" data-focus-skip onclick={(e) => (e.stopPropagation(), setHidden(true))}><HideIcon /></button>
-      {/snippet}
+  {#if rail && docks[side].length}
+    <Tip text="Show the {side} dock">
+      {#snippet children(tip)}<button {...tip} class="dock-button" aria-label="Show the {side} dock"><ShowIcon /></button>{/snippet}
     </Tip>
   {/if}
 <div
@@ -200,6 +192,14 @@
           <ContextMenu.Item onSelect={() => docks.reset()}><RiReset class="menu-icon" />Reset every panel</ContextMenu.Item>
         </ContextMenu.Content>
       </ContextMenu.Root>
+      {#if i === 0 && !rail}
+        <Tip text="Hide the {side} dock">
+          {#snippet children(tip)}
+            <!-- Out of the Tab order, which steps between the panels; the panels' menu and the commands hide the dock too. -->
+            <button {...tip} class="dock-button" aria-label="Hide the {side} dock" data-focus-skip onclick={(e) => (e.stopPropagation(), setHidden(true))}><HideIcon /></button>
+          {/snippet}
+        </Tip>
+      {/if}
       {#if p.open && !p[SHADOW]}
         <div class="dock-body" data-focus-group="panel-{p.id}">{@render content(p.id)}</div>
       {/if}

@@ -59,6 +59,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 #dnd-action-dragged-el .tab { box-shadow: 0 6px 16px rgb(0 0 0 / 0.45); }
 .tab-slot { display: flex; }
 #dnd-action-dragged-el.dock-panel { height: 28px !important; overflow: hidden !important; padding: 0 6px !important; background: var(--popover) !important; border: 1px solid var(--primary) !important; border-radius: var(--radius) !important; box-shadow: 0 6px 16px rgb(0 0 0 / 0.45) !important; }
+#dnd-action-dragged-el .dock-button { display: none !important; }
 
 /* The docks beside the tiles, and their panels (Dock.svelte). Each dock is
    a frame in its own pane, padded around its panels; hidden, the same frame
@@ -98,20 +99,21 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
   .dock-frame.closing .dock { transition: none; }
   .dock-frame.opening .dock { animation: none; }
 }
-/* The frame holds the toggle, not the panels, so it stays at the frame's
-   top right however the panels are pinned. */
+/* The rail's button is placed from the frame, not from the rail in it. */
 .dock-side { position: static; display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .dock { display: flex; flex-direction: column; gap: 4px; min-height: 0; flex: 1; overflow-y: auto; scrollbar-width: thin; }
 .dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: 2px; border-radius: var(--radius); }
-/* Show sits centred across the rail; Hide sits at the very same spot of
-   the frame open, its top right, in its first header's row: 3 px of the
-   rail's 26 either side of the 20 px button, less the frame's 1 px border,
-   from which the button is placed. */
-.dock-button { position: absolute; top: 8px; right: 2px; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
+/* Show sits centred across the rail, 8 px below the frame's top. Hide sits
+   at the right end of its dock's first panel, in the header's row and at
+   the same 8 px below the frame's top while the dock is at its top; it is
+   placed from that panel and scrolls with it, so no row of the dock passes
+   under it. The header keeps its own text and grip clear of the button. */
+.dock-button { position: absolute; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
 .dock-button:hover { background: var(--secondary); color: var(--foreground); }
 .dock-button svg { width: 14px; height: 14px; }
-.dock-frame.rail .dock-button { right: auto; left: 50%; transform: translateX(-50%); }
-.dock-side > .dock > .dock-panel:first-child .dock-head { padding-right: 26px; }
+.dock-frame.rail .dock-button { top: 8px; left: 50%; transform: translateX(-50%); }
+.dock-panel > .dock-button { top: 2px; right: 0; }
+.dock-panel:has(> .dock-button) .dock-head { padding-right: 24px; }
 /* The panels are lists inside a list. A panel is as tall as what it shows
    while its dock has the room. Where the panels do not fit, a panel taller
    than two thirds of the dock's height gives way, down to two thirds: its
@@ -124,7 +126,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
    A panel shrinks from its content's height, its flex basis, and no
    further than the lesser of that and the two thirds its `height` states,
    which `min-height: auto` reads and which sets no height of its own. */
-.dock-panel { display: flex; flex-direction: column; flex: 0 1 content; height: 66.667%; min-height: auto; }
+.dock-panel { position: relative; display: flex; flex-direction: column; flex: 0 1 content; height: 66.667%; min-height: auto; }
 .dock-body [data-slot=scroll-area] { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
 .dock-body [data-slot=scroll-area-viewport] { flex: 0 1 auto; min-height: 0; height: auto; }
 .dock-body [data-slot=scroll-area]:has(> [data-slot=scroll-area-scrollbar]) > [data-slot=scroll-area-viewport] { padding-right: 10px; }

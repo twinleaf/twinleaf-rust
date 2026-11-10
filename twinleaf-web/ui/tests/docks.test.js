@@ -9,7 +9,7 @@ import fc from 'fast-check';
 import { afterAll, describe, expect, it } from 'vitest';
 import { page as browser, commands } from 'vitest/browser';
 import { PANELS } from '../src/lib/docks.svelte.js';
-import { centre, clickOn, mountPage, settle, wait, withExamples } from './harness/page.js';
+import { centre, clickOn, mountPage, settle, until, wait, withExamples } from './harness/page.js';
 
 const LIST = '[data-slot=scroll-area-viewport]';
 const BAR = '[data-slot=scroll-area-scrollbar]';
@@ -199,4 +199,48 @@ describe('a panel in a dock', () => {
     expect(seen.lists, 'lists seen scrolling').toBeGreaterThan(0);
     expect(seen.grown, 'panels seen past their share of a dock').toBeGreaterThan(0);
   }, 600_000);
+});
+
+describe('the button that hides a dock', () => {
+  const buttonOf = (dock) => dock.parentElement.querySelector('button[aria-label^="Hide the"]');
+  const within = (a, b) => a.left >= b.left - 1 && a.right <= b.right + 1 && a.top >= b.top - 1 && a.bottom <= b.bottom + 1;
+  /** The rows of `dock` that show within it and that its hide button lies over, each by its text. */
+  function covered(dock) {
+    const b = buttonOf(dock).getBoundingClientRect(), d = dock.getBoundingClientRect();
+    const top = Math.max(b.top, d.top), bottom = Math.min(b.bottom, d.bottom);
+    return [...dock.querySelectorAll(OWN.rows)]
+      .filter((row) => {
+        const r = row.getBoundingClientRect();
+        return r.height > 0 && r.left < b.right && r.right > b.left && r.top < bottom && r.bottom > top;
+      })
+      .map((row) => row.textContent.trim());
+  }
+
+  it("lies over no row however its dock is scrolled, sits in the first header's row, and hides the dock", async () => {
+    await browser.viewport(1200, 520);
+    const page = await mountPage([['s0.x']], 'columns', 0, signals(30), tableOf({ setting: 14, report: 14, action: 10, other: 0 }), { routes: ['/', '/0', '/1', '/2', '/3', '/4'] });
+    try {
+      await settle(6);
+      let scrolled = 0;
+      for (const dock of docks()) {
+        const side = dock.getAttribute('aria-label');
+        const most = dock.scrollHeight - dock.clientHeight;
+        if (most > 0) scrolled++;
+        for (let top = 0; top <= most; top += 7) {
+          dock.scrollTop = top;
+          expect(covered(dock), `${side}, scrolled ${top} px of ${most}: the rows under its hide button`).toEqual([]);
+        }
+        dock.scrollTop = 0;
+        const head = dock.querySelector('.dock-panel .dock-head');
+        expect(within(buttonOf(dock).getBoundingClientRect(), head.getBoundingClientRect()), `${side}: its hide button is within its first header's row`).toBe(true);
+        expect(buttonOf(dock).contains(document.elementFromPoint(...centre(buttonOf(dock)))), `${side}: its hide button is what the pointer hits`).toBe(true);
+      }
+      expect(scrolled, 'docks seen scrolling').toBeGreaterThan(0);
+      await clickOn(buttonOf(docks().at(-1)));
+      await until(() => docks().length === 1);
+      expect(docks().map((dock) => dock.getAttribute('aria-label')), "the docks open after a click on the right one's hide button").toEqual(['Left dock']);
+    } finally {
+      page.dispose();
+    }
+  }, 60_000);
 });
