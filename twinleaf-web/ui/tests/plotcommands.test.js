@@ -4,9 +4,13 @@
 // themselves as the layout has them, and Split puts an empty plot beside
 // each, as one step, and selects the new plots. A key acts on the
 // selection, and with none selected, a view key on every plot and a plot
-// key on none (round 2 Selection #3), wherever focus is. Through closes,
-// moves to another tab, undos and redos, what shows is the maximized plots
-// still in the tab, or every plot once none is left (#6). A paused plot's
+// key on none (round 2 Selection #3), wherever focus is. Maximize, and
+// Restore, leave the same plots maximized and selected from every origin:
+// the key, the palette, a plot's menu, its button and a double-click on its
+// header. Through those, Escape, splits, tabs opened, closes, moves to
+// another tab, undos and redos, what shows is the maximized plots still in
+// the tab, or every plot once none is left (#6), and what is selected
+// shows (workspace.svelte.js). A paused plot's
 // page, taken down, asks the hub for no more windows. A plot menu's copy
 // count is the count of the window shown now, whichever count the hub
 // answers last (class 7).
@@ -14,7 +18,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, feed, focusPage, frames, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, showing, until, wait, withExamples } from './harness/page.js';
+import { toast as notices } from 'svelte-sonner';
+import { OPEN, centre, feed, focusPage, frames, headerSpot, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, settle, showing, until, wait, withExamples } from './harness/page.js';
 import { GUTTER, plotIds, rects, restrict } from '../src/lib/layout.js';
 import { api } from '../src/lib/protocol.js';
 import { COMMANDS } from '../src/lib/commands.js';
@@ -44,7 +49,7 @@ describe('a plot’s own command', () => {
       await fc.assert(
         fc.asyncProperty(fc.subarray(plotIds(page.ws.layout)), fc.nat(), async (picked, k) => {
           const ids = plotIds(page.ws.layout), id = ids[k % ids.length];
-          page.ws.maximized = null;
+          page.ws.restoreLayout();
           page.ws.selected.clear();
           for (const p of picked) page.ws.selected.add(p);
           flushSync();
@@ -136,7 +141,7 @@ describe('a key', () => {
             if (spectrum !== null) page.history.group('Kind', () => page.ws.setPlot(before[spectrum], { kind: 'spectrum' }));
             // Some plots maximized, or none; what is selected and focused is shown, as only a shown plot can be.
             const was = max && max.map((i) => before[i]);
-            page.ws.maximized = was;
+            page.ws.maximize(was);
             const shown = page.ws.shownIds();
             const picked = picks.map((i) => before[i]).filter((id) => shown.includes(id));
             const into = focus !== null && shown.includes(before[focus]) ? before[focus] : null;
@@ -179,15 +184,71 @@ describe('a key', () => {
   }, 600_000);
 });
 
+/**
+ * Closes every notice on the page and waits until they have gone. The
+ * notices stack up over the middle of the plots, an undo's and a redo's
+ * among them, stay while the pointer rests on them, and take every press
+ * on them: a press meant for a plot comes after this.
+ */
+async function clearNotices() {
+  if (!document.querySelector('[data-sonner-toast]')) return;
+  notices.dismiss();
+  expect(await until(() => !document.querySelector('[data-sonner-toast]'), 3000), 'the notices gone').toBe(true);
+}
+
+/**
+ * The origins of Maximize, which is Restore while plots are maximized: each
+ * makes the command, on plot `id` where the origin is a plot's, and returns
+ * false where it does not offer it.
+ */
+const MAXIMIZE = {
+  key: () => pressKey('f'),
+  palette: async () => {
+    await pressKey('Control+k');
+    await settle();
+    const item = document.querySelector('[data-slot=command-item][data-value^="command maximize "]');
+    if (item) item.click();
+    else await pressKey('Escape');
+    // The palette, closed, fades out over the page, and takes every press until it has gone.
+    expect(await until(() => !document.querySelector('[data-slot=dialog-overlay]'), 2000), 'the palette gone').toBe(true);
+    return !!item;
+  },
+  menu: async (id) => {
+    await plotMenu(id);
+    const row = document.querySelector('[role^=menuitem][data-command=maximize]');
+    expect(row, `the menu of plot ${id} open, with the command’s row`).toBeTruthy();
+    row.click();
+  },
+  button: async (id) => {
+    const button = leafOf(id).querySelector('.plot-head [data-command=maximize]');
+    // A narrow plot's header has no such button.
+    if (!button.getBoundingClientRect().width) return false;
+    await commands.mouse([['move', ...centre(button)], ['down'], ['up']]);
+  },
+  header: async (id) => {
+    const spot = headerSpot(leafOf(id));
+    if (!spot) return false;
+    await commands.mouse([['dblclick', ...spot]]);
+  },
+};
+/** The origins made on a plot, which is selected first unless it is in the selection. */
+const ON_A_PLOT = ['menu', 'button', 'header'];
+
 describe('maximized plots', () => {
-  it('show alone, the maximized ones still in the tab, through any run of closes, moves to another tab, undos and redos', async () => {
+  it('are what the last Maximize from any origin left of the tab’s plots, show alone with the selection among them, and go with Restore, Escape, a split or a tab opened, through any run of those, closes, moves to another tab, undos and redos', async () => {
     const plotStep = fc.oneof(
+      { weight: 4, arbitrary: fc.record({ t: fc.constant('max'), by: fc.constantFrom(...Object.keys(MAXIMIZE)), k: fc.nat() }) },
+      { weight: 2, arbitrary: fc.record({ t: fc.constant('select'), ks: fc.subarray([0, 1, 2, 3]) }) },
+      fc.record({ t: fc.constant('escape') }),
       fc.record({ t: fc.constant('close'), k: fc.nat() }),
       fc.record({ t: fc.constant('toTab'), k: fc.nat() }),
+      fc.record({ t: fc.constant('split'), k: fc.nat() }),
+      fc.record({ t: fc.constant('tab') }),
       fc.record({ t: fc.constant('undo') }),
       fc.record({ t: fc.constant('redo') }),
     );
     let pruned = 0;
+    const seen = new Set();
     await fc.assert(
       fc.asyncProperty(fc.subarray([0, 1, 2, 3], { minLength: 1 }), fc.array(plotStep, { minLength: 1, maxLength: 6 }), async (max, steps) => {
         const page = await mountPage(KEYS, 'grid', 1);
@@ -201,33 +262,80 @@ describe('maximized plots', () => {
           flushSync();
           expect([...page.ws.maximized].sort()).toEqual(max.map((i) => ids[i]).sort());
           for (const s of steps) {
-            const shown = page.ws.shownIds();
-            if (s.t === 'close' && shown.length) {
-              page.ws.selection.only([shown[s.k % shown.length]]);
+            await clearNotices();
+            const shown = page.ws.shownIds(), picked = [...page.ws.selected], was = page.ws.maximized, tab = page.ws.activeId, at = JSON.stringify(s);
+            const on = shown.length ? shown[(s.k ?? 0) % shown.length] : null;
+            // The plots the step leaves maximized, were none to go, and the selection it leaves where the rules say which.
+            let left = was, selected;
+            if (s.t === 'max' && (on || !ON_A_PLOT.includes(s.by))) {
+              const acts = ON_A_PLOT.includes(s.by) ? targets(picked, on) : picked;
+              const made = (await MAXIMIZE[s.by](on)) !== false;
+              // The palette offers it with plots to act on, or a view to leave.
+              if (s.by === 'palette') expect(made, `offered, ${at}`).toBe(acts.length > 0 || !!was);
+              if (made) {
+                left = was ? null : acts;
+                selected = acts;
+                if (was || acts.length) seen.add(`${s.by}:${was ? 'restore' : 'maximize'}`);
+              }
+            } else if (s.t === 'select') page.ws.selection.only(shown.filter((_, i) => s.ks.includes(i)));
+            else if (s.t === 'escape') {
+              // With focus in a plot's signals, as a press on its chip row leaves it, Escape is theirs first, and goes out to the plot (keys.test.js).
+              const theirs = document.activeElement?.matches('.trace-zone');
+              await pressKey('Escape');
+              // Else it leaves a maximized view with the selection kept, or with none deselects.
+              if (!theirs) {
+                left = null;
+                selected = was ? picked : [];
+              }
+            } else if (s.t === 'close' && on) {
+              page.ws.selection.only([on]);
               flushSync();
               await pressKey('Delete');
-            } else if (s.t === 'toTab' && shown.length) {
-              await plotMenu(shown[s.k % shown.length]);
+            } else if (s.t === 'toTab' && on && page.ws.tab.name === 'A') {
+              await plotMenu(on);
               await pickItem('Move to tab', 'Layout 2');
-            } else if (s.t === 'undo') await pressKey('Control+z');
+            } else if (s.t === 'split' && on) {
+              page.ws.selection.only([on]);
+              flushSync();
+              await pressKey('|');
+              left = null;
+            } else if (s.t === 'tab') await pressKey(']');
+            else if (s.t === 'undo') await pressKey('Control+z');
             else if (s.t === 'redo') await pressKey('Control+y');
+            await until(() => !document.querySelector(OPEN), 2000);
             flushSync();
             await frames();
-            // What shows is the maximized plots of the tab while any are, else every plot.
-            const all = plotIds(page.ws.layout), max = page.ws.maximized;
-            if (max) expect(max.length && max.every((id) => all.includes(id))).toBe(true);
-            expect(showing().sort()).toEqual([...(max ?? all)].sort());
-            // A close from the keys moves on to a plot that shows, as the plot clicked last.
-            if (s.t === 'close' && page.ws.focusedId) expect(page.ws.shownIds()).toContain(page.ws.focusedId);
-            if (max && max.length < shown.length) pruned++;
+            // A tab opened shows every plot; a plot that has left the tab is maximized no more, and with none left every plot shows.
+            const kept = page.ws.activeId === tab ? (left ?? []).filter((id) => page.ws.plots[id]) : [];
+            const all = plotIds(page.ws.layout), now = page.ws.maximized;
+            expect(now && [...now].sort(), `maximized after ${at}`).toEqual(kept.length ? kept.sort() : null);
+            expect(showing().sort(), `showing after ${at}`).toEqual([...(now ?? all)].sort());
+            // What is selected, and the plot clicked last, show.
+            const shows = page.ws.shownIds();
+            expect([...page.ws.selected].filter((id) => !shows.includes(id)), `selected but hidden after ${at}`).toEqual([]);
+            if (page.ws.focusedId) expect(shows, `the plot clicked last after ${at}`).toContain(page.ws.focusedId);
+            if (selected) expect([...page.ws.selected].sort(), `selected after ${at}`).toEqual([...selected].sort());
+            if (now && was && now.length < was.length) pruned++;
           }
         } finally {
           page.dispose();
         }
       }),
-      withExamples([[[0, 1], [{ t: 'close', k: 0 }, { t: 'undo' }, { t: 'redo' }, { t: 'toTab', k: 0 }]]]),
+      withExamples([
+        [[0, 1], [{ t: 'close', k: 0 }, { t: 'undo' }, { t: 'redo' }, { t: 'toTab', k: 0 }]],
+        // Each origin restores, then maximizes.
+        [[0, 1], [{ t: 'max', by: 'key', k: 0 }, { t: 'max', by: 'key', k: 0 }, { t: 'max', by: 'palette', k: 0 }, { t: 'max', by: 'palette', k: 0 }, { t: 'max', by: 'menu', k: 1 }, { t: 'max', by: 'menu', k: 1 }]],
+        [[2], [{ t: 'max', by: 'button', k: 0 }, { t: 'max', by: 'button', k: 3 }, { t: 'max', by: 'header', k: 0 }, { t: 'max', by: 'header', k: 1 }, { t: 'select', ks: [] }, { t: 'max', by: 'palette', k: 0 }]],
+        // A plot closed before the view was entered comes back behind it, not selected.
+        [[0], [{ t: 'escape' }, { t: 'close', k: 1 }, { t: 'select', ks: [0] }, { t: 'max', by: 'key', k: 0 }, { t: 'undo' }]],
+        // A split leaves the view; taken back, the view entered again, and made again, its plot stays behind it.
+        [[0], [{ t: 'split', k: 0 }, { t: 'undo' }, { t: 'select', ks: [0] }, { t: 'max', by: 'button', k: 0 }, { t: 'redo' }, { t: 'tab' }, { t: 'tab' }]],
+      ]),
     );
+    // A replay of one failure runs that case alone.
+    if (fc.readConfigureGlobal().path !== undefined) return;
     expect(pruned).toBeGreaterThan(0);
+    expect([...seen].sort()).toEqual(Object.keys(MAXIMIZE).flatMap((by) => [`${by}:maximize`, `${by}:restore`]).sort());
   }, 600_000);
 });
 

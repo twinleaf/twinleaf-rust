@@ -11,7 +11,8 @@
 // alias, or a function the prop is passed to goes unseen.
 //
 // State that one module owns is written nowhere else (OWNED): a line outside
-// the owner that matches its `writes` fails.
+// the owner that matches its `writes` fails. Where the owner itself sets it
+// in one place, `once` matches that line, and a second in the owner fails.
 //
 // A menu row that shows a key is a command's, drawn by CommandItem from the
 // command table (commands.js), so its key is the key that runs it: no other
@@ -34,8 +35,14 @@ const PENDING = new Map([
   ['lib/Dock.svelte docks', 'whether a panel is being dragged'],
 ]);
 
-/** State one module owns: `writes` matches a line that changes it. */
+/** State one module owns: `writes` matches a line that changes it, and `once`, where there is one, the owner's one line that sets it. */
 const OWNED = [
+  {
+    what: 'the maximized plots',
+    owner: 'lib/workspace.svelte.js',
+    writes: /\.#?maximized\s*(=[^=>]|\.(push|pop|shift|unshift|splice|sort|reverse|fill)\()/,
+    once: /\.#maximized\s*=[^=>]/,
+  },
   {
     what: 'the selection of plots and rows',
     owner: 'lib/selection.svelte.js',
@@ -106,15 +113,22 @@ describe('a menu row’s key', () => {
   });
 });
 
-describe.each(OWNED)('$what', ({ owner, writes }) => {
-  it('is written only by its owner', () => {
-    const found = sources(SRC)
-      .filter((file) => rel(file) !== owner)
+describe.each(OWNED)('$what', ({ owner, writes, once }) => {
+  /** The lines of `files` that match `pattern`, comments left out, as `file:line`. */
+  const matching = (files, pattern) =>
+    files
       .flatMap((file) => fs.readFileSync(file, 'utf8').split('\n').map((line, i) => [file, i + 1, line]))
-      .filter(([, , line]) => writes.test(line) && !/^\s*(\/\/|\*)/.test(line))
+      .filter(([, , line]) => pattern.test(line) && !/^\s*(\/\/|\*)/.test(line))
       .map(([file, n]) => `${rel(file)}:${n}`);
-    expect(found).toEqual([]);
+
+  it('is written only by its owner', () => {
+    expect(matching(sources(SRC).filter((file) => rel(file) !== owner), writes)).toEqual([]);
   });
+  if (once) {
+    it('is set by its owner in one place', () => {
+      expect(matching([path.join(SRC, owner)], once)).toHaveLength(1);
+    });
+  }
 });
 
 /** The one module that listens for keys. */

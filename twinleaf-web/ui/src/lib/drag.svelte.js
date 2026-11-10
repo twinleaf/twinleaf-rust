@@ -184,7 +184,7 @@ export class Drags {
           const box = { x: r.left, y: r.top, w: r.width, h: r.height };
           const tree = ws.tab.layout;
           lifted = { tabId: ws.activeId, tree, cells: moveCells(tree, box, group), shown: rects(tree, box), maximized: ws.maximized };
-          ws.maximized = null;
+          ws.restoreLayout();
         }
         // A tab opened or a layout changed under the move, as by a key, ends it.
         if (ws.activeId !== lifted.tabId || ws.tab.layout !== lifted.tree) return cancel();
@@ -214,9 +214,9 @@ export class Drags {
       this.moving = null;
       if (!lifted) return;
       const lands = drop && target && ws.activeId === lifted.tabId && ws.tab.layout === lifted.tree;
-      // What is put down nowhere leaves the tab as it was, its plot maximized again.
+      // What is put down nowhere leaves the tab as it was: the plots that filled it, those it still has, fill it again.
       if (!lands) {
-        if (ws.activeId === lifted.tabId && ws.maximized === null && lifted.maximized?.every((id) => ws.plots[id])) ws.maximized = lifted.maximized;
+        if (ws.activeId === lifted.tabId && ws.maximized === null && lifted.maximized) ws.maximize(lifted.maximized);
         return;
       }
       // The drop is one step.

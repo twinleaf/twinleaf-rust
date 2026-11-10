@@ -7,6 +7,22 @@
 // value is never changed and History keeps it as it was. `guard`, set by
 // History, is told of every edit, so an edit made outside an undo step is
 // caught where it is made.
+//
+// The maximized view is this class's too: `maximize` and `restoreLayout`
+// are how the page enters and leaves it, and `#fill` is the one place that
+// sets which plots fill the tab. What it keeps true:
+// - The maximized plots are plots of the open tab, each once, and never
+//   none: with none, every plot shows.
+// - A maximized plot that is closed or moved to another tab leaves them, by
+//   an edit, an undo or a redo alike, and the rest stay maximized; once the
+//   last has gone, every plot shows. An undo or a redo otherwise keeps the
+//   view as it is, so a plot it brings back stays hidden behind it.
+// - Opening a tab, adding a plot, arranging the tab and resetting it show
+//   every plot.
+// - The plots selected and the plot clicked last are plots that show: one
+//   the view hides is let go of, whether maximizing hid it or an undo or a
+//   redo would select it.
+// Keyboard focus is the page's: the view never moves it.
 
 import { Selection } from './selection.svelte.js';
 import { append, equal, plotIds, presets, removePlot, setRatio, splitBeside } from './layout.js';
@@ -31,11 +47,11 @@ export class Workspace {
   /** The open tab's plots by id, and its layout: each changes only when it does, not with the rest of the tab. */
   plots = $derived(this.tab.plots);
   layout = $derived(this.tab.layout);
-  /** The plots that fill the tab, as an array of ids, or null. */
-  maximized = $state.raw(null);
+  /** The maximized plots, as `maximized` gives them: `#fill` alone sets them. */
+  #maximized = $state.raw(null);
   /** The plots selected in the open tab, the plot clicked last and the rows picked, and their rules: their only writer. */
   selection = new Selection(
-    (id) => id != null && !!this.plots?.[id],
+    (id) => this.shows(id),
     () => this.shownIds(),
   );
   /** The plot last focused in each tab, for coming back to it. */
@@ -61,6 +77,33 @@ export class Workspace {
   get tabs() {
     return this.#tabs;
   }
+  /** The plots that fill the open tab, the rest hidden, as an array of ids, or null while every plot shows. */
+  get maximized() {
+    return this.#maximized;
+  }
+
+  /** Shows plots `ids` of the open tab alone, filling it; those selected that it hides are let go of. With none of the tab's among them, every plot shows. */
+  maximize(ids) {
+    this.#fill(ids);
+  }
+  /** Leaves the maximized view: every plot of the open tab shows again, the selection as it is. */
+  restoreLayout() {
+    this.#fill(null);
+  }
+  /**
+   * Makes the plots of `ids` that the open tab has the maximized plots, or
+   * with none of them, or null, shows every plot; then lets go of every
+   * plot the selection and the plot clicked last name that does not show.
+   * The only writer of the maximized plots, run on every change of what
+   * the open tab holds or which tab is open.
+   */
+  #fill(ids) {
+    const plots = this.tab?.plots ?? {};
+    const kept = [...new Set(ids ?? [])].filter((id) => plots[id]);
+    const now = this.#maximized ?? [];
+    if (kept.length !== now.length || kept.some((id, i) => id !== now[i])) this.#maximized = kept.length ? kept : null;
+    this.selection.prune();
+  }
 
   /** Makes `tabs` the tabs, as an edit. */
   #set(tabs) {
@@ -69,17 +112,12 @@ export class Workspace {
     this.#prune();
   }
   /**
-   * Lets go of every plot the selection, the maximized plots and the plot
+   * Lets go of every plot the maximized plots, the selection and the plot
    * clicked last name that the open tab no longer has: run whenever the
    * tabs change, so none of them ever names a plot that is gone.
    */
   #prune() {
-    const plots = this.tab?.plots ?? {};
-    this.selection.prune();
-    if (this.maximized?.some((id) => !plots[id])) {
-      const kept = this.maximized.filter((id) => plots[id]);
-      this.maximized = kept.length ? kept : null;
-    }
+    this.#fill(this.#maximized);
   }
   /** The open tab replaced by `fn(tab)`. */
   #edit(fn) {
@@ -101,7 +139,12 @@ export class Workspace {
   /** The plots of the open tab as they show, in layout order: only the maximized ones while some are. */
   shownIds() {
     const ids = plotIds(this.layout);
-    return this.maximized ? ids.filter((id) => this.maximized.includes(id)) : ids;
+    return this.#maximized ? ids.filter((id) => this.#maximized.includes(id)) : ids;
+  }
+
+  /** Whether plot `id` is one the open tab shows: one of its plots, and while some are maximized, one of those. */
+  shows(id) {
+    return id != null && !!this.plots?.[id] && (this.#maximized?.includes(id) ?? true);
   }
 
   /** The time plots of the open tab. */
@@ -119,10 +162,11 @@ export class Workspace {
     return [...keys];
   }
 
+  /** Opens tab `id`, every plot of it showing and none selected. */
   selectTab(id) {
     if (this.focusedId) this.lastFocus.set(this.activeId, this.focusedId);
     this.activeId = id;
-    this.maximized = null;
+    this.#fill(null);
     this.selection.clear();
   }
 
@@ -191,8 +235,8 @@ export class Workspace {
   /** Adds plot `p` to the open tab, the tab then laid out as `layout`, and makes it the plot clicked last; plots maximized show the rest again, so it shows. */
   placePlot(p, layout) {
     this.#edit((t) => ({ ...t, plots: { ...t.plots, [p.id]: p }, layout }));
+    this.#fill(null);
     this.selection.point(p.id);
-    this.maximized = null;
   }
 
   /** Gives plot `id` of the open tab the fields of `patch`, as an edit; a patch that changes nothing is none. */
@@ -272,13 +316,13 @@ export class Workspace {
       name = 'grid';
     }
     if (ids.length) this.#edit((t) => ({ ...t, plots: { ...t.plots, ...added }, layout: presets[name](ids) }));
-    this.maximized = null;
+    this.#fill(null);
   }
 
   /** Puts the open tab back to the plots a new page starts with. */
   reset() {
     const d = defaultContent();
     this.#edit((t) => ({ ...t, plots: d.plots, layout: d.layout }));
-    this.maximized = null;
+    this.#fill(null);
   }
 }

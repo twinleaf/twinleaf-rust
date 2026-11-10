@@ -6,6 +6,8 @@
 // - Scrollbars and the dock-width handles deselect, but the Signals panel's.
 // - Escape during a box or a plot move puts it away, puts nothing down,
 //   records nothing and deselects everything; Escape never changes a cursor.
+// - A maximized plot closed while it is moved leaves the maximized plots,
+//   and the rest fill the tab again once the move is put down.
 // - A key pressed in an open menu that none of its rows shows stays there.
 // - The Live button pauses every plot, and Space after it has them follow.
 // - Space on a dock header the keyboard moved to folds its panel, and a
@@ -147,7 +149,7 @@ describe('Escape during a gesture', () => {
             const all = plotIds(page.ws.layout);
             // Three plots maximized, or none: a move lifts them out of it, and one put down nowhere goes back.
             const max = maximize ? all.slice(0, 3) : null;
-            page.ws.maximized = max;
+            page.ws.maximize(max);
             const ids = page.ws.shownIds(), moved = ids[a % ids.length], onto = ids.filter((id) => id !== moved)[b % (ids.length - 1)];
             page.ws.selection.only(picks.map((i) => all[i]).filter((id) => ids.includes(id)));
             flushSync();
@@ -188,6 +190,33 @@ describe('Escape during a gesture', () => {
   }, 600_000);
 });
 
+describe('a maximized plot closed while it is moved', () => {
+  it('leaves the maximized plots, and the rest fill the tab again once the move is put down', async () => {
+    const page = await mountPage(KEYS, 'grid');
+    try {
+      const [a, b, c] = plotIds(page.ws.layout);
+      await focusPage();
+      page.ws.maximize([a, b, c]);
+      flushSync();
+      await frames();
+      const from = centre(leafOf(a).querySelector('.grip')), to = centre(leafOf(b));
+      await commands.mouse(pressTo(from, to));
+      expect(await until(() => document.querySelector('.move-ghost'), 2000)).toBe(true);
+      // Lifted, the plots show whole; Delete closes the plot held, which the press selected.
+      expect(page.ws.maximized).toBe(null);
+      await pressKey('Delete');
+      await commands.mouse([['move', to[0] + 20, to[1] + 10], ['up']]);
+      flushSync();
+      await frames();
+      expect(page.ws.plots[a]).toBeUndefined();
+      expect(document.querySelector('.move-ghost')).toBe(null);
+      expect(page.ws.maximized).toEqual([b, c]);
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
 describe('Escape', () => {
   /** The plots that show a cursors' readout. */
   const withCursors = () => [...document.querySelectorAll('.leaf[data-plot]')].filter((l) => l.querySelector('.cursor-readout')).map((l) => l.dataset.plot).sort();
@@ -209,7 +238,7 @@ describe('Escape', () => {
           // The readout shows once the plots have drawn their cursors.
           await until(() => withCursors().length === want.length);
           expect(withCursors()).toEqual(want);
-          page.ws.maximized = max && max.map((i) => ids[i]);
+          page.ws.maximize(max && max.map((i) => ids[i]));
           const shown = page.ws.shownIds();
           page.ws.selection.only(picks.map((i) => ids[i]).filter((id) => shown.includes(id)));
           if (focus !== null && shown.includes(ids[focus])) leafOf(ids[focus]).querySelector('.plot-card').focus();
@@ -217,7 +246,7 @@ describe('Escape', () => {
           flushSync();
           for (let i = 0; i < presses; i++) await pressKey('Escape');
           // Every plot shown again, so each draws its readout.
-          page.ws.maximized = null;
+          page.ws.restoreLayout();
           await until(() => withCursors().length >= want.length, 3000);
           expect(withCursors()).toEqual(want);
           placed++;

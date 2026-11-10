@@ -63,7 +63,7 @@ export class Selection {
   /** Runs whenever the plots selected change: the page's, to show them. */
   changed = () => {};
 
-  /** `exists(id)` tells whether plot `id` is in the open tab, and `all()` gives every plot it shows, as Ctrl+A selects them. */
+  /** `exists(id)` tells whether plot `id` is one the open tab shows, and `all()` gives every plot it shows, as Ctrl+A selects them. */
   constructor(exists, all) {
     this.exists = exists;
     this.all = all;
@@ -184,7 +184,7 @@ export class Selection {
   }
 
   /**
-   * Puts back what `snapshot` gave, less the plots that are gone: its plots,
+   * Puts back what `snapshot` gave, less the plots that do not show: its plots,
    * or else its row picks, of which those the page shows are the rows picked.
    */
   restore(s) {
@@ -194,7 +194,7 @@ export class Selection {
     this.#setPlots(ids, this.exists(s.focusedId) ? s.focusedId : null);
   }
 
-  /** Lets go of the plots that are gone: the Workspace's, whenever its tabs change. */
+  /** Lets go of the plots that are gone or no longer show: the Workspace’s, whenever its tabs or its maximized plots change. */
   prune() {
     if ([...this.plots].some((id) => !this.exists(id)) || (this.last !== null && !this.exists(this.last))) {
       this.#setPlots([...this.plots].filter((id) => this.exists(id)), this.exists(this.last) ? this.last : null);

@@ -401,11 +401,11 @@ describe('view history', () => {
     const { ws, views, vh, t, ids } = page(), [a, b] = [views.get(ids[0]), views.get(ids[1])];
     vh.step(() => a.pause(t.ms));
     vh.step(() => b.pause(t.ms));
-    ws.maximized = [ids[0]];
+    ws.maximize([ids[0]]);
     expect(vh.back()).toBe(true);
     expect([a.live, b.live]).toEqual([true, false]);
     expect(vh.canBack).toBe(false);
-    ws.maximized = null;
+    ws.restoreLayout();
     expect(vh.back()).toBe(true);
     expect(b.live).toBe(true);
   });

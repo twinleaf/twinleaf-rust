@@ -68,15 +68,21 @@ function plotOf(id, kind, log, live = true) {
 /**
  * Commands over plots of `kinds` (one per id) with `picked` selected and
  * `last` clicked last: every service records what it is asked into `log`,
- * and the workspace holds only whether plots are maximized.
+ * and the workspace holds only which plots are maximized, which a command
+ * changes by `maximize` and `restoreLayout` alone.
  */
 function page(kinds, picked, last, log, maximized = null) {
   const shown = IDS.slice(0, kinds.length);
   const selection = new Selection((id) => shown.includes(id), () => shown);
   selection.only(picked, last);
-  const ws = new Proxy({ maximized }, {
-    get: (t, key) => (key === 'maximized' ? t.maximized : expect.unreachable(`a command read ws.${String(key)}`)),
-    set: (t, key, v) => (key === 'maximized' ? ((t.maximized = v), log.push(`maximized ${v}`), true) : false),
+  const view = {
+    maximized,
+    maximize: (ids) => ((view.maximized = ids), void log.push(`maximize ${ids}`)),
+    restoreLayout: () => ((view.maximized = null), void log.push('restoreLayout')),
+  };
+  const ws = new Proxy(view, {
+    get: (t, key) => (key in t ? t[key] : expect.unreachable(`a command read ws.${String(key)}`)),
+    set: (t, key) => expect.unreachable(`a command set ws.${String(key)}`),
   });
   const record = (name) => (...args) => (log.push(`${name} ${JSON.stringify(args[0]?.map?.((t) => t.id ?? t) ?? args[0])}`), name === 'picker' ? true : Promise.resolve(null));
   const svc = {
@@ -102,7 +108,8 @@ function page(kinds, picked, last, log, maximized = null) {
 
 const runs = [];
 afterEach(() => {
-  for (const [c, run] of runs.splice(0)) c.run = run;
+  // Newest first, so a command replaced twice ends as it began.
+  for (const [c, run] of runs.splice(0).reverse()) c.run = run;
 });
 /** Has command `c` record the plots it is run on into `seen`, in place of running. */
 function spy(c, seen) {
@@ -154,6 +161,22 @@ describe('a command', () => {
     );
   });
 
+  it('Maximize shows the plots it acts on alone, or leaves a maximized view whatever it acts on, from every origin, through the workspace’s two methods', () => {
+    fc.assert(
+      fc.property(setup, fc.boolean(), fc.constantFrom('menu', 'button', 'key', 'palette'), ({ kinds, picks, on }, maximized, from) => {
+        const log = [], shown = IDS.slice(0, kinds.length);
+        const picked = picks.map((i) => IDS[i]).filter((p) => shown.includes(p));
+        // A menu row and a button are made on a plot; a key and the palette from the page.
+        const made = from === 'menu' || from === 'button' ? IDS[(on ?? 0) % shown.length] : null;
+        const p = page(kinds, picked, null, log, maximized ? [shown[0]] : null);
+        const ids = made ? (picked.includes(made) ? picked : [made]) : picked;
+        const taken = p.cmds.run('maximize', { on: made, from });
+        expect(log, from).toEqual(maximized ? ['restoreLayout'] : ids.length ? [`maximize ${ids}`] : []);
+        expect(taken, from).toBe(maximized || ids.length > 0);
+      }),
+    );
+  });
+
   it('reads its row from the same context: a value over the plots it acts on, made on a plot or from the page', () => {
     const log = [];
     const p = page(['time', 'time', 'spectrum'], ['a', 'b'], 'a', log);
@@ -169,5 +192,7 @@ describe('a command', () => {
     expect(offered).toContain('splitRight');
     const none = page(['time'], [], null, log);
     expect(none.cmds.offered().map((c) => c.id)).toEqual(COMMANDS.filter((c) => c.label && c.scope === 'view' && !c.needs?.includes('axis')).map((c) => c.id));
+    // With none selected, Restore is offered while plots are maximized, as F then restores.
+    expect(page(['time'], [], null, log, ['a']).cmds.offered()).toContainEqual({ id: 'maximize', label: 'Restore' });
   });
 });

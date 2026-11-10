@@ -127,8 +127,8 @@ export const COMMANDS = [
     icon: RiFullscreen, activeIcon: RiFullscreenExit, active: (ctx) => !!ctx.svc.ws.maximized,
     label: (ctx) => (ctx.svc.ws.maximized ? 'Restore' : 'Maximize'),
     run: (ctx) => {
-      if (ctx.svc.ws.maximized) ctx.svc.ws.maximized = null;
-      else if (ctx.plots.length) ctx.svc.ws.maximized = ids(ctx);
+      if (ctx.svc.ws.maximized) ctx.svc.ws.restoreLayout();
+      else if (ctx.plots.length) ctx.svc.ws.maximize(ids(ctx));
       else return false;
     },
   },
@@ -280,11 +280,11 @@ export function commands(svc) {
       const c = commandOf(id);
       return c.check ? c.check(context(id, { on })) : Promise.resolve(null);
     },
-    /** The commands the palette offers now, as {id, label}: each with a row that needs no axis and has plots to act on now. */
+    /** The commands the palette offers now, as {id, label}: each with a row that needs no axis and with plots to act on now, or else one that runs with none and is on, as Restore is while plots are maximized. */
     offered() {
       return COMMANDS.filter((c) => c.label && !c.needs?.includes('axis')).flatMap((c) => {
         const ctx = context(c.id, { from: 'palette' });
-        return ctx.plots.length && !c.disabled?.(ctx) ? [{ id: c.id, label: read(c.label, ctx) }] : [];
+        return (ctx.plots.length || (c.empty && c.active?.(ctx))) && !c.disabled?.(ctx) ? [{ id: c.id, label: read(c.label, ctx) }] : [];
       });
     },
   };

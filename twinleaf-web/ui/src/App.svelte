@@ -781,7 +781,7 @@
       },
       on: plotKey,
     },
-    restore: { when: () => !!ws.maximized, on: { escape: () => void (ws.maximized = null) } },
+    restore: { when: () => !!ws.maximized, on: { escape: () => void ws.restoreLayout() } },
     deselect: { when: () => ws.selected.size > 0 || selection.rows.size > 0, on: { escape: () => void selection.clear() } },
     // Tab, the arrows, Enter, Escape and F6 move through the page's tree
     // (focus.js); a move that brings focus into another plot selects it.

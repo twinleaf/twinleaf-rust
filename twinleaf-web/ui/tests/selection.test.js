@@ -117,7 +117,7 @@ describe('Escape', () => {
           // The page has the keys, however long the browser took to give them.
           await focusPage();
           const ids = plotIds(page.ws.layout);
-          page.ws.maximized = max && max.map((i) => ids[i]);
+          page.ws.maximize(max && max.map((i) => ids[i]));
           const shown = page.ws.shownIds();
           const picked = picks.map((i) => ids[i]).filter((id) => shown.includes(id));
           page.ws.selection.only(picked);

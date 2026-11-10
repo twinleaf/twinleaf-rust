@@ -99,7 +99,7 @@ describe('Escape', () => {
             await focusPage();
             const ids = plotIds(page.ws.layout);
             editCursors(page, ids[0], (c) => withYPair(c, 'time', 'shared', -0.5, 0.5));
-            page.ws.maximized = max && max.map((i) => ids[i]);
+            page.ws.maximize(max && max.map((i) => ids[i]));
             if (picks === 'plots') page.ws.selection.only(page.ws.shownIds().slice(0, 2));
             await settle();
             if (picks === 'rows') await clickOn(document.querySelector('.dock-panel tr[id^=prop-] td:last-child'));
