@@ -87,7 +87,7 @@ export const KEYMAP = [
     entries: [
       { show: ['Drag'], what: 'Pan time or frequency' },
       { show: ['Ctrl', 'Drag'], what: 'Zoom to a range' },
-      { show: ['Wheel'], what: 'Zoom time' },
+      { show: ['Wheel'], what: 'Zoom time or frequency' },
       { show: ['Shift', 'Wheel'], what: 'Zoom y' },
       { show: ['Double-click'], what: 'Follow live' },
       { show: ['Right-click'], what: 'Menu' },

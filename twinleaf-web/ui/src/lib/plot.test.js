@@ -152,6 +152,44 @@ describe('A spectrum panned', () => {
   });
 });
 
+describe('A spectrum zoomed by the wheel', () => {
+  const spectrum = (xd, logX) => {
+    const got = [], bursts = [];
+    const pv = Object.assign(Object.create(PlotView.prototype), {
+      xd, fExtent: [1, 1000], logX, targets: () => ['its view'],
+      onFrequencies: (a, b) => got.push([a, b]),
+      viewHistory: { burst: (kind, targets, fn) => (bursts.push([kind, targets]), fn()) },
+    });
+    return { pv, got, bursts };
+  };
+  it('keeps the frequency under the pointer where it is, along a log axis or a linear one, as a zoom burst of the plots it acts on', () => {
+    fc.assert(
+      fc.property(fc.boolean(), fc.double({ min: 0.5, max: 2, noNaN: true }), fc.double({ min: 0, max: 1, noNaN: true }), (logX, factor, anchor) => {
+        const { pv, got, bursts } = spectrum([10, 100], logX);
+        pv.zoomFrequencies(factor, anchor);
+        if (!got.length) return;
+        const [to, from] = logX ? [Math.log10, (v) => 10 ** v] : [(v) => v, (v) => v];
+        const at = (xd) => from(to(xd[0]) + anchor * (to(xd[1]) - to(xd[0])));
+        // Unless an end has stopped at the bins it has.
+        if (got[0][0] > 1 && got[0][1] < 1000) expect(at(got[0])).toBeCloseTo(at([10, 100]), 6);
+        expect((to(got[0][1]) - to(got[0][0])) / (to(100) - to(10))).toBeLessThanOrEqual(factor + 1e-9);
+        expect(bursts).toEqual([['zoom', ['its view']]]);
+      }),
+    );
+  });
+  it('stays within the frequencies it has bins for, and stops narrowing at a hundredth of them', () => {
+    const out = spectrum([2, 900], false);
+    out.pv.zoomFrequencies(4, 0.5);
+    expect(out.got[0]).toEqual([1, 1000]);
+    const all = spectrum([1, 1000], true);
+    all.pv.zoomFrequencies(2, 0.5);
+    expect(all.got, 'at every bin already, zooming out changes nothing').toEqual([]);
+    const narrow = spectrum([500, 505], false);
+    narrow.pv.zoomFrequencies(0.5, 0.5);
+    expect(narrow.got).toEqual([]);
+  });
+});
+
 describe('A view shown a range', () => {
   it('pauses on exactly that range', () => {
     const v = new View({ now: () => 1000 });

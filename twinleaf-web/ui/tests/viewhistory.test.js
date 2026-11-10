@@ -393,6 +393,37 @@ describe('view history on the page, each kind of gesture', () => {
     }
   });
 
+  it('zooms a spectrum’s frequencies about the pointer by the wheel over its plot, a burst of turns one step that Back takes back', async () => {
+    const p = await page();
+    try {
+      const id = plotIds(p.ws.layout)[0];
+      p.history.group('Kind', () => p.ws.setPlot(id, { kind: 'spectrum' }));
+      const f = Array.from({ length: 200 }, (_, i) => 1 + i);
+      p.hub.session.byKey.get(KEYS[0][0]).spectrum = { f, a: f.map((x) => 1 / x), floor: null };
+      flushSync();
+      await frames(3);
+      const pv = p.pv(id), P = pv.geo.plot, at = [P.x + P.w * 0.7, P.y + P.h / 2], under = pv.dataAt(at[0]);
+      expect(p.ws.plots[id].fRange ?? null).toBeNull();
+      await commands.mouse([['move', ...at], ['wheel', 0, -240], ['wait', 40], ['wheel', 0, -240]]);
+      await frames(3);
+      const [lo, hi] = p.ws.plots[id].fRange;
+      expect([lo > 1, hi < 200], 'narrower at both ends').toEqual([true, true]);
+      expect(Math.abs(pv.pxOf(under) - at[0]), 'the frequency under the pointer stays there').toBeLessThan(1.5);
+      // With Shift it zooms y, as over a time plot, and the frequencies stay.
+      await wait(IDLE_MS + 100);
+      await commands.mouse([['hold', 'Shift'], ['wheel', 0, -120], ['let go', 'Shift']]);
+      await frames(3);
+      expect(p.ws.plots[id].fRange).toEqual([lo, hi]);
+      expect(Object.keys(p.views.get(id).state().yRanges)).not.toEqual([]);
+      await press(id, 'Back');
+      await press(id, 'Back');
+      expect(p.ws.plots[id].fRange ?? null, 'Back past the y zoom, then the burst').toBeNull();
+      expect(button(id, 'Back').disabled).toBe(true);
+    } finally {
+      p.dispose();
+    }
+  });
+
   it('keeps each tab’s steps, and goes back past those of a plot moved to another tab', async () => {
     const p = await page('rows', 1);
     try {

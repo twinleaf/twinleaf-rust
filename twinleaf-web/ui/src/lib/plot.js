@@ -458,6 +458,26 @@ export class PlotView {
     this.bindInput();
   }
 
+  /**
+   * Zooms a spectrum's frequencies by `factor` about the one at fraction
+   * `anchor` across the plot, which stays where it is, along a log axis by
+   * its decades. It stays within the frequencies it has bins for, and no
+   * narrower than a hundredth of them. Each is part of a 'zoom' burst of the
+   * views the plot's gestures act on, so a run of wheel turns is one view
+   * step.
+   */
+  zoomFrequencies(factor, anchor) {
+    const xd = this.xd, ext = this.fExtent;
+    if (!xd || !ext) return;
+    const [to, from] = this.logX ? [Math.log10, (v) => 10 ** v] : [(v) => v, (v) => v];
+    const [a, b] = xd.map(to), [lo, hi] = ext.map(to), at = a + anchor * (b - a);
+    const [na, nb] = [Math.max(lo, at - (at - a) * factor), Math.min(hi, at + (b - at) * factor)];
+    if ((na === a && nb === b) || nb - na < (hi - lo) / 100) return;
+    // An end that has reached its last bin is that bin's frequency itself.
+    const lower = na === lo ? ext[0] : from(na), upper = nb === hi ? ext[1] : from(nb);
+    this.viewHistory.burst('zoom', this.targets(), () => this.onFrequencies?.(lower, upper));
+  }
+
   /** The plot's GPU slot for trace `t`, which holds its window, or, by `variant`, its spectrum drawn in a pair of scales. */
   slotOf(t, variant = '') {
     this.slots ??= new WeakMap(); // Trace -> {variant -> slot}
@@ -1660,8 +1680,9 @@ export class PlotView {
     };
     const isTime = () => this.config().kind === 'time';
     // The wheel zooms y over a y axis, or anywhere with Shift, about the
-    // value under the pointer, and zooms time elsewhere: over the time axis
-    // about the live edge while live, over the plot about the pointer.
+    // value under the pointer, and zooms x elsewhere: time, over the time
+    // axis about the live edge while live and over the plot about the
+    // pointer; a spectrum's frequencies, about the one under the pointer.
     el.addEventListener('wheel', (e) => {
       e.preventDefault();
       const factor = Math.exp(e.deltaY * 0.0015);
@@ -1689,7 +1710,7 @@ export class PlotView {
         this.viewHistory.burst('zoom', vs, () => {
           for (const v of vs) v.zoom(factor, axis && v.live ? 1 : fracX(e.clientX), performance.now(), this.liveEdge());
         });
-      }
+      } else this.zoomFrequencies(factor, Math.min(1, Math.max(0, fracX(e.clientX))));
     }, { passive: false });
     // The band under the plot holds the x axis.
     const onAxis = (e) => {
