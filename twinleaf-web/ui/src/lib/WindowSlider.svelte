@@ -4,6 +4,7 @@
   // the exact window, to read or type, at its end (window.js).
   import { onDestroy } from 'svelte';
   import { SPANS } from './constants.js';
+  import { claim } from './keyrouter.js';
   import { nextPreset, positionOf, windowFrom, windowText, windowTyped } from './window.js';
 
   /**
@@ -41,15 +42,22 @@
     onend();
   }
   onDestroy(release);
-  /** The arrows step from preset to preset, with Shift by a twentieth. */
-  function key(e) {
-    const dir = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1 }[e.key];
-    if (e.key === 'Home') onchange(SPANS[0]);
-    else if (e.key === 'End') onchange(SPANS.at(-1));
-    else if (dir) onchange(e.shiftKey ? +(value * 1.05 ** dir).toPrecision(2) : nextPreset(value, dir));
-    else return;
-    e.preventDefault();
-  }
+  // The slider's keys (keymap.js, place 'slider'): the arrows step from
+  // preset to preset, with Shift by a twentieth, and Home and End go to the
+  // narrowest and the widest.
+  onDestroy(
+    claim('slider', {
+      when: (e, at) => !!track?.contains(at),
+      on: {
+        step(e) {
+          const dir = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1 }[e.key];
+          onchange(e.shiftKey ? +(value * 1.05 ** dir).toPrecision(2) : nextPreset(value, dir));
+        },
+        narrowest: () => void onchange(SPANS[0]),
+        widest: () => void onchange(SPANS.at(-1)),
+      },
+    }),
+  );
   function commit() {
     const w = typed === null ? null : windowTyped(typed, widest);
     if (w !== null) onchange(w);
@@ -73,7 +81,6 @@
     onpointermove={(e) => dragging && onchange(at(e))}
     onpointerup={release}
     onpointercancel={release}
-    onkeydown={key}
   >
     <span class="scale" bind:this={scale}>
       <span class="rail"><span class="fill"></span></span>

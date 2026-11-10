@@ -17,8 +17,12 @@
 // command table (commands.js), so its key is the key that runs it: no other
 // component writes a `<kbd>` into a menu row, but the rows of commands the
 // table does not hold yet (OWN_KEYS).
+//
+// The key router (keyrouter.js) is the one listener for keys: no other
+// module listens for a key on the window or an element, and a component
+// hears keys only on a text field, for the field's own editing.
 import { describe, expect, it } from 'vitest';
-import { compile } from 'svelte/compiler';
+import { compile, parse } from 'svelte/compiler';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -109,6 +113,48 @@ describe.each(OWNED)('$what', ({ owner, writes }) => {
       .flatMap((file) => fs.readFileSync(file, 'utf8').split('\n').map((line, i) => [file, i + 1, line]))
       .filter(([, , line]) => writes.test(line) && !/^\s*(\/\/|\*)/.test(line))
       .map(([file, n]) => `${rel(file)}:${n}`);
+    expect(found).toEqual([]);
+  });
+});
+
+/** The one module that listens for keys. */
+const KEY_ROUTER = 'lib/keyrouter.js';
+/** What a text field is: what is typed into. */
+const FIELDS = ['input', 'Input', 'textarea'];
+/** A key event's handler as an attribute, and a key event named to listen for. */
+const KEY_ATTRIBUTE = /^onkey(down|up|press)(capture)?$/, KEY_LISTENED = /['"`]key(down|up|press)['"`]/;
+
+/** The elements of component `source` that hear a key, as `tag attribute`. */
+function keyHandlers(source) {
+  const found = [];
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) return node.forEach(walk);
+    for (const a of Array.isArray(node.attributes) ? node.attributes : []) if (a.type === 'Attribute' && KEY_ATTRIBUTE.test(a.name)) found.push(`${node.name} ${a.name}`);
+    Object.values(node).forEach(walk);
+  };
+  walk(parse(source, { modern: true }).fragment);
+  return found;
+}
+
+describe('a key', () => {
+  const files = sources(SRC).map((file) => [rel(file), fs.readFileSync(file, 'utf8')]);
+
+  it('is found where an element hears it, on a field or not', () => {
+    expect(keyHandlers('<div onkeydowncapture={f}><input onkeydown={g} /><Input onkeyup={h} /></div>')).toEqual(['div onkeydowncapture', 'input onkeydown', 'Input onkeyup']);
+    expect(keyHandlers('<svelte:window onkeydown={f} /><button onclick={g}>go</button>')).toEqual(['svelte:window onkeydown']);
+  });
+  it('is heard by a component only on a text field', () => {
+    const found = files.filter(([file]) => file.endsWith('.svelte')).flatMap(([file, source]) => keyHandlers(source).map((h) => `${file} ${h}`));
+    expect(found.filter((h) => !FIELDS.includes(h.split(' ')[1]))).toEqual([]);
+    expect(found.length).toBeGreaterThan(0);
+  });
+  it('is listened for by the key router alone', () => {
+    const found = files
+      .filter(([file]) => file !== KEY_ROUTER)
+      .flatMap(([file, source]) => source.split('\n').map((line, i) => [file, i + 1, line]))
+      .filter(([, , line]) => KEY_LISTENED.test(line) && !/^\s*(\/\/|\*)/.test(line))
+      .map(([file, n]) => `${file}:${n}`);
     expect(found).toEqual([]);
   });
 });

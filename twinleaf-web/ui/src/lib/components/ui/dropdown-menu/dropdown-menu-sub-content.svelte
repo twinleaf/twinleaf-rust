@@ -1,7 +1,6 @@
 <script>
 	import { DropdownMenu as DropdownMenuPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils.js";
-	import { runShownKey } from "$lib/menus.js";
 	import DropdownMenuPortal from "./dropdown-menu-portal.svelte";
 	let {
 		ref = $bindable(null),
@@ -24,6 +23,5 @@
 			className
 		)}
 		{...restProps}
-		onkeydowncapture={runShownKey}
 	/>
 </DropdownMenuPortal>

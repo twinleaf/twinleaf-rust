@@ -6,7 +6,8 @@
   // lane per signal.
   //
   // As in a menu bar, ← → move from one open dropdown to the other.
-  import { tick } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
+  import { claim } from './keyrouter.js';
   import * as Select from '$lib/components/ui/select/index.js';
   import RiTime from '@lucide/svelte/icons/chart-line';
   import RiSpectrum from '@lucide/svelte/icons/audio-lines';
@@ -39,15 +40,20 @@
     if (layoutOpen) layoutTrigger?.focus();
   });
 
-  /** Moves from one open dropdown to the other, as ← → do in a menu bar. */
-  function across(e) {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-    e.preventDefault();
-    const toLayout = open;
-    open = false;
-    layoutOpen = false;
-    tick().then(() => (toLayout ? (layoutOpen = true) : (open = true)));
-  }
+  // ← → on the trigger of the open dropdown move to the other one (keymap.js, place 'kind').
+  onDestroy(
+    claim('kind', {
+      when: (e, at) => (open && !!kindTrigger?.contains(at)) || (layoutOpen && !!layoutTrigger?.contains(at)),
+      on: {
+        across() {
+          const toLayout = open;
+          open = false;
+          layoutOpen = false;
+          tick().then(() => (toLayout ? (layoutOpen = true) : (open = true)));
+        },
+      },
+    }),
+  );
   // Heard once the move between dropdowns is done, so a move is not a close.
   const changed = () => setTimeout(() => onOpenChange?.(open || layoutOpen));
 </script>
@@ -63,7 +69,7 @@
   <Tip text="Kind: {nameOf(KINDS, plot.kind)}" keys={commandOf('kind').show}>
     {#snippet children(tip)}
       {@const Icon = ICONS[plot.kind]}
-      <Select.Trigger {...tip} bind:ref={kindTrigger} size="sm" class="kind-select" tabindex={-1} aria-label="Plot kind: {nameOf(KINDS, plot.kind)}" onkeydown={(e) => open && across(e)}>
+      <Select.Trigger {...tip} bind:ref={kindTrigger} size="sm" class="kind-select" tabindex={-1} aria-label="Plot kind: {nameOf(KINDS, plot.kind)}">
         <Icon />
       </Select.Trigger>
     {/snippet}
@@ -74,7 +80,7 @@
   <Tip text="Layout: {nameOf(MODES, plot.mode)}">
     {#snippet children(tip)}
       {@const Icon = ICONS[plot.mode]}
-      <Select.Trigger {...tip} bind:ref={layoutTrigger} size="sm" class="kind-select" tabindex={-1} aria-label="Plot layout: {nameOf(MODES, plot.mode)}" onkeydown={(e) => layoutOpen && across(e)}>
+      <Select.Trigger {...tip} bind:ref={layoutTrigger} size="sm" class="kind-select" tabindex={-1} aria-label="Plot layout: {nameOf(MODES, plot.mode)}">
         <Icon />
       </Select.Trigger>
     {/snippet}

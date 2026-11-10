@@ -21,6 +21,7 @@ import fc from 'fast-check';
 import { centre, drag, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, until, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
+import { lastKey } from '../src/lib/keyrouter.js';
 
 const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine'], ['aux.sawtooth']];
 /** Whether plot `id` is paused, as its header's button says. */
@@ -331,12 +332,10 @@ async function ownKeys(zones) {
   await fc.assert(
     fc.asyncProperty(fc.constantFrom(...zones), fc.nat(), fc.constantFrom('Space', 'Enter'), fc.constantFrom('click', 'keys'), async (zone, i, key, how) => {
       const page = await mountPage([['sine.sine', 'sine.cosine'], ['aux.triangle']], 'columns', 1, ['vector.x', 'vector.y', 'vector.z']);
-      const drags = [], heard = [];
+      const drags = [];
       // A drag's start is told to its zone, a consider event that does not bubble: seen on the way down.
       const consider = (e) => e.detail?.info?.source === 'keyboard' && e.detail.info.trigger === 'dragStarted' && drags.push(zone);
-      const hear = (e) => heard.push(e.key);
       window.addEventListener('consider', consider, true);
-      window.addEventListener('keydown', hear);
       try {
         const items = ZONES[zone].items();
         expect(items.length, zone).toBeGreaterThan(0);
@@ -350,15 +349,14 @@ async function ownKeys(zones) {
           ZONES[zone].reach(el).focus();
         }
         await frames();
-        heard.length = 0;
         await pressKey(key);
         await frames();
         expect(drags, `${how}, ${key} on a ${zone}: a keyboard drag`).toEqual([]);
-        if (how === 'click') expect(heard, `${key} after a click on a ${zone}: heard by the page`).toEqual([key === 'Space' ? ' ' : key]);
+        // The key router says who was offered the key pressed last: after a click, the page's claimants.
+        if (how === 'click') expect(lastKey(), `${key} after a click on a ${zone}: heard by the page`).toMatchObject({ key: key === 'Space' ? ' ' : key, page: true });
         seen.add(`${zone}:${how}`);
       } finally {
         window.removeEventListener('consider', consider, true);
-        window.removeEventListener('keydown', hear);
         // A drag left running ends with the page.
         await pressKey('Escape');
         page.dispose();

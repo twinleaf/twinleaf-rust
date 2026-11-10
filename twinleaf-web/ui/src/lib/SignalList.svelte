@@ -14,7 +14,7 @@
   // Its arrows move along the list, as the list's own do once it has focus.
   // A click or Enter adds the signal to the selected plots, and Shift+Enter
   // gives it a new one. Dragging a signal out copies it, and nothing drops back in.
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { flip } from 'svelte/animate';
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
@@ -29,7 +29,8 @@
   import RiNewPlot from '@lucide/svelte/icons/square-plus';
   import RiPalette from '@lucide/svelte/icons/palette';
   import RiCopy from '@lucide/svelte/icons/clipboard-copy';
-  import { actionFor, stepIn } from './keymap.js';
+  import { stepIn } from './keymap.js';
+  import { claim } from './keyrouter.js';
   import { uid } from './tabs.js';
   import { kindLabel } from './constants.js';
 
@@ -85,29 +86,50 @@
   let menuKey = $state(null); // the signal a right-click opened the menu for
   let active = $state(0);
   let focused = $state(false);
-  function onkeydown(e) {
-    // A key shows the row the arrows are on, however the list got focus.
+  let search = $state(null);
+  let list = $state(null);
+  /** Shows the row the arrows are on, however the list got focus, and brings it into view. */
+  function show() {
     focused = true;
-    const action = actionFor('list', e);
-    const key = palette[active]?.key;
-    if (action === 'move') active = stepIn(e, active, palette.length);
-    else if (action === 'add' && key) onAdd(key);
-    else if (action === 'newPlot' && key) onNewPlot([key]);
-    else return;
-    e.preventDefault();
     document.getElementById(`pal-${palette[active]?.id}`)?.scrollIntoView({ block: 'nearest' });
   }
+  // The list's keys (keymap.js, place 'list'), pressed in it or in its
+  // search, which keeps the keys that move its caret.
+  onDestroy(
+    claim('list', {
+      when: (e, at) => list?.contains(at) || (at === search && !CARET_KEYS.includes(e.key)),
+      on: {
+        move(e) {
+          active = stepIn(e, active, palette.length);
+          show();
+        },
+        add() {
+          const key = palette[active]?.key;
+          if (!key) return false;
+          onAdd(key);
+          show();
+        },
+        newPlot() {
+          const key = palette[active]?.key;
+          if (!key) return false;
+          onNewPlot([key]);
+          show();
+        },
+      },
+    }),
+  );
+  /** Escape in the search clears what is typed, before it does anything else. */
   function searchKey(e) {
-    if (e.key === 'Escape' && query) {
-      query = '';
-      e.preventDefault();
-    } else if (!CARET_KEYS.includes(e.key)) onkeydown(e);
+    if (e.key !== 'Escape' || !query) return;
+    query = '';
+    e.preventDefault();
   }
 </script>
 
 <Input
   class="h-7 text-xs"
   type="search"
+  bind:ref={search}
   bind:value={query}
   placeholder="Search {session.signals.length} signals"
   title="Drag a signal onto the plots, or click it to add it to the selected ones"
@@ -136,7 +158,7 @@
     use:dndzone={{ items: palette, type: 'trace', flipDurationMs: FLIP_MS, dropFromOthersDisabled: true, dropTargetStyle: {}, delayTouchStart: true, zoneTabIndex: 0, zoneItemTabIndex: -1, autoAriaDisabled: true }}
     onconsider={consider}
     onfinalize={finalize}
-    {onkeydown}
+    bind:this={list}
     onfocus={(e) => (focused = e.currentTarget.matches(':focus-visible'))}
     onblur={() => (focused = false)}
   >

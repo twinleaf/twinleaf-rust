@@ -2,7 +2,7 @@
   // The layout tabs: drag to reorder, double-click or F2 to rename, and a
   // menu on right-click. The strip is one stop in the Tab order, on the open
   // tab, and the arrows move focus along it (keymap.js, `tabs`).
-  import { getContext, tick } from 'svelte';
+  import { getContext, onDestroy, tick } from 'svelte';
   import { flip } from 'svelte/animate';
   import { dndzone } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
@@ -12,7 +12,7 @@
   import RiClose from '@lucide/svelte/icons/x';
   import RiAdd from '@lucide/svelte/icons/plus';
   import { plotIds } from './layout.js';
-  import { actionFor } from './keymap.js';
+  import { claim } from './keyrouter.js';
   import { prefs } from './prefs.svelte.js';
   import { counted } from './menus.js';
 
@@ -43,26 +43,28 @@
     if (name.trim()) history.group('Rename tab', () => ws.renameTab(t.id, name.trim()));
     renaming = null;
   }
-  /**
-   * The keys of tab `t`, heard on the way down, before the drag library's
-   * listener on the tab's slot, which would take Space and Enter for a
-   * keyboard drag; the tabs move by pointer and by their keys here.
-   */
-  function tabKey(e, t) {
-    if (e.target !== e.currentTarget) return;
-    const all = [...e.currentTarget.closest('[role=tablist]').querySelectorAll('[role=tab]')];
-    const i = all.indexOf(e.currentTarget);
-    const action = actionFor('tabs', e);
-    if (action === 'move') {
-      const to = { ArrowLeft: i - 1, ArrowRight: i + 1, Home: 0, End: all.length - 1 }[e.key];
-      all[Math.max(0, Math.min(all.length - 1, to))].focus();
-    } else if (action === 'open') ws.selectTab(t.id);
-    else if (action === 'rename') startRename(t.id);
-    else if (action === 'close') onClose(t);
-    else return;
-    e.preventDefault();
-    e.stopPropagation();
-  }
+  let strip = $state(null);
+  /** The tab whose element is `el`. */
+  const tabOf = (el) => ws.tabs.find((t) => t.id === el.dataset.tab);
+  // The keys of the tab with focus (keymap.js, place 'tabs'). The router
+  // takes them before the drag library's listener on the tab's slot hears
+  // Space or Enter, which it would take for a keyboard drag; the tabs move
+  // by pointer and by their keys here.
+  onDestroy(
+    claim('tabs', {
+      when: (e, at) => at instanceof Element && at.matches('[role=tab]') && !!strip?.contains(at),
+      on: {
+        move(e, at) {
+          const all = [...strip.querySelectorAll('[role=tab]')], i = all.indexOf(at);
+          const to = { ArrowLeft: i - 1, ArrowRight: i + 1, Home: 0, End: all.length - 1 }[e.key];
+          all[Math.max(0, Math.min(all.length - 1, to))].focus();
+        },
+        open: (e, at) => void ws.selectTab(at.dataset.tab),
+        rename: (e, at) => void startRename(at.dataset.tab),
+        close: (e, at) => void onClose(tabOf(at)),
+      },
+    }),
+  );
   // While a tab is dragged, the strip shows the drag library's order, its
   // placeholder among the tabs; the tabs themselves change once, at the drop.
   let dragged = $state.raw(null);
@@ -78,6 +80,7 @@
   <div
     class="flex min-h-8 flex-wrap gap-1"
     onpointerdown={(e) => drags.startMarquee(e)}
+    bind:this={strip}
     role="tablist"
     aria-label="Layouts"
     tabindex="-1"
@@ -102,7 +105,6 @@
                 tabindex={t.id === ws.activeId ? 0 : -1}
                 aria-selected={t.id === ws.activeId}
                 onclick={() => ws.selectTab(t.id)}
-                onkeydowncapture={(e) => tabKey(e, t)}
                 ondblclick={() => startRename(t.id)}
               >
                 {#if renaming === t.id}

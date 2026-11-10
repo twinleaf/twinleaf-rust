@@ -5,6 +5,7 @@
   // cancelled pointer, or a change to the layout it was dragged in, as an
   // undo, gives `onMove(null)` and sets nothing.
   import { onDestroy, untrack } from 'svelte';
+  import { claim } from './keyrouter.js';
 
   /** The smallest share either side keeps. */
   const MIN_SHARE = 0.08;
@@ -37,19 +38,14 @@
       ratio = Math.min(1 - MIN_SHARE, Math.max(MIN_SHARE, from + (at(ev) - start) / room));
       onMove(ratio);
     };
-    const key = (ev) => {
-      if (ev.key !== 'Escape') return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      stop(false);
-    };
+    const unclaim = claim('drag', { on: { cancel: () => stop(false) } });
     const up = () => stop(true);
     const cancel = () => stop(false);
     const stop = (set) => {
       el.removeEventListener('pointermove', move);
       el.removeEventListener('pointerup', up);
       el.removeEventListener('pointercancel', cancel);
-      window.removeEventListener('keydown', key, true);
+      unclaim();
       if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
       dragging = false;
       end = null;
@@ -59,7 +55,6 @@
     el.addEventListener('pointermove', move);
     el.addEventListener('pointerup', up);
     el.addEventListener('pointercancel', cancel);
-    window.addEventListener('keydown', key, true);
     end = () => stop(false);
   }
 

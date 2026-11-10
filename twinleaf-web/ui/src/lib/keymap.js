@@ -1,18 +1,21 @@
 // Every key and gesture the page reads, by where focus is. The keys sheet
-// lists this table, and each place's handler finds its action here with
-// `actionFor`, so what the sheet says is what the keys do. A plot's keys,
-// Space and Ctrl+C are plot commands, listed here from their table
-// (commands.js).
+// lists this table, and the key router (keyrouter.js) finds each key's
+// action here with `actionFor`, so what the sheet says is what the keys do.
+// A plot's keys, Space and Ctrl+C are plot commands, listed here from their
+// table (commands.js).
 //
-// An entry is {show, on, keys, action, what}: `show` is how the sheet
-// writes the keys, `on` where a gesture is made, `keys` the
-// KeyboardEvent.key values that do it (none for what the browser or the
-// plot's pointer handling reads), `action` the name its place's handler
-// runs, and `what` what it does. `shift` true or false makes an entry take
-// only that Shift; without it, either. Places of one title share a section
-// of the sheet (`sheet`). A plot's key is a plot command, which with no
-// plot selected does nothing, unless its `scope` is 'view': a view
-// command, which with none selected acts on every plot.
+// An entry is {show, on, keys, ctrl, shift, action, what}: `show` is how the
+// sheet writes the keys, and an entry without it is not on the sheet; `on`
+// where a gesture is made; `keys` the KeyboardEvent.key values that do it
+// (none for what the browser or the plot's pointer handling reads), in
+// lower case for an entry with `ctrl`; `ctrl` true takes them with Ctrl or
+// ⌘ only, and without it they are taken with neither; `shift` true or false
+// makes an entry take only that Shift, and without it, either; `action` is
+// the name its claimant in the router runs, and `what` what it does. Places
+// of one title share a section of the sheet (`sheet`), and a place without
+// a title has none. A plot's key is a plot command, which with no plot
+// selected does nothing, unless its `scope` is 'view': a view command,
+// which with none selected acts on every plot.
 import { COMMANDS, commandOf } from './commands.js';
 
 /** Plot command `c`'s keys as an entry, its id the action of its keys where it has any. */
@@ -33,11 +36,11 @@ export const KEYMAP = [
       { show: ['1–9'], keys: digits, action: 'goToPlot', what: 'Go to plot' },
       { show: ['[', ']'], keys: ['[', ']'], action: 'stepTab', what: 'Previous, next tab' },
       keysOf(commandOf('pause')),
-      { show: ['Ctrl', 'A'], what: 'Select every plot' },
-      keysOf(commandOf('copyData')),
-      { show: ['Ctrl', 'Z'], what: 'Undo' },
-      { show: ['Ctrl', 'Y'], what: 'Redo; or Ctrl Shift Z' },
-      { show: ['Ctrl', 'K'], what: 'Commands' },
+      { show: ['Ctrl', 'A'], keys: ['a'], ctrl: true, action: 'selectAll', what: 'Select every plot' },
+      { ...keysOf(commandOf('copyData')), keys: ['c'], ctrl: true, shift: false, action: 'copyData' },
+      { show: ['Ctrl', 'Z'], keys: ['z'], ctrl: true, shift: false, action: 'undo', what: 'Undo' },
+      { show: ['Ctrl', 'Y'], keys: ['y', 'z'], ctrl: true, action: 'redo', what: 'Redo; or Ctrl Shift Z' },
+      { show: ['Ctrl', 'K'], keys: ['k'], ctrl: true, action: 'palette', what: 'Commands' },
       { show: ['?'], keys: ['?'], action: 'help', what: 'This sheet' },
     ],
   },
@@ -116,14 +119,34 @@ export const KEYMAP = [
       { show: ['Click'], what: 'Pick a row' },
       { show: ['Shift', 'Click'], what: 'Pick a run of rows' },
       { show: ['Ctrl', 'Click'], what: 'Add or drop a row' },
+      { keys: ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'], action: 'move' },
       { show: ['Shift', '↑', '↓'], what: 'Extend the pick' },
-      { show: ['Ctrl', 'A'], what: 'Pick every row' },
-      { show: ['Ctrl', 'C'], what: 'Copy, as a sheet pastes' },
-      { show: ['Enter'], what: 'Run, switch or edit the picked rows' },
+      { show: ['Ctrl', 'A'], keys: ['a'], ctrl: true, action: 'pickAll', what: 'Pick every row' },
+      { show: ['Ctrl', 'C'], keys: ['c'], ctrl: true, action: 'copy', what: 'Copy, as a sheet pastes' },
+      { show: ['Enter'], keys: ['Enter'], action: 'enter', what: 'Run, switch or edit the picked rows' },
       { show: ['Ctrl', 'Click'], on: 'action', what: 'Pick it to run with others' },
       { show: ['☆'], what: 'Add to Favorites' },
     ],
   },
+  // What the sheet does not list: a panel's header, the window slider, a
+  // plot's kind and layout dropdowns side by side, and a drag under way.
+  {
+    place: 'panel',
+    entries: [
+      { keys: [' '], action: 'fold' },
+      { keys: ['Enter'], action: 'enter' },
+    ],
+  },
+  {
+    place: 'slider',
+    entries: [
+      { keys: ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'], action: 'step' },
+      { keys: ['Home'], action: 'narrowest' },
+      { keys: ['End'], action: 'widest' },
+    ],
+  },
+  { place: 'kind', entries: [{ keys: ['ArrowLeft', 'ArrowRight'], action: 'across' }] },
+  { place: 'drag', entries: [{ keys: ['Escape'], action: 'cancel' }] },
 ];
 
 /**
@@ -133,9 +156,11 @@ export const KEYMAP = [
 export function sheet() {
   const sections = [];
   for (const { title, entries } of KEYMAP) {
+    if (!title) continue;
     let section = sections.find((s) => s.title === title);
     if (!section) sections.push((section = { title, rows: [] }));
     for (const { show, on, what } of entries) {
+      if (!show) continue;
       const id = [...show, on ?? ''].join(' ');
       const row = section.rows.find((r) => r.id === id);
       if (!row) section.rows.push({ id, show, on, what });
@@ -146,13 +171,14 @@ export function sheet() {
 }
 
 /**
- * The action `e` names in `place`, or null. A key with Ctrl, ⌘ or Alt names
- * none, as those are the browser's.
+ * The action `e` names in `place`, or null. A key with Alt names none, as
+ * those are the browser's, and one with Ctrl or ⌘ only an entry with `ctrl`.
  */
 export function actionFor(place, e) {
-  if (e.ctrlKey || e.metaKey || e.altKey) return null;
+  if (e.altKey) return null;
+  const ctrl = !!(e.ctrlKey || e.metaKey), key = ctrl ? e.key.toLowerCase() : e.key;
   const entries = KEYMAP.find((p) => p.place === place)?.entries ?? [];
-  const hit = entries.find((x) => x.keys?.includes(e.key) && (x.shift === undefined || x.shift === e.shiftKey));
+  const hit = entries.find((x) => !!x.ctrl === ctrl && x.keys?.includes(key) && (x.shift === undefined || x.shift === !!e.shiftKey));
   return hit?.action ?? null;
 }
 

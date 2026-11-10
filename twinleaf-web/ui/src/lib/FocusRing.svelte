@@ -74,7 +74,7 @@
       frame = requestAnimationFrame(follow);
     };
     follow();
-    const events = ['focusin', 'focusout', 'keyup', 'pointerdown'];
+    const events = ['focusin', 'focusout', 'pointerdown'];
     for (const type of events) window.addEventListener(type, update);
     return () => {
       cancelAnimationFrame(frame);

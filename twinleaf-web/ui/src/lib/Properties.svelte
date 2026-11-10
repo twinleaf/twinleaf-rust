@@ -29,7 +29,8 @@
   // which shows the value they agree on or how many values they differ in.
   // Each cell reads its own device's value, so one device's change redraws
   // only its cells.
-  import { getContext, tick, untrack } from 'svelte';
+  import { getContext, onDestroy, tick, untrack } from 'svelte';
+  import { claim } from './keyrouter.js';
   import { getCoreRowModel } from '@tanstack/table-core';
   import { createSvelteTable, FlexRender, renderSnippet } from '$lib/components/ui/data-table/index.js';
   import * as Table from '$lib/components/ui/table/index.js';
@@ -233,33 +234,26 @@
     );
   }
 
-  function tableKey(e) {
-    const n = rows.length;
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
-      copyRows();
-      e.preventDefault();
-      e.stopPropagation();
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
-      selection.pickRows(rows.map((r) => prefix + r.name), current ? prefix + current.name : rows[0] ? prefix + rows[0].name : null);
-      e.preventDefault();
-      e.stopPropagation();
-      return;
-    }
-    // From no row of this table, a move goes to its first row, or End to its last.
-    const steps = { ArrowDown: 1, ArrowUp: -1, PageDown: PAGE, PageUp: -PAGE };
-    const to = e.key === 'Home' ? 0 : e.key === 'End' ? n - 1 : e.key in steps ? (active < 0 ? 0 : active + steps[e.key]) : undefined;
-    if (to !== undefined) {
-      const i = Math.max(0, Math.min(n - 1, to));
-      // The arrows pick the row they move to; with Shift they pick the run to it.
-      pick(i, { shiftKey: e.shiftKey });
-      tick().then(() => document.getElementById(`prop-${active}`)?.scrollIntoView({ block: 'nearest' }));
-    } else if (e.key === 'Enter') enter();
-    else return;
-    e.preventDefault();
-    e.stopPropagation();
-  }
+  // The table's keys (keymap.js, place 'properties'), pressed anywhere in it.
+  onDestroy(
+    claim('properties', {
+      when: (e, at) => !!tableEl?.contains(at),
+      on: {
+        copy: () => void copyRows(),
+        pickAll: () => void selection.pickRows(rows.map((r) => prefix + r.name), current ? prefix + current.name : rows[0] ? prefix + rows[0].name : null),
+        move(e) {
+          // From no row of this table, a move goes to its first row, or End to its last.
+          const n = rows.length, steps = { ArrowDown: 1, ArrowUp: -1, PageDown: PAGE, PageUp: -PAGE };
+          const to = e.key === 'Home' ? 0 : e.key === 'End' ? n - 1 : active < 0 ? 0 : active + steps[e.key];
+          // The arrows pick the row they move to; with Shift they pick the run to it.
+          pick(Math.max(0, Math.min(n - 1, to)), { shiftKey: e.shiftKey });
+          tick().then(() => document.getElementById(`prop-${active}`)?.scrollIntoView({ block: 'nearest' }));
+        },
+        enter: () => void enter(),
+      },
+    }),
+  );
+  /** Enter in the edit bar's field writes what is typed, and Escape puts the shared value back. */
   function editorKey(e) {
     if (e.key === 'Enter' && bar && draft.trim() !== '') {
       e.preventDefault();
@@ -349,7 +343,6 @@
     aria-label="Properties: arrows move, Enter edits or runs"
     aria-activedescendant={current ? `prop-${active}` : undefined}
     bind:ref={tableEl}
-    onkeydown={tableKey}
   >
     <Table.Header>
       {#each table.getHeaderGroups() as group (group.id)}

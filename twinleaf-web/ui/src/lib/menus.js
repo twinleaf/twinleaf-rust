@@ -10,25 +10,32 @@ export const common = (values) => (!values.length ? null : values.every((v) => v
 
 /** What a row's `<kbd>` says for a key that is not its own name. */
 const KBD = { '⇧': 'shift', ctrl: 'control' };
+/** What a menu is on the page, a submenu too. */
+const MENU = '[data-slot$=-menu-content], [data-slot$=-menu-sub-content]';
 /**
- * A menu's keydown, seen before the menu's own: a key one of its rows shows
- * runs that row, so the key does with the menu open what it does with it
- * closed. Enter stays the highlighted row's while one is highlighted, and a
- * field in the menu keeps what is typed in it.
+ * Key `e`, pressed on `at` in an open menu, before the menu hears it: a key
+ * one of the menu's rows shows runs that row, so the key does with the menu
+ * open what it does with it closed, and this says whether one ran. A
+ * submenu inside a menu comes after it. Enter stays the highlighted row's
+ * while one is highlighted, and a field in the menu keeps what is typed in
+ * it.
  */
-export function runShownKey(e) {
-  if (e.target.closest?.('input, textarea') || e.altKey || e.metaKey) return;
-  if (e.key === 'Enter' && e.currentTarget.querySelector('[data-highlighted]')) return;
+export function runShownKey(e, at) {
+  if (!(at instanceof Element) || at.closest('input, textarea') || e.altKey || e.metaKey) return false;
+  const menus = [];
+  for (let m = at.closest(MENU); m; m = m.parentElement?.closest(MENU)) menus.unshift(m);
   const key = e.key.toLowerCase(), named = key.length > 1;
-  for (const row of e.currentTarget.querySelectorAll('[role^=menuitem]:not([data-disabled])')) {
-    const keys = [...row.querySelectorAll('kbd')].map((k) => k.textContent.trim().toLowerCase()).map((k) => KBD[k] ?? k);
-    if (!keys.length || keys.at(-1) !== key) continue;
-    // A key with a name takes the Shift its row shows; a character is typed however its keyboard types it.
-    if (named && keys.includes('shift') !== e.shiftKey) continue;
-    if (keys.includes('control') !== e.ctrlKey) continue;
-    e.preventDefault();
-    e.stopPropagation();
-    row.click();
-    return;
+  for (const menu of menus) {
+    if (e.key === 'Enter' && menu.querySelector('[data-highlighted]')) continue;
+    for (const row of menu.querySelectorAll('[role^=menuitem]:not([data-disabled])')) {
+      const keys = [...row.querySelectorAll('kbd')].map((k) => k.textContent.trim().toLowerCase()).map((k) => KBD[k] ?? k);
+      if (!keys.length || keys.at(-1) !== key) continue;
+      // A key with a name takes the Shift its row shows; a character is typed however its keyboard types it.
+      if (named && keys.includes('shift') !== e.shiftKey) continue;
+      if (keys.includes('control') !== e.ctrlKey) continue;
+      row.click();
+      return true;
+    }
   }
+  return false;
 }

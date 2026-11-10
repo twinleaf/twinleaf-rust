@@ -11,6 +11,7 @@ import { dock, dockOuter, leaf, rects, restrict } from './layout.js';
 import { OUTER_SHARE, cellAt, moveCells, signalCells } from './moves.js';
 import { chip, newPlot } from './tabs.js';
 import { DRAG_START } from './constants.js';
+import { claim } from './keyrouter.js';
 
 const LANDED_MS = 700;
 /** The empty background a box selection starts on, besides what listens for it: a dock, a panel's body, a list's own space below its items. */
@@ -106,16 +107,16 @@ export class Drags {
     const [x0, y0] = [e.clientX, e.clientY];
     let drawn = false;
     // Escape puts the box away and clears the selection, Shift or not.
-    const key = (ev) => {
-      if (ev.key !== 'Escape') return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      stop();
-      window.removeEventListener('keydown', key, true);
-      this.marquee = null;
-      this.selection.clear();
-    };
-    window.addEventListener('keydown', key, true);
+    const unclaim = claim('drag', {
+      on: {
+        cancel: () => {
+          stop();
+          unclaim();
+          this.marquee = null;
+          this.selection.clear();
+        },
+      },
+    });
     const stop = follow(
       (ev) => {
         if (!drawn && Math.hypot(ev.clientX - x0, ev.clientY - y0) < DRAG_START) return;
@@ -131,7 +132,7 @@ export class Drags {
         this.selection.only([...hit], null);
       },
       () => {
-        window.removeEventListener('keydown', key, true);
+        unclaim();
         // A click that draws no box clears the selection, but in what keeps it, as the Signals panel.
         if (!drawn && !e.shiftKey && !this.selection.keeps(e.target)) this.selection.clear();
         this.marquee = null;
@@ -198,16 +199,16 @@ export class Drags {
       stop();
       end(false);
     };
-    const key = (ev) => {
-      if (ev.key !== 'Escape') return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      cancel();
-      this.selection.clear();
-    };
-    window.addEventListener('keydown', key, true);
+    const unclaim = claim('drag', {
+      on: {
+        cancel: () => {
+          cancel();
+          this.selection.clear();
+        },
+      },
+    });
     const end = (drop) => {
-      window.removeEventListener('keydown', key, true);
+      unclaim();
       this.compass = null;
       this.preview = null;
       this.moving = null;

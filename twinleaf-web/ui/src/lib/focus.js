@@ -124,13 +124,6 @@ export function remember(e) {
   }
 }
 
-/** Goes up a level from the cursor, and says whether there was one to go to. */
-export function leave() {
-  const n = cursorOf(document.activeElement), to = n && parentOf(n);
-  if (to) focusNode(to);
-  return !!to;
-}
-
 /** Goes down a level from node `n`, if it has children. */
 export function enter(n) {
   const to = down(page, n);
@@ -139,14 +132,13 @@ export function enter(n) {
 }
 
 /**
- * Moves the cursor by key `e`, and says whether it did. A key a component
- * already took, a key with Alt, Ctrl or Meta, and every key in a menu or
- * dialog stay where they are. Escape on a node that `keepsEscape` says acts
- * on its own Escape first stays too.
+ * Moves the cursor by key `e`, pressed on `at`, and says whether it did. A
+ * key with Alt, Ctrl or Meta and every key in a menu or dialog stay where
+ * they are.
  */
-export function navigate(e, keepsEscape = () => false) {
-  if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return false;
-  const at = e.target instanceof Element ? e.target : null;
+export function navigate(e, at = e.target) {
+  if (e.altKey || e.ctrlKey || e.metaKey) return false;
+  if (!(at instanceof Element)) at = null;
   if (at?.closest(POPUP)) return false;
   const n = cursorOf(document.activeElement);
   let to = null;
@@ -159,7 +151,7 @@ export function navigate(e, keepsEscape = () => false) {
     if (!n || at !== n || !n.matches(NODE)) return false;
     to = down(page, n);
   } else if (e.key === 'Escape') {
-    if (!n || keepsEscape(n)) return false;
+    if (!n) return false;
     to = parentOf(n);
   }
   if (!to) return false;

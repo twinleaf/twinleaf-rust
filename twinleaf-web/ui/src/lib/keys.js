@@ -22,15 +22,22 @@ let keyboardLast = false;
 /** The elements the keyboard moved focus to, while they keep it. */
 const keyboardFocused = new WeakSet();
 if (typeof window !== 'undefined') {
-  window.addEventListener('keydown', () => (keyboardLast = true), true);
   window.addEventListener('pointerdown', () => (keyboardLast = false), true);
   window.addEventListener('focusin', (e) => (keyboardLast ? keyboardFocused.add(e.target) : keyboardFocused.delete(e.target)), true);
 }
 
-/** Whether key event `e` belongs to where it was pressed, rather than to the plots the keys act on. */
-export function keepsKey(e) {
-  const at = e.target instanceof Element ? e.target : null;
-  if (!at) return false;
+/** Notes a key pressed, as the key router does for each before anything acts on it. */
+export function keyPressed() {
+  keyboardLast = true;
+}
+
+/**
+ * Whether key event `e`, pressed on `at`, belongs to where it was pressed,
+ * rather than to the plots the keys act on. A key pressed on no element
+ * belongs to none.
+ */
+export function keepsKey(e, at = e.target) {
+  if (!(at instanceof Element)) return false;
   if (at.closest(TYPING)) return true;
   if (!PRESS.includes(e.key)) return false;
   const pressable = at.closest(PRESSABLE);

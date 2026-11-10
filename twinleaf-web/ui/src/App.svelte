@@ -14,7 +14,7 @@
   // toolbar, pan and zoom set time plots only. Each gesture and command
   // that moves views is a step of the tab's view history
   // (viewhistory.svelte.js), which each plot's Back and Forward go through.
-  import { getContext, onMount, setContext, tick, untrack } from 'svelte';
+  import { getContext, onDestroy, onMount, setContext, tick, untrack } from 'svelte';
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
   import { ViewHistory } from './lib/viewhistory.svelte.js';
   import { CursorEdits } from './lib/cursors.js';
@@ -23,7 +23,7 @@
   import { plotIds } from './lib/layout.js';
   import { exportText, importText, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
-  import { actionFor } from './lib/keymap.js';
+  import { claim } from './lib/keyrouter.js';
   import { commands as plotCommands } from './lib/commands.js';
   import CommandItem from './lib/CommandItem.svelte';
   import { keepsKey, plotPickers } from './lib/keys.js';
@@ -50,7 +50,7 @@
   import WriteNotice from './lib/WriteNotice.svelte';
   import { MAX_COPY_ROWS, blockTable, lostSeconds, writeTables } from './lib/copy.js';
   import { timeAxis } from './lib/plot.js';
-  import { leave, navigate, remember } from './lib/focus.js';
+  import { navigate, remember } from './lib/focus.js';
   import KeysDialog from './lib/KeysDialog.svelte';
   import ExportDialog from './lib/ExportDialog.svelte';
   import WindowSlider from './lib/WindowSlider.svelte';
@@ -734,27 +734,17 @@
     if (item) drags.moveSignal(item, to ? { plotId: to } : { plotId: from, edge: 'right' });
   }
 
-  /**
-   * A button presses on Space's keyup, not its keydown. A Space the page took
-   * for its own, to pause, takes the keyup too, so a button focused by a
-   * click presses nothing.
-   */
-  function onKeyUp(e) {
-    if (e.key === ' ' && !keepsKey(e)) e.preventDefault();
-  }
-
   /** The plot `el` is in, by id, or null. */
   const plotAt = (el) => el?.closest?.('.leaf[data-plot]')?.dataset.plot ?? null;
 
   /**
-   * Runs the plot command of key `e` (keymap.js, place 'plot'), wherever it
-   * was pressed, on the plots it acts on (commands.js). A key whose command
-   * is not taken, as with no plots to act on, does nothing, and goes on.
+   * Runs plot command `action` of key `e` (keymap.js, place 'plot') on the
+   * plots it acts on (commands.js), and says whether it was taken: a command
+   * with no plots to act on is not, and its key goes on.
    */
-  function plotKey(e) {
-    const action = actionFor('plot', e);
+  function plotKey(action, e) {
     const how = { back: e.key === 'ArrowLeft' || e.key === 'ArrowDown', shift: e.shiftKey };
-    if (action && commands.run(action, { from: 'key', how })) e.preventDefault();
+    return commands.run(action, { from: 'key', how });
   }
   /**
    * Puts an empty plot beside each of plots `ids`, on side `dir` of it, as
@@ -770,81 +760,71 @@
     if (fromKeys) focusPlot(made[0].id);
   }
 
-  function onKey(e) {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
-      e.preventDefault();
-      paletteOpen = !paletteOpen;
-      return;
-    }
-    // Escape, once a menu or a drag has had it, leaves the maximized view,
-    // the selection kept; then deselects; with nothing selected it goes out
-    // a level. It never clears cursors.
-    if (e.key === 'Escape' && !e.defaultPrevented && !keepsKey(e) && (ws.maximized || ws.selected.size || selection.rows.size)) {
-      e.preventDefault();
-      if (ws.maximized) return void (ws.maximized = null);
-      return selection.clear();
-    }
+  /** Takes the last edit back, or with `redo` does it again. A plot's kind it changes is a view step, as the command's is. */
+  function undo(redo) {
+    const label = viewHistory.edited(() => (redo ? history.redo() : history.undo()));
+    if (label) toast(`${redo ? 'Redo' : 'Undo'}: ${label}`);
+    refreshToolbar();
+  }
+
+  // The page's keys, each a claimant of the key router, which holds their
+  // order (keyrouter.js ORDER) and offers each the keys of its place in
+  // keymap.js.
+  const claimed = Object.entries({
+    palette: { on: { palette: () => void (paletteOpen = !paletteOpen) } },
+    // A key pressed in a plot is its plot command; but on a control inside
+    // it, the arrows move between the controls, and what keeps its own keys
+    // keeps them (keys.js).
+    plot: {
+      when(e, at) {
+        const card = at?.closest?.('.plot-card');
+        if (!card) return false;
+        const inside = at !== card && !at.matches('.trace-zone');
+        return !inside || (!e.key.startsWith('Arrow') && !keepsKey(e, at));
+      },
+      on: plotKey,
+    },
+    restore: { when: () => !!ws.maximized, on: { escape: () => void (ws.maximized = null) } },
+    deselect: { when: () => ws.selected.size > 0 || selection.rows.size > 0, on: { escape: () => void selection.clear() } },
     // Tab, the arrows, Enter, Escape and F6 move through the page's tree
     // (focus.js); a move that brings focus into another plot selects it.
-    const from = plotAt(document.activeElement);
-    if (navigate(e)) {
-      const to = plotAt(document.activeElement);
-      if (to && to !== from && e.key !== 'Escape') selection.arrived(to);
-      return;
-    }
-    // What is typed into a field, a menu or dialog's own keys, and the keys
-    // that press a button focused from the keyboard stay there (keys.js).
-    if (keepsKey(e)) return;
-    // Ctrl+Z takes the last edit back, and Ctrl+Y or Ctrl+Shift+Z does it again.
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && ['z', 'y'].includes(e.key.toLowerCase())) {
-      e.preventDefault();
-      const redo = e.key.toLowerCase() === 'y' || e.shiftKey;
-      // A plot's kind an undo or a redo changes is a view step, as the command's is.
-      const label = viewHistory.edited(() => (redo ? history.redo() : history.undo()));
-      if (label) toast(`${redo ? 'Redo' : 'Undo'}: ${label}`);
-      return refreshToolbar();
-    }
-    // Ctrl+C with no text selected copies the data of the selected plots, or of every plot.
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'c' && !String(window.getSelection() ?? '')) {
-      e.preventDefault();
-      return void commands.run('copyData', { from: 'key' });
-    }
-    // Ctrl+A outside a field selects every plot of the tab, not the page's text.
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
-      e.preventDefault();
-      return selection.only(ws.shownIds(), null);
-    }
-    const action = actionFor('page', e);
-    if (action === 'goToPlot') {
-      // The plots as they show: only the maximized ones while some are.
-      const id = ws.shownIds()[+e.key - 1];
-      if (!id) return;
-      e.preventDefault();
-      selection.arrived(id);
-      return focusPlot(id);
-    }
-    if (action === 'help') return void (keysOpen = true);
-    if (action === 'stepTab') {
-      if (ws.tabs.length < 2) return;
-      e.preventDefault();
-      return stepTab(e.key === ']' ? 1 : -1);
-    }
-    if (action !== 'pause' && action !== 'escape') {
-      // Every other key is a plot's key, wherever focus is; among property
-      // rows, which are what is picked there, none.
-      if (!action && !e.defaultPrevented && !e.target.closest?.(ROWS)) plotKey(e);
-      return;
-    }
-    if (action === 'escape') return leave();
-    // Space pauses the selected plots, or every plot, or has them follow live again.
-    e.preventDefault();
-    commands.run('pause', { from: 'key' });
-  }
+    navigation: {
+      on(action, e, at) {
+        const from = plotAt(document.activeElement);
+        if (!navigate(e, at)) return false;
+        const to = plotAt(document.activeElement);
+        if (to && to !== from && e.key !== 'Escape') selection.arrived(to);
+      },
+    },
+    page: {
+      on: {
+        undo: () => undo(false),
+        redo: () => undo(true),
+        // With no text selected: selected text is the browser's to copy.
+        copyData: () => !String(window.getSelection() ?? '') && void commands.run('copyData', { from: 'key' }),
+        // Every plot of the tab, not the page's text.
+        selectAll: () => void selection.only(ws.shownIds(), null),
+        goToPlot(e) {
+          // The plots as they show: only the maximized ones while some are.
+          const id = ws.shownIds()[+e.key - 1];
+          if (!id) return false;
+          selection.arrived(id);
+          focusPlot(id);
+        },
+        help: () => void (keysOpen = true),
+        stepTab: (e) => ws.tabs.length > 1 && void stepTab(e.key === ']' ? 1 : -1),
+      },
+    },
+    // Among property rows, which are what is picked there, a plot's keys do nothing.
+    plots: { when: (e, at) => !at?.closest?.(ROWS), on: plotKey },
+    pause: { on: { pause: () => void commands.run('pause', { from: 'key' }) } },
+  }).map(([id, claimant]) => claim(id, claimant));
+  onDestroy(() => claimed.forEach((unclaim) => unclaim()));
 </script>
 
 <!-- Nothing on the page drags natively: plots, signals and tabs move by
      pointer, and a native drag would only carry a picture of the page. -->
-<svelte:window onkeydown={onKey} onkeyup={onKeyUp} onfocusin={remember} onpointerdowncapture={(e) => selection.press(e)} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
+<svelte:window onfocusin={remember} onpointerdowncapture={(e) => selection.press(e)} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
 <canvas class="gl-layer" bind:this={glCanvas}></canvas>
 
 {#snippet plotTile(id)}
@@ -871,7 +851,6 @@
         onFocus={() => selection.point(id)}
         onPress={() => selection.pressOn(id)}
         onEach={(what, fn) => eachPlot(targetIdsOf(id), what, fn)}
-        onKey={plotKey}
         onEdit={(what, patch) => history.group(what, () => ws.setPlot(id, patch))}
         onView={(patch) => viewHistory.step(() => targetIdsOf(id).forEach((i) => ws.plots[i]?.kind === ws.plots[id]?.kind && ws.setView(i, patch)))}
         targetIds={() => targetIdsOf(id)}

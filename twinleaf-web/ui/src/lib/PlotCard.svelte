@@ -30,7 +30,8 @@
   import CommandItem from './CommandItem.svelte';
   import { axesLike, commandOf, xSpan } from './commands.js';
   import KindPicker from './KindPicker.svelte';
-  import { keepsKey, plotPickers } from './keys.js';
+  import { plotPickers } from './keys.js';
+  import { claim } from './keyrouter.js';
   import Tip from './Tip.svelte';
   import RiDraggable from '@lucide/svelte/icons/grip-vertical';
   import RiBack from '@lucide/svelte/icons/arrow-left';
@@ -49,7 +50,7 @@
   import { DRAG_START, KINDS, MODES, kindLabel } from './constants.js';
   import { writeTables } from './copy.js';
   import { toast } from './toast.svelte.js';
-  import { actionFor, stepIn } from './keymap.js';
+  import { stepIn } from './keymap.js';
   import { chip } from './tabs.js';
   import WindowSlider from './WindowSlider.svelte';
 
@@ -58,7 +59,7 @@
     targetPlots = () => [plot],
     onFocus, onPress, onSelect, onStartMove, onMoveToTab,
     onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal,
-    onEach, targetIds = () => [plot.id], onKey, viewHistory, cursors,
+    onEach, targetIds = () => [plot.id], viewHistory, cursors,
   } = $props();
   /** The plot commands (commands.js): this plot's rows, buttons and keys run them, made on this plot. */
   const commands = getContext('commands');
@@ -623,7 +624,7 @@
       el.removeEventListener('pointermove', move);
       el.removeEventListener('pointerup', up);
       el.removeEventListener('lostpointercapture', lost);
-      window.removeEventListener('keydown', key, true);
+      unclaim();
       if (el.hasPointerCapture(pointer)) el.releasePointerCapture(pointer);
       endOverlayDrag = null;
       const d = overlayDrag;
@@ -632,53 +633,43 @@
     };
     const up = () => end(true);
     const lost = () => end(false);
-    const key = (ev) => {
-      if (ev.key !== 'Escape') return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      end(false);
-    };
+    const unclaim = claim('drag', { on: { cancel: () => end(false) } });
     el.addEventListener('pointermove', move);
     el.addEventListener('pointerup', up);
     el.addEventListener('lostpointercapture', lost);
-    window.addEventListener('keydown', key, true);
     endOverlayDrag = () => end(false);
   }
   /** Ends a legend or readout drag with nothing kept: the plot going away mid-drag. */
   let endOverlayDrag = null;
   onDestroy(() => endOverlayDrag?.());
-  /** Keys pressed on the plot, its drawing and signals included. What keeps its own keys, as keys.js says, keeps them. */
-  function plotKey(e) {
-    const inside = e.target !== card && e.target !== zone;
-    // On a control in the header, the arrows move between the controls (focus.js).
-    if (inside && e.key.startsWith('Arrow')) return;
-    if (inside && keepsKey(e)) return;
-    onKey(e);
-  }
   /** Opens this plot's picker for keymap.js plot action `action`, as the page asks when the keys act on this plot; says whether it has one. */
   function openPicker(action) {
     const open = { enterSignals: () => (plot.items.length ? ((active = 0), zone.focus()) : openAdd()), addSignals: () => openAdd(), kind: openKind }[action];
     open?.();
     return !!open;
   }
-  /** The keys of the plot's signals while they have focus; the rest go on to the plot. */
-  function signalsKey(e) {
-    if (e.target !== zone) return;
-    // A key shows the signal the arrows are on, however the row got focus.
-    zoneFocused = true;
-    const action = actionFor('signals', e);
-    if (action === 'move') {
-      active = stepIn(e, active, plot.items.length);
-      document.getElementById(`chip-${plot.items[active]?.id}`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    } else if (action === 'remove') {
-      remove(plot.items[active]?.id);
-      active = Math.min(active, plot.items.length - 1);
-      if (!plot.items.length) card.focus();
-    } else if (action === 'leave') card.focus();
-    else return;
-    e.preventDefault();
-    e.stopPropagation();
-  }
+  // The keys of the plot's signals while they have focus (keymap.js, place
+  // 'signals'); the rest go on to the plot. A key of theirs shows the
+  // signal the arrows are on, however the row got focus.
+  onDestroy(
+    claim('signals', {
+      when: (e, at) => at === zone,
+      on: {
+        move(e) {
+          zoneFocused = true;
+          active = stepIn(e, active, plot.items.length);
+          document.getElementById(`chip-${plot.items[active]?.id}`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        },
+        remove() {
+          zoneFocused = true;
+          remove(plot.items[active]?.id);
+          active = Math.min(active, plot.items.length - 1);
+          if (!plot.items.length) card.focus();
+        },
+        leave: () => card.focus(),
+      },
+    }),
+  );
   const description = $derived(`${kindLabel(plot.kind, plot.mode)} plot: ${plot.items.map((i) => i.key).join(', ') || 'no signals'}`);
 </script>
 
@@ -735,7 +726,6 @@
   oncontextmenucapture={() => onPress?.()}
   onclick={clicked}
   onfocusin={onFocus}
-  onkeydown={plotKey}
   role="group"
   tabindex="0"
   data-focus="plot"
@@ -772,7 +762,6 @@
             onconsider={consider}
             onfinalize={finalize}
             oncontextmenucapture={(e) => ((signalFilter = ''), (addActive = 0), (menuChip = makeCurrent(e.target.closest?.('.trace-chip')?.dataset.key ?? null)))}
-            onkeydowncapture={signalsKey}
             onfocus={(e) => (zoneFocused = e.currentTarget.matches(':focus-visible'))}
             onblur={() => (zoneFocused = false)}
           >

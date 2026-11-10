@@ -14,7 +14,8 @@
   // library rearranges, and the drop hands them to `docks`. Where the
   // dragged panel would land shows its header alone, and the place is read
   // from the cursor, as the panel dragged is its header too.
-  import { tick } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
+  import { PAGE, claim } from './keyrouter.js';
   import { flip } from 'svelte/animate';
   import { dragHandleZone, dragHandle, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
@@ -76,6 +77,27 @@
     pressedAt = null;
     if (still && e.button === 0) docks.toggle(id);
   }
+  /** The panel whose header is `head`. */
+  const panelOf = (head) => items.find((p) => `panel-${p.id}` === head.dataset.focusKey);
+  /** What a header's key does only when the keyboard moved focus to the header, as keys.js has buttons keep the keys that press them; after a click the key is the page's, so Space pauses the plots. */
+  const whenReached = (fn) => (e, head) => (focusedByKeyboard(head) ? fn(head, panelOf(head)) : PAGE);
+  // A header's keys (keymap.js, place 'panel'): Space folds or unfolds, and
+  // Enter goes into the contents, unfolding them first. Neither reaches the
+  // drag library, whose listeners on the header and its panel would start a
+  // keyboard drag of the panel.
+  onDestroy(
+    claim('panel', {
+      when: (e, at) => at instanceof Element && at.matches('.dock-head') && !!root?.contains(at),
+      on: {
+        fold: whenReached((head, p) => void docks.toggle(p.id)),
+        enter: whenReached((head, p) => {
+          if (p.open) return void enter(head);
+          docks.toggle(p.id);
+          tick().then(() => enter(head));
+        }),
+      },
+    }),
+  );
   let items = $state([]);
   let dragging = $state(false);
   const rail = $derived(railed);
@@ -161,31 +183,6 @@
                 e.currentTarget.focus({ preventScroll: true });
               }}
               onclick={(e) => clickHead(e, p.id)}
-              onkeydowncapture={(e) => {
-                // Space folds or unfolds. Enter goes into the contents, unfolding them first.
-                // They are the header's only when the keyboard moved focus to it, as
-                // keys.js has buttons keep them; after a click they are the page's, so
-                // Space pauses the plots. Neither ever reaches the drag library, whose
-                // listeners on the header and its panel this capture runs before: they
-                // would start a keyboard drag of the panel and keep the key from the
-                // page. The page has the keys from outside the drag zone instead.
-                const head = e.currentTarget;
-                if (e.key !== ' ' && e.key !== 'Enter') return;
-                e.stopImmediatePropagation();
-                if (!focusedByKeyboard(head)) {
-                  const handed = new KeyboardEvent('keydown', { key: e.key, code: e.code, shiftKey: e.shiftKey, bubbles: true, cancelable: true });
-                  root.dispatchEvent(handed);
-                  if (handed.defaultPrevented) e.preventDefault();
-                  return;
-                }
-                e.preventDefault();
-                if (e.key === ' ') docks.toggle(p.id);
-                else if (p.open) enter(head);
-                else {
-                  docks.toggle(p.id);
-                  tick().then(() => enter(head));
-                }
-              }}
             >
               <span class="dock-fold" aria-hidden="true"><RiChevron /></span>
               <span class="dock-title">{panel.title}</span>
