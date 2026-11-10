@@ -2,9 +2,9 @@
   // One dock, left or right: its panels in a column, each under a header
   // that drags it, within this dock or to the other, and folds it with its
   // chevron. A dock that shows no panels, as it has none or is hidden, is a
-  // rail along the page's edge: a panel dropped on it joins the dock's
-  // panels, at the end, and shows the dock, and a click on a hidden dock's
-  // rail shows it. Only docks take panels, so none lands on the tiles.
+  // rail along the page's edge, which draws no panel: a panel dropped on it
+  // joins the dock's panels, at the end, and shows the dock, and a click on
+  // a hidden dock's rail shows it. Only docks take panels, so none lands on the tiles.
   //
   // A dock that has panels has one button, which hides it and shows it
   // again, in the dock's top corner at the page's edge: the one place that

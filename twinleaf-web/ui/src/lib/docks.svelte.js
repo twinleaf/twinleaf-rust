@@ -9,6 +9,10 @@
 // the places: no dock keeps a list of its own that could disagree. A move
 // gives one panel a new place; nothing writes a dock's panels as a list.
 //
+// While a panel is dragged the arrangement stands: nothing moves, folds,
+// hides or shows until the panel is let go, and the drop is the next
+// write. So a dock is, for the whole of a drag, what it was as it began.
+//
 // The arrangement is kept under KEY, as each side's panels in order. A
 // saved one keeps the panels this page knows, once each, and a panel it
 // lacks joins its default dock, so a page that adds a panel shows it to
@@ -127,8 +131,10 @@ export class Docks {
    * The one write of the arrangement: every panel's place, `places`, and
    * whether each dock is hidden, `hidden`, each as it was unless given. It
    * saves the arrangement unless `save` is false, as for one just read.
+   * While a panel is dragged it does nothing.
    */
   #arrange({ places = this.#places, hidden = this.#hidden }, save = true) {
+    if (this.#dragging) return;
     this.#places = places;
     this.#hidden = hidden;
     if (!save) return;
@@ -174,7 +180,7 @@ export class Docks {
     this.#arrange(normalize(null));
   }
 
-  /** A drag of a panel begins. */
+  /** A drag of a panel begins: the arrangement stands until it ends. */
   startDrag() {
     this.#dragging = true;
   }

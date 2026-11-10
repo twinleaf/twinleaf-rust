@@ -1,14 +1,14 @@
 // A panel dragged between the docks, on the whole page with the real
 // mouse. Every panel is in one dock, whatever is done: dragged to the other
 // dock or to its rail, carried over a dock and back, let go over the plots,
-// with a dock hidden or shown in the middle of the drag, folded, moved from
-// its menu, the docks hidden, shown and reset, and the page loaded again
-// from what it saved.
+// with a command to hide or show a dock given in the middle of the drag,
+// folded, moved from its menu, the docks hidden, shown and reset, and the
+// page loaded again from what it saved.
 import fc from 'fast-check';
 import { afterAll, describe, expect, it } from 'vitest';
 import { page as browser, commands } from 'vitest/browser';
 import { DEFAULT, KEY, PANELS } from '../src/lib/docks.svelte.js';
-import { centre, clickOn, dropped, glide, mountPage, pickItem, pressKey, rested, rightClick, settle, until, wait } from './harness/page.js';
+import { centre, clickOn, dropped, glide, mountPage, pickItem, pressKey, rested, rightClick, settle, until, wait, watchFrames } from './harness/page.js';
 
 const SIDES = ['left', 'right'];
 const IDS = Object.keys(PANELS);
@@ -89,7 +89,7 @@ async function letGo() {
   await commands.mouse([['up']]);
   await rest();
 }
-/** Hides dock `side`, or shows it, by the command palette, as the keyboard does with the mouse busy. */
+/** Gives the command that hides dock `side`, or shows it, from the command palette, as the keyboard can with the mouse busy. */
 async function byPalette(side) {
   const palette = () => document.querySelector('[data-slot=dialog-overlay]');
   await pressKey('Control+k');
@@ -110,7 +110,7 @@ const panel = fc.constantFrom(...IDS), side = fc.constantFrom(...SIDES), at = fc
  * - drag: to the other dock, `at` of the way down it, or onto its rail.
  * - back: over the other dock, or its rail, and back to its own, let go there.
  * - cancel: out over the plots, Escape, and let go there.
- * - amid: picked up, dock `side` hidden or shown by a command, then let go over `to`: its own dock or the other.
+ * - amid: picked up, a command given to hide dock `side`, or show it, then let go over `to`: its own dock or the other.
  * - fold: its header clicked. menu: moved to the other dock from its header's menu.
  * - toggle: dock `side`'s button clicked. reset: every panel put back, from a header's menu.
  * - reload: the page mounted again from what it saved.
@@ -127,7 +127,7 @@ const step = fc.oneof(
 const EXAMPLES = [
   // Settings to the left dock; a panel carried over the left dock and back; the left dock hidden; Settings dragged out of what the left dock still draws.
   [[{ t: 'drag', panel: 'settings', at: 0 }, { t: 'back', panel: 'favorites' }, { t: 'toggle', side: 'left' }, { t: 'drag', panel: 'settings', at: 0.6 }, { t: 'reload' }]],
-  // Settings picked up, its dock hidden by a command, and let go in the other dock.
+  // Settings picked up, a command given to hide its dock, and let go in the other dock.
   [[{ t: 'amid', panel: 'settings', side: 'right', to: 'other' }, { t: 'reload' }]],
   // Onto a hidden dock's rail, and back out of the dock that showed.
   [[{ t: 'toggle', side: 'left' }, { t: 'drag', panel: 'reports', at: 0.3 }, { t: 'drag', panel: 'reports', at: 0 }, { t: 'reset' }]],
@@ -198,6 +198,96 @@ describe('a panel', () => {
       }),
       { examples: EXAMPLES, numRuns: EXAMPLES.length + Math.min(RANDOM, fc.readConfigureGlobal().numRuns) },
     );
-    expect(Object.entries(seen).filter(([, n]) => n < 1).map(([what]) => what), 'not seen: panels dragged to the other dock, onto a rail, a dock hidden amid a drag, reloads').toEqual([]);
+    expect(Object.entries(seen).filter(([, n]) => n < 1).map(([what]) => what), 'not seen: panels dragged to the other dock, onto a rail, a command given amid a drag, reloads').toEqual([]);
   }, 600_000);
+});
+
+// While a panel is dragged, a dock that was shown keeps its width and its
+// panels, whatever is asked of the docks meanwhile; a dock hidden before
+// the drag is a rail, widened to take the panel; and a rail draws no panel.
+// Each is read at every frame, from before the panel is picked up until
+// the docks rest after it is let go.
+describe('a dock, while a panel is dragged', () => {
+  /** The least width a dock is drawn with its panels, in px: narrower, a frame is a rail or sliding to one. */
+  const LEAST = 100;
+  /** How wide dock `side`'s frame is, to the px. */
+  const widthOf = (side) => Math.round(frameOf(side).getBoundingClientRect().width);
+  /** What is wrong with the docks as they are drawn, as text; '' when nothing is. */
+  function faults() {
+    const out = [];
+    for (const side of SIDES) {
+      const frame = frameOf(side), f = frame.getBoundingClientRect();
+      // A dock sliding shut has faded its panels out by the time it is narrow.
+      const faded = Number(getComputedStyle(frame.querySelector('.dock')).opacity) < 0.01;
+      const heads = faded ? [] : [...frame.querySelectorAll('.dock-head')].map((head) => head.getBoundingClientRect()).filter((r) => r.width > 0 && r.height > 0 && r.left < f.right && r.right > f.left);
+      const narrow = frame.classList.contains('rail') || f.width < LEAST;
+      if (narrow && heads.length) out.push(`the ${side} dock, ${frame.classList.contains('rail') ? 'a rail ' : ''}${Math.round(f.width)} px wide, draws ${heads.length} panel${heads.length > 1 ? 's' : ''}`);
+      const b = frame.querySelector('.dock-button')?.getBoundingClientRect();
+      if (b && heads.some((r) => r.left < b.right && r.right > b.left && r.top < b.bottom && r.bottom > b.top)) out.push(`the ${side} dock's button is over a header`);
+    }
+    return out.join('; ');
+  }
+  const press = async (side) => {
+    await clickOn(frameOf(side).querySelector('.dock-button'));
+    await rest();
+  };
+  /**
+   * The drags, by what each is. `before` readies the page; `panel` is
+   * dragged to the `other` dock or back into its `own`; and a command to
+   * hide dock `amid` is given while it is held.
+   */
+  const DRAGS = [
+    { what: 'from the right dock to the left', panel: 'settings', to: 'other' },
+    { what: 'from the left dock to the right', panel: 'devices', to: 'other' },
+    { what: 'from the right dock to the rail of the left, hidden before', before: () => press('left'), panel: 'reports', to: 'other' },
+    { what: 'from the left dock to the rail of the right, hidden before', before: () => press('right'), panel: 'signals', to: 'other' },
+    {
+      what: 'within the right dock, once a panel was carried over the left dock and back and the left dock hidden',
+      before: async () => {
+        await carry(await pickUp('favorites'), overPlots, () => spot('left', 0.3), overPlots, () => spot('right', 0.3));
+        await letGo();
+        await press('left');
+      },
+      panel: 'reports',
+      to: 'own',
+    },
+    { what: 'out of the right dock, with a command to hide it meanwhile', panel: 'settings', to: 'other', amid: 'right' },
+    { what: 'into the left dock, with a command to hide it meanwhile', panel: 'settings', to: 'other', amid: 'left' },
+  ];
+
+  it('keeps its width and its panels if it was shown, is a widened rail if it was hidden, and as a rail draws no panel and has its button over none, at every frame', async () => {
+    await browser.viewport(1200, 900);
+    const seen = { widened: 0, placed: 0 };
+    for (const d of DRAGS) {
+      const page = await mount(null);
+      let stopFaults = () => [];
+      try {
+        await settle(6);
+        await d.before?.();
+        expectOnce(`${d.what}, before the drag`);
+        stopFaults = watchFrames(faults);
+        const own = sideOn(d.panel), shown = SIDES.filter((side) => !railed(side)), rails = SIDES.filter(railed);
+        const was = Object.fromEntries(SIDES.map((side) => [side, widthOf(side)]));
+        const stops = Object.fromEntries(SIDES.map((side) => [side, watchFrames(() => widthOf(side))]));
+        let at = await carry(await pickUp(d.panel), overPlots);
+        if (d.amid) await byPalette(d.amid);
+        at = await carry(at, () => spot(d.to === 'own' ? own : across(own), 0.3));
+        if (frameOf(across(own)).querySelector('.dock-panel.shadow')) seen.placed++;
+        const widths = Object.fromEntries(SIDES.map((side) => [side, stops[side]()]));
+        for (const side of shown) expect(widths[side], `${d.what}: how wide the ${side} dock, shown, was at each frame the panel was held`).toEqual([was[side]]);
+        for (const side of rails) {
+          expect(Math.max(...widths[side]), `${d.what}: how wide the ${side} dock's rail, ${was[side]} px before, became for the panel`).toBeGreaterThan(was[side]);
+          seen.widened++;
+        }
+        await letGo();
+        if (d.amid) expect(SIDES.filter((side) => !railed(side)), `${d.what}: the docks shown once the panel is let go`).toEqual(SIDES);
+        expectOnce(d.what);
+      } finally {
+        const were = stopFaults();
+        page.dispose();
+        expect(were.filter(Boolean), `${d.what}: what was wrong with the docks at some frame`).toEqual([]);
+      }
+    }
+    expect(Object.entries(seen).filter(([, n]) => n < 1).map(([what]) => what), 'not seen: a rail widened, a placeholder in the other dock').toEqual([]);
+  }, 300_000);
 });

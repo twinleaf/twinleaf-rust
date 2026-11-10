@@ -94,13 +94,13 @@ describe('a panel', () => {
   );
   const whole = (docks) => ({ left: docks.left, right: docks.right, hidden: docks.hidden });
 
-  it('is in one dock after any run of moves, drops, folds, hides, resets and reloads, and what is saved loads as the same arrangement', () => {
+  it('is in one dock after any run of moves, drops, folds, hides, resets and reloads, moves only by the drop while one is dragged, and what is saved loads as the same arrangement', () => {
     fc.assert(
       fc.property(fc.array(step, { maxLength: 30 }), (steps) => {
         const storage = memory();
         let docks = new Docks(storage);
         for (const s of steps) {
-          const before = whole(docks), was = docks.sideOf(s.panel);
+          const before = whole(docks), was = docks.sideOf(s.panel), held = docks.dragging;
           if (s.t === 'moveTo') docks.moveTo(s.panel, s.side, s.index);
           else if (s.t === 'step') docks.step(s.panel, s.by);
           else if (s.t === 'toggle') docks.toggle(s.panel);
@@ -111,6 +111,13 @@ describe('a panel', () => {
           const said = JSON.stringify(s);
           expect([...docks.left, ...docks.right].map((p) => p.id).sort(), `after ${said}: the panels of both docks`).toEqual([...IDS].sort());
           for (const id of IDS) expect(docks[docks.sideOf(id)].filter((p) => p.id === id), `after ${said}: ${id} in the dock it is said to be in`).toHaveLength(1);
+          // While a panel is dragged the arrangement stands, but for the drop.
+          if (held && !['drop', 'reload'].includes(s.t)) {
+            expect(whole(docks), `after ${said}, a panel dragged: the arrangement`).toEqual(before);
+            if (storage.store.size) expect(whole(new Docks(storage)), `after ${said}, a panel dragged: what is saved, loaded`).toEqual(before);
+            continue;
+          }
+          expect(docks.dragging, `after ${said}: a panel is dragged`).toBe(s.t === 'startDrag');
           // A panel that moved is where it was sent, the others in the order they had.
           if (s.t === 'moveTo' || s.t === 'drop') {
             expect(docks.sideOf(s.panel), `after ${said}: the side of ${s.panel}`).toBe(s.side);

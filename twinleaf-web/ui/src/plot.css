@@ -154,6 +154,10 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .dock-body [data-slot=scroll-area-viewport] { flex: 0 1 auto; min-height: 0; height: auto; }
 .dock-body [data-slot=scroll-area]:has(> [data-slot=scroll-area-scrollbar]) > [data-slot=scroll-area-viewport] { padding-right: 10px; }
 .dock-panel + .dock-panel { border-top: 1px solid var(--border); padding-top: 4px; }
+/* A rail draws no panel: where one dragged onto it would land is a bare
+   place at its top, for the drop to settle on. */
+.dock-side.rail .dock-panel { border-color: transparent; }
+.dock-side.rail .dock-panel > * { display: none; }
 .dock-panel.shadow { flex: none; height: 28px; min-height: 0; opacity: 0.6; border: 1px dashed var(--primary); border-radius: var(--radius); }
 .dock-head { display: flex; align-items: center; gap: 4px; height: 26px; flex: none; padding: 0 2px; border-radius: var(--radius); cursor: grab; user-select: none; outline: none; color: var(--muted-foreground); font: 600 12px var(--font-ui); }
 .dock-head:hover { color: var(--foreground); }
