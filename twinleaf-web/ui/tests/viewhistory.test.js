@@ -536,8 +536,6 @@ describe('a plot closed and brought back by Ctrl+Z', () => {
           expect(p.ws.plots[id], 'back').toBeDefined();
           expect(one(p, id), 'its view').toBe(was);
           expect(p.hub.holding, 'paused again, it holds its history').toBe(true);
-          // A plot reads its detail at most every 100 ms.
-          await wait(150);
           expect(read, 'and reads it again').toContainEqual([id, 'detail']);
           await press(ids[(k + 1) % ids.length], 'Back');
           expect(shown(p), 'Back past the gesture').toBe(start);

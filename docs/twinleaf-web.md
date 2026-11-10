@@ -154,8 +154,15 @@ canvas and its WebGL layer.
    base near the newest point), and draws one instanced quad per segment,
    split at breaks. Axes, cursors and readouts go on a 2D canvas above, the
    time axis counting from the session's first point (`t0`).
-5. Paused, a plot asks `/api/window` (with the hub id) for its view, and
-   draws the reply where it covers it. The reply is the raw rows, decimated
+5. Paused, a plot asks `/api/window` (with the hub id) for its view and a
+   span either side at every move, and once for its whole captured history.
+   The session reads one window at a time for each, one a frame at most, and
+   aborts a read the view has left or wants finer than
+   (`Session.fetchWindow`). Each frame the plot draws from whichever of the
+   two windows and its live points spans the most of the view, and of those
+   the one with the most points across it (`pickSource` in `plot.js`), so a
+   move is drawn from the best the page holds until its reply lands. The
+   reply is the raw rows, decimated
    when they are more than two a pixel, and from 128 rows a point on the
    points of a level of the trace's `Pyramid` (`pyramid.rs`): FPCS
    decimations of every row the history holds, at ratios that double, kept

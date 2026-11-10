@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import fc from 'fast-check';
-import { Points, Trace } from './session.svelte.js';
-import { axisSlots, blurred, onPixelGrid, pickLevel, PlotView, rowCounts, timeAxis, View } from './plot.js';
+import { Detail, Points, Trace } from './session.svelte.js';
+import { axisSlots, blurred, onPixelGrid, pickLevel, pickSource, PlotView, rowCounts, timeAxis, View } from './plot.js';
 
 const meta = { id: 0, route: '/', stream: 'sine', column: 'sine', units: 'V', rate: 1000 };
 
@@ -452,6 +452,76 @@ describe('the level a plot draws', () => {
     const ls = levels([95, 0, 0]);
     expect(at(ls, 4, 0)).toBe(0);
     expect(at(ls, 8, 0)).toBe(1);
+  });
+});
+
+describe('what a paused plot draws from', () => {
+  // A plot 200 px wide showing 0 to 100 s: half a second a pixel column.
+  const X0 = 0, X1 = 100, WIDTH = 200;
+  const xs = (from, to, n) => Array.from({ length: n }, (_, i) => from + ((to - from) * i) / Math.max(1, n - 1));
+  /** A window of the hub's history from `from` to `to`, of `n` points, each of `ratio` rows. */
+  const windowOf = (from, to, n, ratio = 8) => new Detail(new Trace(meta), { t0: from, t1: to, ratio, chunks: n ? [{ x: xs(from, to, n), y: xs(0, 1, n) }] : [] });
+  /** A level of live points from `from` to `to`, `n` of them. */
+  const levelOf = (from, to, n) => {
+    const l = new Points(1e9);
+    if (n) l.push(xs(from, to, n), xs(0, 1, n), false);
+    return l;
+  };
+  const pick = (...held) => held.indexOf(pickSource(held, X0, X1, WIDTH));
+
+  it('is the densest of what spans the view, whichever layer it is', () => {
+    // A detail window read for a view thirty times as wide, the overview, and the live level.
+    expect(pick(windowOf(-1000, 2000, 900), windowOf(-5000, 100, 2600), levelOf(-20, 120, 1400))).toBe(2);
+    expect(pick(windowOf(-1000, 2000, 900), windowOf(-500, 100, 2400), levelOf(-20, 120, 280))).toBe(1);
+    expect(pick(windowOf(-100, 200, 1500), windowOf(-5000, 100, 2600), levelOf(-20, 120, 280))).toBe(0);
+  });
+
+  it('is a window of the raw rows over anything else that spans the view, and the first of two as dense', () => {
+    expect(pick(windowOf(-10, 110, 120, 1), windowOf(-10, 110, 600), levelOf(-10, 110, 1200))).toBe(0);
+    expect(pick(windowOf(-10, 110, 600), windowOf(-10, 110, 120, 1), levelOf(-10, 110, 1200))).toBe(1);
+    expect(pick(windowOf(-100, 200, 600), windowOf(-100, 200, 600), levelOf(-100, 200, 3))).toBe(0);
+  });
+
+  it('is what spans the most of the view when none spans it all, however coarse, to the pixel column', () => {
+    expect(pick(windowOf(50, 150, 4000), windowOf(-900, 100, 300), levelOf(60, 100, 4000))).toBe(1);
+    expect(pick(windowOf(50, 150, 4000), windowOf(20, 100, 300), levelOf(10, 100, 30))).toBe(2);
+    // A fifth of a column short of the view's start counts as spanning it.
+    expect(pick(windowOf(0.1, 150, 4000), levelOf(-50, 100, 30))).toBe(0);
+    expect(pick(windowOf(0.4, 150, 4000), levelOf(-50, 100, 30))).toBe(1);
+  });
+
+  it('is the first held when none has a point', () => {
+    expect(pick(windowOf(0, 100, 0), levelOf(0, 0, 0))).toBe(0);
+  });
+
+  it('spans as many pixel columns of the view as anything held, and no other that spans as many has more points across it', () => {
+    const source = fc.record({
+      window: fc.boolean(),
+      from: fc.integer({ min: -300, max: 90 }),
+      length: fc.integer({ min: 1, max: 600 }),
+      n: fc.integer({ min: 0, max: 3000 }),
+      raw: fc.boolean(),
+    });
+    const seen = { whole: 0, part: 0 };
+    fc.assert(
+      fc.property(fc.array(source, { minLength: 1, maxLength: 4 }), (made) => {
+        const held = made.map((m) => (m.window ? windowOf(m.from, m.from + m.length, m.n, m.raw ? 1 : 8) : levelOf(m.from, m.from + m.length, m.n)));
+        const columns = (s) => (s.length ? Math.round(((Math.min(s.xAt(s.absEnd - 1), X1) - Math.max(s.xAt(s.absStart), X0)) / (X1 - X0)) * WIDTH) : 0);
+        const points = (s) => (s.ratio === 1 && s.length ? Infinity : [...s.x.subarray(s.start, s.end)].filter((x) => x >= X0 && x < X1).length);
+        const src = pickSource(held, X0, X1, WIDTH);
+        expect(held).toContain(src);
+        const most = Math.max(0, ...held.map(columns));
+        expect(Math.max(0, columns(src))).toBe(most);
+        const rivals = held.filter((s) => Math.max(0, columns(s)) === most);
+        expect(points(src)).toBe(Math.max(...rivals.map(points)));
+        // Of those as dense, the first held.
+        expect(rivals.find((s) => points(s) === points(src))).toBe(src);
+        seen[most === WIDTH ? 'whole' : 'part']++;
+      }),
+      { numRuns: 500 },
+    );
+    expect(seen.whole).toBeGreaterThan(0);
+    expect(seen.part).toBeGreaterThan(0);
   });
 });
 

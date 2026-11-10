@@ -338,10 +338,27 @@ function drawStrip(ctx, share, color, x, w, top, alpha) {
   ctx.globalAlpha = 1;
 }
 
-/** How much of [x0, x1] the points of `src`, a trace or a window, span. */
-function spanWithin(src, x0, x1) {
-  if (src.length === 0) return 0;
-  return Math.max(0, Math.min(src.xAt(src.absEnd - 1), x1) - Math.max(src.xAt(src.absStart), x0));
+/**
+ * What a plot `width` px wide draws [x0, x1] of a trace from, of `held`:
+ * the windows of the hub's history and the level of its points that the
+ * page holds, in the order a tie goes by. It is the one whose points span
+ * the most of the view's pixel columns; of those that span as many, the one
+ * with the most points across the view, where a window of the raw rows has
+ * the most there are; and of those, the first.
+ */
+export function pickSource(held, x0, x1, width) {
+  const column = (x1 - x0) / width;
+  const score = (s) => {
+    if (s.length === 0) return [0, 0];
+    const spanned = Math.min(s.xAt(s.absEnd - 1), x1) - Math.max(s.xAt(s.absStart), x0);
+    return [Math.round(Math.max(0, spanned) / column), s.ratio === 1 ? Infinity : s.lowerBound(x1) - s.lowerBound(x0)];
+  };
+  let best = held[0], most = score(best);
+  for (const s of held.slice(1)) {
+    const [columns, points] = score(s);
+    if (columns > most[0] || (columns === most[0] && points > most[1])) [best, most] = [s, [columns, points]];
+  }
+  return best;
 }
 
 /** The spectrum's bin nearest frequency f. */
@@ -664,20 +681,22 @@ export class PlotView {
     const session = this.hub.session;
     const plans = traces.map((t, index) => {
       // Live, it draws the level of the live points that suits the window.
-      // Paused, it draws from the hub's history: the detail window when it
-      // covers the view, else whichever of it, the overview of the whole
-      // capture and that level covers most, the sharper on a tie.
+      // Paused, it draws from whichever of the hub's history the page holds
+      // shows the view best (`pickSource`): the detail window, the overview
+      // of the whole capture, or that level.
       const level = pickLevel(t.levels, x0, x1, geo.plot.w, this.drawnLevel.get(t));
       this.drawnLevel.set(t, level);
       const live = t.levels[level];
       const d = this.view.live ? null : session.windowOf(this.plotId, 'detail', t);
       const o = this.view.live ? null : session.windowOf(this.plotId, 'overview', t);
-      const src = d?.covers(x0, x1) ? d : [d, o, live].filter(Boolean).reduce((best, s) => (spanWithin(s, x0, x1) > spanWithin(best, x0, x1) ? s : best));
+      const src = pickSource([d, o, live].filter(Boolean), x0, x1, geo.plot.w);
       const a0 = Math.max(src.absStart, src.lowerBound(x0) - 1);
       const a1 = Math.min(src.absEnd, src.lowerBound(x1) + 1);
       const [lo, hi] = a1 > a0 ? src.extent(a0, a1) : [Infinity, -Infinity];
       return { t, src, fromWindow: src !== live, level, a0, a1, lo, hi, index };
     });
+    // What this frame draws: the times, and what each trace is drawn from.
+    this.drawn = { x0, x1, plans };
     // The history the plot moves through, oldest to newest: what its view can show.
     this.history = this.view.limits(perf);
     // Shared ranges take the union of their traces. A fit fits to what this frame shows.

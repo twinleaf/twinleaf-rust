@@ -24,6 +24,8 @@ const CLOCK_WINDOW_MS = 2000;
 const CLOCK_SLEW = 0.005;
 /** How far, in seconds, the clock may be from its goal before it is set there at once. */
 const CLOCK_SNAP = 0.5;
+/** How much longer one window may be than another and count as the same length, as a pan's are but for rounding. */
+const SAME_SPAN = 1 + 1e-9;
 
 /**
  * One line of points, in device seconds, kept for `keep` seconds before the
@@ -187,18 +189,6 @@ export class Detail {
   get absEnd() {
     return this.end;
   }
-  /**
-   * Whether the window holds raw rows across the whole view. It may not
-   * start at the view's left edge when the view reaches back past the oldest
-   * row the server's Buffer keeps, or past the start of the stream's run (a
-   * reboot, a new session). It does not reach the right edge of a view past
-   * the newest samples it was read at, where the live stream goes on.
-   */
-  covers(x0, x1) {
-    if (!(this.t0 <= x0 && this.t1 >= x1) || this.end === 0) return false;
-    const period = 1 / this.meta.rate;
-    return this.x[0] <= x0 + 2 * period && this.x[this.end - 1] >= x1 - 2 * period;
-  }
 }
 Detail.prototype.lowerBound = Trace.prototype.lowerBound;
 Detail.prototype.xAt = Trace.prototype.xAt;
@@ -270,11 +260,11 @@ export class Session {
 
   traces = new Map(); // trace id -> Trace
   byKey = new Map(); // signal key -> Trace
-  /** Each paused plot's full-resolution windows: plot id -> (Trace -> Detail). */
+  /** Each paused plot's windows of the hub's history, by layer. */
   windows = new Map(); // plot id -> {detail, overview}: each a Map, trace -> Detail
   /** How many times every window was dropped, for the page to read them again. */
   detailsDropped = $state(0);
-  windowTokens = new Map(); // plot id -> {asked, shown}: the newest request of each layer, and the one drawn
+  reads = new Map(); // plot id -> {detail, overview}: each layer's {flying, waiting, sent}, see `fetchWindow`
   latest = -Infinity; // device time of the newest point
   offset = null; // device time minus page time, in seconds
   arrivals = []; // [page ms, device time minus page time in s] of each batch that moved `latest`, the last CLOCK_WINDOW_MS
@@ -335,7 +325,7 @@ export class Session {
       case 'clear':
         // The server re-decimated its history; a fresh copy follows.
         for (const t of this.traces.values()) t.clear();
-        this.windows.clear();
+        this.clearAllWindows();
         this.detailsDropped++;
         return;
       case 'config':
@@ -439,35 +429,72 @@ export class Session {
     return this.windows.get(plotId)?.[layer].get(trace);
   }
 
+  // Each layer of each plot reads one window at a time, and sends at most
+  // one read a frame, so a move asks at once and a run of moves asks once a
+  // frame. An ask made while a read is in flight waits, in place of any ask
+  // already waiting, and is sent as the reply lands, when the window being
+  // read holds the view it asks for and is no longer than the window it
+  // asks for: that reply shows the view as finely as a read begun over
+  // would, and sooner. Any other read in flight is of a stretch the plot
+  // has left, or coarser than the view wants: it is aborted, its reply
+  // never parsed, and the ask is sent in its place. So the view a move ends
+  // at is drawn from the first reply to land after it, replies land in the
+  // order asked, and none replaces a later one's.
+
   /**
-   * Reads [t0, t1] of `traces`, about `width` px wide, into plot `plotId`'s
-   * `layer`. A reply replaces what the layer shows unless a later request's
-   * reply already did: none is thrown away for being overtaken by a request
-   * still in flight.
+   * Asks for [x0, x1] of `traces` and `pad` seconds either side, about
+   * `width` px wide, for plot `plotId`'s `layer`: read at once, or once the
+   * layer's read in flight has landed or the frame has passed.
    */
-  async fetchWindow(plotId, layer, traces, t0, t1, width) {
-    const tokens = this.tokensOf(plotId);
-    const token = ++tokens.asked;
-    const replies = await Promise.all(
-      traces.map((t) => api.window({ hub: this.id, id: t.meta.id, t0, t1, width }).then((reply) => [t, reply], () => null)),
-    );
-    if (token <= tokens.shown[layer]) return;
-    tokens.shown[layer] = token;
-    let windows = this.windows.get(plotId);
-    if (!windows) this.windows.set(plotId, (windows = { detail: new Map(), overview: new Map() }));
-    for (const got of replies) if (got) windows[layer].set(got[0], new Detail(got[0], got[1]));
+  fetchWindow(plotId, layer, traces, x0, x1, pad, width) {
+    let reads = this.reads.get(plotId);
+    if (!reads) this.reads.set(plotId, (reads = { detail: { flying: null, waiting: null, sent: null }, overview: { flying: null, waiting: null, sent: null } }));
+    const read = reads[layer];
+    const ask = { traces, t0: x0 - pad, t1: x1 + pad, width }, flying = read.flying;
+    if (flying && !(flying.t0 <= x0 && flying.t1 >= x1 && flying.t1 - flying.t0 <= (ask.t1 - ask.t0) * SAME_SPAN)) this.#abort(read);
+    read.waiting = ask;
+    this.#send(plotId, layer, read);
   }
 
-  tokensOf(plotId) {
-    let tokens = this.windowTokens.get(plotId);
-    if (!tokens) this.windowTokens.set(plotId, (tokens = { asked: 0, shown: { detail: 0, overview: 0 } }));
-    return tokens;
+  /** Sends the ask `read` has waiting, unless it has a read in flight or sent one this frame. */
+  #send(plotId, layer, read) {
+    const ask = read.waiting;
+    if (!ask || read.flying || read.sent) return;
+    read.waiting = null;
+    read.sent = clock.frame(() => {
+      read.sent = null;
+      this.#send(plotId, layer, read);
+    });
+    const { traces, t0, t1, width } = ask, abort = new AbortController();
+    const flying = (read.flying = { t0, t1, abort });
+    const one = (t) => api.window({ hub: this.id, id: t.meta.id, t0, t1, width, signal: abort.signal }).then((reply) => [t, reply], () => null);
+    Promise.all(traces.map(one)).then((replies) => {
+      // Aborted, it is no longer the layer's read.
+      if (read.flying !== flying) return;
+      read.flying = null;
+      let windows = this.windows.get(plotId);
+      if (!windows) this.windows.set(plotId, (windows = { detail: new Map(), overview: new Map() }));
+      for (const got of replies) if (got) windows[layer].set(got[0], new Detail(got[0], got[1]));
+      this.#send(plotId, layer, read);
+    });
   }
 
-  /** Drops the plot's windows, as its view streams again; replies on their way are dropped too. */
+  /** Aborts the read `read` has in flight, and drops the ask it has waiting. */
+  #abort(read) {
+    read.flying?.abort.abort();
+    read.flying = null;
+    read.waiting = null;
+  }
+
+  /** Drops the plot's windows, as its view streams again, with the reads on their way and still to send. */
   clearWindows(plotId) {
     this.windows.delete(plotId);
-    const tokens = this.tokensOf(plotId);
-    tokens.shown = { detail: tokens.asked, overview: tokens.asked };
+    for (const read of Object.values(this.reads.get(plotId) ?? {})) this.#abort(read);
+    this.reads.delete(plotId);
+  }
+
+  /** Drops every plot's windows and reads, as the hub's history is replaced or the page leaves the hub. */
+  clearAllWindows() {
+    for (const plotId of new Set([...this.windows.keys(), ...this.reads.keys()])) this.clearWindows(plotId);
   }
 }

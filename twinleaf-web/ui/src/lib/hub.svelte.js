@@ -35,6 +35,7 @@ export class Hub {
   /** Applies one text message: a snapshot's `hub`, a snapshot's state, or a change. */
   text(msg) {
     if (msg.type === 'hub') {
+      this.session.clearAllWindows();
       this.session = new Session(msg.id);
       this.connected = true;
       this.seq = msg.seq;
@@ -135,9 +136,10 @@ export class Hub {
     this.ws = ws;
   }
 
-  /** Closes the socket for good, as the page goes away. */
+  /** Closes the socket for good, and ends the session's window reads, as the page goes away. */
   close() {
     this.closed = true;
+    this.session.clearAllWindows();
     if (this.ws) this.ws.onclose = null;
     this.ws?.close();
   }

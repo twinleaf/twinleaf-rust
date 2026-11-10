@@ -247,10 +247,12 @@
   // Paused, every pan or zoom asks the server for the plot's view at full
   // resolution, read from its raw buffer, which reaches back as far as the
   // history kept. Live, the decimated stream is used.
-  // A move asks at once, then at most every DETAIL_MS while it goes on, and
-  // once more after it stops, so a drag keeps the detail close behind it.
-  const DETAIL_MS = 100;
-  const detailAsks = new Map(); // plot id -> {last, timer}
+  // Every move asks, and the session paces the reads (`Session.fetchWindow`).
+  /**
+   * The share of the view's span asked for either side of it, so a pan or a
+   * zoom out stays within the window read until the next one lands.
+   */
+  const DETAIL_PAD = 1;
   const overviewKeys = new Map(); // plot id -> what its overview was read for
   function requestDetail(id) {
     const v = views.get(id);
@@ -259,22 +261,10 @@
       return hub.session.clearWindows(id);
     }
     requestOverview(id, v);
-    let ask = detailAsks.get(id);
-    if (!ask) detailAsks.set(id, (ask = { last: 0, timer: null }));
-    if (ask.timer) return;
-    const run = () => {
-      ask.last = clock.now();
-      ask.timer = null;
-      const plot = plotAnywhere(id);
-      if (!plot || plot.kind !== 'time' || views.get(id)?.live !== false) return;
-      const [x0, x1] = views.get(id).range(hub.now(clock.now()));
-      // A span either side, so zooming out a few steps or panning stays covered.
-      const pad = x1 - x0;
-      hub.session.fetchWindow(id, 'detail', tracesOf(plot), x0 - pad, x1 + pad, window.innerWidth * 2);
-    };
-    const wait = DETAIL_MS - (clock.now() - ask.last);
-    if (wait <= 0) run();
-    else ask.timer = clock.after(wait, run);
+    const plot = plotAnywhere(id);
+    if (!plot || plot.kind !== 'time') return;
+    const [x0, x1] = v.range(hub.now(clock.now()));
+    hub.session.fetchWindow(id, 'detail', tracesOf(plot), x0, x1, DETAIL_PAD * (x1 - x0), window.innerWidth * 2);
   }
   const tracesOf = (plot) => plot.items.map((i) => hub.session.byKey.get(i.key)).filter(Boolean);
   // Each view reads the oldest time its plot can show from what the hub holds of these.
@@ -291,7 +281,7 @@
     const key = `${hi}|${traces.map((t) => t.meta.id).join(',')}`;
     if (overviewKeys.get(id) === key) return;
     overviewKeys.set(id, key);
-    hub.session.fetchWindow(id, 'overview', traces, lo, hi, window.innerWidth * 2);
+    hub.session.fetchWindow(id, 'overview', traces, lo, hi, 0, window.innerWidth * 2);
   }
 
 
@@ -617,11 +607,9 @@
     };
     raf = clock.frame(loop);
     // A hot reload unmounts the page without leaving it, so the socket, the
-    // GPU context and the window reads still to ask go with the copy that
-    // made them.
+    // GPU context and the window reads go with the copy that made them.
     return () => {
       clock.cancel(raf);
-      for (const ask of detailAsks.values()) clock.cancel(ask.timer);
       hub.close();
       renderer.dispose();
     };

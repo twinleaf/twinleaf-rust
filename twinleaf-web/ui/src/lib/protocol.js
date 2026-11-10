@@ -92,10 +92,14 @@ export const spectraMessage = (ids) => JSON.stringify({ type: 'spectra', traces:
 /** Whether the page holds a plot paused, so the hub holds its history as it was then. */
 export const holdMessage = (on) => JSON.stringify({ type: 'hold', on });
 
-/** Sends one /api request and returns its reply, or throws the server's refusal as an Error. */
-async function request(path, { query, body } = {}) {
+/**
+ * Sends one /api request and returns its reply, or throws the server's
+ * refusal as an Error. Aborting `signal` ends the request, its reply
+ * unread, and throws the signal's reason.
+ */
+async function request(path, { query, body, signal } = {}) {
   const url = query ? `${path}?${new URLSearchParams(query)}` : path;
-  const init = body === undefined ? {} : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) };
+  const init = body === undefined ? { signal } : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal };
   const r = await fetch(url, init);
   const reply = await r.json().catch(() => ({ error: `${r.status} ${r.statusText}` }));
   if (!r.ok) throw new Error(reply.error ?? `${r.status} ${r.statusText}`);
@@ -126,9 +130,10 @@ export const api = {
   setHistory: (seconds, bytes) => request('/api/history', { body: { seconds, bytes: Math.round(bytes) } }),
   /**
    * Reads trace `id` of hub `hub` between t0 and t1, decimated to about
-   * `width` px. Replies {t0, t1, ratio, chunks: [{x, y}]}, `ratio` raw rows per point.
+   * `width` px, until `signal` aborts the read. Replies {t0, t1, ratio,
+   * chunks: [{x, y}]}, `ratio` raw rows per point.
    */
-  window: ({ hub, id, t0, t1, width }) => request('/api/window', { query: { hub, id, t0, t1, width: Math.round(width) } }),
+  window: ({ hub, id, t0, t1, width, signal }) => request('/api/window', { query: { hub, id, t0, t1, width: Math.round(width) }, signal }),
   /**
    * Reads every raw row of trace `id` of hub `hub` between t0 and t1, or,
    * past `limit` rows, only how many. Replies {count, oldest, x, y}, `oldest`

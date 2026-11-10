@@ -32,8 +32,20 @@ import '../../src/plot.css';
 /** The virtual clock of the page mounted; null while none is, or while it is on the real clock. */
 let virtual = null;
 
-/** One frame of the browser's own, `step` run in it where a page's frame callbacks run. */
-const turn = (step) => new Promise((done) => requestAnimationFrame(() => (step?.(), done())));
+/** A task of the browser's own: every promise settled before it has run what waited on it, however long the chain. */
+const task = () =>
+  new Promise((done) => {
+    const { port1, port2 } = new MessageChannel();
+    port1.onmessage = () => (port1.close(), done());
+    port2.postMessage(null);
+  });
+
+/**
+ * One frame of the browser's own, `step` run in it where a page's frame
+ * callbacks run, and then a task: what the frame's timers resolved, as a
+ * hub's reply, has reached the page before the test goes on.
+ */
+const turn = (step) => new Promise((done) => requestAnimationFrame(() => (step?.(), task().then(done))));
 
 /**
  * Lets `n` frames pass. On the virtual clock each is one frame of the
@@ -465,12 +477,17 @@ export const HISTORY_HEADROOM = 2;
  *   history has, that it held older samples before.
  * - /api/window answers any range as the server does (twinleaf-web/src/hub.rs
  *   `window`): the rows it holds within it, decimated to at most twice
- *   `width` points, at least 64; and /api/rows counts them.
- * Returns {now, oldest, asked}: `oldest` the oldest time held, and `asked`
- * each window read so far, as {id, t0, t1, width, points}. The answers are
- * undone by `vi.restoreAllMocks()`.
+ *   `width` points, at least 64; and /api/rows counts them. A window read
+ *   answers `delay` ms of the page's time after it is asked, at once with
+ *   none, and one aborted meanwhile throws as an aborted request does.
+ * Returns {now, oldest, asked, read}: `oldest` the oldest time held;
+ * `asked` each window read so far, as {id, t0, t1, width, points, at,
+ * answered, aborted}, `at` and `answered` the page's time it was asked and
+ * answered, null while it is not; and `read(t0, t1, width)` the window a
+ * read is answered with, as {ratio, x}. The answers are undone by
+ * `vi.restoreAllMocks()`.
  */
-export function holdHistory(page, { history, seconds = history + HISTORY_HEADROOM, now = 100_000, behind = 0, dropped = seconds >= history } = {}) {
+export function holdHistory(page, { history, seconds = history + HISTORY_HEADROOM, now = 100_000, behind = 0, dropped = seconds >= history, delay = 0 } = {}) {
   const hub = page.hub, session = hub.session, newest = now + behind, oldest = newest - seconds, asked = [];
   session.now = () => now;
   const keeps = LEVEL_SECONDS.map((s) => Math.min(s, history * (1 + COARSE_REACH)));
@@ -494,14 +511,24 @@ export function holdHistory(page, { history, seconds = history + HISTORY_HEADROO
     const a = Math.ceil(Math.max(t0, oldest) * RATE), b = Math.floor(Math.min(t1, newest) * RATE);
     return { count: Math.max(0, b - a + 1), x: (n) => Float64Array.from({ length: n }, (_, i) => (a + i * ratio) / RATE) };
   };
-  vi.spyOn(api, 'window').mockImplementation(async ({ id, t0, t1, width }) => {
+  const read = (t0, t1, width) => {
     const raw = rows(t0, t1).count, ratio = Math.max(1, Math.ceil(raw / Math.max(64, 2 * width)));
-    const x = rows(t0, t1, ratio).x(Math.ceil(raw / ratio));
-    asked.push({ id, t0, t1, width, points: x.length });
+    return { ratio, x: rows(t0, t1, ratio).x(Math.ceil(raw / ratio)) };
+  };
+  vi.spyOn(api, 'window').mockImplementation(async ({ id, t0, t1, width, signal }) => {
+    const { ratio, x } = read(t0, t1, width);
+    const ask = { id, t0, t1, width, points: x.length, at: clock.now(), answered: null, aborted: false };
+    asked.push(ask);
+    if (delay > 0) await new Promise((done) => (clock.after(delay, done), signal?.addEventListener('abort', done)));
+    if (signal?.aborted) {
+      ask.aborted = true;
+      throw signal.reason;
+    }
+    ask.answered = clock.now();
     return { t0, t1, ratio, chunks: x.length ? [{ x, y: Float32Array.from(x, (v) => Math.sin(v / 7 + id)) }] : [] };
   });
   vi.spyOn(api, 'rows').mockImplementation(async ({ t0, t1 }) => ({ count: rows(t0, t1).count, oldest, x: [], y: [] }));
-  return { now, oldest, asked };
+  return { now, oldest, asked, read };
 }
 
 /**

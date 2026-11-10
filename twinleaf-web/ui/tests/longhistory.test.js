@@ -210,15 +210,19 @@ describe('a plot on a hub that holds hours', () => {
       };
       turnWheel(page, id, 400, { n: ALL_THE_WAY });
       const wide = await reads(0);
-      // The whole capture once for each signal, and the view with a span either side.
+      // The whole capture once for each signal, and the view with a span
+      // either side. A signal's detail is read once a frame at most, so
+      // turns within one frame read it twice however many they are: the
+      // first turn's view at once, and where they ended the frame after.
       const overview = wide.filter((a) => a.t0 === hub.oldest && a.t1 === hub.at);
       expect(overview.map((a) => a.id).sort(), `${history} s: one overview a signal`).toEqual(traces.map((t) => t.meta.id));
-      expect(wide.length, `${history} s: reads for one burst`).toBeLessThanOrEqual(3 * traces.length);
+      expect(wide.length - overview.length, `${history} s: detail reads for turns within one frame`).toBeLessThanOrEqual(2 * traces.length);
       const from = hub.asked.length;
       turnWheel(page, id, -400, { n: 12, at: 0.4 });
       const narrow = await reads(from);
       expect(narrow.length).toBeGreaterThan(0);
-      expect(narrow.length, `${history} s: reads for one burst`).toBeLessThanOrEqual(2 * traces.length);
+      expect(narrow.length, `${history} s: detail reads for turns within one frame`).toBeLessThanOrEqual(2 * traces.length);
+      expect(new Set(narrow.map((a) => `${a.id}|${a.at}`)).size, `${history} s: one read a signal a frame`).toBe(narrow.length);
       for (const a of narrow.slice(-traces.length)) expect(a.t1 - a.t0, 'the view and a span either side').toBeCloseTo(3 * view.span, 6);
       for (const a of hub.asked) {
         expect(a.width, `${history} s: the width asked for`).toBe(width);
