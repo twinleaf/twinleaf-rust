@@ -340,7 +340,8 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .chip .x:hover { color: var(--foreground); }
 .chip.ghost { opacity: 0.4; border-style: dashed; }
 .drop-target { border-color: var(--primary) !important; background: color-mix(in oklch, var(--primary) 8%, transparent); }
-.palette .chip { padding: 5px 8px; font-size: 13px; }
+.palette .chip { padding: 5px 8px; font-size: 13px; cursor: pointer; transition: background-color 120ms, border-color 120ms; }
+.palette .chip:hover { background: var(--accent); border-color: color-mix(in oklch, var(--foreground) 25%, var(--border)); }
 .palette .sig-key { overflow: hidden; text-overflow: ellipsis; }
 .palette .sig-units { color: var(--muted-foreground); font-size: 11px; }
 .sig-empty { padding: 8px; color: var(--muted-foreground); font-size: 12px; text-align: center; }

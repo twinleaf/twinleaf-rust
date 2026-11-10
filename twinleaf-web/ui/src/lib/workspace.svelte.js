@@ -228,6 +228,14 @@ export class Workspace {
     }
   }
 
+  /** Takes signal `key` out of each of plots `ids` that shows it. */
+  removeFrom(ids, key) {
+    for (const id of ids) {
+      const plot = this.plots[id];
+      if (plot?.items.some((i) => i.key === key)) this.setPlot(id, { items: plot.items.filter((i) => i.key !== key) });
+    }
+  }
+
   /** Sets the open tab's split at `path` (as layout.js `gutters` names it) to `ratio`. */
   setRatio(path, ratio) {
     this.setLayout(setRatio(this.layout, path, ratio));

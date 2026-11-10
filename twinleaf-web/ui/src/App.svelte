@@ -486,15 +486,21 @@
     const ids = selection.pageTargets('plot');
     if (ids.length) history.group(ids.length > 1 ? `Add ${key} (${plotsText(ids.length)})` : `Add ${key}`, () => ws.addTo(ids, key));
   }
+  /** Takes signal `key` out of every selected plot, as one step. */
+  function removeSignal(key) {
+    const ids = selection.pageTargets('plot');
+    if (ids.length) history.group(ids.length > 1 ? `Remove ${key} (${plotsText(ids.length)})` : `Remove ${key}`, () => ws.removeFrom(ids, key));
+  }
   /**
    * What the Signals list's Add to plot says of signal `key`, as {text,
    * can}: the plot it would join, or how many, from the same selection the
-   * command acts on; or why it joins none.
+   * command acts on; or why it joins none. Where every selected plot shows
+   * it already, `remove` is true and the row takes it out of them instead.
    */
   function addsTo(key) {
     const ids = selection.pageTargets('plot'), lacking = ids.filter((id) => !ws.plots[id].items.some((i) => i.key === key));
     if (!ids.length) return { text: 'No plot selected', can: false };
-    if (!lacking.length) return { text: 'Already shown', can: false };
+    if (!lacking.length) return { text: ids.length > 1 ? plotsText(ids.length) : labelOf(ids[0]), can: true, remove: true };
     return { text: lacking.length > 1 ? plotsText(lacking.length) : labelOf(lacking[0]), can: true };
   }
   /** Moves keyboard focus to plot `id`, once it is on the page. */
@@ -908,7 +914,7 @@
   {:else if id === 'signals'}
     <!-- The whole panel keeps the plot selection: its search, its list and its scrollbar. -->
     <div class="contents" data-keeps-selection>
-      <SignalList session={hub.session} {drags} onAdd={addSignal} onNewPlot={newPlotWith} {addsTo} />
+      <SignalList session={hub.session} {drags} onAdd={addSignal} onRemove={removeSignal} onNewPlot={newPlotWith} {addsTo} />
     </div>
   {:else}
     {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} panel={id} />{/key}

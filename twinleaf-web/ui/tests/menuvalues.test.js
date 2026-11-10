@@ -94,7 +94,7 @@ const CASES = [
   [['A', 'B'], 'the add-signal menu', 'A', { 'Remove every signal': '4 signals' }],
   // The Signals list's first signal is aux.triangle.
   [[], 'the Signals list’s menu', null, { 'Add to plot': 'No plot selected', 'New plot': 'Time · Overlay' }],
-  [['A'], 'the Signals list’s menu', null, { 'Add to plot': 'Already shown' }],
+  [['A'], 'the Signals list’s menu', null, { 'Remove from plot': 'sine.sine, aux.triangle' }],
   [['B'], 'the Signals list’s menu', null, { 'Add to plot': 'sine.sine, mag.x' }],
   [['B', 'D'], 'the Signals list’s menu', null, { 'Add to plot': '2 plots' }],
   [[], 'a tab’s menu', null, { Duplicate: '4 plots', Close: '4 plots' }],

@@ -25,6 +25,7 @@
   import ColorPicker from './ColorPicker.svelte';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import RiAdd from '@lucide/svelte/icons/plus';
+  import RiTrash from '@lucide/svelte/icons/trash-2';
   import RiNewPlot from '@lucide/svelte/icons/square-plus';
   import RiPalette from '@lucide/svelte/icons/palette';
   import RiCopy from '@lucide/svelte/icons/clipboard-copy';
@@ -34,10 +35,11 @@
 
   /**
    * `drags` is the page's Drags; `onAdd(key)` adds to the selected plots,
-   * `onNewPlot(keys)` makes a plot, and `addsTo(key)` says where Add to
-   * plot would put the signal, as {text, can}.
+   * `onRemove(key)` takes it out of them, `onNewPlot(keys)` makes a plot, and
+   * `addsTo(key)` says where Add to plot would put the signal, as {text,
+   * can}, or with `remove`, that the row takes it out instead.
    */
-  let { session, drags, onAdd, onNewPlot, addsTo = () => ({ text: '', can: true }) } = $props();
+  let { session, drags, onAdd, onRemove, onNewPlot, addsTo = () => ({ text: '', can: true }) } = $props();
 
   const FLIP_MS = 150;
   /** The keys the search keeps for its caret, though the list moves by them. */
@@ -165,7 +167,11 @@
 <ContextMenu.Content class="menu-icons">
   {#if menuKey}
     {@const adds = addsTo(menuKey)}
+    {#if adds.remove}
+      <ContextMenu.Item variant="destructive" onSelect={() => onRemove(menuKey)}><RiTrash class="menu-icon" />Remove from plot{#if adds.text}<span class="menu-value">{adds.text}</span>{/if}</ContextMenu.Item>
+    {:else}
     <ContextMenu.Item disabled={!adds.can} onSelect={() => onAdd(menuKey)}><RiAdd class="menu-icon" />Add to plot{#if adds.text}<span class="menu-value">{adds.text}</span>{/if}<ContextMenu.Shortcut><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
+    {/if}
     <ContextMenu.Item onSelect={() => onNewPlot([menuKey])}><RiNewPlot class="menu-icon" />New plot<span class="menu-value">{kindLabel('time', 'overlay')}</span><ContextMenu.Shortcut><kbd>⇧</kbd><kbd>Enter</kbd></ContextMenu.Shortcut></ContextMenu.Item>
     <ContextMenu.Sub>
       <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorOf({ key: menuKey })}"></i>{#if colors.picked[menuKey] === undefined}Auto{/if}</span></ContextMenu.SubTrigger>
