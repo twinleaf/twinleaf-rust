@@ -2,13 +2,14 @@
 // the user's verdicts list it (round 2, Selection #1, #2, #16, #17). A
 // press on each control of every kind the list names, with any plots
 // selected, clears the selection or keeps it as the list says; a press on a
-// plot's own control selects that plot first; keyboard focus selects; and
-// Escape leaves a maximized view first, the selection kept, then deselects.
+// plot's own control selects that plot first; keyboard focus selects;
+// Escape leaves a maximized view first, the selection kept, then deselects;
+// and the plot keys act on no plot from a property table.
 import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, frames, mountPage } from './browser/page.js';
+import { centre, focusPage, frames, mountPage, pickItem, plotMenu } from './browser/page.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine']];
@@ -113,6 +114,8 @@ describe('Escape', () => {
       fc.asyncProperty(fc.option(fc.subarray([0, 1, 2], { minLength: 1 })), fc.subarray([0, 1, 2]), fc.option(fc.nat(2)), async (max, picks, focus) => {
         const page = await mountPage(KEYS, 'columns');
         try {
+          // The page has the keys, however long the browser took to give them.
+          await focusPage();
           const ids = plotIds(page.ws.layout);
           page.ws.maximized = max && max.map((i) => ids[i]);
           const shown = page.ws.shownIds();
@@ -255,13 +258,8 @@ describe('a split', () => {
       const ids = plotIds(page.ws.layout);
       page.ws.selected.add(ids[0]);
       flushSync();
-      const body = document.querySelector(`.leaf[data-plot="${ids[0]}"] .plot-body`);
-      const r = body.getBoundingClientRect();
-      body.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }));
-      flushSync();
-      await frames();
-      [...document.querySelectorAll('[role=menuitem]')].find((m) => m.textContent.trim().startsWith('Split right')).click();
-      flushSync();
+      await plotMenu(ids[0]);
+      await pickItem('Split right');
       const made = plotIds(page.ws.layout).filter((p) => !ids.includes(p));
       expect([...page.ws.selected]).toEqual(made);
       page.history.undo();
@@ -352,20 +350,24 @@ describe('property rows', () => {
     }
   });
 
-  it('keep the plot keys from acting on any plot', async () => {
-    const page = await mountPage(KEYS, 'columns', 0, [], RPCS);
-    try {
-      const ids = plotIds(page.ws.layout);
-      click(row('gain'));
-      flushSync();
-      row('gain').closest('[role=grid]').focus();
-      for (const key of ['l', 'y', 'k', 'f', 'Delete']) await commands.key(key);
-      flushSync();
-      expect(plotIds(page.ws.layout)).toEqual(ids);
-      for (const id of ids) expect(page.ws.plots[id].legend, id).toBe(false);
-      expect(page.ws.maximized).toBe(null);
-    } finally {
-      page.dispose();
+  it('keep the plot keys from acting on any plot, rows picked or plots still selected as the keys reach the table', async () => {
+    // A row clicked, or every plot selected and the table reached from the keys, which picks no row.
+    for (const reach of [() => click(row('gain')), (page) => page.ws.selection.only(plotIds(page.ws.layout))]) {
+      const page = await mountPage(KEYS, 'columns', 0, [], RPCS);
+      try {
+        const ids = plotIds(page.ws.layout);
+        reach(page);
+        flushSync();
+        await commands.key('Shift');
+        row('gain').closest('[role=grid]').focus();
+        for (const key of ['l', 'y', 'k', 'f', 'Delete']) await commands.key(key);
+        flushSync();
+        expect(plotIds(page.ws.layout)).toEqual(ids);
+        for (const id of ids) expect(page.ws.plots[id].legend, id).toBe(false);
+        expect(page.ws.maximized).toBe(null);
+      } finally {
+        page.dispose();
+      }
     }
   });
 });

@@ -8,12 +8,11 @@ import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, frames, mountPage, wait } from './browser/page.js';
+import { centre, drag, focusPage, frames, mountPage, wait } from './browser/page.js';
 import { GUTTER, dock, gutters, plotIds, rects } from '../src/lib/layout.js';
+import { OUTER_INSET, STEP } from '../src/lib/moves.js';
 
 const EDGES = ['left', 'right', 'top', 'bottom'];
-/** The distance from a plot's middle to its compass's side cells, and an outer cell's inset, in px. */
-const STEP = 42, OUTER_INSET = 24;
 const setup = () => mountPage();
 
 /** Every plot whose tile on screen is more than a pixel from the box layout.js `rects` gives it. */
@@ -146,6 +145,34 @@ describe('a gap drag', () => {
 });
 
 describe('a gap drag', () => {
+  it('whose tiles a tab switch takes away ends there, and leaves the keys to the page', async () => {
+    const page = await mountPage([[], []], 'columns', 1);
+    try {
+      const [a] = plotIds(page.ws.layout), tab = page.ws.activeId;
+      await focusPage();
+      const [x, y] = centre(document.querySelector('.tiles .separator'));
+      await commands.mouse([['move', x, y], ['down'], ['move', x + 40, y]]);
+      // The next tab, and back: the tiles the drag was in are gone.
+      await commands.key(']');
+      expect(page.ws.activeId).not.toBe(tab);
+      await commands.key('[');
+      expect(page.ws.activeId).toBe(tab);
+      await commands.mouse([['up']]);
+      flushSync();
+      await frames();
+      // Escape is the page's again: it deselects.
+      page.ws.selection.only([a]);
+      flushSync();
+      await commands.key('Escape');
+      flushSync();
+      expect(page.ws.selected.size).toBe(0);
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
+describe('a gap drag', () => {
   it('that an undo changes the layout under ends there and writes nothing', async () => {
     const page = await setup();
     page.history.group('Arrange', () => page.ws.arrange('columns'));
@@ -202,7 +229,11 @@ describe('a plot move', () => {
     expect(document.querySelector('.drop-preview')).not.toBe(null);
     page.ws.selectTab(page.ws.tabs[1].id);
     flushSync();
-    await commands.mouse([['move', tx, ty - STEP + 2], ['up']]);
+    // The move ends there: the pointer going on shows no cell of it.
+    await commands.mouse([['move', tx, ty - STEP + 2]]);
+    await frames();
+    expect(document.querySelector('.drop-preview, .compass, .move-ghost')).toBe(null);
+    await commands.mouse([['up']]);
     flushSync();
     await frames();
     expect(page.ws.tabs).toBe(tabs);
