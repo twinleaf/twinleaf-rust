@@ -566,10 +566,12 @@
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
-    // A hot reload unmounts the page without leaving it, so the socket and
-    // the GPU context go with the copy that opened them.
+    // A hot reload unmounts the page without leaving it, so the socket, the
+    // GPU context and the window reads still to ask go with the copy that
+    // made them.
     return () => {
       cancelAnimationFrame(raf);
+      for (const ask of detailAsks.values()) clearTimeout(ask.timer);
       hub.close();
       renderer.dispose();
     };
