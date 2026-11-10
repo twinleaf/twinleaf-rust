@@ -52,9 +52,9 @@
    * `devices`: the checked Devices, a column each, in order. `channels`:
    * the RPC channels shown, as properties.js names them, every one by
    * default. `panel` names the panel, so its rows' picks are told from
-   * another panel's.
+   * another panel's. `filter` is the words every row shown has in its name.
    */
-  let { devices, channels = undefined, panel = 'properties' } = $props();
+  let { devices, channels = undefined, panel = 'properties', filter = '' } = $props();
 
   /** The rows PageUp and PageDown move by. */
   const PAGE = 10;
@@ -67,7 +67,7 @@
 
   /** Whether this is the Favorites panel, of every starred property. */
   const starredOnly = $derived(isFavorites(channels));
-  const rows = $derived(panelRows(devices, channels, favorites));
+  const rows = $derived(panelRows(devices, channels, favorites, filter));
   const grouped = $derived(!channels || channels.length > 1 || starredOnly);
   const buttons = $derived(isButtons(channels));
 
@@ -304,7 +304,7 @@
 {/snippet}
 
 {#if !rows.length}
-  <div class="props-empty">{starredOnly ? 'Star a property to add it here' : 'Nothing here on the checked devices'}</div>
+  <div class="props-empty">{filter.trim() ? 'No property matches' : starredOnly ? 'Star a property to add it here' : 'Nothing here on the checked devices'}</div>
 {:else if buttons}
   <ScrollArea class="props">
     <div class="action-grid" data-rows>

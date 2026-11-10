@@ -62,10 +62,14 @@ export const isButtons = (channels) => channels?.length === 1 && channels[0] ===
 /**
  * The rows a panel of `channels` shows of `devices`, as `mergeRows` gives
  * them: the Favorites panel's are every row whose name `starred` (a
- * Favorites) holds, and no `channels` is every channel.
+ * Favorites) holds, and no `channels` is every channel. Of those, the rows
+ * whose name holds every word of `filter`, whatever the case; with no word,
+ * all of them.
  */
-export function panelRows(devices, channels, starred) {
-  return isFavorites(channels) ? mergeRows(devices).filter((r) => starred.has(r.name)) : mergeRows(devices, channels);
+export function panelRows(devices, channels, starred, filter = '') {
+  const rows = isFavorites(channels) ? mergeRows(devices).filter((r) => starred.has(r.name)) : mergeRows(devices, channels);
+  const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
+  return words.length ? rows.filter((r) => words.every((w) => r.name.toLowerCase().includes(w))) : rows;
 }
 
 /** The devices of `devices` a write of `row` reaches: those whose entry is writable, or an action. */

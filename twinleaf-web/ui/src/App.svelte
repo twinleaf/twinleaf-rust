@@ -59,6 +59,7 @@
   import IconButton from './lib/IconButton.svelte';
   import Tip from './lib/Tip.svelte';
   import { Button } from '$lib/components/ui/button/index.js';
+  import { Input } from '$lib/components/ui/input/index.js';
   import * as Select from '$lib/components/ui/select/index.js';
   import { Slider } from '$lib/components/ui/slider/index.js';
   import { Checkbox } from '$lib/components/ui/checkbox/index.js';
@@ -317,13 +318,17 @@
     return new SvelteSet();
   });
   const checked = $derived([...hub.session.devices.values()].sort(byRoute).filter((d) => !unchecked.has(d.route)));
+  /** The words every property row shown has in its name: one filter for every panel of properties. */
+  let propertyFilter = $state('');
+  /** Whether panel `id` is the first open panel of properties in its dock, which holds the filter's field. */
+  const holdsFilter = (id) => SIDES.some((side) => docks[side].find((p) => p.open && PANELS[p.id].channels)?.id === id);
   // The property rows the page shows, in page order, which a Shift pick runs
   // along: each open panel of rows or action buttons of the docks shown,
   // left then right, top to bottom.
   selection.rowOrder = () =>
     SIDES.filter((side) => docks.shown(side))
       .flatMap((side) => docks[side].filter((p) => p.open && PANELS[p.id].channels))
-      .flatMap(({ id }) => panelRows(checked, PANELS[id].channels, history.favorites).map((r) => `${id}:${r.name}`));
+      .flatMap(({ id }) => panelRows(checked, PANELS[id].channels, history.favorites, propertyFilter).map((r) => `${id}:${r.name}`));
 
   // Each dock's width, a share of the page, dragged at its edge or moved
   // with the arrows there, and kept for the next visit. A double-click puts
@@ -917,7 +922,10 @@
       <SignalList session={hub.session} {drags} onAdd={addSignal} onRemove={removeSignal} onNewPlot={newPlotWith} {addsTo} />
     </div>
   {:else}
-    {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} panel={id} />{/key}
+    {#if holdsFilter(id)}
+      <Input class="mb-1.5 h-7 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows />
+    {/if}
+    {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} panel={id} filter={propertyFilter} />{/key}
   {/if}
 {/snippet}
 
