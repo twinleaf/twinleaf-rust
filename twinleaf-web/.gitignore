@@ -2,3 +2,5 @@ ui/node_modules/
 ui/dist/
 ui/.vite/
 target/
+ui/.stryker-tmp/
+ui/reports/
