@@ -1,5 +1,6 @@
 // The whole page, mounted for a browser test with state of its own, and the
 // gestures the tests make on it with the real mouse.
+import { withY } from '../../src/lib/cursors.js';
 import { flushSync, mount, unmount } from 'svelte';
 import fc from 'fast-check';
 import { expect, vi } from 'vitest';
@@ -11,7 +12,7 @@ import { History } from '../../src/lib/history.svelte.js';
 import { Favorites } from '../../src/lib/favorites.svelte.js';
 import { Views } from '../../src/lib/views.js';
 import { presets } from '../../src/lib/layout.js';
-import { emptyTab, makeTab, newPlot } from '../../src/lib/tabs.js';
+import { emptyTab, loadTabs, makeTab, newPlot } from '../../src/lib/tabs.js';
 import { api } from '../../src/lib/protocol.js';
 import '../../src/app.css';
 import '../../src/plot.css';
@@ -100,18 +101,19 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
  * after it. Its hub has no socket and has announced the signals `signals`
  * in `units` and a device with `rpcs` at each of `routes`, as `stubHub`
  * takes them. localStorage holds `saved`, by key as JSON, and nothing
- * else, as it mounts. What the page asks of /api is refused, as a hub that
+ * else, as it mounts; with `fromSaved`, its tabs are those `saved` keeps, as
+ * a page loaded again reads them. What the page asks of /api is refused, as a hub that
  * has gone away refuses it, until the page is disposed of; but with
  * `rowsPerSecond`, /api/rows counts that many rows a second of each
  * signal's window. It returns the page's state, each plot's view and
  * PlotView among it.
  */
-export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null } = {}) {
+export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null, fromSaved = false } = {}) {
   localStorage.clear();
   for (const [k, v] of Object.entries(saved)) localStorage.setItem(k, JSON.stringify(v));
   const ps = keys.map((k) => newPlot('time', 'overlay', k));
   const tab = makeTab('A', { plots: Object.fromEntries(ps.map((p) => [p.id, p])), layout: ps.length ? presets[preset](ps.map((p) => p.id)) : null });
-  const ws = new Workspace({ tabs: [tab, ...Array.from({ length: more }, (_, i) => emptyTab(`Layout ${i + 2}`))], activeId: tab.id });
+  const ws = new Workspace(fromSaved ? loadTabs(localStorage) : { tabs: [tab, ...Array.from({ length: more }, (_, i) => emptyTab(`Layout ${i + 2}`))], activeId: tab.id });
   const history = new History(ws, new Favorites(null));
   const target = document.body.appendChild(document.createElement('div'));
   const hub = stubHub(signals, rpcs, routes, units);
@@ -161,6 +163,16 @@ export function feed(hub, seconds = 20) {
   session.apply({ kind: 'spectra', spectra: traces.map((t) => ({ id: t.meta.id, f, a: f.map((v) => 1 / v), floor: 0.02 })) }, perf);
   session.tick(perf);
 }
+
+/**
+ * Gives plot `id` of `page`'s open tab the cursors `change(cursors)` makes
+ * of those it has (cursors.js), as a step made before a case.
+ */
+export function editCursors(page, id, change) {
+  page.history.group('Prepare', () => page.ws.setPlot(id, { cursors: change(page.ws.plots[id].cursors) }));
+}
+/** `cursors` with Y1 and Y2 of y axis `key` of a plot of `kind` at `a` and `b`. */
+export const withYPair = (cursors, kind, key, a, b) => withY(withY(cursors, kind, key, 'a', a), kind, key, 'b', b);
 
 export async function settle(n = 3) {
   flushSync();

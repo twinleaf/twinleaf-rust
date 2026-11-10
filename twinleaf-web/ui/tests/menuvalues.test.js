@@ -8,7 +8,7 @@
 // view of every plot it would copy.
 import { describe, expect, it } from 'vitest';
 import { MENUS, closeAll, openMenu, settle } from './harness/menus.js';
-import { feed, mountPage, wait } from './harness/page.js';
+import { editCursors, feed, mountPage, wait, withYPair } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { prefs } from '../src/lib/prefs.svelte.js';
 
@@ -32,10 +32,7 @@ async function fixture(rowsPerSecond = 100) {
   page.history.group('Prepare', () => (page.ws.setPlot(B, { mode: 'independent' }), page.ws.setPlot(C, { kind: 'spectrum' })));
   await wait(300);
   await settle();
-  const pv = page.pv(A);
-  pv.view.cursors = { a: 14, b: 16 };
-  pv.setYCursor('shared', 'a', 0.1);
-  pv.setYCursor('shared', 'b', 0.5);
+  editCursors(page, A, (c) => withYPair({ ...c, x: { a: 14, b: 16 } }, 'time', 'shared', 0.1, 0.5));
   await wait(200);
   await settle();
   return { ...page, ids, plots: { A, B, C, D } };

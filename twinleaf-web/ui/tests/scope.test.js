@@ -6,13 +6,17 @@
 // (round 1 #2), so what its menu does acts on what is selected. A command
 // made on a y axis acts, on each plot, on its axis in the same units, and
 // leaves a plot with none alone; whatever plots it changes, it is one view
-// step, which one Back takes back (round 2, View history #6).
+// step, which one Back takes back (round 2, View history #6). A command on
+// the cursors, from a menu, a popover, the readout or a double-click that
+// follows live, is an edit: exactly one undo step on however many plots,
+// which undo takes back and redo makes again.
 import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, closeAll, feed, leafOf, mountPage, rightClick, settle, wait, withExamples } from './harness/page.js';
+import { centre, closeAll, editCursors, feed, leafOf, mountPage, rightClick, settle, wait, withExamples, withYPair } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
+import { SAVE_KEY } from '../src/lib/tabs.js';
 
 const SIGNALS = ['sine.sine', 'aux.triangle'];
 /** Every plot shows the same signals, so an axis of one plot is on every plot, laid out in rows wide enough for their headers. */
@@ -40,6 +44,8 @@ function spots(page, id) {
     'a y axis': [(band.x0 + band.x1) / 2, P.y + P.h / 2],
     'the x axis': [P.x + P.w / 2, P.y + P.h + 8],
     'the plot area': [P.x + P.w / 2, P.y + P.h / 2],
+    // Its lower right, which the readout in its corner never covers.
+    'the plot area, clear of the readout': [P.x + P.w * 0.8, P.y + P.h * 0.8],
     'the readout': at('.cursor-readout'),
     'the legend': at('.pinned-legend .row'),
     'a chip': at('.trace-chip .name'),
@@ -96,22 +102,22 @@ const Y_FIELDS = ['Lowest value shown', 'Highest value shown'], F_FIELDS = ['Low
 async function spectraWithCursors(page) {
   setEvery(page, { kind: 'spectrum' });
   await settle();
-  eachPv(page, (pv) => (pv.view.specCursors = { a: 3, b: 7 }));
+  eachPv(page, (pv) => editCursors(page, pv.plotId, (c) => ({ ...c, f: { a: 3, b: 7 } })));
 }
 /** Every time plot's view with X1 and X2 placed in what it shows. */
 function timeCursors(page) {
-  eachPv(page, (pv) => (pv.view.cursors = { a: 14, b: 16 }));
+  eachPv(page, (pv) => editCursors(page, pv.plotId, (c) => ({ ...c, x: { a: 14, b: 16 } })));
 }
 /** Y1 and Y2 on every plot's shared axis. */
 function yCursors(page) {
-  eachPv(page, (pv) => (pv.setYCursor('shared', 'a', 0.1), pv.setYCursor('shared', 'b', 0.5)));
+  eachPv(page, (pv) => editCursors(page, pv.plotId, (c) => withYPair(c, pv.config().kind, 'shared', 0.1, 0.5)));
 }
 
 /**
  * Each command, made on plot `id` from where it is offered: `prepare(page)`
  * sets every plot up for it, `act(page, id)` makes it as a person would and
  * returns what `acted` needs, and `acted(page, id, got)` says whether it
- * changed plot `id`.
+ * changed plot `id`. One with `cursors` is a command on the cursors.
  */
 const COMMANDS = {
   'typed y bounds': {
@@ -139,6 +145,7 @@ const COMMANDS = {
     acted: (page, id, key) => page.ws.plots[id]?.axisSides?.[key] === 'right',
   },
   'the y popover’s cursor clear': {
+    cursors: true,
     prepare: yCursors,
     act: async (page, id) => (await rightClick(spots(page, id)['a y axis']), await button('Clear this axis')),
     acted: (page, id) => !page.pv(id).hasYCursors('shared'),
@@ -154,9 +161,10 @@ const COMMANDS = {
     acted: (page, id) => same(page.ws.plots[id].fRange, [3, 7]),
   },
   'the x popover’s cursor clear': {
+    cursors: true,
     prepare: spectraWithCursors,
     act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await button('Clear the X cursors')),
-    acted: (page, id) => page.pv(id).view.specCursors.a === null,
+    acted: (page, id) => !page.ws.plots[id].cursors?.f,
   },
   'the readout’s zoom to X1–X2, on spectra': {
     prepare: spectraWithCursors,
@@ -169,14 +177,50 @@ const COMMANDS = {
     acted: (page, id) => !page.pv(id).view.live,
   },
   'the readout’s Clear X cursors': {
+    cursors: true,
     prepare: spectraWithCursors,
     act: async (page, id) => (await rightClick(spots(page, id)['the readout']), await choose('Clear X cursors')),
-    acted: (page, id) => page.pv(id).view.specCursors.a === null,
+    acted: (page, id) => !page.ws.plots[id].cursors?.f,
   },
   'the readout’s Clear Y cursors': {
+    cursors: true,
     prepare: yCursors,
     act: async (page, id) => (await rightClick(spots(page, id)['the readout']), await choose('Clear Y cursors')),
     acted: (page, id) => !page.pv(id).hasYCursors('shared'),
+  },
+  'the readout’s Clear all cursors': {
+    cursors: true,
+    prepare: (page) => (timeCursors(page), yCursors(page)),
+    act: async (page, id) => (await rightClick(spots(page, id)['the readout']), await choose('Clear all cursors')),
+    acted: (page, id) => !page.ws.plots[id].cursors,
+  },
+  'Add X cursors from the menu': {
+    cursors: true,
+    act: async (page, id) => (await rightClick(spots(page, id)['the plot area']), await choose('Add X cursors')),
+    acted: (page, id) => page.pv(id).cursorsPlaced() === 2 && !page.views.get(id).live,
+  },
+  'Add Y cursors from the menu': {
+    cursors: true,
+    act: async (page, id) => (await rightClick(spots(page, id)['the plot area']), await choose('Add Y cursors')),
+    acted: (page, id) => page.pv(id).hasYCursors('shared'),
+  },
+  'Clear cursors from the menu': {
+    cursors: true,
+    prepare: (page) => (timeCursors(page), yCursors(page)),
+    act: async (page, id) => (await rightClick(spots(page, id)['the plot area, clear of the readout']), await choose('Clear cursors')),
+    acted: (page, id) => !page.ws.plots[id].cursors,
+  },
+  'the x popover’s Add X cursors': {
+    cursors: true,
+    act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await button('Add X cursors')),
+    acted: (page, id) => page.pv(id).cursorsPlaced() === 2,
+  },
+  'a double-click, which follows live': {
+    cursors: true,
+    // Every plot paused with X1 and X2 placed: following live removes them.
+    prepare: (page) => (timeCursors(page), eachPv(page, (pv) => pv.view.pause(performance.now()))),
+    act: async (page, id) => (await dblclick(spots(page, id)['the plot area, clear of the readout']), await wait(50)),
+    acted: (page, id) => !page.ws.plots[id].cursors?.x && page.views.get(id).live,
   },
   'Kind from the menu': {
     act: async (page, id) => (await rightClick(spots(page, id)['the plot area']), await choose('Kind', 'Spectrum')),
@@ -211,7 +255,7 @@ describe('a command made on a plot', () => {
         try {
           feed(page.hub);
           await settle();
-          const { prepare, act, acted } = COMMANDS[name];
+          const { prepare, act, acted, cursors } = COMMANDS[name];
           await prepare?.(page);
           // The readout and the legend show what a frame drew a few times a second.
           await wait(150);
@@ -221,10 +265,20 @@ describe('a command made on a plot', () => {
           if (focus !== null) leafOf(ids[focus]).querySelector('.plot-card').focus();
           else document.activeElement?.blur();
           await settle();
+          const tabs = page.ws.tabs, steps = page.history.undos.length;
           const got = await act(page, id);
           await settle();
           const want = picked.includes(id) ? picked : [id];
           for (const p of ids) expect(acted(page, p, got), `${name} on ${ids.indexOf(p)}, made on ${k} with ${picks} selected`).toBe(want.includes(p));
+          if (cursors) {
+            // One edit, on however many plots: undo puts every plot's cursors back, and redo makes it again.
+            expect(page.history.undos.length - steps, `${name}: undo steps`).toBe(1);
+            const after = page.ws.tabs;
+            page.history.undo();
+            expect(page.ws.tabs, `${name} undone`).toBe(tabs);
+            page.history.redo();
+            expect(page.ws.tabs, `${name} done again`).toBe(after);
+          }
           seen.add(`${name}:${want.length > 1 ? 'many' : 'one'}`);
         } finally {
           page.dispose();
@@ -396,7 +450,7 @@ const ON_AXIS = {
     acted: (pv, key) => pv.hasYCursors(key),
   },
   'the popover’s cursor clear': {
-    prepare: (pv, key) => (pv.setYCursor(key, 'a', 0.1), pv.setYCursor(key, 'b', 0.2)),
+    prepare: (pv, key, page) => editCursors(page, pv.plotId, (c) => withYPair(c, pv.config().kind, key, 0.1, 0.2)),
     act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await button('Clear this axis')),
     acted: (pv, key) => !pv.hasYCursors(key),
   },
@@ -422,7 +476,7 @@ describe('a command made on a y axis', () => {
         try {
           const axes = axesOf(page, plots);
           expect(axes.length, `every axis drawn: ${axes.join(' ')}`).toBe(5);
-          if (prepare) for (const [n, k] of axes) prepare(page.pv(plots[n]), k);
+          if (prepare) for (const [n, k] of axes) prepare(page.pv(plots[n]), k, page);
           await settle();
           const before = shows(page);
           await act(page, plots[on], key, Object.values(plots));
@@ -496,6 +550,39 @@ describe('Add Y cursors on an axis, then its clear', () => {
       for (const id of ids) for (const x of page.pv(id).yAxes) expect(page.pv(id).hasYCursors(x.key), `${ids.indexOf(id)}:${x.key}`).toBe(false);
     } finally {
       page.dispose();
+    }
+  });
+});
+
+describe('cursors placed on a plot', () => {
+  it('are saved with its tab, and are on the plot when the page is loaded again', async () => {
+    const first = await mountPage([SIGNALS, SIGNALS], 'rows', 0, SIGNALS);
+    let saved, placed;
+    try {
+      feed(first.hub);
+      await settle();
+      const [a] = plotIds(first.ws.layout);
+      await rightClick(spots(first, a)['the plot area']);
+      await choose('Add X cursors');
+      // Once the first menu has gone, the next opens.
+      await closeAll();
+      await rightClick(spots(first, a)['the plot area, clear of the readout']);
+      await choose('Add Y cursors');
+      placed = first.ws.plots[a].cursors;
+      expect([placed.x.a, placed.x.b, placed.y.time.shared.a, placed.y.time.shared.b]).toEqual([expect.any(Number), expect.any(Number), expect.any(Number), expect.any(Number)]);
+      saved = JSON.parse(localStorage.getItem(SAVE_KEY));
+    } finally {
+      first.dispose();
+    }
+    const again = await mountPage([], 'rows', 0, SIGNALS, [], { saved: { [SAVE_KEY]: saved }, fromSaved: true });
+    try {
+      feed(again.hub);
+      await settle();
+      const [a, b] = plotIds(again.ws.layout);
+      expect(again.ws.plots[a].cursors).toEqual(placed);
+      expect([again.pv(a).cursorsPlaced(), again.pv(b).cursorsPlaced()], 'drawn on the plot that had them').toEqual([4, 0]);
+    } finally {
+      again.dispose();
     }
   });
 });

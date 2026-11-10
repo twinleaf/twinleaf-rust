@@ -2,14 +2,15 @@
 // round 1 #29): each plot's header has Back and Forward in place of the
 // split buttons, which stay in its menu and keys. Random runs of drags that
 // rest midway, wheel bursts, double-clicks that follow live, X cursors added
-// from the menu and let go by following live, Ctrl+A and Escape, and Back
+// from the menu and removed by following live, Ctrl+A and Escape, and Back
 // and Forward pressed on any plot, with the real mouse: each gesture that
 // moves a view is one step of the tab's, whatever plots it moves, and Back
 // and Forward go through them, each plot's buttons pressable just when the
-// tab has a step to go to. The window's slider, dragged through its detents
+// tab has a step to go to, and neither moves a cursor: cursors are edits,
+// which Ctrl+Z undoes. The window's slider, dragged through its detents
 // with a rest midway, or stepped by its keys in a burst, is one step too.
 // Then each kind of gesture once: arrow keys, the toolbar's Live, a plot's
-// Pause on a selection, Y cursors, a spectrum's pan, cursors and y zoom,
+// Pause on a selection, Y cursors, a spectrum's pan and y zoom,
 // tabs and a plot moved between them, a maximized plot, and a plot that
 // leaves the page mid-drag. Under 480 px Back and Forward go, as the split
 // buttons did. A plot closed and brought back by Ctrl+Z (#7) shows its view
@@ -21,7 +22,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, frames, mountPage, wait } from './harness/page.js';
+import { centre, frames, mountPage, until, wait } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { GONE, IDLE_MS } from '../src/lib/viewhistory.svelte.js';
 
@@ -44,6 +45,8 @@ async function page(preset = 'rows', more = 0) {
   return p;
 }
 
+/** The cursors of every plot of the tab, as the tab keeps them, in one string. */
+const cursorsOf = (p) => JSON.stringify(plotIds(p.ws.layout).map((id) => p.ws.plots[id].cursors ?? null));
 /** What every plot of the tab shows, in one string. */
 const shown = (p) => JSON.stringify(plotIds(p.ws.layout).map((id) => seen(p.views.get(id).state())));
 
@@ -122,12 +125,13 @@ describe('a plot’s header', () => {
 
 describe('view history on the page', () => {
   it('makes each gesture one step of the tab, whatever plots it moves, and Back and Forward on any plot go through them', async () => {
-    const count = { back: 0, several: 0, bursts: 0, rested: 0, cursorsBack: 0 };
+    const count = { back: 0, several: 0, bursts: 0, rested: 0, cursorsKept: 0 };
     await fc.assert(
-      // Each run, somewhere among the rest, places X cursors and follows live,
-      // so Back brings cursors back, and drags every plot at once, resting midway.
+      // Each run, somewhere among the rest, places X cursors, so Back and
+      // Forward go past steps with cursors placed, and drags every plot at
+      // once, resting midway.
       fc.asyncProperty(fc.array(gesture, { minLength: 4, maxLength: 9 }), fc.nat(), fc.nat(), fc.nat(), async (rest, i, j, at) => {
-        const gestures = rest.toSpliced(i % (rest.length + 1), 0, { t: 'addXFollow', at }).toSpliced(j % (rest.length + 2), 0, { t: 'all', on: true }, { t: 'drag', at, dx: 120, rest: true });
+        const gestures = rest.toSpliced(i % (rest.length + 1), 0, { t: 'addX', at }).toSpliced(j % (rest.length + 2), 0, { t: 'all', on: true }, { t: 'drag', at, dx: 120, rest: true });
         const p = await page();
         try {
           const ids = plotIds(p.ws.layout);
@@ -175,23 +179,23 @@ describe('view history on the page', () => {
             } else if (g.t === 'addX' || g.t === 'addXFollow') {
               await pickFromMenu(id, 'Add X cursors');
               moved('add X cursors');
-              // Following live then lets the cursors go, which Back brings back.
+              // Following live then removes the cursors, which is an edit: no Back brings them back.
               if (g.t === 'addXFollow') await act({ t: 'follow', at: g.at });
             } else if (g.t === 'all') {
               await commands.key(g.on ? 'Control+a' : 'Escape');
               flushSync();
               check('select');
             } else {
-              const back = g.t === 'back', before = line[at];
+              const back = g.t === 'back', before = line[at], cursors = cursorsOf(p);
               await press(id, back ? 'Back' : 'Forward');
+              // Back and Forward retrace the views: no cursor moves.
+              expect(cursorsOf(p), `${g.t}: the cursors`).toBe(cursors);
               if (back && at > 0) at--;
               else if (!back && at < line.length - 1) at++;
               check(g.t);
               if (back && line[at] !== before) {
                 count.back++;
-                // Cursors a follow live let go, brought back.
-                const placed = (line) => JSON.parse(line).map((s) => JSON.parse(s).cursors.a !== null);
-                if (placed(line[at]).some((on, i) => on && !placed(before)[i])) count.cursorsBack++;
+                if (/\d/.test(cursors)) count.cursorsKept++;
               }
             }
           };
@@ -340,20 +344,24 @@ describe('view history on the page, each kind of gesture', () => {
     }
   });
 
-  it('makes Y cursors placed from the menu a step', async () => {
+  it('makes Y cursors placed from the menu an edit, which Ctrl+Z takes back, and no view step', async () => {
     const p = await page();
     try {
-      const id = plotIds(p.ws.layout)[0], start = one(p, id);
+      const id = plotIds(p.ws.layout)[0];
       await pickFromMenu(id, 'Add Y cursors');
-      expect(Object.keys(p.views.get(id).state().yCursors)).not.toEqual([]);
-      await press(id, 'Back');
-      expect(one(p, id)).toBe(start);
+      expect(p.ws.plots[id].cursors?.y?.time, 'placed').toBeTruthy();
+      expect(button(id, 'Back').disabled, 'no view moved, so Back has nowhere to go').toBe(true);
+      // Once the menu has closed and given the page its keys back.
+      await until(() => !document.querySelector('[role=menu]'));
+      await commands.key('Control+z');
+      flushSync();
+      expect(p.ws.plots[id].cursors, 'undone').toBeUndefined();
     } finally {
       p.dispose();
     }
   });
 
-  it('makes a spectrum’s pan, its X cursors and its y zoom steps, and Back puts each back', async () => {
+  it('makes a spectrum’s pan and its y zoom steps, and Back puts each back, past the X cursors placed between, which stay', async () => {
     const p = await page();
     try {
       const id = plotIds(p.ws.layout)[0];
@@ -368,7 +376,8 @@ describe('view history on the page, each kind of gesture', () => {
       await dragOn(id, -80);
       expect(p.ws.plots[id].fRange ?? null, 'the drag pans the frequencies').not.toBeNull();
       await pickFromMenu(id, 'Add X cursors');
-      expect(p.views.get(id).specCursors.a, 'X cursors on the spectrum').not.toBeNull();
+      const placed = p.ws.plots[id].cursors;
+      expect(placed?.f?.a, 'X cursors on the spectrum').toEqual(expect.any(Number));
       const [, y] = centre(bodyOf(id)), yAxis = bodyOf(id).getBoundingClientRect().left + 10;
       await commands.mouse([['move', yAxis, y], ['wheel', 0, -120], ['wait', 40], ['wheel', 0, -120]]);
       await frames();
@@ -376,9 +385,8 @@ describe('view history on the page, each kind of gesture', () => {
       await press(id, 'Back');
       expect(Object.keys(p.views.get(id).state().yRanges), 'Back past the y zoom').toEqual([]);
       await press(id, 'Back');
-      expect(p.views.get(id).specCursors, 'Back past the X cursors').toEqual({ a: null, b: null });
-      await press(id, 'Back');
       expect([p.ws.plots[id].fRange ?? null, one(p, id)], 'Back past the pan').toEqual([start.fRange, start.view]);
+      expect(p.ws.plots[id].cursors, 'the cursors stay').toEqual(placed);
     } finally {
       p.dispose();
     }

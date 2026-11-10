@@ -17,6 +17,7 @@
   import { getContext, onMount, setContext, tick, untrack } from 'svelte';
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
   import { ViewHistory } from './lib/viewhistory.svelte.js';
+  import { CursorEdits } from './lib/cursors.js';
   import { Drags } from './lib/drag.svelte.js';
   import { Renderer } from './lib/gl.js';
   import { plotIds } from './lib/layout.js';
@@ -103,6 +104,8 @@
     ws.activeId;
     untrack(refreshToolbar);
   });
+  // The plots' cursors, which are edits: placing, moving or removing any is one undo step (cursors.js).
+  const cursors = new CursorEdits(ws, history);
   const drags = new Drags(ws, refreshToolbar, history);
   setContext('selection', selection);
   // What the panels write to devices and run on them, and its notices
@@ -592,8 +595,22 @@
     const vs = chosen();
     viewHistory.burst('window', vs, () => vs.forEach((vw) => vw.setSpan(v)));
   }
+  /**
+   * Has plots `ids` follow the newest samples again, as one view step, back
+   * at their windows with `restore`. Their time X cursors, which live would
+   * scroll away, are removed, as one edit, which undo takes back.
+   */
+  function follow(ids, restore = false) {
+    viewHistory.step(() => ids.forEach((id) => views.of(id).follow(restore)));
+    cursors.followed(ids);
+  }
+  /** Pauses plots `ids` where they are, as one view step. */
+  function pause(ids) {
+    const perf = performance.now();
+    viewHistory.step(() => ids.forEach((id) => views.of(id).pause(perf)));
+  }
   function followLive() {
-    viewHistory.step(() => chosen().forEach((vw) => vw.follow(true)));
+    follow(selection.pageTargets('view').filter((id) => ws.plots[id]?.kind === 'time'), true);
   }
   /**
    * The toolbar's Live button: pauses every time plot of the tab while all
@@ -601,22 +618,17 @@
    * selected plots alone.
    */
   function toggleLive() {
-    // Whether to pause, read once: each view that moves sets `live` again.
-    const perf = performance.now(), pause = live;
-    viewHistory.step(() => tabViews().forEach((vw) => (pause ? vw.pause(perf) : vw.follow())));
+    if (live) pause(ws.timeIds());
+    else follow(ws.timeIds());
     refreshToolbar();
   }
   function setDelay(ms) {
     delayMs = ms;
     views.setDelay(ms / 1000);
   }
-  /** Clears the cursors of plots `ids`, by default the selection's or every plot's, and says whether any were placed. */
+  /** Clears the cursors of plots `ids`, by default the selection's or every plot's, as one edit, and says whether any were placed. */
   function clearCursors(ids = selection.pageTargets('view')) {
-    let had = false;
-    viewHistory.step(() => {
-      for (const id of ids) had = views.get(id)?.clearCursors() || had;
-    });
-    return had;
+    return cursors.clear(ids);
   }
   const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addSignal, newPlot: newPlotWith, followLive, clearCursors: () => clearCursors(), exportTabs, importTabs: () => importInput.click() };
 
@@ -760,7 +772,7 @@
         const on = !ws.plots[lead].legend;
         eachPlot(ids, on ? 'Show the legend' : 'Hide the legend', () => ({ legend: on }));
       },
-      follow: () => viewHistory.step(() => ids.forEach((id) => views.of(id).follow(true))),
+      follow: () => follow(ids, true),
       pan: () => viewHistory.burst('pan', timeViews(ids), () => timeViews(ids).forEach((v) => v.pan((e.shiftKey ? 1 : PAN) * (back ? -1 : 1), perf))),
       zoom: () => viewHistory.burst('zoom', timeViews(ids), () => timeViews(ids).forEach((v) => v.zoom(back ? ZOOM : 1 / ZOOM, v.live ? 1 : 0.5, perf))),
     }[action];
@@ -849,9 +861,9 @@
     if (action === 'escape') return leave();
     // Space pauses the selected plots, or every plot, or has them follow live again.
     e.preventDefault();
-    const perf = performance.now(), vs = selection.pageTargets('view').map((id) => views.of(id));
-    const pause = vs.some((v) => v.live);
-    viewHistory.step(() => vs.forEach((v) => (pause ? v.pause(perf) : v.follow())));
+    const ids = selection.pageTargets('view');
+    if (ids.some((id) => views.of(id).live)) pause(ids);
+    else follow(ids);
   }
 </script>
 
@@ -870,7 +882,10 @@
         {hub}
         view={views.of(id)}
         {viewHistory}
+        {cursors}
         targets={() => targetsOf(id)}
+        onFollow={(restore) => follow(targetIdsOf(id), restore)}
+        onPause={() => pause(targetIdsOf(id))}
         {hover}
         {renderer}
         {registry}

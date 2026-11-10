@@ -82,9 +82,14 @@ export class CursorEdits {
     this.history = history;
   }
 
+  /** The cursors the tab keeps of plot `id` of the open tab. */
+  saved(id) {
+    return this.ws.plots[id]?.cursors;
+  }
+
   /** The cursors plot `id` of the open tab shows: a drag's draft of them while it moves one, else the tab's. */
   get(id) {
-    return this.drafts.has(id) ? this.drafts.get(id) : this.ws.plots[id]?.cursors;
+    return this.drafts.has(id) ? this.drafts.get(id) : this.saved(id);
   }
 
   /** Shows `cursors` on plot `id` until the drag that moves them ends. */

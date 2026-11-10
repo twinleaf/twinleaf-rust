@@ -1,5 +1,5 @@
 // Undo and redo for what a person edits on the page: the tabs, their plots
-// and layout, and the starred properties. A step holds the tabs and stars
+// and layout, the cursors placed on the plots, and the starred properties. A step holds the tabs and stars
 // before and after, with the plots selected at each, so undo puts the
 // selection back as it was.
 //

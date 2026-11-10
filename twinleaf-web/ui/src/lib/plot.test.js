@@ -229,21 +229,16 @@ describe('A plot switched between kinds', () => {
 });
 
 describe('Y cursors', () => {
-  // A plot of one shared y axis, 0 to 10 over a 100 px lane from y = 0.
-  const plot = (kind = 'time', view = new View({ now: () => 0 })) => {
+  // A plot of one shared y axis, 0 to 10 over a 100 px lane from y = 0, drawing the cursors `held.now`.
+  const plot = (kind = 'time', held = { now: undefined }) => {
     const cfg = { kind };
-    const pv = Object.assign(Object.create(PlotView.prototype), { config: () => cfg, view, viewHistory: { step: (fn) => fn() }, log: false });
+    const pv = Object.assign(Object.create(PlotView.prototype), { config: () => cfg, plotId: 'p', cursors: { get: () => held.now }, log: false });
     pv.yAxes = [{ key: 'shared', lane: { x: 40, y: 0, w: 200, h: 100 }, range: [0, 10], x0: 0, x1: 40 }];
-    return { pv, cfg };
+    return { pv, cfg, held };
   };
-  it('are the view’s, so a plot drawn again with it finds them', () => {
-    const { pv } = plot();
-    pv.setYCursor('shared', 'b', 5);
-    expect(plot('time', pv.view).pv.yCursors.get('shared')).toEqual({ a: null, b: 5 });
-  });
+  const Y = (kind, a, b = null) => ({ y: { [kind]: { shared: { a, b } } } });
   it('are found near their line, across the lane or on their tag in the gutter', () => {
-    const { pv } = plot();
-    pv.setYCursor('shared', 'a', 5); // y = 50
+    const { pv } = plot('time', { now: Y('time', 5) }); // y = 50
     expect(pv.yCursorNear(100, 52)).toEqual({ key: 'shared', name: 'a' });
     expect(pv.yCursorNear(20, 48)).toEqual({ key: 'shared', name: 'a' });
     expect(pv.yCursorNear(100, 70)).toBeNull();
@@ -252,22 +247,22 @@ describe('Y cursors', () => {
     const { pv } = plot();
     expect(pv.yValueAt('shared', 25)).toBe(7.5);
   });
-  it('are placed a third in from each end of an axis', () => {
-    const { pv } = plot();
-    pv.addYCursors('shared');
-    const yc = pv.yCursors.get('shared');
-    expect(yc.a).toBeCloseTo(10 / 3);
-    expect(yc.b).toBeCloseTo(20 / 3);
+  it('are placed a third in from each end of an axis, the plot’s other cursors kept', () => {
+    const { pv } = plot('time', { now: { x: { a: 1, b: null } } });
+    const c = pv.yCursorsAdded('shared');
+    expect(c.x).toEqual({ a: 1, b: null });
+    expect(c.y.time.shared.a).toBeCloseTo(10 / 3);
+    expect(c.y.time.shared.b).toBeCloseTo(20 / 3);
   });
-  it('belong to the plot’s kind, and all go when cleared', () => {
-    const { pv, cfg } = plot();
-    pv.setYCursor('shared', 'a', 5);
+  it('belong to the plot’s kind, and are cleared by axis or all at once', () => {
+    const { pv, cfg, held } = plot('time', { now: { ...Y('time', 5), f: { a: 3, b: 4 } } });
+    expect([pv.hasYCursors('shared'), pv.cursorsPlaced()]).toEqual([true, 1]);
     cfg.kind = 'spectrum';
-    expect(pv.yCursors.get('shared')).toBeUndefined();
-    expect(pv.view.clearCursors()).toBe(true);
+    expect([pv.hasYCursors('shared'), pv.cursorsPlaced()]).toEqual([false, 3]);
+    expect(pv.yCursorsCleared('shared')).toEqual(held.now);
+    expect(pv.xCursorsCleared()).toEqual(Y('time', 5));
     cfg.kind = 'time';
-    expect(pv.yCursors.get('shared')).toBeUndefined();
-    expect(pv.view.clearCursors()).toBe(false);
+    expect(pv.yCursorsCleared()).toEqual({ f: { a: 3, b: 4 } });
   });
 });
 
@@ -295,12 +290,9 @@ describe('A plot’s view', () => {
     pv.autoscale();
     expect(view.state().yRanges).toEqual({ time: { shared: [-1.16, 1.16] } });
   });
-  it('clears every cursor in one place, time X cursors with the rest', () => {
+  it('holds no cursor: a view’s state says nothing of them, and following live changes none', () => {
     const view = new View({ now: () => 0 });
-    view.cursors = { a: 1, b: null };
-    expect(view.clearCursors()).toBe(true);
-    expect(view.cursors).toEqual({ a: null, b: null });
-    expect(view.clearCursors()).toBe(false);
+    expect(Object.keys(view.state()).sort()).toEqual(['live', 'pausedAt', 'right', 'span', 'spectra', 'window', 'yRanges']);
   });
 });
 

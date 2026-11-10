@@ -1,7 +1,9 @@
-// Back and Forward through what the plots of a tab have shown, from the
-// buttons on each plot. A step holds, for each plot one gesture moved, what
+// Back and Forward retrace where one was looking: what the plots of a tab
+// have shown, from the buttons on each plot. What was made or placed, a
+// plot's cursors among it, is the edit history's, which Ctrl+Z undoes. A
+// step holds, for each plot one gesture moved, what
 // it showed before and after: its View `state` (live or paused and where,
-// its span and window, its cursors, the y ranges it holds and the spectra a
+// its span and window, the y ranges it holds and the spectra a
 // paused spectrum holds) and its view fields (tabs.js VIEW_FIELDS, as a
 // spectrum's frequencies). Back shows the before of every plot of the
 // step still in the tab, so the plots one gesture moved go back together;
@@ -27,7 +29,7 @@
 // gesture is part of that one.
 //
 // The edit history (history.svelte.js) is apart: an undo never moves a
-// view, and Back never edits.
+// view, and Back never edits, so it never moves a cursor.
 
 import { SvelteMap } from 'svelte/reactivity';
 import { sameView } from './plot.js';

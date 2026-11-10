@@ -32,6 +32,11 @@ const OWNED = [
     owner: 'lib/selection.svelte.js',
     writes: /\.selected\.(add|delete|clear)\(|\bfocusedId\s*=[^=]|\.selection\.(plots\.(add|delete|clear)\(|last\s*=[^=]|rows\s*=[^=])/,
   },
+  {
+    what: 'a plot’s cursors',
+    owner: 'lib/cursors.js',
+    writes: /setPlot\([^)]*\bcursors\b|\.cursors\s*=[^=]|\.cursors\.[\w.[\]]+\s*=[^=]/,
+  },
 ];
 
 const SRC = path.resolve('src');

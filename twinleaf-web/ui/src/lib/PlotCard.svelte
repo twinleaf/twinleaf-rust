@@ -62,7 +62,7 @@
     targetPlots = () => [plot],
     onFocus, onPress, onSelect, onRemove, onStartMove, onSplit, onMaximize, onMoveToTab, onClearCursors,
     onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal, onCopy, onExport, onCheckCopy,
-    onEach, targetIds = () => [plot.id], onKey, viewHistory,
+    onEach, targetIds = () => [plot.id], onKey, viewHistory, cursors, onFollow, onPause,
   } = $props();
 
   /** Runs `fn(pv)` on the PlotView of each plot a command here acts on. */
@@ -72,6 +72,26 @@
   };
   /** Runs `fn`, a command here that moves the views, as one view step, however many plots it moves. */
   const asStep = (fn) => viewHistory.step(fn);
+  /**
+   * Gives each plot a cursor command here acts on the cursors `fn(pv)`
+   * returns for it, as one edit named `what`: `each` runs over those
+   * plots, `eachPv` by default, or `eachAxis` of an axis.
+   */
+  const editCursors = (what, fn, each = eachPv) => {
+    const byId = new Map();
+    each((p, axis) => byId.set(p.plotId, fn(p, axis)));
+    cursors.set(what, byId);
+  };
+  /** Places X1 and X2 in view on each plot a command here acts on, pausing the time plots, which hold the moment they mark. */
+  function addXCursors() {
+    asStep(() => eachPv((p) => p.config().kind === 'time' && p.view.pause(performance.now())));
+    editCursors('Add X cursors', (p) => p.xCursorsAdded());
+  }
+  const clearXCursors = () => editCursors('Clear X cursors', (p) => p.xCursorsCleared());
+  /** Places Y1 and Y2 on the axis of each plot that matches this plot's y axis `key`. */
+  const addYCursors = (key) => editCursors('Add Y cursors', (p, axis) => p.yCursorsAdded(axis), (fn) => eachAxis(key, fn));
+  /** Removes the Y cursors of the axis of each plot that matches this plot's y axis `key`, or with no key, of every axis of each plot. */
+  const clearYCursors = (key) => editCursors('Clear Y cursors', (p, axis) => p.yCursorsCleared(axis), key === undefined ? eachPv : (fn) => eachAxis(key, fn));
   /**
    * Runs `fn(pv, axis)` for a command made on this plot's y axis `key`, on
    * the PlotView of each plot the command acts on, `axis` the key of that
@@ -410,9 +430,8 @@
   let windowSpan = $state(10);
   /** Pauses the plot and the plots linked to it, or has them follow live again. */
   function playPause() {
-    // Whether to pause, read once: this plot's own view may be the first to move.
-    const perf = performance.now(), pause = view.live;
-    forTargets((v) => (pause ? v.pause(perf) : v.follow()));
+    if (view.live) onPause();
+    else onFollow(false);
   }
 
   onMount(() => {
@@ -423,6 +442,9 @@
       hub,
       view,
       targets,
+      targetIds,
+      cursors,
+      onFollow,
       hoverTime: hover,
       plotId: plot.id,
       renderer,
@@ -946,13 +968,13 @@
       <div class="axis-row" role="group" aria-label="X cursors">
         <span>Cursors</span>
         <Tip text="Add X1 and X2">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" onclick={() => (asStep(() => eachPv((p) => p.addXCursors())), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" onclick={() => (addXCursors(), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
         </Tip>
         <Tip text="Zoom to X1–X2" keys={['Ctrl', 'drag']}>
           {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Zoom to the X cursors" onclick={() => (pv?.zoomToCursors(), (xAxisOpen = false))}><RiZoomTo /></button>{/snippet}
         </Tip>
         <Tip text="Clear the X cursors">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear the X cursors" onclick={() => (asStep(() => eachPv((p) => p.clearXCursors())), (xAxisOpen = false))}><RiEraser /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear the X cursors" onclick={() => (clearXCursors(), (xAxisOpen = false))}><RiEraser /></button>{/snippet}
         </Tip>
       </div>
     </Popover.Content>
@@ -998,10 +1020,10 @@
       <div class="axis-row" role="group" aria-label="Y cursors">
         <span>Cursors</span>
         <Tip text="Add Y1 and Y2 on this axis">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (asStep(() => eachAxis(region.keys[0], (p, axis) => p.addYCursors(axis))), (axisOpen = false))}><RiYCursors /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" onclick={() => (addYCursors(region.keys[0]), (axisOpen = false))}><RiYCursors /></button>{/snippet}
         </Tip>
         <Tip text="Clear this axis's cursors">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (asStep(() => eachAxis(region.keys[0], (p, axis) => p.clearYCursors(axis))), (axisOpen = false))}><RiEraser /></button>{/snippet}
+          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (clearYCursors(region.keys[0]), (axisOpen = false))}><RiEraser /></button>{/snippet}
         </Tip>
       </div>
       {#if boundsError}<div class="axis-error">{boundsError}</div>{/if}
@@ -1110,8 +1132,8 @@
                   <ContextMenu.Item onSelect={copyReadout}><RiCopy class="menu-icon" />Copy table{@render value(counted((c.x ? 1 + plot.items.length : 0) + c.ys.length, 'row'))}</ContextMenu.Item>
                   {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2{@render span()}</ContextMenu.Item>{/if}
                   <ContextMenu.Separator />
-                  {#if c.x}<ContextMenu.Item onSelect={() => asStep(() => eachPv((p) => p.clearXCursors()))}><RiXCursors class="menu-icon" />Clear X cursors{@render value(xFirst())}</ContextMenu.Item>{/if}
-                  {#if c.ys.length}<ContextMenu.Item onSelect={() => asStep(() => eachPv((p) => p.clearYCursors()))}><RiYCursors class="menu-icon" />Clear Y cursors{@render value(counted(targetPvs().reduce((n, p) => n + p.yCursorAxes(), 0), 'axis', 'axes'))}</ContextMenu.Item>{/if}
+                  {#if c.x}<ContextMenu.Item onSelect={clearXCursors}><RiXCursors class="menu-icon" />Clear X cursors{@render value(xFirst())}</ContextMenu.Item>{/if}
+                  {#if c.ys.length}<ContextMenu.Item onSelect={() => clearYCursors()}><RiYCursors class="menu-icon" />Clear Y cursors{@render value(counted(targetPvs().reduce((n, p) => n + p.yCursorAxes(), 0), 'axis', 'axes'))}</ContextMenu.Item>{/if}
                   <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear all cursors{@render value(placed())}</ContextMenu.Item>
                 </ContextMenu.Content>
               </ContextMenu.Root>
@@ -1144,8 +1166,8 @@
       {/if}
       <ContextMenu.Label>Cursors</ContextMenu.Label>
       <!-- Cursors are dragged out of the axes; these place a pair in view. -->
-      <ContextMenu.Item onSelect={() => asStep(() => eachPv((p) => p.addXCursors()))}><RiXCursors class="menu-icon" />Add X cursors{@render span()}</ContextMenu.Item>
-      <ContextMenu.Item onSelect={() => asStep(() => eachAxis(region.keys?.[0], (p, axis) => p.addYCursors(axis)))}><RiYCursors class="menu-icon" />Add Y cursors{@render value(yLands(region.keys?.[0]))}</ContextMenu.Item>
+      <ContextMenu.Item onSelect={addXCursors}><RiXCursors class="menu-icon" />Add X cursors{@render span()}</ContextMenu.Item>
+      <ContextMenu.Item onSelect={() => addYCursors(region.keys?.[0])}><RiYCursors class="menu-icon" />Add Y cursors{@render value(yLands(region.keys?.[0]))}</ContextMenu.Item>
       <ContextMenu.Item onSelect={onClearCursors}><RiEraser class="menu-icon" />Clear cursors{@render value(placed())}</ContextMenu.Item>
       <ContextMenu.Label>Show</ContextMenu.Label>
       <ContextMenu.Sub>

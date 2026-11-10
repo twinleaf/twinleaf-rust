@@ -3,7 +3,7 @@
 // another tab and properties.
 import { expect } from 'vitest';
 import { commands } from '@vitest/browser/context';
-import { centre, click, feed, leafOf, mountPage, rightClick, settle, wait } from './page.js';
+import { centre, click, editCursors, feed, leafOf, mountPage, rightClick, settle, wait, withYPair } from './page.js';
 import { plotIds } from '../../src/lib/layout.js';
 
 export { OPEN, click, closeAll, leafOf, rightClick, settle } from './page.js';
@@ -28,9 +28,7 @@ export async function menuPage() {
   page.history.group('Prepare', () => page.ws.setPlot(ids[0], { mode: 'independent', legend: true }));
   await settle();
   const pv = page.pv(ids[0]);
-  pv.view.cursors = { a: 14, b: 16 };
-  pv.setYCursor(pv.yAxes[0].key, 'a', 0.1);
-  pv.setYCursor(pv.yAxes[0].key, 'b', 0.5);
+  editCursors(page, ids[0], (c) => withYPair({ ...c, x: { a: 14, b: 16 } }, 'time', pv.yAxes[0].key, 0.1, 0.5));
   // The legend and the readout show what a frame drew a few times a second.
   await wait(200);
   await settle();

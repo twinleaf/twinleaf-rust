@@ -17,6 +17,7 @@ import { colors } from './colors.svelte.js';
 import { prefs } from './prefs.svelte.js';
 import { spanText } from './units.js';
 import { WINDOW_LIMITS, windowText } from './window.js';
+import { placedIn, withX, withY, withoutX, withoutY, xOf, yOf } from './cursors.js';
 
 /** A CSS colour as [r, g, b, a] in 0..1, resolved by the browser, so theme tokens work. */
 function cssRgba(css) {
@@ -435,10 +436,13 @@ export class PlotView {
    * this one is selected, or else its own. `hoverTime` holds the time under the
    * pointer, which every time plot draws a line at. `viewHistory` is the
    * page's ViewHistory: each drag, burst of wheel turns and command here
-   * that moves the views is a step of it.
+   * that moves the views is a step of it. `cursors` is the page's
+   * CursorEdits, which holds the cursors the plot draws and writes those a
+   * drag here moves, on the plots `targetIds` returns: the ids of the plots
+   * of `targets`. `onFollow(restore)` has the page follow live on those.
    */
-  constructor({ body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, viewHistory }) {
-    Object.assign(this, { body, overlay, config, hub, view, targets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, viewHistory });
+  constructor({ body, overlay, config, hub, view, targets, targetIds, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors }) {
+    Object.assign(this, { body, overlay, config, hub, view, targets, targetIds, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors });
     this.zoomBand = null; // [x0, x1] in client px while a Ctrl+drag marks a range to zoom to
     this.ctx = overlay.getContext('2d');
     this.specHover = null;
@@ -511,16 +515,14 @@ export class PlotView {
     return ranges;
   }
 
-  /**
-   * The Y cursors of the plot's kind, which its view holds, range key ->
-   * {a, b}: Y1 and Y2 of the y axis with that key, each a value in the
-   * axis's units or null. Each kind keeps its own, as its axes differ.
-   */
-  get yCursors() {
-    const kind = this.config().kind;
-    let cursors = this.view.yCursorsByKind.get(kind);
-    if (!cursors) this.view.yCursorsByKind.set(kind, (cursors = new Map()));
-    return cursors;
+  /** The plot's cursors as it draws them: the tab's, or those of the drag that is moving one (cursors.js). */
+  get placed() {
+    return this.cursors.get(this.plotId);
+  }
+
+  /** Y1 and Y2 of the y axis with range key `key`, as {a, b}, each a value in the axis's units or null. */
+  yPair(key) {
+    return yOf(this.placed, this.config().kind, key);
   }
 
   rangeKey(cfg, trace) {
@@ -948,7 +950,7 @@ export class PlotView {
     // pointer. Beside the plot, over a y axis, it reads no time.
     const hx = this.hover?.x ?? null;
     const overTime = hx !== null && hx >= P.x && hx <= P.x + P.w;
-    this.setMarker('hover', overTime ? this.dataAt(hx) : null);
+    this.setHover(overTime ? this.dataAt(hx) : null);
     const marks = this.markers();
     const inView = (v) => v !== null && v >= xd[0] && v <= xd[1];
     const vline = (v, style, dash = []) => {
@@ -1053,7 +1055,7 @@ export class PlotView {
       for (const a of axes) {
         if (a.lane !== hoverLane) continue;
         // On a Y cursor of this axis, the cursor's own tag reads the height.
-        const yc = this.yCursors.get(a.key);
+        const yc = this.yPair(a.key);
         const sy = yScale(a.range, a.lane);
         if (yc && ['a', 'b'].some((n) => yc[n] !== null && Math.abs(sy(yc[n]) - hy) < TAB.h)) continue;
         const v = sy.invert(hy);
@@ -1156,7 +1158,7 @@ export class PlotView {
           };
     const ys = [];
     for (const a of axes) {
-      const yc = this.yCursors.get(a.key);
+      const yc = this.yPair(a.key);
       if (!yc || (yc.a === null && yc.b === null)) continue;
       const units = a.plans[0]?.t.meta.units ?? '';
       const fv = spectrum ? fy : (v) => si(v, units);
@@ -1248,7 +1250,7 @@ export class PlotView {
       }
     }
     for (const a of axes) {
-      const yc = this.yCursors.get(a.key);
+      const yc = this.yPair(a.key);
       if (!yc || yc.a === null || yc.b === null) continue;
       const sy = this.axisScale(a), y0 = sy(yc.a), y1 = sy(yc.b);
       const t = Math.max(a.lane.y, Math.min(y0, y1)), b = Math.min(a.lane.y + a.lane.h, Math.max(y0, y1));
@@ -1280,7 +1282,7 @@ export class PlotView {
       }
     }
     for (const a of axes) {
-      const yc = this.yCursors.get(a.key);
+      const yc = this.yPair(a.key);
       if (!yc) continue;
       const sy = this.axisScale(a);
       const tx = a.side === 'left' ? a.x1 - TAB.w / 2 - 1 : a.x0 + TAB.w / 2 + 1;
@@ -1315,7 +1317,7 @@ export class PlotView {
       tabs.push({ kind: 'x', name, x, y: P.y + P.h + 3, w: TAB.w, h: TAB.h });
     });
     for (const a of axes) {
-      const yc = this.yCursors.get(a.key);
+      const yc = this.yPair(a.key);
       ['a', 'b'].forEach((name, i) => {
         if (yc && yc[name] !== null) return;
         const x = a.side === 'left' ? a.x1 - TAB.w - 1 : a.x0 + 1;
@@ -1373,7 +1375,7 @@ export class PlotView {
     else for (const v of this.targets()) v.show(a, b, performance.now());
   }
 
-  /** Zooms to the time or frequencies between X1 and X2, when both are placed, as one view step. */
+  /** Zooms to the time or frequencies between X1 and X2, when both are placed, as one view step. The cursors stay. */
   zoomToCursors() {
     const { a, b } = this.markers();
     if (a !== null && b !== null) this.viewHistory.step(() => this.showRange(Math.min(a, b), Math.max(a, b)));
@@ -1414,7 +1416,7 @@ export class PlotView {
   /** The placed Y cursor within a few pixels of (x, y), across its lane or on its tag in the gutter, as {key, name}, or null. */
   yCursorNear(x, y) {
     for (const a of this.yAxes) {
-      const yc = this.yCursors.get(a.key);
+      const yc = this.yPair(a.key);
       if (!yc || x < Math.min(a.x0, a.lane.x) || x > Math.max(a.x1, a.lane.x + a.lane.w)) continue;
       if (y < a.lane.y - 4 || y > a.lane.y + a.lane.h + 4) continue;
       const sy = this.axisScale(a);
@@ -1423,66 +1425,50 @@ export class PlotView {
     return null;
   }
 
-  /** Sets Y cursor `name` of the y axis `key` to `v`, or removes it with null. */
-  setYCursor(key, name, v) {
-    let yc = this.yCursors.get(key);
-    if (!yc) this.yCursors.set(key, (yc = { a: null, b: null }));
-    yc[name] = v;
-  }
-
   /** The value of y axis `key` at client y, or null without that axis. */
   yValueAt(key, clientY) {
     const a = this.yAxes.find((a) => a.key === key);
     return a ? this.axisScale(a).invert(clientY) : null;
   }
 
-  /** Places X1 and X2 a third of the way in from each side of the view, pausing a time plot, as dragging them out does, as one view step. */
-  addXCursors() {
-    const P = this.geo?.plot;
-    if (!P || !this.xd) return;
-    this.viewHistory.step(() => {
-      if (this.config().kind === 'time') for (const v of this.targets()) v.pause(performance.now());
-      this.setMarker('a', this.dataAt(P.x + P.w / 3));
-      this.setMarker('b', this.dataAt(P.x + (2 * P.w) / 3));
-    });
+  // A command on the cursors gives the cursors the plot would have after
+  // it; the page writes them, on every plot the command acts on, as one
+  // edit (cursors.js CursorEdits).
+
+  /** The plot's cursors with X1 and X2 a third of the way in from each side of the view; as they are before it has drawn an x axis. */
+  xCursorsAdded() {
+    const P = this.geo?.plot, kind = this.config().kind;
+    if (!P || !this.xd) return this.placed;
+    return withX(withX(this.placed, kind, 'a', this.dataAt(P.x + P.w / 3)), kind, 'b', this.dataAt(P.x + (2 * P.w) / 3));
   }
 
-  /** Places Y1 and Y2 a third of the way in from the bottom and top of y axis `key`, or of the first axis, as one view step. */
-  addYCursors(key) {
-    const a = this.yAxes.find((a) => a.key === key) ?? this.yAxes[0];
-    if (!a) return;
+  /** The plot's cursors with Y1 and Y2 a third of the way in from the bottom and top of y axis `key`, or of the first axis. */
+  yCursorsAdded(key) {
+    const a = this.yAxes.find((a) => a.key === key) ?? this.yAxes[0], kind = this.config().kind;
+    if (!a) return this.placed;
     const sy = this.axisScale(a);
-    this.viewHistory.step(() => {
-      this.setYCursor(a.key, 'a', sy.invert(a.lane.y + (2 * a.lane.h) / 3));
-      this.setYCursor(a.key, 'b', sy.invert(a.lane.y + a.lane.h / 3));
-    });
+    return withY(withY(this.placed, kind, a.key, 'a', sy.invert(a.lane.y + (2 * a.lane.h) / 3)), kind, a.key, 'b', sy.invert(a.lane.y + a.lane.h / 3));
   }
 
-  /** Removes X1 and X2, as one view step. */
-  clearXCursors() {
-    this.viewHistory.step(() => {
-      this.setMarker('a', null);
-      this.setMarker('b', null);
-    });
+  /** The plot's cursors without X1 and X2. */
+  xCursorsCleared() {
+    return withoutX(this.placed, this.config().kind);
+  }
+
+  /** The plot's cursors without the Y cursors of y axis `key`, or with none, of every y axis. */
+  yCursorsCleared(key) {
+    return withoutY(this.placed, this.config().kind, key);
   }
 
   /** Whether y axis `key` has a Y cursor placed. */
   hasYCursors(key) {
-    const yc = this.yCursors.get(key);
-    return !!yc && (yc.a !== null || yc.b !== null);
-  }
-
-  /** Removes the Y cursors of y axis `key`, or with none, of every y axis, as one view step. */
-  clearYCursors(key) {
-    this.viewHistory.step(() => (key === undefined ? this.yCursors.clear() : this.yCursors.delete(key)));
+    const yc = this.yPair(key);
+    return yc.a !== null || yc.b !== null;
   }
 
   /** How many cursors are placed: X1 and X2, and each Y1 and Y2 of every kind. */
   cursorsPlaced() {
-    const { a, b } = this.markers();
-    let n = (a !== null) + (b !== null);
-    for (const cursors of this.view.yCursorsByKind.values()) for (const c of cursors.values()) n += (c.a !== null) + (c.b !== null);
-    return n;
+    return placedIn(this.placed, this.config().kind);
   }
 
   /** How many of the plot's y axes have a Y cursor placed. */
@@ -1503,16 +1489,29 @@ export class PlotView {
 
   /** The hover position and the X1 and X2 cursors, as a and b, in this plot's x units. */
   markers() {
-    if (this.config().kind === 'spectrum') return { hover: this.specHover, ...this.view.specCursors };
-    return { hover: this.hoverTime.t, ...this.view.cursors };
+    const kind = this.config().kind;
+    return { hover: kind === 'spectrum' ? this.specHover : this.hoverTime.t, ...xOf(this.placed, kind) };
   }
 
-  setMarker(name, value) {
-    if (this.config().kind === 'spectrum') {
-      if (name === 'hover') this.specHover = value;
-      else this.view.specCursors[name] = value;
-    } else if (name === 'hover') this.hoverTime.t = value;
-    else for (const v of this.targets()) v.cursors[name] = value;
+  /** Sets the hover position: a spectrum's own, or the time every time plot marks. */
+  setHover(value) {
+    if (this.config().kind === 'spectrum') this.specHover = value;
+    else this.hoverTime.t = value;
+  }
+
+  /**
+   * Shows X cursor `name` at `value`, or removed with null, while a drag
+   * moves it: a time cursor on every plot the drag acts on, a spectrum's on
+   * this plot.
+   */
+  draftX(name, value) {
+    const kind = this.config().kind;
+    for (const id of kind === 'time' ? this.targetIds() : [this.plotId]) this.cursors.draft(id, withX(this.cursors.get(id), kind, name, value));
+  }
+
+  /** Shows Y cursor `name` of y axis `key` at `value`, or removed with null, while a drag moves it. */
+  draftY(key, name, value) {
+    this.cursors.draft(this.plotId, withY(this.placed, this.config().kind, key, name, value));
   }
 
   /** The data x under clientX, and back. */
@@ -1701,7 +1700,8 @@ export class PlotView {
     // the axis into the plot drawing a cursor out of it, as a guide comes off
     // a ruler, and a drag along it seeking ('seek', the time axis only) or
     // offsetting ('y'); 'plot' pans; 'none' does nothing more. A drag, from
-    // its press to its release, is one view step.
+    // its press to its release, is one view step for what it moves of the
+    // views, and one edit for a cursor it places, moves or removes.
     el.addEventListener('pointerdown', (e) => {
       this.onFocus?.();
       if (e.button !== 0) return;
@@ -1734,7 +1734,7 @@ export class PlotView {
         const a = this.yAxes.find((a) => a.key === key);
         drag.mode = 'ycursor';
         drag.key = key;
-        drag.cursor = pick(this.yCursors.get(key) ?? { a: null, b: null }, (v) => Math.abs(this.axisScale(a)(v) - e.clientY));
+        drag.cursor = pick(this.yPair(key), (v) => Math.abs(this.axisScale(a)(v) - e.clientY));
       } else if (across) {
         // In from a y axis: an X cursor. A time cursor holds a moment the
         // live view would scroll away, so it pauses the view.
@@ -1762,7 +1762,7 @@ export class PlotView {
       const P = this.geo?.plot;
       if (!P) return;
       this.hover = { x: e.clientX, y: e.clientY };
-      this.setMarker('hover', this.dataAt(e.clientX));
+      this.setHover(this.dataAt(e.clientX));
       this.axisHover = onAxis(e) ? e.clientX : null;
       const yAxis = this.yAxisAt(e.clientX, e.clientY);
       // Each region names its drag: an X cursor or the time axis moves
@@ -1792,9 +1792,9 @@ export class PlotView {
         const P0 = this.geo.plot;
         this.zoomBand = [drag.x0, Math.min(P0.x + P0.w, Math.max(P0.x, e.clientX))];
       } else if (drag.mode === 'xcursor') {
-        this.setMarker(drag.cursor, this.dataAt(e.clientX));
+        this.draftX(drag.cursor, this.dataAt(e.clientX));
       } else if (drag.mode === 'ycursor') {
-        this.setYCursor(drag.key, drag.cursor, this.yValueAt(drag.key, e.clientY));
+        this.draftY(drag.key, drag.cursor, this.yValueAt(drag.key, e.clientY));
       } else if (drag.mode === 'seek') {
         // The window moves with the pointer, at the scale of the whole
         // history, and stays within it.
@@ -1815,40 +1815,52 @@ export class PlotView {
       const P = this.geo?.plot;
       // A cursor let go off its lane is removed: an X cursor beside the plot,
       // a Y cursor above or below its lane, as a tab let go where it rests.
-      if (drag?.mode === 'xcursor' && drag.moved && P && (e.clientX < P.x || e.clientX > P.x + P.w)) this.setMarker(drag.cursor, null);
+      if (drag?.mode === 'xcursor' && drag.moved && P && (e.clientX < P.x || e.clientX > P.x + P.w)) this.draftX(drag.cursor, null);
       if (drag?.mode === 'ycursor' && drag.moved) {
         const lane = this.yAxes.find((a) => a.key === drag.key)?.lane;
-        if (lane && (e.clientY < lane.y || e.clientY > lane.y + lane.h)) this.setYCursor(drag.key, drag.cursor, null);
+        if (lane && (e.clientY < lane.y || e.clientY > lane.y + lane.h)) this.draftY(drag.key, drag.cursor, null);
+      }
+      // A cursor drag is one edit, written as it ends: the cursor placed, moved or removed.
+      if (drag?.mode === 'xcursor' || drag?.mode === 'ycursor') {
+        const saved = this.cursors.saved(this.plotId), kind = this.config().kind;
+        const pair = (c) => (drag.mode === 'xcursor' ? xOf(c, kind) : yOf(c, kind, drag.key));
+        const was = pair(saved)[drag.cursor], now = pair(this.placed)[drag.cursor];
+        this.cursors.commit(`${was === null ? 'Place' : now === null ? 'Remove' : 'Move'} ${drag.mode === 'xcursor' ? 'X' : 'Y'}${drag.cursor === 'a' ? 1 : 2}`);
       }
       // A range marked with Ctrl, wider than a slip, zooms to it.
       if (drag?.mode === 'zoom' && this.zoomBand && Math.abs(this.zoomBand[1] - this.zoomBand[0]) >= DRAG_START) this.zoomTo(...this.zoomBand);
       this.letGo();
     });
-    /** Ends the drag under way, if any, its view step with it: as its release does, or the pointer lost, or the plot going. */
+    /**
+     * Ends the drag under way, if any, its view step with it: as its release
+     * does, or the pointer lost, or the plot going. A cursor it was moving
+     * and has not written stays where the tab has it.
+     */
     this.letGo = () => {
       this.zoomBand = null;
       this.seeking = false;
       if (!drag) return;
       drag = null;
+      this.cursors.cancel();
       this.viewHistory.end();
     };
     el.addEventListener('pointercancel', () => this.letGo());
     el.addEventListener('pointerleave', () => {
-      this.setMarker('hover', null);
+      this.setHover(null);
       this.axisHover = null;
       this.hover = null;
     });
     // A double-click on a y axis fits it, through `onFitY(key)` when the
     // page gives one, so it fits that axis on every plot the gesture acts on.
-    // On the plot it
-    // follows the newest samples again, from wherever the view was, at the
-    // window it had before it paused.
+    // On the plot it has the page follow the newest samples again
+    // (`onFollow`), from wherever the view was, at the window it had before
+    // it paused.
     el.addEventListener('dblclick', (e) => {
       // The time axis seeks; two clicks there do nothing more.
       if (onAxis(e)) return;
       const band = this.yAxisAt(e.clientX, e.clientY);
       if (band) this.onFitY ? this.onFitY(this.axisTargets(band, e.clientY)[0]) : this.autoscale();
-      else this.viewHistory.step(() => this.targets().forEach((v) => v.follow(true)));
+      else this.onFollow(true);
     });
   }
 
@@ -1924,8 +1936,9 @@ export function sameView(a, b) {
 
 /**
  * What one plot shows: a time plot's x range, live, trailing the newest
- * samples by `delay`, or paused at `right`; the plot's cursors and y
- * ranges; and the spectra a paused spectrum holds. It reads the time from
+ * samples by `delay`, or paused at `right`; the plot's y ranges; and the
+ * spectra a paused spectrum holds. The plot's cursors are not here: they
+ * are edits, kept in its tab (cursors.js). It reads the time from
  * the hub, so it outlives any one hub's session, and it outlives the plot's
  * component, so a remount keeps all of them.
  */
@@ -1939,9 +1952,6 @@ export class View {
   right = 0; // device time of the right edge when paused
   pausedAt = null; // device time it paused at, the end of what it captured
   limits = null; // [oldest, newest] a paused view stays within, as its plot last drew it
-  cursors = { a: null, b: null }; // a time plot's X1 and X2, placed, device time
-  specCursors = { a: null, b: null }; // a spectrum's X1 and X2, in Hz
-  yCursorsByKind = new Map(); // plot kind -> range key -> Y1 and Y2, {a, b}: PlotView's `yCursors`
   yByKind = new Map(); // plot kind, a spectrum's by y scale -> range key -> {range, auto}: PlotView's `y`
   spectra = new Map(); // Trace -> the spectrum a spectrum plot shows of it, held while paused: PlotView's `spectrumOf`
   listeners = new Set();
@@ -2005,11 +2015,6 @@ export class View {
     this.notify();
   }
 
-  /** Whether time cursors hold the view where it is. */
-  held() {
-    return this.cursors.a !== null || this.cursors.b !== null;
-  }
-
   /** Holds the view where it is; samples keep arriving behind it. */
   pause(perf) {
     if (!this.live) return;
@@ -2047,31 +2052,18 @@ export class View {
   /**
    * Follows the newest samples again. As unpausing, it goes on at the span
    * it shows, and keeps its window. With `restore`, as a double-click, it
-   * goes back to its window. The time cursors go: live, they would scroll
-   * away.
+   * goes back to its window.
    */
   follow(restore = false) {
     this.live = true;
     this.span = restore ? this.window : Math.min(this.liveSeconds(), this.span);
     this.pausedAt = null;
-    this.cursors = { a: null, b: null };
     this.notify();
-  }
-
-  /** Removes every cursor: X1 and X2 of either kind and every Y cursor. Says whether any were placed. */
-  clearCursors() {
-    const placed = (c) => c.a !== null || c.b !== null;
-    let had = placed(this.cursors) || placed(this.specCursors);
-    for (const byKey of this.yCursorsByKind.values()) for (const c of byKey.values()) had ||= placed(c);
-    this.cursors = { a: null, b: null };
-    this.specCursors = { a: null, b: null };
-    this.yCursorsByKind.clear();
-    return had;
   }
 
   /**
    * What the view shows, as a value a view history step keeps: live or
-   * paused and where, its span and window, every cursor placed, the y
+   * paused and where, its span and window, the y
    * ranges it holds (one that fits itself to the data is left out), and,
    * paused, the spectra it holds. `sameView` compares two.
    */
@@ -2079,9 +2071,6 @@ export class View {
     const { live, window, span, right, pausedAt } = this;
     return {
       live, window, span, right, pausedAt,
-      cursors: { ...this.cursors },
-      specCursors: { ...this.specCursors },
-      yCursors: byKindOf(this.yCursorsByKind, (c) => c.a !== null || c.b !== null, (c) => ({ a: c.a, b: c.b })),
       yRanges: byKindOf(this.yByKind, (st) => !st.auto && !!st.range, (st) => [...st.range]),
       spectra: live ? null : new Map(this.spectra),
     };
@@ -2097,9 +2086,6 @@ export class View {
     Object.assign(this, { live: s.live, window: s.window, span: s.span, limits: null });
     if (s.live) this.pausedAt = null;
     else [this.right, this.pausedAt] = [Math.min(s.right, newest), Math.min(s.pausedAt ?? s.right, newest)];
-    this.cursors = { ...s.cursors };
-    this.specCursors = { ...s.specCursors };
-    this.yCursorsByKind = mapsOf(s.yCursors, (c) => ({ ...c }));
     this.yByKind = mapsOf(s.yRanges, (range) => ({ range: [...range], auto: false }));
     this.spectra = new Map(s.spectra ?? []);
     this.notify();

@@ -10,6 +10,7 @@ import { Workspace } from './workspace.svelte.js';
 import { Favorites } from './favorites.svelte.js';
 import { makeTab, newPlot, VIEW_FIELDS } from './tabs.js';
 import { plotIds } from './layout.js';
+import { CursorEdits } from './cursors.js';
 
 const edits = (ws, favorites) => JSON.stringify([JSON.parse(JSON.stringify(ws.tabs, (k, v) => (VIEW_FIELDS.has(k) ? undefined : v))), [...favorites.names].sort()]);
 
@@ -21,6 +22,8 @@ const step = fc.oneof(
   fc.record({ t: fc.constant('star'), name: fc.constantFrom('a', 'b', 'c') }),
   fc.record({ t: fc.constant('view'), at: fc.nat(), lo: fc.integer({ min: 1, max: 100 }) }),
   fc.record({ t: fc.constant('same'), at: fc.nat() }),
+  // A cursor drag over `n` plots: it shows each place it passes, and writes the last as it ends.
+  fc.record({ t: fc.constant('cursor'), n: fc.integer({ min: 1, max: 3 }), path: fc.array(fc.option(fc.integer({ min: 0, max: 3 })), { minLength: 1, maxLength: 4 }) }),
   fc.record({ t: fc.constant('throw'), at: fc.nat() }),
   fc.record({ t: fc.constant('undo') }),
   fc.record({ t: fc.constant('redo') }),
@@ -34,6 +37,7 @@ describe('history, against a model of it', () => {
         const ws = new Workspace({ tabs: [tab], activeId: tab.id });
         const favorites = new Favorites(null);
         const history = new History(ws, favorites);
+        const cursors = new CursorEdits(ws, history);
         const docs = [edits(ws, favorites)];
         let at = 0;
         const edit = (label, fn) => {
@@ -53,7 +57,13 @@ describe('history, against a model of it', () => {
           else if (s.t === 'star') edit('Star', () => favorites.pin([s.name], !favorites.has(s.name)));
           else if (s.t === 'view' && id) ws.setView(id, { fRange: [s.lo, s.lo * 10] });
           else if (s.t === 'same' && id) edit('Same', () => ws.setPlot(id, { kind: ws.plots[id].kind }));
-          else if (s.t === 'throw' && id) {
+          else if (s.t === 'cursor' && id) {
+            const steps = history.undos.length;
+            for (const at of s.path) for (const i of ids.slice(0, s.n)) cursors.draft(i, at === null ? undefined : { x: { a: at, b: null } });
+            expect(history.undos.length, 'a drag writes nothing until it ends').toBe(steps);
+            edit('Cursor', () => cursors.commit('Move X1'));
+            expect(history.undos.length - steps, 'one step at most, however many plots').toBeLessThanOrEqual(1);
+          } else if (s.t === 'throw' && id) {
             expect(() => history.group('Broken', () => (ws.closePlot(id), favorites.pin(['z'], true), fail()))).toThrow();
           } else if (s.t === 'undo') {
             const label = history.undo();
