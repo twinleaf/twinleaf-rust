@@ -244,21 +244,56 @@ describe('the hub', () => {
 });
 
 describe('the history a hub holds', () => {
-  const memory = (oldest) => ({ type: 'memory', bytes: 0, budget: 0, seconds: 0, max_age: 0, rate: 0, oldest });
-
-  it('has dropped nothing while each trace starts where it first did, however late that is', () => {
+  const memory = (oldest, maxAge = 0) => ({ type: 'memory', bytes: 0, budget: 0, seconds: 0, max_age: maxAge, rate: 0, oldest });
+  /** A session that has heard of traces 0, 1 and 2, and the traces. */
+  const heard = () => {
     const s = new Session('h');
-    s.text(memory({ 0: 997, 1: 990 }));
-    s.text(memory({ 0: 997, 1: 990 }));
-    expect(s.droppedBefore([0, 1])).toBeNull();
+    for (const id of [0, 1, 2]) s.text({ type: 'trace', trace: { id, route: '/', stream: 's', column: `c${id}`, units: 'V', rate: 100 } });
+    return { s, traces: [...s.traces.values()] };
+  };
+
+  it('starts at the oldest time the hub holds of any of the traces asked of, the longer history where they differ', () => {
+    const { s, traces } = heard();
+    s.text(memory({ 0: 1010, 1: 1020 }));
+    expect(s.held(traces).oldest).toBe(1010);
+    expect(s.held([traces[1]]).oldest).toBe(1020);
+    expect(s.held([traces[1], traces[2]]).oldest).toBe(1020);
   });
 
-  it('has dropped what was before a trace’s oldest once that is later than it first was, the latest of the traces asked of', () => {
-    const s = new Session('h');
+  it('starts at the oldest point the page has, of any level, until the hub says, and nowhere with none', () => {
+    const { s, traces } = heard();
+    expect(s.held(traces).oldest).toBeNull();
+    s.apply({ kind: 'points', chunks: [{ id: 0, level: 0, brk: false, xs: [50, 51], ys: [0, 0] }, { id: 1, level: 2, brk: false, xs: [7, 51], ys: [0, 0] }] }, 0);
+    expect(s.held(traces).oldest).toBe(7);
+    expect(s.held([traces[0]]).oldest).toBe(50);
+    // The hub holds less than the page's coarse level kept.
+    s.text(memory({ 0: 40, 1: 40 }));
+    expect(s.held(traces).oldest).toBe(40);
+  });
+
+  it('has dropped nothing while each trace starts where it first did, however late that is', () => {
+    const { s, traces } = heard();
     s.text(memory({ 0: 997, 1: 990 }));
-    s.text(memory({ 0: 1010, 1: 1020 }));
-    expect(s.droppedBefore([0])).toBe(1010);
-    expect(s.droppedBefore([0, 1])).toBe(1020);
-    expect(s.droppedBefore([2])).toBeNull();
+    s.text(memory({ 0: 997, 1: 990 }));
+    expect(s.held(traces).dropped).toBe(false);
+  });
+
+  it('has dropped samples of the traces asked of once one starts later than it first did', () => {
+    const { s, traces } = heard();
+    s.text(memory({ 0: 997, 1: 990 }));
+    s.text(memory({ 0: 997, 1: 1020 }));
+    expect(s.held([traces[0]]).dropped).toBe(false);
+    expect(s.held([traces[1]]).dropped).toBe(true);
+    expect(s.held(traces).dropped).toBe(true);
+    expect(s.held([traces[2]]).dropped).toBe(false);
+  });
+
+  it('says the History setting the hub last said, and none before it has, or while it has none', () => {
+    const { s, traces } = heard();
+    expect(s.held(traces).history).toBeNull();
+    s.text(memory({ 0: 0 }, 0));
+    expect(s.held(traces).history).toBeNull();
+    s.text(memory({ 0: 0 }, 86400));
+    expect(s.held(traces).history).toBe(86400);
   });
 });

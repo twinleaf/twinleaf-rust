@@ -75,14 +75,13 @@ export class ViewHistory {
   #bursting = false; // whether a burst's change is running, so a step inside it is part of it
 
   /**
-   * `ws` is the page's Workspace and `views` its Views. `dropped(id)` is
-   * the time before which the hub has dropped what it held of plot `id`'s
-   * signals, or null when it has dropped none; `notice(text)` tells the
-   * person; `now()` is the page time, in ms; `edit(label, fn)` runs `fn`
-   * as one edit named `label`, History's `group`.
+   * `ws` is the page's Workspace and `views` its Views, each View knowing
+   * the oldest time its plot can show; `notice(text)` tells the person;
+   * `now()` is the page time, in ms; `edit(label, fn)` runs `fn` as one
+   * edit named `label`, History's `group`.
    */
-  constructor(ws, views, { dropped = () => null, notice = () => {}, now = () => performance.now(), edit = (label, fn) => fn() } = {}) {
-    Object.assign(this, { ws, views, dropped, notice, now, edit });
+  constructor(ws, views, { notice = () => {}, now = () => performance.now(), edit = (label, fn) => fn() } = {}) {
+    Object.assign(this, { ws, views, notice, now, edit });
   }
 
   /** Whether Back would change what the open tab shows. */
@@ -242,17 +241,12 @@ export class ViewHistory {
   /**
    * Shows plot `id` of the open tab as `s` has it. A paused time plot's
    * view whose start the hub has dropped moves later to start at the oldest
-   * time it holds; says whether it moved.
+   * time the plot can show (View `startHeld`); says whether it moved.
    */
   #put(id, s) {
-    let view = s.view, lost = false;
-    const dropped = this.ws.plots[id].kind === 'time' && !view.live ? this.dropped(id) : null;
-    if (dropped !== null && view.right - view.span < dropped) {
-      const right = Math.max(view.right, dropped + view.span);
-      lost = right > view.right;
-      view = { ...view, right, pausedAt: Math.max(view.pausedAt ?? right, right) };
-    }
-    this.views.get(id).restore(view, this.now());
+    const view = this.views.get(id);
+    view.restore(s.view, this.now());
+    const lost = this.ws.plots[id].kind === 'time' && view.startHeld(this.now());
     const plot = this.ws.plots[id], patch = {};
     for (const f of VIEW_FIELDS) if (JSON.stringify(plot[f] ?? null) !== JSON.stringify(s.fields[f])) patch[f] = s.fields[f];
     if (Object.keys(patch).length) this.ws.setView(id, patch);

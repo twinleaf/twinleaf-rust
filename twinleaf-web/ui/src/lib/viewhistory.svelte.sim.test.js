@@ -45,12 +45,14 @@ function setup() {
   const tabs = [tab('A', 'time', 3), tab('B', 'spectrum', 2)];
   const ws = new Workspace({ tabs, activeId: tabs[0].id });
   const t = { ms: 0, notices: [] };
-  const hub = { now: (perf) => START + perf / 1000, liveSeconds: () => 600, historySeconds: () => HELD_S };
+  const hub = { now: (perf) => START + perf / 1000, liveSeconds: () => 600 };
   const oldest = () => Math.max(START, hub.now(t.ms) - HELD_S);
   const dropped = () => (oldest() > START ? oldest() : null);
   const views = new Views(hub);
+  // What the hub holds of every plot's signals: each view reads the oldest time its plot can show from it.
+  views.held = () => ({ oldest: oldest(), dropped: dropped() !== null, history: null });
   for (const id of ws.allPlotIds()) views.of(id);
-  const vh = new ViewHistory(ws, views, { now: () => t.ms, dropped, notice: (text) => t.notices.push(text) });
+  const vh = new ViewHistory(ws, views, { now: () => t.ms, notice: (text) => t.notices.push(text) });
   // Each signal's newest spectrum estimate, a new one as time passes.
   const estimate = new Map();
   const spectrumOf = (key) => {
@@ -60,13 +62,11 @@ function setup() {
   };
   /**
    * What the page draws each frame does to the open tab's views: a time
-   * plot fits y once, and paused keeps within what it captured; a live
-   * spectrum takes its newest estimate.
+   * plot fits y once, and a live spectrum takes its newest estimate.
    */
   const frame = () => {
     for (const id of Object.keys(ws.plots)) {
       const p = ws.plots[id], v = views.get(id), kind = p.kind === 'time' ? 'time' : 'spectrum:log';
-      if (p.kind === 'time') v.limits = v.live ? null : [oldest(), v.pausedAt];
       if (!v.yByKind.has(kind)) v.yByKind.set(kind, new Map());
       const st = v.yByKind.get(kind).get('shared') ?? { range: null, auto: true };
       v.yByKind.get(kind).set('shared', st);
@@ -322,8 +322,8 @@ describe('view history', () => {
 
   it('shows a view that starts before the hub had anything as it was, with no notice, while the hub has dropped nothing', () => {
     // The hub's oldest time is its first sample, which is no drop.
-    const { ws, views, t, hub } = page(), id = Object.keys(ws.plots)[0], v = views.get(id);
-    const vh = new ViewHistory(ws, views, { now: () => t.ms, oldest: () => START + 3, dropped: () => null, notice: (text) => t.notices.push(text) });
+    const { ws, views, vh, t, hub } = page(), id = Object.keys(ws.plots)[0], v = views.get(id);
+    views.held = () => ({ oldest: START + 3, dropped: false, history: null });
     t.ms = 2000;
     vh.step(() => v.pause(t.ms));
     const paused = v.state();

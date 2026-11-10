@@ -177,8 +177,23 @@ const reducedMotion = typeof matchMedia === 'undefined' ? null : matchMedia('(pr
  * line by under half a pixel at the switch from this many.
  */
 export const LEVEL_FLOOR = 4;
-/** How far short of its full history the hub may hold, in seconds, and a paused view still reach the full length. */
-export const HISTORY_SLACK = 2;
+/**
+ * The oldest time a view can show: `history` seconds, the hub's History
+ * setting, before `time`, the view's time, or `oldest`, the oldest time the
+ * hub holds of the plot's signals, whichever is later. A view's time is
+ * where it ends zoomed all the way out: the newest samples less the display
+ * delay while live, the moment of the pause while paused. So a view is as
+ * wide as the setting at most, and reads as the setting does once the hub
+ * holds that long: the hub keeps more than the setting by a headroom
+ * (twinleaf-web/src/hub.rs HISTORY_HEADROOM), so what it holds reaches the
+ * setting before any view no further than that behind its newest sample.
+ * It is `oldest` while the hub has said no setting, and null when nothing
+ * says what is held. The zoom limit, the history bar, Back and a plot an
+ * undo brings back all read it from `View.oldest`.
+ */
+export function oldestShown(oldest, time, history) {
+  return oldest === null || !history ? oldest : Math.max(oldest, time - history);
+}
 /**
  * How far past the floor a coarser level must reach before a plot moves to
  * it, as a factor. A plot then moves back to the finer level only once the
@@ -639,23 +654,8 @@ export class PlotView {
       const [lo, hi] = a1 > a0 ? src.extent(a0, a1) : [Infinity, -Infinity];
       return { t, src, fromWindow: src !== live, level, a0, a1, lo, hi, index };
     });
-    // The history the plot moves through, oldest to newest: from the oldest
-    // time the hub holds of its signals, or, until the hub has said, the
-    // oldest point the page has, to the newest point; or, paused, to the
-    // moment it paused, the end of what it captured. A paused view stays
-    // within it. Once the hub holds its full history, give or take what it
-    // trimmed around the pause, a paused view's widest is that history's
-    // length exactly, so it reads as the History setting does.
-    let lo = Infinity, hi = -Infinity;
-    for (const t of traces) for (const l of t.levels) if (l.length) [lo, hi] = [Math.min(lo, l.xAt(l.absStart)), Math.max(hi, l.xAt(l.absEnd - 1))];
-    lo = this.hub.session.oldestHeld(traces.map((t) => t.meta.id)) ?? lo;
-    if (!this.view.live && this.view.pausedAt !== null) {
-      hi = this.view.pausedAt;
-      const full = hi - (this.hub.session.memory?.maxAge || Infinity);
-      if (lo <= full + HISTORY_SLACK) lo = full;
-    }
-    this.history = lo < hi ? [lo, hi] : null;
-    this.view.limits = this.view.live ? null : this.history;
+    // The history the plot moves through, oldest to newest: what its view can show.
+    this.history = this.view.limits(perf);
     // Shared ranges take the union of their traces. A fit fits to what this frame shows.
     const ext = new Map();
     for (const p of plans) {
@@ -2017,7 +2017,8 @@ export class View {
   delay = 0.15;
   right = 0; // device time of the right edge when paused
   pausedAt = null; // device time it paused at, the end of what it captured
-  limits = null; // [oldest, newest] a paused view stays within, as its plot last drew it
+  /** What the hub holds of the plot's signals, as Session `held` gives it. Views sets it for the plot the view is of. */
+  held = () => ({ oldest: null, dropped: false, history: null });
   yByKind = new Map(); // plot kind, a spectrum's by y scale -> range key -> {range, auto}: PlotView's `y`
   spectra = new Map(); // Trace -> the spectrum a spectrum plot shows of it, held while paused: PlotView's `spectrumOf`
   listeners = new Set();
@@ -2032,6 +2033,31 @@ export class View {
   }
 
   /**
+   * The view's time at page time `perf`, where it ends zoomed all the way
+   * out: the newest samples less the delay while live, and the moment it
+   * paused while paused, whatever `perf`.
+   */
+  time(perf) {
+    return this.live || this.pausedAt === null ? this.hub.now(perf) - this.delay : this.pausedAt;
+  }
+
+  /** The oldest time the view can show at page time `perf`, as `oldestShown` gives it, or null when nothing says. */
+  oldest(perf) {
+    const { oldest, history } = this.held();
+    return oldestShown(oldest, this.time(perf), history);
+  }
+
+  /**
+   * [oldest, newest], what the view can show at page time `perf`, live or
+   * paused: from the oldest time it can show to its time. A paused view
+   * stays within it. Null when no time before the view's can be shown.
+   */
+  limits(perf) {
+    const oldest = this.oldest(perf), time = this.time(perf);
+    return oldest !== null && oldest < time ? [oldest, time] : null;
+  }
+
+  /**
    * Zooms by `factor` about the point at fraction `anchor` across the plot,
    * which stays under the pointer. Zooming in anywhere but the newest edge
    * holds a moment the live view would scroll away, so it pauses the view.
@@ -2039,10 +2065,13 @@ export class View {
    * never sends a held history off streaming; going live is the history
    * bar's end, or Follow live. A zoom that leaves the view live sets its
    * window; one that pauses it, or of a paused view, leaves the window as it
-   * was, for going live again.
+   * was, for going live again. It goes as wide as what the view can show,
+   * and live no wider than the decimation keeps; a live window wider than
+   * what the hub holds yet is not narrowed by zooming out.
    */
   zoom(factor, anchor, perf, edge = LIVE_EDGE) {
-    const widest = this.live ? this.liveSeconds() : this.limits ? this.limits[1] - this.limits[0] : Math.max(WINDOW_LIMITS[1], this.hub.historySeconds?.(perf) ?? 0);
+    const limits = this.limits(perf), held = limits ? limits[1] - limits[0] : WINDOW_LIMITS[1];
+    const widest = this.live ? Math.max(this.span, Math.min(this.liveSeconds(), held)) : held;
     const span = Math.min(widest, Math.max(WINDOW_LIMITS[0], this.span * factor));
     if (this.live && factor < 1 && anchor < edge) this.pause(perf);
     if (!this.live) {
@@ -2064,8 +2093,9 @@ export class View {
 
   /** Keeps a paused view within its limits, the history its plot captured. */
   keepWithin() {
-    if (this.live || !this.limits) return;
-    const [lo, hi] = this.limits;
+    const limits = this.live ? null : this.limits();
+    if (!limits) return;
+    const [lo, hi] = limits;
     this.span = Math.min(this.span, Math.max(WINDOW_LIMITS[0], hi - lo));
     this.right = Math.min(hi, Math.max(lo + this.span, this.right));
   }
@@ -2149,12 +2179,32 @@ export class View {
    */
   restore(s, perf) {
     const newest = this.hub.now(perf) - this.delay;
-    Object.assign(this, { live: s.live, window: s.window, span: s.span, limits: null });
+    Object.assign(this, { live: s.live, window: s.window, span: s.span });
     if (s.live) this.pausedAt = null;
     else [this.right, this.pausedAt] = [Math.min(s.right, newest), Math.min(s.pausedAt ?? s.right, newest)];
     this.yByKind = mapsOf(s.yRanges, (range) => ({ range: [...range], auto: false }));
     this.spectra = new Map(s.spectra ?? []);
     this.notify();
+  }
+
+  /**
+   * Moves a paused view that starts before the oldest time its plot can
+   * show, on a hub that has dropped samples of its signals, later to start
+   * there, ending no later than the newest samples at page time `perf`,
+   * and says whether it did. A view as `keepWithin` leaves it starts no
+   * earlier than that time, so it stays; and a view that starts before the
+   * first sample of a hub that has dropped none stays: nothing it showed is
+   * gone.
+   */
+  startHeld(perf) {
+    const oldest = this.oldest();
+    if (this.live || oldest === null || !this.held().dropped) return false;
+    const newest = this.pausedAt ?? this.right;
+    if (this.span <= newest - oldest && this.right >= Math.min(newest, oldest + this.span)) return false;
+    this.right = Math.min(this.hub.now(perf) - this.delay, Math.max(this.right, oldest + this.span));
+    this.pausedAt = Math.max(this.pausedAt ?? this.right, this.right);
+    this.notify();
+    return true;
   }
 
   onChange(fn) {

@@ -101,14 +101,6 @@ export class Hub {
     this.sentHold = on;
   }
 
-  /** The seconds of history the hub stores at page time `perfMs`, back to the oldest time it holds of any trace. */
-  historySeconds(perfMs) {
-    const m = this.session.memory;
-    if (!m) return 0;
-    const oldest = Math.min(...Object.values(m.oldest ?? {}));
-    return Math.max(m.seconds, isFinite(oldest) ? this.now(perfMs) - oldest : 0);
-  }
-
   /** The widest a live window goes, in seconds: what the coarsest level of decimation keeps. */
   liveSeconds() {
     return this.session.levels.at(-1) ?? WINDOW_LIMITS[1];

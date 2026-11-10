@@ -96,7 +96,7 @@
   const { hub, ws, history, registry, views } = getContext('page');
   setContext('history', history);
   views.onChange = viewChanged;
-  const viewHistory = new ViewHistory(ws, views, { dropped: droppedOf, notice: (text) => toast.warning(text), edit: (label, fn) => history.group(label, fn) });
+  const viewHistory = new ViewHistory(ws, views, { notice: (text) => toast.warning(text), edit: (label, fn) => history.group(label, fn) });
   // What a press, a click, a key or an undo does to the plot selection: the Workspace's.
   const selection = ws.selection;
   selection.changed = () => refreshToolbar();
@@ -276,11 +276,8 @@
     else ask.timer = setTimeout(run, wait);
   }
   const tracesOf = (plot) => plot.items.map((i) => hub.session.byKey.get(i.key)).filter(Boolean);
-  /** The time before which the hub has dropped what it held of plot `id`'s signals, or null when it has dropped none. */
-  function droppedOf(id) {
-    const plot = plotAnywhere(id);
-    return plot ? hub.session.droppedBefore(tracesOf(plot).map((t) => t.meta.id)) : null;
-  }
+  // Each view reads the oldest time its plot can show from what the hub holds of these.
+  views.tracesOf = (id) => tracesOf(plotAnywhere(id) ?? { items: [] });
   /** Reads paused plot `id`'s whole captured history once, again only when its signals or its pause change. */
   function requestOverview(id, v) {
     const plot = plotAnywhere(id);

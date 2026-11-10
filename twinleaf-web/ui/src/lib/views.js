@@ -11,11 +11,18 @@ export class Views {
   delay = 0.15;
   /** Runs with plot `id` whenever its view moves: the page's, which main.js makes the Views before. */
   onChange = () => {};
+  /** The traces of plot `id`'s signals the hub has: the page's, which main.js makes the Views before. */
+  tracesOf = () => [];
 
-  /** `hub` gives the views the time; `onChange`, if given, is `onChange`. */
+  /** `hub` gives the views the time and what it holds; `onChange`, if given, is `onChange`. */
   constructor(hub, onChange) {
     this.hub = hub;
     if (onChange) this.onChange = onChange;
+  }
+
+  /** What the hub holds of plot `id`'s signals, as Session `held` gives it: what each View reads its plot's oldest time from. */
+  held(id) {
+    return this.hub.session?.held(this.tracesOf(id)) ?? { oldest: null, dropped: false, history: null };
   }
 
   /** The view of plot `id`, made the first time it is asked for. */
@@ -24,6 +31,7 @@ export class Views {
     if (!v) {
       v = new View(this.hub);
       v.delay = this.delay;
+      v.held = () => this.held(id);
       v.onChange(() => this.onChange(id));
       this.map.set(id, v);
     }

@@ -116,15 +116,17 @@ describe('axisSlots', () => {
   });
 });
 
-describe('View.zoom, paused, on a hub that stores more than a live window', () => {
-  it('goes as wide as the history the hub stores', () => {
-    const v = new View({ now: () => 1000, historySeconds: () => 1800 });
+describe('View.zoom, on a hub that holds more than a live window', () => {
+  const held = () => ({ oldest: -900, dropped: false, history: null });
+  it('goes as wide, paused, as from the oldest time the hub holds to the pause, before any frame is drawn', () => {
+    const v = Object.assign(new View({ now: () => 1000 }), { held });
     v.pause(0);
     for (let i = 0; i < 60; i++) v.zoom(1.25, 1, 0);
-    expect(v.span).toBe(1800);
+    expect(v.span).toBe(v.pausedAt + 900);
+    expect(v.right).toBe(v.pausedAt);
   });
   it('stays within a live window while live', () => {
-    const v = new View({ now: () => 1000, historySeconds: () => 1800 });
+    const v = Object.assign(new View({ now: () => 1000 }), { held });
     for (let i = 0; i < 60; i++) v.zoom(1.25, 1, 0);
     expect(v.span).toBe(120);
   });
@@ -226,9 +228,9 @@ describe('A paused view panned later', () => {
 describe('A paused view, given the history its plot captured', () => {
   const capture = () => {
     let now = 1000;
-    const v = new View({ now: () => now, historySeconds: () => 1800 });
+    const v = new View({ now: () => now });
+    v.held = () => ({ oldest: 400, dropped: false, history: null });
     v.pause(0);
-    v.limits = [400, v.pausedAt];
     now = 5000; // the device goes on long after the pause
     return v;
   };
@@ -536,7 +538,7 @@ describe('a live plot drawn frame after frame', () => {
       lane: (rect, base, x0, x1) => ((drawn.lane = { x0, x1, width: Math.round(rect.w * dpr) }), true),
       drawTrace: (src, ring, a0, a1) => drawn.draws.push({ src, a0, a1 }),
     };
-    const hub = { now: () => hub.t, t: 0, session: { windowOf: () => undefined, oldestHeld: () => null, memory: null } };
+    const hub = { now: () => hub.t, t: 0, session: { windowOf: () => undefined } };
     const view = new View(hub);
     view.span = span;
     view.delay = 0;

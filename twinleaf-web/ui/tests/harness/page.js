@@ -360,3 +360,18 @@ export function quietApi(rows = () => Promise.resolve({ count: 0, oldest: null, 
   vi.spyOn(api, 'window').mockImplementation(() => new Promise(() => {}));
   vi.spyOn(api, 'rows').mockImplementation(rows);
 }
+
+/**
+ * Turns the wheel over plot `id`'s plot area by `deltaY` px, `n` times, at
+ * fraction `at` across it, on the whole pixel nearest, with Shift held when
+ * `shift`, and returns the fraction across that pixel is at. The turns are
+ * dispatched one after another with no frame between, so what they zoom to
+ * depends on neither the browser's input queue nor the machine's speed.
+ */
+export function turnWheel(page, id, deltaY, { n = 1, at = 0.5, shift = false } = {}) {
+  const P = page.pv(id).geo.plot, canvas = leafOf(id).querySelector('.plot-body canvas'), x = Math.round(P.x + at * P.w);
+  for (let i = 0; i < n; i++) {
+    canvas.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY, clientX: x, clientY: Math.round(P.y + P.h / 2), shiftKey: shift }));
+  }
+  return (x - P.x) / P.w;
+}

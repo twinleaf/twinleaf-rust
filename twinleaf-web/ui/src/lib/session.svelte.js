@@ -407,35 +407,33 @@ export class Session {
   // covers every time the plot can be moved to, so nothing the hub holds is
   // ever drawn blank while a detail window is on its way.
 
+  /**
+   * What the hub holds of `traces`, as {oldest, dropped, history}.
+   * `oldest` is the oldest time it holds of any of them: where it holds
+   * more of one than of another, the longer history's. While it has said of
+   * none, it is the oldest point the page has of them, or null with none.
+   * The page's own points can be older than the hub's: a coarse level keeps
+   * what the hub has dropped. `dropped` is whether the hub has dropped
+   * samples it held this session of any of them: before its oldest time, a
+   * trace that has dropped nothing never had any. `history` is the hub's
+   * History setting, the seconds it keeps of each stream at most, or null
+   * while it has not said.
+   */
+  held(traces) {
+    let oldest = null, dropped = false;
+    for (const t of traces) {
+      const at = this.memory?.oldest?.[t.meta.id];
+      if (at === undefined) continue;
+      oldest = Math.min(oldest ?? Infinity, at);
+      if (at > this.firstHeld[t.meta.id]) dropped = true;
+    }
+    if (oldest === null) {
+      for (const t of traces) for (const l of t.levels) if (l.length) oldest = Math.min(oldest ?? Infinity, l.xAt(l.absStart));
+    }
+    return { oldest, dropped, history: this.memory?.maxAge || null };
+  }
+
   /** The `layer` window, 'detail' or 'overview', of `trace` that plot `plotId` last read, if any. */
-  /**
-   * The time before which the hub has dropped samples it held this session
-   * of traces `ids`, the latest of theirs, or null when it has dropped none:
-   * before its oldest time, a trace that has dropped nothing never had any.
-   */
-  /**
-   * The oldest time the hub holds of any of traces `ids`, or null while it
-   * has said of none. The page's own points can be older: a coarse level
-   * keeps what the hub has dropped.
-   */
-  oldestHeld(ids) {
-    let at = null;
-    for (const id of ids) {
-      const oldest = this.memory?.oldest?.[id];
-      if (oldest !== undefined) at = Math.min(at ?? Infinity, oldest);
-    }
-    return at;
-  }
-
-  droppedBefore(ids) {
-    let at = null;
-    for (const id of ids) {
-      const oldest = this.memory?.oldest?.[id], first = this.firstHeld[id];
-      if (oldest !== undefined && first !== undefined && oldest > first) at = Math.max(at ?? -Infinity, oldest);
-    }
-    return at;
-  }
-
   windowOf(plotId, layer, trace) {
     return this.windows.get(plotId)?.[layer].get(trace);
   }
