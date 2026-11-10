@@ -128,7 +128,7 @@ export const KEYMAP = [
       { show: ['Ctrl', 'C'], what: 'Copy, as a sheet pastes' },
       { show: ['Enter'], what: 'Run, switch or edit the picked rows' },
       { show: ['Ctrl', 'Click'], on: 'action', what: 'Pick it to run with others' },
-      { show: ['☆'], what: 'Pin to Favorites' },
+      { show: ['☆'], what: 'Add to Favorites' },
     ],
   },
 ];

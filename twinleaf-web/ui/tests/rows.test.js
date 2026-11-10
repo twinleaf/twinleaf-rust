@@ -2,8 +2,8 @@
 // 1, #8 to #11, #13 and #27; round 2, Selection #13 and #15). A click picks
 // a row alone, Ctrl drops or adds one, Shift picks the run from the row
 // clicked last in page order, across panels and docks and past folded
-// panels, and a right-click on a row not picked picks it alone. Pin and
-// Unpin, from the menu or a picked row's star, act on every picked row as
+// panels, and a right-click on a row not picked picks it alone. Add to and
+// Remove from Favorites, from the menu or a picked row's star, act on every picked row as
 // one undo step. In a table, the table's keys act on its rows, the page's
 // keys act as anywhere, and the plots' keys do nothing. Every press is the
 // real mouse's.
@@ -221,7 +221,7 @@ describe('a property row', () => {
     }
   }, 600_000);
 
-  it('menu offers Pin and Unpin for the picked rows it changes, the star on a picked row sets every picked row, and either is one step undo takes back', async () => {
+  it('menu offers Add to and Remove from Favorites for the picked rows it changes, the star on a picked row sets every picked row, and either is one step undo takes back', async () => {
     const page = await mount();
     const seen = { both: 0, menu: 0, starPicked: 0, starOther: 0 };
     const favorites = page.history.favorites;
@@ -251,11 +251,11 @@ describe('a property row', () => {
             const count = (list) => ((toPin.length && toUnpin.length) || list.length > 1 ? `${list.length} ` : '');
             // An item's label, less its value (the Favorites' count).
             const label = (m) => [...m.childNodes].filter((n) => !n.classList?.contains('menu-value')).map((n) => n.textContent).join('').trim();
-            const items = menuItems().map(label).filter((t) => /^(Pin|Unpin)/.test(t));
-            expect(items).toEqual([...(toPin.length ? [`Pin ${count(toPin)}to Favorites`] : []), ...(toUnpin.length ? [`Unpin ${count(toUnpin)}from Favorites`] : [])]);
+            const items = menuItems().map(label).filter((t) => /^(Add|Remove) .*Favorites/.test(t));
+            expect(items).toEqual([...(toPin.length ? [`Add ${count(toPin)}to Favorites`] : []), ...(toUnpin.length ? [`Remove ${count(toUnpin)}from Favorites`] : [])]);
             if (toPin.length && toUnpin.length) seen.both++;
             const pin = k % 2 === 0 ? toPin.length > 0 : !toUnpin.length;
-            await clickOn(menuItems().find((m) => m.textContent.trim().startsWith(pin ? 'Pin' : 'Unpin')));
+            await clickOn(menuItems().find((m) => m.textContent.trim().startsWith(pin ? 'Add' : 'Remove')));
             want = pin ? [...new Set([...pinned, ...names])] : pinned.filter((n) => !names.includes(n));
             seen.menu++;
           } else {

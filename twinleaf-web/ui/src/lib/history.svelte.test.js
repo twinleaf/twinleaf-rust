@@ -120,7 +120,7 @@ describe('undo and redo', () => {
 
   it('take back pinning several properties', () => {
     const { favorites, history } = setup();
-    history.group('Pin 3 to Favorites', () => favorites.pin(['a', 'b', 'c'], true));
+    history.group('Add 3 to Favorites', () => favorites.pin(['a', 'b', 'c'], true));
     history.undo();
     expect(favorites.names.size).toBe(0);
     history.redo();

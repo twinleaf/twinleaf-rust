@@ -104,7 +104,7 @@ const CASES = [
   // Devices is the first of the left dock's two panels; the right dock holds six.
   [[], 'a dock panel’s menu', null, { 'Move up': '1 of 2', 'Move down': '1 of 2', 'Move to the right dock': '6 panels' }],
   // A right-click picks the first property, gain.
-  [[], 'the properties menu', null, { 'Copy row': '3', Pin: '0 pinned' }],
+  [[], 'the properties menu', null, { 'Copy row': '3', Add: '0 starred' }],
   [['settings:gain', 'settings:offset'], 'the properties menu', null, { 'Copy 2 rows': '2 rows · 1 device' }],
 ];
 

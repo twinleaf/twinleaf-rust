@@ -206,7 +206,7 @@
   function pin(names, on) {
     const changed = names.filter((n) => favorites.has(n) !== on);
     if (!changed.length) return;
-    const what = `${on ? 'Pin' : 'Unpin'} ${changed.length > 1 ? `${changed.length} ` : ''}${on ? 'to' : 'from'} Favorites`;
+    const what = `${on ? 'Add' : 'Remove'} ${changed.length > 1 ? `${changed.length} ` : ''}${on ? 'to' : 'from'} Favorites`;
     history.group(what, () => favorites.pin(changed, on));
   }
   /** A star clicked on row `name`: on a picked row it sets every picked row as this one turns, on another just this one. */
@@ -275,7 +275,7 @@
 
 {#snippet nameCell({ row })}
   {@const starred = favorites.has(row.name)}
-  <button class="star" class:on={starred} tabindex="-1" aria-pressed={starred} aria-label="{starred ? 'Unpin' : 'Pin'} {row.name} {starred ? 'from' : 'to'} Favorites" title={starred ? 'Unpin from Favorites' : 'Pin to Favorites'} onclick={(e) => (e.stopPropagation(), starClicked(row.name))}><RiStar /></button>
+  <button class="star" class:on={starred} tabindex="-1" aria-pressed={starred} aria-label="{starred ? 'Remove' : 'Add'} {row.name} {starred ? 'from' : 'to'} Favorites" title={starred ? 'Remove from Favorites' : 'Add to Favorites'} onclick={(e) => (e.stopPropagation(), starClicked(row.name))}><RiStar /></button>
   <span class="pname" title="{row.rpc.type ?? 'no type'} · {row.rpc.access.join('/') || 'action'}{row.rpc.persistent ? ' · persistent' : ''}">
     {row.name}{#if mixed(row)}<b class="mark" title="The devices differ">≠</b>{/if}{#if row.differs}<b class="mark warn" title="The devices declare it differently">!</b>{/if}
   </span>
@@ -304,7 +304,7 @@
 {/snippet}
 
 {#if !rows.length}
-  <div class="props-empty">{starredOnly ? 'Star a property to pin it here' : 'Nothing here on the checked devices'}</div>
+  <div class="props-empty">{starredOnly ? 'Star a property to add it here' : 'Nothing here on the checked devices'}</div>
 {:else if buttons}
   <ScrollArea class="props">
     <div class="action-grid" data-rows>
@@ -401,10 +401,10 @@
   {@const toUnpin = names.filter((n) => favorites.has(n))}
   {@const count = (list) => (toPin.length && toUnpin.length) || list.length > 1 ? `${list.length} ` : ''}
   {#if toPin.length}
-    <ContextMenu.Item onSelect={() => pin(toPin, true)}><RiStar class="menu-icon" />Pin {count(toPin)}to Favorites<span class="menu-value">{favorites.names.size} pinned</span></ContextMenu.Item>
+    <ContextMenu.Item onSelect={() => pin(toPin, true)}><RiStar class="menu-icon" />Add {count(toPin)}to Favorites<span class="menu-value">{favorites.names.size} starred</span></ContextMenu.Item>
   {/if}
   {#if toUnpin.length}
-    <ContextMenu.Item onSelect={() => pin(toUnpin, false)}><RiStar class="menu-icon" />Unpin {count(toUnpin)}from Favorites<span class="menu-value">{favorites.names.size} pinned</span></ContextMenu.Item>
+    <ContextMenu.Item onSelect={() => pin(toUnpin, false)}><RiStar class="menu-icon" />Remove {count(toUnpin)}from Favorites<span class="menu-value">{favorites.names.size} starred</span></ContextMenu.Item>
   {/if}
 </ContextMenu.Content>
 </ContextMenu.Root>
