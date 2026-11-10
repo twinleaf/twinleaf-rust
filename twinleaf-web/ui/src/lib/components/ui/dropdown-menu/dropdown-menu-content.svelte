@@ -35,6 +35,7 @@
 		)}
 		{...restProps}
 		onkeydowncapture={runShownKey}
+		{@attach (el) => layer.element(el)}
 		onInteractOutside={(e) => (layer.outside(), onInteractOutside?.(e))}
 		onCloseAutoFocus={(e) => (layer.closing(e), onCloseAutoFocus?.(e))}
 	/>

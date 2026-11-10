@@ -74,6 +74,59 @@ export class Layers {
 /** The page's layers. */
 const layers = new Layers();
 
+/** The menus' elements on the page, each given by its content as it mounts. */
+const menus = new Set();
+/** How long a menu's copy stays if its fade never ends, in ms. */
+const FADE_MS = 400;
+/**
+ * A press on `target`, seen before anything it does. A menu shows what its
+ * commands act on, live, while it is open; the press that closes it can
+ * change that, and the menu would show the new words as it fades. So each
+ * menu the press is outside of is hidden, and a copy of it as it reads now
+ * fades in its place. The menu itself is untouched: opened again before it
+ * has gone, or left open by the press, it shows again.
+ */
+export function freezeMenus(target) {
+  // A press in a menu or a submenu is no press outside.
+  if (target.closest?.('[data-slot$=-menu-content], [data-slot$=-menu-sub-content]')) return;
+  for (const el of menus) {
+    if (!el.isConnected) menus.delete(el);
+    else if (el.dataset.state === 'open' && el.dataset.frozen === undefined) fadeCopy(el);
+  }
+}
+function fadeCopy(el) {
+  const copy = el.cloneNode(true);
+  copy.removeAttribute('id');
+  copy.inert = true;
+  Object.assign(copy.style, { position: 'absolute', top: '0', left: '0', width: `${el.offsetWidth}px`, pointerEvents: 'none' });
+  copy.dataset.state = 'closed';
+  // Hidden by an attribute of its own (plot.css): the menu's style is its library's to write.
+  el.dataset.frozen = '';
+  el.after(copy);
+  // The copy goes when its fade ends. The menu stays hidden until it opens
+  // again, if it does before it has left the page.
+  const copyGone = () => (clearTimeout(timer), copy.remove());
+  let closed = false;
+  const watch = new MutationObserver(() => {
+    const again = closed && el.dataset.state === 'open';
+    if (el.dataset.state === 'closed') closed = true;
+    if (el.isConnected && !again) return;
+    watch.disconnect();
+    copyGone();
+    delete el.dataset.frozen;
+  });
+  watch.observe(el, { attributes: true, attributeFilter: ['data-state'] });
+  watch.observe(el.parentNode, { childList: true });
+  copy.addEventListener('animationend', copyGone, { once: true });
+  // A press that closed nothing leaves the menu open: it shows again.
+  const timer = setTimeout(() => {
+    copyGone();
+    if (closed || el.dataset.state !== 'open') return;
+    watch.disconnect();
+    delete el.dataset.frozen;
+  }, FADE_MS);
+}
+
 /**
  * Makes the calling root component a layer, `close()` closing it, and
  * returns `shown(open)`, which it calls with whether it is open.
@@ -99,6 +152,11 @@ export function overlayContent() {
   return {
     outside() {
       if (layer) layer.keepFocus = true;
+    },
+    /** A menu's content gives its element, for `freezeMenus`. */
+    element(el) {
+      menus.add(el);
+      return () => menus.delete(el);
     },
     closing(e) {
       if (!layer) return;

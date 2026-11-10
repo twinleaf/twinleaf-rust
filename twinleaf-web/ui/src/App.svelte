@@ -25,6 +25,7 @@
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
   import { actionFor, scopeOf } from './lib/keymap.js';
   import { keepsKey, plotPickers } from './lib/keys.js';
+  import { freezeMenus } from './lib/overlay.svelte.js';
   import { api } from './lib/protocol.js';
   import { THEMES, TRACE_WIDTH, prefs } from './lib/prefs.svelte.js';
   import RiSun from '@lucide/svelte/icons/sun';
@@ -742,6 +743,12 @@
     if (e.key === ' ' && !keepsKey(e)) e.preventDefault();
   }
 
+  /** A press anywhere on the page, seen before anything under it: a menu it closes keeps its words (overlay.svelte.js), then the selection hears it. */
+  function pressed(e) {
+    freezeMenus(e.target);
+    selection.press(e);
+  }
+
   /** The plot `el` is in, by id, or null. */
   const plotAt = (el) => el?.closest?.('.leaf[data-plot]')?.dataset.plot ?? null;
 
@@ -873,7 +880,7 @@
 
 <!-- Nothing on the page drags natively: plots, signals and tabs move by
      pointer, and a native drag would only carry a picture of the page. -->
-<svelte:window onkeydown={onKey} onkeyup={onKeyUp} onfocusin={remember} onpointerdowncapture={(e) => selection.press(e)} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
+<svelte:window onkeydown={onKey} onkeyup={onKeyUp} onfocusin={remember} onpointerdowncapture={pressed} oncontextmenu={nativeMenu} ondragstart={(e) => e.preventDefault()} />
 <canvas class="gl-layer" bind:this={glCanvas}></canvas>
 
 {#snippet plotTile(id)}

@@ -277,6 +277,8 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 [data-slot$=-menu-label] { display: flex; align-items: center; gap: 8px; padding: 10px 8px 3px; font-size: 10px; line-height: 14px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted-foreground); }
 [data-slot$=-menu-label]:first-child { padding-top: 4px; }
 [data-slot$=-menu-label]::after { content: ''; flex: 1; min-width: 12px; height: 1px; background: var(--border); }
+/* A menu whose copy fades in its place as a press closes it (overlay.svelte.js): gone at once, not over the menu's transition time. */
+[data-frozen] { visibility: hidden !important; transition: none !important; }
 /* A row's trailing column, on the row's right edge: its value, in
    fixed-width digits and at least a column wide, so the values of a menu
    line up; or while the hints show, its shortcut in the value's place. A
