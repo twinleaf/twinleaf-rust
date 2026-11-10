@@ -2,7 +2,8 @@
 // selection, from a key, a plot's menu, the Layout menu or the Signals list,
 // is at most one undo step; so is each drag, press to release, of a plot, a
 // gap, a signal's chip, a tab, a legend or a cursor: one pulled out of its
-// tab, moved, or dragged off its plot, which removes it. Undo puts back the
+// tab, moved, dragged off its plot, which removes it, or, out of view,
+// dragged back in by the tag that names it at the plot's edge. Undo puts back the
 // tabs as they were and the selection as it was just before the step, less
 // the plots that are gone, the property rows picked too, less those whose
 // property went; redo puts back both as they were just after it.
@@ -223,6 +224,35 @@ const DRAGS = {
     if (off) expect(at, 'let go above its lane, it is removed').toBeNull();
     else expect(Math.abs(pv.axisScale(axis)(at) - to[1])).toBeLessThan(PX);
     return 1;
+  },
+  async 'an X cursor out of view, by its tag at the edge'(page, a, b) {
+    const { id, pv, P } = await heldPlot(page, a), name = b % 2 ? 'b' : 'a', [x0, x1] = pv.xd;
+    // Before the view's start, or after its end.
+    editCursors(page, id, () => ({ x: { a: null, b: null, [name]: b % 4 < 2 ? x0 - 5 : x1 + 5 } }));
+    await still(id);
+    const tag = pv.tabs.find((t) => t.placed && t.kind === 'x' && t.name === name), to = [P.x + P.w * (0.3 + 0.1 * (b % 5)), P.y + P.h / 2];
+    expect(tag, 'its tag at the edge').toBeTruthy();
+    await pull([tag.x + tag.w / 2, tag.y + tag.h / 2], to);
+    expect(Math.abs(pv.pxOf(xOf(page.ws.plots[id].cursors, 'time')[name]) - to[0]), 'it lands under the pointer').toBeLessThan(PX);
+    return 1;
+  },
+  async 'a Y cursor out of view, by its tag at the edge'(page, a, b) {
+    const { id, pv } = await heldPlot(page, a), name = b % 2 ? 'b' : 'a', key = pv.yAxes[0].key, [lo, hi] = pv.yBounds(key);
+    await commands.mouse([['move', ...centre(leafOf(id))]]);
+    const reached = (t) => !!t && document.elementFromPoint(t.x + t.w / 2, t.y + t.h / 2) === pv.overlay;
+    let tag;
+    // Above what the axis shows, or below it: below where a small plot's header covers the tag above.
+    for (const v of b % 4 < 2 ? [hi + 1, lo - 1] : [lo - 1]) {
+      if (reached(tag)) break;
+      editCursors(page, id, () => ({ y: { time: { [key]: { a: null, b: null, [name]: v } } } }));
+      await still(id);
+      tag = pv.tabs.find((t) => t.placed && t.kind === 'y' && t.name === name);
+    }
+    expect(reached(tag), 'its tag at the edge').toBe(true);
+    const steps = page.history.undos.length, lane = pv.yAxes[0].lane, to = [lane.x + lane.w / 2, lane.y + lane.h * (0.3 + 0.1 * (b % 5))];
+    await pull([tag.x + tag.w / 2, tag.y + tag.h / 2], to);
+    expect(Math.abs(pv.axisScale(pv.yAxes[0])(yOf(page.ws.plots[id].cursors, 'time', key)[name]) - to[1]), 'it lands under the pointer').toBeLessThan(PX);
+    return steps;
   },
 };
 

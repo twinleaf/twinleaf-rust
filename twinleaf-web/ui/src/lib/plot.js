@@ -447,7 +447,7 @@ export class PlotView {
     this.ctx = overlay.getContext('2d');
     this.specHover = null;
     this.yAxes = []; // the y axes, as last drawn: {key, lane, range, side, slot, x0, x1, color, plans}
-    this.tabs = []; // the tabs cursors not yet placed rest as, as last drawn
+    this.tabs = []; // the tabs a cursor is dragged out of, as last drawn: those cursors not yet placed rest as, and the tags of those out of view
     this.tagsPlaced = [];
     this.axisHover = null; // clientX over the x axis, where a drag seeks
     this.phosphor = new Map(); // signal key -> the shares its axis column shows, eased frame to frame
@@ -1222,7 +1222,8 @@ export class PlotView {
    * X2 are lines through every lane, named on the x axis, their place at the
    * top of the plot; Y1 and Y2 lines across their axis's lane, named in its
    * gutter, their level just inside it; the span between a pair shaded. One
-   * out of view is named at the edge it lies beyond, with an arrow. A cursor
+   * out of view is named at the edge it lies beyond, with an arrow, by a tag
+   * to drag it back into view by. A cursor
    * not yet placed rests as a tab to drag out, X1 and X2 at the x axis's
    * left end and Y1 and Y2 at the top of each y axis, shown while the
    * pointer is on that axis; a pull across an axis draws one out too.
@@ -1232,7 +1233,7 @@ export class PlotView {
     const xName = { a: 'X1', b: 'X2' }, yName = { a: 'Y1', b: 'Y2' };
     const inView = (v) => v !== null && v >= xd[0] && v <= xd[1];
     const fx = this.spectrum ? (f) => `${f.toPrecision(4)} Hz` : time.readout;
-    // A tag centred on (cx, cy), or, with `align`, beside cx on that side.
+    // A tag centred on (cx, cy), or, with `align`, beside cx on that side. It gives the tag's box.
     const tag = (cx, cy, text, fill, align = 'center') => {
       const w = Math.max(TAB.w, ctx.measureText(text).width + 6);
       const x = align === 'left' ? cx : align === 'right' ? cx - w : cx - w / 2;
@@ -1241,7 +1242,10 @@ export class PlotView {
       ctx.fillStyle = T.tagText;
       ctx.textAlign = 'center';
       ctx.fillText(text, x + w / 2, cy + 4);
+      return { x: Math.round(x), y: Math.round(cy - TAB.h / 2), w, h: TAB.h };
     };
+    // The tags of the placed cursors out of view, each a tab to drag its cursor back in by.
+    const tabs = [];
     if (marks.a !== null && marks.b !== null) {
       const l = Math.max(P.x, sx(Math.min(marks.a, marks.b))), r = Math.min(P.x + P.w, sx(Math.max(marks.a, marks.b)));
       if (r > l) {
@@ -1277,8 +1281,8 @@ export class PlotView {
         tag(right ? px - 2 : px + 2, P.y + TAB.h / 2 + 2, text, color[name], right ? 'right' : 'left');
       } else {
         const step = name === 'b' ? TAB.w + 10 : 0;
-        if (v < xd[0]) tag(P.x + TAB.w / 2 + 4 + step, xTagY, `‹${xName[name]}`, color[name]);
-        else tag(P.x + P.w - TAB.w / 2 - 4 - step, xTagY, `${xName[name]}›`, color[name]);
+        const box = v < xd[0] ? tag(P.x + TAB.w / 2 + 4 + step, xTagY, `‹${xName[name]}`, color[name]) : tag(P.x + P.w - TAB.w / 2 - 4 - step, xTagY, `${xName[name]}›`, color[name]);
+        tabs.push({ kind: 'x', name, placed: true, ...box });
       }
     }
     for (const a of axes) {
@@ -1304,13 +1308,12 @@ export class PlotView {
           tag(this.tagSlot(a.lane, a.side, py, w, TAB.h), py, text, color[name], 'left');
         } else {
           const step = name === 'b' ? TAB.h + 2 : 0;
-          if (py < a.lane.y) tag(tx, a.lane.y + TAB.h / 2 + 1 + step, `${yName[name]}˄`, color[name]);
-          else tag(tx, a.lane.y + a.lane.h - TAB.h / 2 - 1 - step, `${yName[name]}˅`, color[name]);
+          const box = py < a.lane.y ? tag(tx, a.lane.y + TAB.h / 2 + 1 + step, `${yName[name]}˄`, color[name]) : tag(tx, a.lane.y + a.lane.h - TAB.h / 2 - 1 - step, `${yName[name]}˅`, color[name]);
+          tabs.push({ kind: 'y', key: a.key, axis: a, name, placed: true, ...box });
         }
       }
     }
-    // The tabs, beside the plot under the y axis when there is room.
-    const tabs = [];
+    // The tabs of the cursors not yet placed, X1 and X2 beside the plot under the y axis when there is room.
     ['a', 'b'].forEach((name, i) => {
       if (marks[name] !== null) return;
       const x = (xTabsBeside ? P.x - 2 * TAB.w - 4 : P.x + 2) + i * (TAB.w + 2);
@@ -1331,6 +1334,8 @@ export class PlotView {
     const overXAxis = hov.y > P.y + P.h && hov.x >= body.x && hov.x <= body.x + body.w;
     const overAxis = this.yAxisAt(hov.x, hov.y);
     for (const t of tabs) {
+      // A placed cursor's tag is drawn already, and always shows.
+      if (t.placed) continue;
       const shown =
         t === on ||
         (t.kind === 'x'
@@ -1381,7 +1386,7 @@ export class PlotView {
     if (a !== null && b !== null) this.viewHistory.step(() => this.showRange(Math.min(a, b), Math.max(a, b)));
   }
 
-  /** The tab at (x, y) a cursor not yet placed rests as, if any. */
+  /** The tab at (x, y) a cursor is dragged out of, if any: one a cursor not yet placed rests as, or the tag at the plot's edge of one out of view. */
   tabAt(x, y) {
     return this.tabs.find((t) => x >= t.x && x <= t.x + t.w && y >= t.y && y <= t.y + t.h) ?? null;
   }
@@ -1695,7 +1700,7 @@ export class PlotView {
     // nearer to the pointer by `dist`.
     const pick = (pair, dist) => (pair.a === null ? 'a' : pair.b === null ? 'b' : dist(pair.a) <= dist(pair.b) ? 'a' : 'b');
     // A drag's mode: 'xcursor' and 'ycursor' move a cursor, or drag one out
-    // of its tab; 'axis' on the x
+    // of its tab, which brings one out of view back under the pointer; 'axis' on the x
     // axis and 'y' on a y axis wait to learn their direction, a pull across
     // the axis into the plot drawing a cursor out of it, as a guide comes off
     // a ruler, and a drag along it seeking ('seek', the time axis only) or
