@@ -485,6 +485,10 @@ export class PlotView {
      *   while it is out of view; 'tab', where it rests while not placed,
      *   with `alpha`, how plainly it shows. A line and a tag of a cursor in
      *   view hold `at`, where the cursor is along its axis, in client px.
+     * - what follows the pointer, drawn over the rest, each with `through`,
+     *   as a press goes through it to what is under: 'pointer', the
+     *   pointer's value on a y axis, with that axis's `key`; 'tip', the
+     *   hover's tip.
      */
     this.pressable = [];
     this.tagsPlaced = [];
@@ -773,7 +777,12 @@ export class PlotView {
    * The hover's tip: one line naming the signal nearest the pointer and its
    * value there, so a plot of many signals answers which line is which
    * without a legend. It sits beside the pointer, at (px, py), inside the
-   * lane, and stays there while the signal moves under it.
+   * lane, and stays there while the signal moves under it. It covers no
+   * cursor's tag or tab, nor the pointer's own tags: where it would, it
+   * takes the place nearest the pointer that is clear of them and of the
+   * pointer, beside or above or below the pointer or one of them, and where
+   * the lane has no such place it is not drawn. It is a part of
+   * `pressable`, 'tip', which a press goes through.
    */
   drawTip(ctx, T, lane, near, value, px, py) {
     const name = near.t.key.length > 18 ? `${near.t.key.slice(0, 17)}…` : near.t.key;
@@ -786,6 +795,24 @@ export class PlotView {
     if (y < lane.y) y = py + GAP;
     x = Math.max(lane.x, x);
     y = Math.max(lane.y, Math.min(lane.y + lane.h - H, y));
+    const kept = this.pressable.filter((p) => p.part === 'pointer' || (p.text && (p.alpha ?? 1) > 0));
+    const clear = (x, y) => !kept.some((p) => overlaps(p, { x, y, w, h: H }));
+    if (!clear(x, y)) {
+      const xs = [px + GAP, px - GAP - w, ...kept.flatMap((p) => [p.x + p.w + 2, p.x - 2 - w])];
+      const ys = [py - GAP - H, py + GAP, ...kept.flatMap((p) => [p.y - 2 - H, p.y + p.h + 2])];
+      let best = null;
+      for (const cx of xs)
+        for (const cy of ys) {
+          const inLane = cx >= lane.x && cx + w <= lane.x + lane.w && cy >= lane.y && cy + H <= lane.y + lane.h;
+          const onPointer = px > cx - 2 && px < cx + w + 2 && py > cy - 2 && py < cy + H + 2;
+          if (!inLane || onPointer || !clear(cx, cy)) continue;
+          const d = Math.hypot(Math.max(cx - px, 0, px - cx - w), Math.max(cy - py, 0, py - cy - H));
+          if (!best || d < best.d) best = { x: cx, y: cy, d };
+        }
+      if (!best) return;
+      ({ x, y } = best);
+    }
+    this.pressable.push({ part: 'tip', through: true, x, y, w, h: H });
     ctx.fillStyle = T.tipBg;
     ctx.fillRect(x, y, w, H);
     ctx.strokeStyle = T.tipBorder;
@@ -1113,21 +1140,25 @@ export class PlotView {
       ctx.moveTo(hoverLane.x, py);
       ctx.lineTo(hoverLane.x + hoverLane.w, py);
       ctx.stroke();
+      // The pointer's tags have one place each: against their side of the
+      // lane at the pointer's height, those of several axes side by side. One
+      // that would cover a cursor's tag there is not drawn, at whatever
+      // height they would touch; it never moves aside.
+      const cursorTags = this.pressable.filter((p) => p.text && (p.alpha ?? 1) > 0);
+      this.tagsPlaced = [];
       for (const a of axes) {
         if (a.lane !== hoverLane) continue;
-        // On a Y cursor of this axis, the cursor's own tag reads the height.
-        const yc = this.yPair(a.key);
-        const sy = yScale(a.range, a.lane);
-        if (yc && ['a', 'b'].some((n) => yc[n] !== null && Math.abs(sy(yc[n]) - hy) < TAB.h)) continue;
-        const v = sy.invert(hy);
+        const v = yScale(a.range, a.lane).invert(hy);
         const text = spectrum ? v.toExponential(2) : v.toPrecision(4);
         const w = ctx.measureText(text).width + 8;
-        const x = this.tagSlot(a.lane, a.side, py, w, 16);
+        const box = { x: this.tagSlot(a.lane, a.side, py, w, 16), y: py - 8, w, h: 16 };
+        if (cursorTags.some((p) => overlaps(p, box))) continue;
+        this.pressable.push({ part: 'pointer', through: true, key: a.key, ...box });
         ctx.fillStyle = a.color;
-        ctx.fillRect(x, py - 8, w, 16);
+        ctx.fillRect(box.x, box.y, w, 16);
         ctx.fillStyle = T.tagText;
         ctx.textAlign = 'center';
-        ctx.fillText(text, x + w / 2, py + 4);
+        ctx.fillText(text, box.x + w / 2, py + 4);
       }
     }
 
@@ -1472,11 +1503,12 @@ export class PlotView {
 
   /**
    * What a press at (x, y) lands on: of `pressable`, the one drawn last
-   * there, which lies over the others, or null where there is none. With
+   * there that a press does not go through, which lies over the others, or
+   * null where there is none. With
    * `parts`, only those parts count, as for what lies under a cursor.
    */
   pressAt(x, y, parts = null) {
-    return this.pressable.findLast((p) => (!parts || parts.includes(p.part)) && x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h) ?? null;
+    return this.pressable.findLast((p) => !p.through && (!parts || parts.includes(p.part)) && x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h) ?? null;
   }
 
   /**
@@ -1973,6 +2005,8 @@ const SEEK_BAR = 4, SEEK_MIN = 2;
  * from the plot beside it and further below it.
  */
 const CURSOR_STUB = 4;
+/** Whether boxes `a` and `b`, each {x, y, w, h}, overlap. */
+const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
 /** How far to either side of a cursor's line, in px, a press still lands on it. */
 const CURSOR_GRAB = 6;
 /** A cursor's tab, in px: its name, on the axis it reads, or resting where it is dragged out of. */

@@ -7,6 +7,11 @@
 // ranges nor the view do. A tag or a line is held where it was pressed, so
 // the cursor moves as far as the pointer does; a tab, or the tag of a
 // cursor out of view, brings its cursor under the pointer.
+//
+// And what follows the pointer, drawn over the rest and let through by a
+// press: the hover's tip covers no cursor's tag or tab, and the pointer's
+// value on a y axis has one place, where it is left out while it would
+// cover a cursor's tag.
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
@@ -152,6 +157,133 @@ describe('a press on a plot', () => {
       for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(what === 'covered' || what === 'underAnother' ? -1 : 10);
     } finally {
       await commands.mouse([['up']]);
+      page.dispose();
+    }
+  }, 600_000);
+});
+
+/** Whether boxes `a` and `b`, each {x, y, w, h}, overlap. */
+const overlap = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+/** The cursors' tags and tabs that show, of what plot view `pv` drew. */
+const shown = (pv) => pv.pressable.filter((p) => p.text && (p.alpha ?? 1) > 0);
+/** Puts the pointer over the plot at `at`, with no press, and has plot view `pv` draw the frame after. */
+function hover(pv, canvas, at) {
+  canvas.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: at[0], clientY: at[1] }));
+  pv.draw(clock.now());
+}
+
+describe('what follows the pointer over a plot', () => {
+  it('the hover’s tip, beside the pointer, covers no cursor’s tag or tab, wherever the pointer is about one', async () => {
+    const m = await mounted(), { page, id, canvas } = m;
+    const count = { tips: 0, about: 0, moved: 0, none: 0 };
+    try {
+      await fc.assert(
+        fc.asyncProperty(plotCase, async (c) => {
+          await arrange(m, c);
+          const pv = page.pv(id), P = pv.geo.plot;
+          for (const b of tagsAndTabs(pv).map(({ x, y, w, h }) => ({ x, y, w, h }))) {
+            // On the tag, beside it and at its corners, and where a tip beside the pointer would reach it.
+            const xs = [b.x - 150, b.x - 14, b.x + b.w / 2, b.x + b.w + 14], ys = [b.y - 14, b.y - 4, b.y + b.h / 2, b.y + b.h + 4, b.y + b.h + 14];
+            for (const x of xs)
+              for (const y of ys) {
+                if (x < P.x || x > P.x + P.w || y < P.y || y > P.y + P.h) continue;
+                hover(pv, canvas, [x, y]);
+                const tip = pv.pressable.find((p) => p.part === 'tip');
+                count.about++;
+                if (!tip) {
+                  count.none++;
+                  continue;
+                }
+                for (const tag of shown(pv)) expect(overlap(tip, tag), `${c.kind} ${c.layout}: with the pointer at ${[x, y].map(Math.round)}, the tip ${JSON.stringify(tip)} covers ${nameOf(tag)} ${JSON.stringify([tag.x, tag.y, tag.w, tag.h])}`).toBe(false);
+                expect(pv.pressAt(tip.x + tip.w / 2, tip.y + tip.h / 2)?.part, 'a press goes through the tip').not.toBe('tip');
+                count.tips++;
+                // Above and right of the pointer is where it sits with nothing in its way.
+                if (tip.x !== x + 10 || tip.y !== y - 26) count.moved++;
+              }
+          }
+          canvas.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
+        }),
+        { examples: EXAMPLES, numRuns: EXAMPLES.length + Math.ceil(fc.readConfigureGlobal().numRuns / 4) },
+      );
+      expect(count.tips, 'tips drawn').toBeGreaterThan(500);
+      expect(count.moved, 'tips drawn somewhere other than above and right of the pointer').toBeGreaterThan(100);
+      expect(count.none, 'hovers with no tip drawn, as with no signal under the pointer').toBeLessThan(count.about / 2);
+    } finally {
+      page.dispose();
+    }
+  }, 600_000);
+
+  it('the pointer’s value on a y axis keeps its place as the pointer crosses a Y cursor a pixel at a time, and is not drawn where it would cover a cursor’s tag', async () => {
+    const m = await mounted(), { page, id, canvas } = m;
+    const count = { sweeps: 0, drawn: 0, hidden: 0, crossings: 0 };
+    try {
+      await fc.assert(
+        fc.asyncProperty(plotCase, async (c) => {
+          await arrange(m, c);
+          const pv = page.pv(id);
+          for (const line of pv.pressable.filter((p) => p.part === 'line' && p.kind === 'y').map(({ at, axis, name }) => ({ at, axis, name }))) {
+            const lane = line.axis.lane, x = lane.x + lane.w / 2;
+            // The pointer's tag is 16 px high and a cursor's 14: from clear above the cursor's to clear below it.
+            const states = [];
+            for (let y = Math.round(line.at) - 40; y <= Math.round(line.at) + 40; y++) {
+              if (y < lane.y + 1 || y > lane.y + lane.h - 1) continue;
+              hover(pv, canvas, [x, y]);
+              const tags = shown(pv);
+              for (const axis of pv.yAxes.filter((a) => a.lane.y === lane.y)) {
+                const own = pv.pressable.find((p) => p.part === 'pointer' && p.key === axis.key), first = (axis.slot ?? 0) === 0;
+                const where = `${c.kind} ${c.layout}: with the pointer at ${[x, y]}, crossing ${line.name} of ${line.axis.key}, the pointer's value on ${axis.key}`;
+                if (own) {
+                  for (const tag of tags) expect(overlap(own, tag), `${where} covers ${nameOf(tag)}`).toBe(false);
+                  expect(own.y, `${where} is at the pointer's height`).toBe(y + 0.5 - 8);
+                  // Against its side of the lane, never moved in past a cursor's tag.
+                  if (first) expect(axis.side === 'left' ? own.x : own.x + own.w, `${where} is against the lane's ${axis.side} side`).toBe(axis.side === 'left' ? lane.x + 1 : lane.x + lane.w - 1);
+                  count.drawn++;
+                } else {
+                  // Left out only where a cursor's tag is in its place.
+                  const place = { x: axis.side === 'left' ? lane.x + 1 : lane.x + lane.w - 21, y: y + 0.5 - 8, w: 20, h: 16 };
+                  if (first) expect(tags.some((tag) => overlap(place, tag)), `${where} is not drawn, with no cursor's tag in its place`).toBe(true);
+                  count.hidden++;
+                }
+                if (axis.key === line.axis.key) states.push(own ? 'drawn' : 'hidden');
+              }
+            }
+            // Each change from drawn to hidden and back, across the cursor's own tags and any other tag its sweep meets.
+            count.crossings += states.filter((s, i) => i && s !== states[i - 1]).length;
+            count.sweeps++;
+          }
+          canvas.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
+        }),
+        { examples: EXAMPLES, numRuns: EXAMPLES.length + Math.ceil(fc.readConfigureGlobal().numRuns / 4) },
+      );
+      for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(20);
+    } finally {
+      page.dispose();
+    }
+  }, 600_000);
+
+  it('the pointer’s value is hidden over one stretch of heights about a lone Y cursor: drawn, hidden, drawn, with no height between where it shows again', async () => {
+    const m = await mounted(), { page, id, canvas } = m;
+    try {
+      for (const layout of Object.keys(LAYOUTS)) {
+        await arrange(m, { kind: 'time', layout, x: { a: null, b: null }, y: SIGNALS.map(() => ({ a: 0.4, b: null })), readoutAt: CORNERS[1] });
+        const pv = page.pv(id);
+        const lines = pv.pressable.filter((p) => p.part === 'line' && p.kind === 'y').map(({ at, axis }) => ({ at, axis }));
+        expect(lines.length, `${layout}: a Y cursor on each axis`).toBe(pv.yAxes.length);
+        for (const line of lines) {
+          const lane = line.axis.lane, runs = [];
+          for (let y = Math.round(line.at) - 40; y <= Math.round(line.at) + 40; y++) {
+            hover(pv, canvas, [lane.x + lane.w / 2, y]);
+            const state = pv.pressable.some((p) => p.part === 'pointer' && p.key === line.axis.key) ? 'drawn' : 'hidden';
+            if (runs.at(-1)?.[0] === state) runs.at(-1)[1]++;
+            else runs.push([state, 1]);
+          }
+          expect(runs.map((r) => r[0]), `${layout}, ${line.axis.key}: ${JSON.stringify(runs)}`).toEqual(['drawn', 'hidden', 'drawn']);
+          // Hidden while the two tags, 16 px and 14 px high, would touch.
+          expect(runs[1][1], `${layout}, ${line.axis.key}: the heights it is hidden over`).toBe(30);
+        }
+      }
+      canvas.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
+    } finally {
       page.dispose();
     }
   }, 600_000);
