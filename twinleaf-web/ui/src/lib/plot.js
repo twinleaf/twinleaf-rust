@@ -472,10 +472,23 @@ export class PlotView {
     this.ctx = overlay.getContext('2d');
     this.specHover = null;
     this.yAxes = []; // the y axes, as last drawn: {key, lane, range, side, slot, x0, x1, color, plans}
-    this.tabs = []; // the tabs a cursor is dragged out of, as last drawn: those cursors not yet placed rest as, and the tags of those out of view
+    /**
+     * What the plot last drew that a press lands on, each {part, x, y, w, h}
+     * in client px, in the order drawn: the last one at a point is on top
+     * there and takes the press (`pressAt`). The parts:
+     * - 'plot', the plot area; 'xaxis', the band under it; 'yaxis', the
+     *   band of a y axis, `band` being {side, slot, x0, x1, keys};
+     * - a cursor's, with `kind` 'x' or 'y', `name` 'a' or 'b', and of a Y
+     *   cursor `key` and `axis`, its y axis: 'line', the box about its
+     *   line, with the `runs` drawn of it; 'tag', its name or its value,
+     *   with `text` and `fill`, or with `edge` its tag at the plot's edge
+     *   while it is out of view; 'tab', where it rests while not placed,
+     *   with `alpha`, how plainly it shows. A line and a tag of a cursor in
+     *   view hold `at`, where the cursor is along its axis, in client px.
+     */
+    this.pressable = [];
     this.tagsPlaced = [];
     this.tickLabels = []; // the box of each tick label, {x, y, w, h} in client px, as last drawn
-    this.cursorTags = []; // the box of each placed cursor's tag: its name, its value, or its tag at the edge when out of view
     this.cursorStubs = []; // each cursor line's run past the plot's edge into the axis, {x0, y0, x1, y1}
     this.axisHover = null; // clientX over the x axis, where a drag seeks
     this.phosphor = new Map(); // signal key -> the shares its axis column shows, eased frame to frame
@@ -803,6 +816,7 @@ export class PlotView {
     const traces = allTraces ?? plans.map((p) => p.t);
     if (!xd || plans.length === 0) {
       this.legend = { rows: {}, cursors: null };
+      this.pressable = [];
       ctx.fillStyle = T.axisText;
       const msg = traces.length ? 'waiting for data…' : 'drop signals here';
       ctx.textAlign = 'center';
@@ -901,6 +915,12 @@ export class PlotView {
       else [a.x0, a.x1] = [P.x + P.w + inner, outermost ? body.x + body.w : P.x + P.w + inner + w];
     }
     this.axisBands = axes.map(({ side, slot, x0, x1, keys }) => ({ side, slot, x0, x1, keys }));
+    // The regions a press lands on, under everything drawn over them.
+    this.pressable = [
+      { part: 'plot', x: P.x, y: P.y, w: P.w, h: P.h },
+      { part: 'xaxis', x: P.x, y: P.y + P.h, w: P.w, h: body.y + body.h - P.y - P.h },
+      ...this.axisBands.map((band) => ({ part: 'yaxis', band, x: band.x0, y: P.y, w: band.x1 - band.x0, h: P.h })),
+    ];
     this.yAxes = axes;
     this.tagsPlaced = []; // the tags laid along the lanes' sides this frame, see tagSlot
     // Over a y axis, the axis's gutter shows behind its labels how often each
@@ -1259,38 +1279,35 @@ export class PlotView {
   }
 
   /**
-   * Draws the placed cursors, and the tabs of those not yet placed. X1 and
-   * X2 are lines through every lane, named just above the x axis, their
-   * place at the top of the plot; Y1 and Y2 lines across their axis's lane,
-   * named just inside it beside the axis, their level next to the name; the
-   * span between a pair shaded. Every tag is inside the plot, so none
-   * covers a tick label, and each line runs on CURSOR_STUB px past the
-   * plot's edge into its axis, as a tick mark does, to be set against one.
-   * A cursor out of view is named at the edge it lies beyond, with an
-   * arrow, by a tag to drag it back into view by. A cursor
-   * not yet placed rests as a tab to drag out, X1 and X2 at the x axis's
-   * left end and Y1 and Y2 at the top of each y axis, shown while the
-   * pointer is on that axis; a pull across an axis draws one out too.
+   * Lays out the cursors as parts of `pressable`, after the regions under
+   * them, and draws them from it in its order: every line, then every tag,
+   * then the tabs, so a tag lies over any line and what lies over another
+   * takes the press there.
+   *
+   * X1 and X2 are lines through every lane, named just above the x axis,
+   * their place at the top of the plot; Y1 and Y2 lines across their
+   * axis's lane, named just inside it beside the axis, their level next to
+   * the name; the span between a pair shaded. Every tag is inside the plot,
+   * so none covers a tick label, and each line runs on CURSOR_STUB px past
+   * the plot's edge into its axis, as a tick mark does, to be set against
+   * one. A cursor out of view is named at the edge it lies beyond, with an
+   * arrow, by a tag to drag it back into view by. A cursor not yet placed
+   * rests as a tab to drag out, X1 and X2 at the x axis's left end and Y1
+   * and Y2 at the top of each y axis, shown while the pointer is on that
+   * axis; a pull across an axis draws one out too.
    */
   drawCursors(ctx, T, P, body, marks, axes, xd, sx, time, xTabsBeside, hoverLane) {
     const color = { a: T.cursorA, b: T.cursorB };
     const xName = { a: 'X1', b: 'X2' }, yName = { a: 'Y1', b: 'Y2' };
     const inView = (v) => v !== null && v >= xd[0] && v <= xd[1];
     const fx = this.spectrum ? (f) => `${f.toPrecision(4)} Hz` : time.readout;
-    // A tag centred on (cx, cy), or, with `align`, beside cx on that side. It gives the tag's box.
-    const tag = (cx, cy, text, fill, align = 'center') => {
+    // The box and text of a tag centred on (cx, cy), or, with `align`, beside cx on that side.
+    const tag = (cx, cy, text, align = 'center') => {
       const w = Math.max(TAB.w, ctx.measureText(text).width + 6);
       const x = align === 'left' ? cx : align === 'right' ? cx - w : cx - w / 2;
-      ctx.fillStyle = fill;
-      ctx.fillRect(Math.round(x), Math.round(cy - TAB.h / 2), w, TAB.h);
-      ctx.fillStyle = T.tagText;
-      ctx.textAlign = 'center';
-      ctx.fillText(text, x + w / 2, cy + 4);
-      return { x: Math.round(x), y: Math.round(cy - TAB.h / 2), w, h: TAB.h };
+      return { x: Math.round(x), y: Math.round(cy - TAB.h / 2), w, h: TAB.h, text };
     };
-    // The tags of the placed cursors out of view, each a tab to drag its cursor back in by.
-    const tabs = [];
-    this.cursorTags = [];
+    const lines = [], tags = [], tabs = [];
     this.cursorStubs = [];
     if (marks.a !== null && marks.b !== null) {
       const l = Math.max(P.x, sx(Math.min(marks.a, marks.b))), r = Math.min(P.x + P.w, sx(Math.max(marks.a, marks.b)));
@@ -1314,28 +1331,19 @@ export class PlotView {
     for (const name of ['a', 'b']) {
       const v = marks[name];
       if (v === null) continue;
+      const cursor = { kind: 'x', name, fill: color[name] };
       if (inView(v)) {
         const px = Math.round(sx(v)) + 0.5;
-        ctx.strokeStyle = color[name];
-        for (const lane of this.geo.lanes) {
-          ctx.beginPath();
-          ctx.moveTo(px, lane.y);
-          ctx.lineTo(px, lane.y + lane.h);
-          ctx.stroke();
-        }
-        ctx.beginPath();
-        ctx.moveTo(px, P.y + P.h);
-        ctx.lineTo(px, P.y + P.h + CURSOR_STUB);
-        ctx.stroke();
+        const runs = [...this.geo.lanes.map((lane) => [px, lane.y, px, lane.y + lane.h]), [px, P.y + P.h, px, P.y + P.h + CURSOR_STUB]];
+        lines.push({ part: 'line', ...cursor, at: px, runs, x: px - CURSOR_GRAB, y: P.y, w: 2 * CURSOR_GRAB, h: P.h + CURSOR_STUB });
         this.cursorStubs.push({ x0: px, y0: P.y + P.h, x1: px, y1: P.y + P.h + CURSOR_STUB });
-        this.cursorTags.push(tag(within(px, P.x + TAB.w / 2, P.x + P.w - TAB.w / 2), xTagY, xName[name], color[name]));
+        tags.push({ part: 'tag', ...cursor, at: px, ...tag(within(px, P.x + TAB.w / 2, P.x + P.w - TAB.w / 2), xTagY, xName[name]) });
         const text = fx(v), right = px + ctx.measureText(text).width + 10 > P.x + P.w;
-        this.cursorTags.push(tag(right ? px - 2 : px + 2, P.y + TAB.h / 2 + 2, text, color[name], right ? 'right' : 'left'));
+        tags.push({ part: 'tag', ...cursor, at: px, ...tag(right ? px - 2 : px + 2, P.y + TAB.h / 2 + 2, text, right ? 'right' : 'left') });
       } else {
         const step = name === 'b' ? TAB.w + 10 : 0;
-        const box = v < xd[0] ? tag(P.x + TAB.w / 2 + 4 + step, xTagY, `‹${xName[name]}`, color[name]) : tag(P.x + P.w - TAB.w / 2 - 4 - step, xTagY, `${xName[name]}›`, color[name]);
-        tabs.push({ kind: 'x', name, placed: true, ...box });
-        this.cursorTags.push(box);
+        const box = v < xd[0] ? tag(P.x + TAB.w / 2 + 4 + step, xTagY, `‹${xName[name]}`) : tag(P.x + P.w - TAB.w / 2 - 4 - step, xTagY, `${xName[name]}›`);
+        tags.push({ part: 'tag', ...cursor, edge: true, ...box });
       }
     }
     for (const a of axes) {
@@ -1350,25 +1358,22 @@ export class PlotView {
         const v = yc[name];
         const py = v === null ? NaN : sy(v);
         if (!isFinite(py)) continue;
+        const cursor = { kind: 'y', name, key: a.key, axis: a, fill: color[name] };
         if (py >= a.lane.y && py <= a.lane.y + a.lane.h) {
           const y = Math.round(py) + 0.5;
-          ctx.strokeStyle = color[name];
-          ctx.beginPath();
-          ctx.moveTo(a.lane.x - (left ? CURSOR_STUB : 0), y);
-          ctx.lineTo(a.lane.x + a.lane.w + (left ? 0 : CURSOR_STUB), y);
-          ctx.stroke();
+          const x0 = a.lane.x - (left ? CURSOR_STUB : 0), x1 = a.lane.x + a.lane.w + (left ? 0 : CURSOR_STUB);
+          lines.push({ part: 'line', ...cursor, at: py, runs: [[x0, y, x1, y]], x: x0, y: y - CURSOR_GRAB, w: x1 - x0, h: 2 * CURSOR_GRAB });
           this.cursorStubs.push({ x0: edge, y0: y, x1: edge + (left ? -CURSOR_STUB : CURSOR_STUB), y1: y });
           // Its name, then its level, side by side from the axis inward, kept within the lane.
           const cy = within(py, a.lane.y + TAB.h / 2, a.lane.y + a.lane.h - TAB.h / 2);
-          this.cursorTags.push(tag(this.tagSlot(a.lane, a.side, cy, TAB.w, TAB.h), cy, yName[name], color[name], 'left'));
+          tags.push({ part: 'tag', ...cursor, at: py, ...tag(this.tagSlot(a.lane, a.side, cy, TAB.w, TAB.h), cy, yName[name], 'left') });
           const text = fv(v), w = Math.max(TAB.w, ctx.measureText(text).width + 6);
-          this.cursorTags.push(tag(this.tagSlot(a.lane, a.side, cy, w, TAB.h), cy, text, color[name], 'left'));
+          tags.push({ part: 'tag', ...cursor, at: py, ...tag(this.tagSlot(a.lane, a.side, cy, w, TAB.h), cy, text, 'left') });
         } else {
           const step = name === 'b' ? TAB.h + 2 : 0;
           const inside = left ? [edge + 1, 'left'] : [edge - 1, 'right'];
-          const box = py < a.lane.y ? tag(inside[0], a.lane.y + TAB.h / 2 + 1 + step, `${yName[name]}˄`, color[name], inside[1]) : tag(inside[0], a.lane.y + a.lane.h - TAB.h / 2 - 1 - step, `${yName[name]}˅`, color[name], inside[1]);
-          tabs.push({ kind: 'y', key: a.key, axis: a, name, placed: true, ...box });
-          this.cursorTags.push(box);
+          const box = py < a.lane.y ? tag(inside[0], a.lane.y + TAB.h / 2 + 1 + step, `${yName[name]}˄`, inside[1]) : tag(inside[0], a.lane.y + a.lane.h - TAB.h / 2 - 1 - step, `${yName[name]}˅`, inside[1]);
+          tags.push({ part: 'tag', ...cursor, edge: true, ...box });
         }
       }
     }
@@ -1376,34 +1381,43 @@ export class PlotView {
     ['a', 'b'].forEach((name, i) => {
       if (marks[name] !== null) return;
       const x = (xTabsBeside ? P.x - 2 * TAB.w - 4 : P.x + 2) + i * (TAB.w + 2);
-      tabs.push({ kind: 'x', name, x, y: P.y + P.h + 3, w: TAB.w, h: TAB.h });
+      tabs.push({ part: 'tab', kind: 'x', name, fill: color[name], text: xName[name], x, y: P.y + P.h + 3, w: TAB.w, h: TAB.h });
     });
     for (const a of axes) {
       const yc = this.yPair(a.key);
       ['a', 'b'].forEach((name, i) => {
         if (yc && yc[name] !== null) return;
         const x = a.side === 'left' ? a.x1 - TAB.w - 1 : a.x0 + 1;
-        tabs.push({ kind: 'y', key: a.key, axis: a, name, x, y: a.lane.y + 2 + i * (TAB.h + 2), w: TAB.w, h: TAB.h });
+        tabs.push({ part: 'tab', kind: 'y', name, key: a.key, axis: a, fill: color[name], text: yName[name], x, y: a.lane.y + 2 + i * (TAB.h + 2), w: TAB.w, h: TAB.h });
       });
     }
-    this.tabs = tabs;
-    const hov = this.hover;
-    if (!hov) return;
-    const on = this.tabAt(hov.x, hov.y);
-    const overXAxis = hov.y > P.y + P.h && hov.x >= body.x && hov.x <= body.x + body.w;
-    const overAxis = this.yAxisAt(hov.x, hov.y);
+    this.pressable.push(...lines, ...tags, ...tabs);
+    // A tab shows while the pointer is on it, plainly, or on its axis; or on another tab or edge tag of its y axis.
+    const hov = this.hover, on = hov ? this.pressAt(hov.x, hov.y) : null;
+    const overXAxis = !!hov && hov.y > P.y + P.h && hov.x >= body.x && hov.x <= body.x + body.w;
+    const overAxis = hov ? this.yAxisAt(hov.x, hov.y) : null;
     for (const t of tabs) {
-      // A placed cursor's tag is drawn already, and always shows.
-      if (t.placed) continue;
-      const shown =
-        t === on ||
-        (t.kind === 'x'
-          ? overXAxis
-          : (overAxis && overAxis.side === t.axis.side && overAxis.slot === (t.axis.slot ?? 0) && t.axis.lane === hoverLane) || on?.axis === t.axis);
-      if (!shown) continue;
-      ctx.globalAlpha = t === on ? 1 : 0.6;
-      tag(t.x + t.w / 2, t.y + t.h / 2, t.kind === 'x' ? xName[t.name] : yName[t.name], color[t.name]);
-      ctx.globalAlpha = 1;
+      const beside = t.kind === 'x' ? overXAxis : (overAxis && overAxis.side === t.axis.side && overAxis.slot === (t.axis.slot ?? 0) && t.axis.lane === hoverLane) || ((on?.part === 'tab' || on?.edge) && on.axis === t.axis);
+      t.alpha = t === on ? 1 : beside ? 0.6 : 0;
+    }
+    for (const p of this.pressable) {
+      if (p.part === 'line') {
+        ctx.strokeStyle = p.fill;
+        ctx.beginPath();
+        for (const [x0, y0, x1, y1] of p.runs) {
+          ctx.moveTo(x0, y0);
+          ctx.lineTo(x1, y1);
+        }
+        ctx.stroke();
+      } else if (p.text && (p.alpha ?? 1) > 0) {
+        ctx.globalAlpha = p.alpha ?? 1;
+        ctx.fillStyle = p.fill;
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+        ctx.fillStyle = T.tagText;
+        ctx.textAlign = 'center';
+        ctx.fillText(p.text, p.x + p.w / 2, p.y + TAB.h / 2 + 4);
+        ctx.globalAlpha = 1;
+      }
     }
   }
 
@@ -1445,9 +1459,13 @@ export class PlotView {
     if (a !== null && b !== null) this.viewHistory.step(() => this.showRange(Math.min(a, b), Math.max(a, b)));
   }
 
-  /** The tab at (x, y) a cursor is dragged out of, if any: one a cursor not yet placed rests as, or the tag at the plot's edge of one out of view. */
-  tabAt(x, y) {
-    return this.tabs.find((t) => x >= t.x && x <= t.x + t.w && y >= t.y && y <= t.y + t.h) ?? null;
+  /**
+   * What a press at (x, y) lands on: of `pressable`, the one drawn last
+   * there, which lies over the others, or null where there is none. With
+   * `parts`, only those parts count, as for what lies under a cursor.
+   */
+  pressAt(x, y, parts = null) {
+    return this.pressable.findLast((p) => (!parts || parts.includes(p.part)) && x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h) ?? null;
   }
 
   /**
@@ -1475,18 +1493,6 @@ export class PlotView {
   axisScale(axis) {
     const range = this.logY ? axis.range.map((v) => 10 ** v) : axis.range;
     return (this.logY ? scaleLog() : scaleLinear()).domain(range).range([axis.lane.y + axis.lane.h, axis.lane.y]);
-  }
-
-  /** The placed Y cursor within a few pixels of (x, y), across its lane or on its tag in the gutter, as {key, name}, or null. */
-  yCursorNear(x, y) {
-    for (const a of this.yAxes) {
-      const yc = this.yPair(a.key);
-      if (!yc || x < Math.min(a.x0, a.lane.x) || x > Math.max(a.x1, a.lane.x + a.lane.w)) continue;
-      if (y < a.lane.y - 4 || y > a.lane.y + a.lane.h + 4) continue;
-      const sy = this.axisScale(a);
-      for (const name of ['b', 'a']) if (yc[name] !== null && Math.abs(sy(yc[name]) - y) < 6) return { key: a.key, name };
-    }
-    return null;
   }
 
   /** The value of y axis `key` at client y, or null without that axis. */
@@ -1592,16 +1598,6 @@ export class PlotView {
     const f = this.logX ? (Math.log10(v) - Math.log10(xd[0])) / (Math.log10(xd[1]) - Math.log10(xd[0])) : (v - xd[0]) / (xd[1] - xd[0]);
     return P.x + f * P.w;
   }
-  /** The placed X cursor within a few pixels of clientX, if any. */
-  cursorNear(clientX) {
-    const m = this.markers();
-    for (const name of ['b', 'a']) {
-      const px = this.pxOf(m[name]);
-      if (px !== null && Math.abs(px - clientX) < 6) return name;
-    }
-    return null;
-  }
-
   /**
    * What is under (x, y), for its context menu: a y axis and the range keys
    * it shows, the x axis, or the plot area and the range keys there.
@@ -1673,9 +1669,7 @@ export class PlotView {
 
   /** The y axis band (x, y) is over, {side, slot, x0, x1, keys}, or null. */
   yAxisAt(x, y) {
-    const P = this.geo?.plot;
-    if (!P || y < P.y || y > P.y + P.h) return null;
-    return this.axisBands?.find((b) => x >= b.x0 && x < b.x1) ?? null;
+    return this.pressAt(x, y, ['yaxis'])?.band ?? null;
   }
 
   /**
@@ -1752,15 +1746,14 @@ export class PlotView {
       } else this.zoomFrequencies(factor, Math.min(1, Math.max(0, fracX(e.clientX))));
     }, { passive: false });
     // The band under the plot holds the x axis.
-    const onAxis = (e) => {
-      const P = this.geo?.plot;
-      return !!P && this.xd && e.clientY > P.y + P.h && e.clientX >= P.x && e.clientX <= P.x + P.w;
-    };
+    const onAxis = (e) => !!this.pressAt(e.clientX, e.clientY, ['xaxis']);
     // Of a pair, the cursor a pull places: the first not placed, else the
     // nearer to the pointer by `dist`.
     const pick = (pair, dist) => (pair.a === null ? 'a' : pair.b === null ? 'b' : dist(pair.a) <= dist(pair.b) ? 'a' : 'b');
-    // A drag's mode: 'xcursor' and 'ycursor' move a cursor, or drag one out
-    // of its tab, which brings one out of view back under the pointer; 'axis' on the x
+    // A drag's mode, by what its press landed on (`pressAt`): 'xcursor' and
+    // 'ycursor', on a cursor's line, tag or tab, move the cursor, a line or
+    // a tag held where it was pressed, and a tab, or the tag of a cursor out
+    // of view, bringing its cursor under the pointer; 'axis' on the x
     // axis and 'y' on a y axis wait to learn their direction, a pull across
     // the axis into the plot drawing a cursor out of it, as a guide comes off
     // a ruler, and a drag along it seeking ('seek', the time axis only) or
@@ -1772,18 +1765,19 @@ export class PlotView {
       if (e.button !== 0) return;
       el.setPointerCapture(e.pointerId);
       this.viewHistory.begin();
-      const tab = this.tabAt(e.clientX, e.clientY);
-      const ycursor = tab ? null : this.yCursorNear(e.clientX, e.clientY);
-      const cursor = tab || ycursor ? null : this.cursorNear(e.clientX);
-      const band = this.yAxisAt(e.clientX, e.clientY);
+      const on = this.pressAt(e.clientX, e.clientY);
+      const cursor = on?.kind ? on : null;
+      const band = on?.part === 'yaxis' ? on.band : null;
       // With Shift a click selects the plot, so a press does nothing here: no
       // pan, offset or cursor moves the plot by accident.
-      const mode = e.shiftKey ? 'none' : tab ? `${tab.kind}cursor` : ycursor ? 'ycursor' : cursor ? 'xcursor' : onAxis(e) ? 'axis' : band ? 'y' : (e.ctrlKey || e.metaKey) && this.inPlot(e.clientX, e.clientY) ? 'zoom' : 'plot';
+      const mode = e.shiftKey ? 'none' : cursor ? `${cursor.kind}cursor` : on?.part === 'xaxis' ? 'axis' : band ? 'y' : (e.ctrlKey || e.metaKey) && on?.part === 'plot' ? 'zoom' : 'plot';
       const targets = band ? this.axisTargets(band, e.clientY) : this.yTargets(e.clientY);
-      drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: 0, mode, targets, band, cursor: tab?.name ?? ycursor?.name ?? cursor, key: tab?.key ?? ycursor?.key };
+      // How far from the cursor the pointer holds it, along the cursor's axis.
+      const grab = cursor?.at === undefined ? 0 : (cursor.kind === 'x' ? e.clientX : e.clientY) - cursor.at;
+      drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: 0, mode, targets, band, cursor: cursor?.name, key: cursor?.key, grab };
       // A time cursor holds a moment the live view would scroll away, so
       // dragging one out pauses the view.
-      if (mode === 'xcursor' && tab && isTime()) for (const v of this.targets()) v.pause(clock.now());
+      if (mode === 'xcursor' && cursor.at === undefined && isTime()) for (const v of this.targets()) v.pause(clock.now());
     });
     // Turns an axis drag that has moved off the press into what its
     // direction says, and says whether it is still to decide.
@@ -1832,12 +1826,12 @@ export class PlotView {
       const yAxis = this.yAxisAt(e.clientX, e.clientY);
       // Each region names its drag: an X cursor or the time axis moves
       // sideways, a Y cursor or a y axis up and down, and the plot pans by hand.
-      const mode = drag?.mode;
+      const mode = drag?.mode, over = drag ? null : this.pressAt(e.clientX, e.clientY);
       if (mode === 'plot' && drag.started) el.style.cursor = 'grabbing';
-      else if (!drag && this.tabAt(e.clientX, e.clientY)) el.style.cursor = 'grab';
-      else if (mode === 'ycursor' || (!drag && this.yCursorNear(e.clientX, e.clientY))) el.style.cursor = 'ns-resize';
+      else if (over?.part === 'tab' || over?.edge) el.style.cursor = 'grab';
+      else if (mode === 'ycursor' || over?.kind === 'y') el.style.cursor = 'ns-resize';
       else if (mode === 'zoom' || (!drag && (e.ctrlKey || e.metaKey) && this.inPlot(e.clientX, e.clientY))) el.style.cursor = 'zoom-in';
-      else el.style.cursor = mode === 'xcursor' || this.cursorNear(e.clientX) || this.axisHover !== null ? 'ew-resize' : yAxis ? 'ns-resize' : 'grab';
+      else el.style.cursor = mode === 'xcursor' || over?.kind === 'x' || this.axisHover !== null ? 'ew-resize' : yAxis ? 'ns-resize' : 'grab';
       if (!drag) return;
       // A pan, an offset or a pull starts once the pointer has moved off the
       // press, and its first step counts from the press, so nothing is lost.
@@ -1857,9 +1851,9 @@ export class PlotView {
         const P0 = this.geo.plot;
         this.zoomBand = [drag.x0, Math.min(P0.x + P0.w, Math.max(P0.x, e.clientX))];
       } else if (drag.mode === 'xcursor') {
-        this.draftX(drag.cursor, this.dataAt(e.clientX));
+        this.draftX(drag.cursor, this.dataAt(e.clientX - drag.grab));
       } else if (drag.mode === 'ycursor') {
-        this.draftY(drag.key, drag.cursor, this.yValueAt(drag.key, e.clientY));
+        this.draftY(drag.key, drag.cursor, this.yValueAt(drag.key, e.clientY - drag.grab));
       } else if (drag.mode === 'seek') {
         // The window moves with the pointer, at the scale of the whole
         // history, and stays within it.
@@ -1968,6 +1962,8 @@ const SEEK_BAR = 4, SEEK_MIN = 2;
  * from the plot beside it and further below it.
  */
 const CURSOR_STUB = 4;
+/** How far to either side of a cursor's line, in px, a press still lands on it. */
+const CURSOR_GRAB = 6;
 /** A cursor's tab, in px: its name, on the axis it reads, or resting where it is dragged out of. */
 const TAB = { w: 22, h: 14 };
 /** How far a tick label's digits reach above and below the line they are written on, in px, in the axes' 11 px type. */

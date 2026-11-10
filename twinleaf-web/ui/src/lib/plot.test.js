@@ -277,12 +277,6 @@ describe('Y cursors', () => {
     return { pv, cfg, held };
   };
   const Y = (kind, a, b = null) => ({ y: { [kind]: { shared: { a, b } } } });
-  it('are found near their line, across the lane or on their tag in the gutter', () => {
-    const { pv } = plot('time', { now: Y('time', 5) }); // y = 50
-    expect(pv.yCursorNear(100, 52)).toEqual({ key: 'shared', name: 'a' });
-    expect(pv.yCursorNear(20, 48)).toEqual({ key: 'shared', name: 'a' });
-    expect(pv.yCursorNear(100, 70)).toBeNull();
-  });
   it('read the axis they are dragged on', () => {
     const { pv } = plot();
     expect(pv.yValueAt('shared', 25)).toBe(7.5);
@@ -333,6 +327,44 @@ describe('A plot’s view', () => {
   it('holds no cursor: a view’s state says nothing of them, and following live changes none', () => {
     const view = new View({ now: () => 0 });
     expect(Object.keys(view.state()).sort()).toEqual(['live', 'pausedAt', 'pausedHistory', 'right', 'span', 'spectra', 'window', 'yRanges']);
+  });
+});
+
+describe('A press on a plot', () => {
+  // A y axis band beside a plot, a cursor's line across the plot and a little into the band, and two tags over the line, the second over half of the first.
+  const pv = Object.assign(Object.create(PlotView.prototype), {
+    pressable: [
+      { part: 'plot', x: 40, y: 0, w: 200, h: 100 },
+      { part: 'yaxis', band: { side: 'left' }, x: 0, y: 0, w: 40, h: 100 },
+      { part: 'line', kind: 'y', name: 'a', x: 36, y: 44, w: 204, h: 12 },
+      { part: 'tag', kind: 'y', name: 'a', x: 41, y: 43, w: 30, h: 14 },
+      { part: 'tag', kind: 'x', name: 'b', x: 56, y: 43, w: 30, h: 14 },
+    ],
+  });
+  const at = (x, y, parts) => {
+    const p = pv.pressAt(x, y, parts);
+    return p && [p.part, p.kind, p.name].filter(Boolean).join(' ');
+  };
+  it('lands on what was drawn last there: a tag over a line, an axis or another tag', () => {
+    expect(at(100, 20)).toBe('plot');
+    expect(at(10, 20)).toBe('yaxis');
+    expect(at(100, 50)).toBe('line y a');
+    expect(at(38, 50)).toBe('line y a');
+    expect(at(45, 50)).toBe('tag y a');
+    expect(at(60, 50)).toBe('tag x b');
+    expect(at(80, 50)).toBe('tag x b');
+  });
+  it('lands on nothing where nothing was drawn, and each box ends short of its far edges', () => {
+    expect(at(300, 50)).toBeNull();
+    expect(at(240, 20)).toBeNull();
+    expect(at(239, 99)).toBe('plot');
+    expect(at(100, 100)).toBeNull();
+  });
+  it('finds what lies under a cursor when asked for the parts alone, as the axis a wheel turn or a menu is for', () => {
+    expect(at(38, 50, ['yaxis'])).toBe('yaxis');
+    expect(pv.yAxisAt(38, 50)).toEqual({ side: 'left' });
+    expect(pv.yAxisAt(50, 50)).toBeNull();
+    expect(at(60, 50, ['plot'])).toBe('plot');
   });
 });
 

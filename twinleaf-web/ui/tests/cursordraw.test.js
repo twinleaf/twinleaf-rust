@@ -50,13 +50,15 @@ describe('a plot’s cursors, as drawn', () => {
             const pv = page.pv(id), P = pv.geo.plot, body = pv.body.getBoundingClientRect(), n = ids.indexOf(id);
             expect(pv.tickLabels.length, `plot ${n} labels its ticks`).toBeGreaterThan(3);
             count.labels += pv.tickLabels.length;
-            expect(pv.cursorTags.length > 0, `plot ${n} draws a tag for each cursor placed`).toBe(pv.cursorsPlaced() > 0);
-            for (const tag of pv.cursorTags) {
+            const tags = pv.pressable.filter((p) => p.part === 'tag');
+            expect(tags.length > 0, `plot ${n} draws a tag for each cursor placed`).toBe(pv.cursorsPlaced() > 0);
+            for (const { x, y, w, h } of tags) {
+              const tag = { x, y, w, h };
               for (const label of pv.tickLabels) expect(overlap(tag, label), `plot ${n}: tag ${JSON.stringify(tag)} over tick label ${JSON.stringify(label)}`).toBe(false);
               expect(tag.x >= P.x - 0.5 && tag.x + tag.w <= P.x + P.w + 0.5 && tag.y >= P.y - 0.5 && tag.y + tag.h <= P.y + P.h + 0.5, `plot ${n}: tag ${JSON.stringify(tag)} inside the plot ${JSON.stringify(P)}`).toBe(true);
               count.tags++;
             }
-            count.edge += pv.tabs.filter((t) => t.placed).length;
+            count.edge += tags.filter((t) => t.edge).length;
             for (const s of pv.cursorStubs) {
               const box = { x: Math.min(s.x0, s.x1) - 0.5, y: Math.min(s.y0, s.y1) - 0.5, w: Math.abs(s.x1 - s.x0) + 1, h: Math.abs(s.y1 - s.y0) + 1 };
               // Wholly beside the plot, in the body, and some px long.

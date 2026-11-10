@@ -186,7 +186,7 @@ const DRAGS = {
   },
   async 'an X cursor out of its tab'(page, a, b) {
     const { id, pv, P } = await heldPlot(page, a), name = b % 2 ? 'b' : 'a';
-    const tab = pv.tabs.find((t) => t.kind === 'x' && t.name === name), to = [P.x + P.w * (0.3 + 0.1 * (b % 5)), P.y + P.h / 2];
+    const tab = pv.pressable.find((t) => t.part === 'tab' && t.kind === 'x' && t.name === name), to = [P.x + P.w * (0.3 + 0.1 * (b % 5)), P.y + P.h / 2];
     await pull([tab.x + tab.w / 2, tab.y + tab.h / 2], to);
     // It lands under the pointer.
     expect(Math.abs(pv.pxOf(xOf(page.ws.plots[id].cursors, 'time')[name]) - to[0])).toBeLessThan(PX);
@@ -196,7 +196,7 @@ const DRAGS = {
     // A tab the pointer reaches: a small plot's header, shown over its top while the pointer is on it, covers the first.
     await commands.mouse([['move', ...centre(leafOf(id))]]);
     const reached = (t) => document.elementFromPoint(t.x + t.w / 2, t.y + t.h / 2) === pv.overlay;
-    const tabs = pv.tabs.filter((t) => t.kind === 'y' && reached(t)), tab = tabs[b % tabs.length], name = tab.name, lane = tab.axis.lane, to = [lane.x + lane.w / 2, lane.y + lane.h * (0.3 + 0.1 * (b % 5))];
+    const tabs = pv.pressable.filter((t) => t.part === 'tab' && t.kind === 'y' && reached(t)), tab = tabs[b % tabs.length], name = tab.name, lane = tab.axis.lane, to = [lane.x + lane.w / 2, lane.y + lane.h * (0.3 + 0.1 * (b % 5))];
     await pull([tab.x + tab.w / 2, tab.y + tab.h / 2], to);
     // Under the pointer on the axis as it is drawn now: a first cursor placed makes room at the top of the plot.
     const axis = pv.yAxes.find((x) => x.key === tab.key);
@@ -231,7 +231,7 @@ const DRAGS = {
     // Before the view's start, or after its end.
     editCursors(page, id, () => ({ x: { a: null, b: null, [name]: b % 4 < 2 ? x0 - 5 : x1 + 5 } }));
     await still(id);
-    const tag = pv.tabs.find((t) => t.placed && t.kind === 'x' && t.name === name), to = [P.x + P.w * (0.3 + 0.1 * (b % 5)), P.y + P.h / 2];
+    const tag = pv.pressable.find((t) => t.edge && t.kind === 'x' && t.name === name), to = [P.x + P.w * (0.3 + 0.1 * (b % 5)), P.y + P.h / 2];
     expect(tag, 'its tag at the edge').toBeTruthy();
     await pull([tag.x + tag.w / 2, tag.y + tag.h / 2], to);
     expect(Math.abs(pv.pxOf(xOf(page.ws.plots[id].cursors, 'time')[name]) - to[0]), 'it lands under the pointer').toBeLessThan(PX);
@@ -247,7 +247,7 @@ const DRAGS = {
       if (reached(tag)) break;
       editCursors(page, id, () => ({ y: { time: { [key]: { a: null, b: null, [name]: v } } } }));
       await still(id);
-      tag = pv.tabs.find((t) => t.placed && t.kind === 'y' && t.name === name);
+      tag = pv.pressable.find((t) => t.edge && t.kind === 'y' && t.name === name);
     }
     expect(reached(tag), 'its tag at the edge').toBe(true);
     const steps = page.history.undos.length, lane = pv.yAxes[0].lane, to = [lane.x + lane.w / 2, lane.y + lane.h * (0.3 + 0.1 * (b % 5))];
