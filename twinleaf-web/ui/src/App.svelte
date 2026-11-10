@@ -346,7 +346,7 @@
   const checked = $derived([...hub.session.devices.values()].sort(byRoute).filter((d) => !unchecked.has(d.route)));
   /** The words every property row shown has in its name: one filter for every panel of properties. */
   let propertyFilter = $state('');
-  /** Whether dock `side` has a panel of properties, open or folded, and so holds the filter's field, above its panels. */
+  /** Whether dock `side` has a panel of properties, open or folded, and so holds the filter's field, in its top row. */
   const holdsFilter = (side) => docks[side].some((p) => PANELS[p.id].channels);
   // The property rows the page shows, in page order, which a Shift pick runs
   // along: each open panel of rows or action buttons of the docks shown,
@@ -406,14 +406,13 @@
   // tiles beside it in step. Its panels keep the width they have open,
   // `contentSize` in px, pinned to the outer edge and cut off by the moving
   // edge, so they never reflow; shutting, they fade out by the slide's
-  // midpoint, and opening, they fade in after it. The button that hides a
-  // dock is in its first panel and fades with it; the rail's button shows
-  // once the frame is the rail.
+  // midpoint, and opening, they fade in after it. The dock's button is
+  // placed from the frame's outer edge, so it stays where it is throughout.
   let dockGroup = $state(null);
   /** The room the panes share, in px: the group less its handles. */
   let paneRoom = $state(0);
-  /** A rail's width in px: one holding panels has its show button; an empty one is a strip to drop on, wider while a panel is dragged. */
-  const RAIL_PX = { panels: 26, empty: 8, awaiting: 56 };
+  /** A rail's width in px: one holding panels has its dock's button, 6 px in from its border each side; an empty one is a strip to drop on, wider while a panel is dragged. */
+  const RAIL_PX = { panels: 34, empty: 8, awaiting: 56 };
   const railPx = (side) => (docks.dragging ? RAIL_PX.awaiting : docks[side].length ? RAIL_PX.panels : RAIL_PX.empty);
   /** A side's rail as a share of the panes' room, the size its pane collapses to. */
   const railShare = (side) => (paneRoom ? (railPx(side) / paneRoom) * 100 : 0);
@@ -899,14 +898,14 @@
 
 {#snippet dockTop(side)}
   {#if holdsFilter(side)}
-    <Input class="mb-1.5 h-7 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows />
+    <Input class="h-7 min-w-0 flex-1 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows />
   {/if}
 {/snippet}
 
 {#snippet dockFrame(side)}
-  <!-- The dock's frame, its rail too: it fills its pane, and its panels keep their open size while it slides. -->
+  <!-- The dock's frame, its rail too: it fills its pane, and its panels keep their open size while it slides. It is no wider than its pane, cuts its panels off and does not scroll, so focus that lands in them moves nothing. -->
   <aside
-    class="dock-frame {side} flex min-h-0 flex-1 cursor-crosshair flex-col overflow-hidden rounded-lg border bg-card"
+    class="dock-frame {side} flex min-h-0 min-w-0 flex-1 cursor-crosshair flex-col overflow-clip rounded-lg border bg-card"
     class:rail={railed[side]}
     class:holding={docks[side].length > 0}
     class:awaiting={railed[side] && docks.dragging}

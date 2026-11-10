@@ -59,7 +59,6 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 #dnd-action-dragged-el .tab { box-shadow: 0 6px 16px rgb(0 0 0 / 0.45); }
 .tab-slot { display: flex; }
 #dnd-action-dragged-el.dock-panel { height: 28px !important; overflow: hidden !important; padding: 0 6px !important; background: var(--popover) !important; border: 1px solid var(--primary) !important; border-radius: var(--radius) !important; box-shadow: 0 6px 16px rgb(0 0 0 / 0.45) !important; }
-#dnd-action-dragged-el .dock-button { display: none !important; }
 
 /* The docks beside the tiles, and their panels (Dock.svelte). Each dock is
    a frame in its own pane, padded around its panels; hidden, the same frame
@@ -99,7 +98,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
   .dock-frame.closing :is(.dock, .dock-top) { transition: none; }
   .dock-frame.opening :is(.dock, .dock-top) { animation: none; }
 }
-/* The rail's button is placed from the frame, not from the rail in it. */
+/* The dock's button is placed from the frame, not from the dock in it. */
 .dock-side { position: static; display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .dock { display: flex; flex-direction: column; gap: 4px; min-height: 0; flex: 1; overflow-y: auto; }
 /* The dock scrolls its panels itself: the box panels are dragged within is
@@ -120,20 +119,24 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
   .dock { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 }
 .dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: -1px; border-radius: var(--radius); }
-/* What a dock holds above its panels, the filter of its properties: the
-   panels scroll below it, not under it, and no panel's fold moves it. */
-.dock-top { flex: none; }
-/* Show sits centred across the rail, 8 px below the frame's top. Hide sits
-   at the right end of its dock's first panel, in the header's row; it is
-   placed from that panel and scrolls with it, so no row of the dock passes
-   under it. That header ends short of the button, with room for the focus
-   ring around it, so neither the header nor its ring is under the button. */
-.dock-button { position: absolute; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
+/* A dock's top row, as tall as a field: the dock's button in its corner at
+   the page's edge and, beside it, the filter of the dock's properties where
+   it has one. The row keeps the button's width and a gap clear of what it
+   holds. The panels scroll below the row, not under it, and no panel's fold
+   moves it. */
+.dock-top { flex: none; display: flex; align-items: center; height: 28px; margin-bottom: 6px; }
+.dock-side.left > .dock-top { padding-left: 26px; }
+.dock-side.right > .dock-top { padding-right: 26px; }
+/* A dock's button, which hides it and shows it. It is placed from the
+   frame's corner at the page's edge, which stays put as the dock slides,
+   6 px in from the frame's border each way and centred in the top row's
+   height: one place whether the frame is the dock or its rail, which is as
+   wide as the button and that inset each side. */
+.dock-button { position: absolute; top: 10px; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
 .dock-button:hover { background: var(--secondary); color: var(--foreground); }
 .dock-button svg { width: 14px; height: 14px; }
-.dock-frame.rail .dock-button { top: 8px; left: 50%; transform: translateX(-50%); }
-.dock-panel > .dock-button { top: 2px; right: 0; }
-.dock-panel:has(> .dock-button) .dock-head { margin-right: 24px; }
+.dock-frame.left .dock-button { left: 6px; }
+.dock-frame.right .dock-button { right: 6px; }
 /* The panels are lists inside a list. A panel is as tall as what it shows
    while its dock has the room. Where the panels do not fit, a panel taller
    than two thirds of the dock's height gives way, down to two thirds: its

@@ -201,49 +201,99 @@ describe('a panel in a dock', () => {
   }, 600_000);
 });
 
-describe('the button that hides a dock', () => {
-  const buttonOf = (dock) => dock.parentElement.querySelector('button[aria-label^="Hide the"]');
-  const within = (a, b) => a.left >= b.left - 1 && a.right <= b.right + 1 && a.top >= b.top - 1 && a.bottom <= b.bottom + 1;
-  /** The rows of `dock` that show within it and that its hide button lies over, each by its text. */
-  function covered(dock) {
-    const b = buttonOf(dock).getBoundingClientRect(), d = dock.getBoundingClientRect();
+// A dock has one button, which hides it and shows it again, at one place:
+// the dock's top corner at the page's edge, in the dock's top row, which
+// its panels scroll beneath. So a click there hides the dock, the next one
+// there shows it, and nothing of the dock is ever under the button.
+describe('the button that hides and shows a dock', () => {
+  const SIDES = ['left', 'right'];
+  const FIELD = 'input[aria-label^="Filter the properties"]';
+  const frameOf = (side) => document.querySelector(`.dock-frame.${side}`);
+  const buttonsOf = (side) => [...frameOf(side).querySelectorAll('button')].filter((b) => /^(Hide|Show) the \w+ dock$/.test(b.getAttribute('aria-label') ?? ''));
+  /** Where the button of dock `side` is, in px, as text; or how many buttons the dock has, when not one. */
+  const placeOf = (side) => {
+    const all = buttonsOf(side);
+    if (all.length !== 1) return `${all.length} buttons`;
+    const { left, top, width, height } = all[0].getBoundingClientRect();
+    return `${width} by ${height} px at ${left}, ${top}`;
+  };
+  const railed = (side) => frameOf(side).classList.contains('rail');
+  /** Whether dock `side` is at rest, as its rail when `hidden` and with its panels when not. */
+  const rests = (side, hidden) => railed(side) === hidden && !document.querySelector('.layout.sliding') && !frameOf(side).matches('.opening, .closing');
+  /** The rows of dock `side` that show within it and lie under its button, each by its text. */
+  function covered(side) {
+    const b = buttonsOf(side)[0].getBoundingClientRect(), d = frameOf(side).querySelector('.dock').getBoundingClientRect();
     const top = Math.max(b.top, d.top), bottom = Math.min(b.bottom, d.bottom);
-    return [...dock.querySelectorAll(OWN.rows)]
+    return [...frameOf(side).querySelectorAll(`${OWN.rows}, .dock-head`)]
       .filter((row) => {
         const r = row.getBoundingClientRect();
-        return r.height > 0 && r.left < b.right && r.right > b.left && r.top < bottom && r.bottom > top;
+        return bottom > top && r.height > 0 && r.left < b.right && r.right > b.left && r.top < bottom && r.bottom > top;
       })
       .map((row) => row.textContent.trim());
   }
+  const all = (ids) => ids.map((id) => ({ id, open: true }));
+  /** The arrangements mounted, by what they are: null the page's own, and one with the properties in the left dock. */
+  const ARRANGED = {
+    'the properties in the right dock': null,
+    'the properties in the left dock': { left: all(['favorites', 'settings', 'reports', 'actions', 'diagnostics', 'other']), right: all(['devices', 'signals']) },
+  };
 
-  it("lies over no row however its dock is scrolled, sits in the first header's row, and hides the dock", async () => {
+  it('is at one place, to the pixel, with a filter beside it or none, however its dock is scrolled, and as the dock hides and shows; and three clicks there hide, show and hide the dock', async () => {
     await browser.viewport(1200, 520);
-    const page = await mountPage([['s0.x']], 'columns', 0, signals(30), tableOf({ setting: 14, report: 14, action: 10, other: 0 }), { routes: ['/', '/0', '/1', '/2', '/3', '/4'] });
-    try {
-      await settle(6);
-      let scrolled = 0;
-      for (const dock of docks()) {
-        const side = dock.getAttribute('aria-label');
-        const most = dock.scrollHeight - dock.clientHeight;
-        if (most > 0) scrolled++;
-        for (let top = 0; top <= most; top += 7) {
-          dock.scrollTop = top;
-          expect(covered(dock), `${side}, scrolled ${top} px of ${most}: the rows under its hide button`).toEqual([]);
+    const places = { left: new Map(), right: new Map() }, filtered = { left: new Set(), right: new Set() };
+    let scrolled = 0;
+    for (const [arranged, saved] of Object.entries(ARRANGED)) {
+      const page = await mountPage([['s0.x']], 'columns', 0, signals(30), tableOf({ setting: 14, report: 14, action: 10, other: 4 }), { routes: ['/', '/0', '/1', '/2', '/3', '/4'], saved: saved ? { 'tl-docks-v1': saved } : {} });
+      try {
+        await settle(6);
+        for (const side of SIDES) {
+          const said = `the ${side} dock, ${arranged}`, frame = frameOf(side), dock = frame.querySelector('.dock');
+          const note = (where, at = placeOf(side)) => places[side].has(at) || places[side].set(at, `${arranged}, ${where}`);
+          const field = frame.querySelector(FIELD);
+          filtered[side].add(!!field);
+          const button = buttonsOf(side)[0];
+          expect(buttonsOf(side).length, `${said}: its buttons that hide or show it`).toBe(1);
+          // The top row: the button in the corner at the page's edge, the field ending short of it, the panels below both.
+          const b = button.getBoundingClientRect(), f = frame.getBoundingClientRect();
+          expect(side === 'left' ? b.left - f.left : f.right - b.right, `${said}: px from the page's edge of its frame to its button`).toBeLessThanOrEqual(8);
+          expect(b.bottom, `${said}: its button's bottom, above its panels`).toBeLessThanOrEqual(dock.getBoundingClientRect().top);
+          if (field) {
+            const r = field.getBoundingClientRect();
+            expect(side === 'left' ? r.left - b.right : b.left - r.right, `${said}: px between its filter's field and its button`).toBeGreaterThanOrEqual(2);
+            expect(r.top < b.bottom && r.bottom > b.top, `${said}: its filter's field and its button share a row`).toBe(true);
+          }
+          const most = dock.scrollHeight - dock.clientHeight;
+          if (most > 0) scrolled++;
+          for (let top = 0; top <= most; top += 7) {
+            dock.scrollTop = top;
+            note(`scrolled ${top} px of ${most}`);
+            expect(covered(side), `${said}, scrolled ${top} px of ${most}: what is under its button`).toEqual([]);
+            expect(button.contains(document.elementFromPoint(...centre(button))), `${said}, scrolled ${top} px of ${most}: its button is what the pointer hits`).toBe(true);
+          }
+          dock.scrollTop = most / 2;
+          // Three clicks at one place, the pointer never moving, and a fourth that leaves the dock shown.
+          await commands.mouse([['move', ...centre(button)]]);
+          const stop = watchFrames(() => placeOf(side));
+          for (const [n, hidden] of [true, false, true, false].entries()) {
+            await commands.mouse([['down'], ['up']]);
+            expect(await until(() => rests(side, hidden)), `${said}: ${hidden ? 'hidden' : 'shown'} after click ${n + 1} at the one place`).toBe(true);
+            expect(await rested(() => frameOf(side).getBoundingClientRect().width), `${said}: its frame comes to rest`).toBe(true);
+            expect(buttonsOf(side).map((el) => el.getAttribute('aria-label')), `${said}, ${hidden ? 'hidden' : 'shown'}: what its button says it does`).toEqual([`${hidden ? 'Show' : 'Hide'} the ${side} dock`]);
+            note(hidden ? 'hidden' : 'shown again');
+          }
+          for (const at of stop()) note('at some frame as it hid or showed', at);
         }
-        dock.scrollTop = 0;
-        // The row is the header's height across its panel's width: the header ends short of the button.
-        const head = dock.querySelector('.dock-panel .dock-head').getBoundingClientRect(), across = dock.querySelector('.dock-panel').getBoundingClientRect();
-        expect(within(buttonOf(dock).getBoundingClientRect(), { left: across.left, right: across.right, top: head.top, bottom: head.bottom }), `${side}: its hide button is within its first header's row`).toBe(true);
-        expect(buttonOf(dock).contains(document.elementFromPoint(...centre(buttonOf(dock)))), `${side}: its hide button is what the pointer hits`).toBe(true);
+      } finally {
+        page.dispose();
       }
-      expect(scrolled, 'docks seen scrolling').toBeGreaterThan(0);
-      await clickOn(buttonOf(docks().at(-1)));
-      await until(() => docks().length === 1);
-      expect(docks().map((dock) => dock.getAttribute('aria-label')), "the docks open after a click on the right one's hide button").toEqual(['Left dock']);
-    } finally {
-      page.dispose();
     }
-  }, 60_000);
+    expect(scrolled, 'docks seen scrolling').toBeGreaterThan(0);
+    for (const side of SIDES) {
+      expect([...filtered[side]].sort(), `the ${side} dock was seen with a filter and without one`).toEqual([false, true]);
+      const were = [...places[side]].map(([at, where]) => `${at} (${where})`);
+      expect(were, `where the ${side} dock's button was`).toEqual(were.slice(0, 1));
+    }
+  }, 120_000);
 });
 
 describe("the filter of a dock's properties", () => {
@@ -290,8 +340,8 @@ describe("the filter of a dock's properties", () => {
   }, 60_000);
 });
 
-// What a person presses or reads in a dock, found on the page: every
-// control, every run of text, every scroll bar's thumb, and the focus ring
+// What a person presses or reads in a dock, its top row too, found on the
+// page: every control, every run of text, every scroll bar's thumb, and the focus ring
 // around a header. No two of them overlap, however tall the window and
 // wherever the dock is scrolled, and every scroll bar has one look.
 describe('what a dock shows', () => {
@@ -344,12 +394,12 @@ describe('what a dock shows', () => {
     const bar = thumb.parentElement.getBoundingClientRect(), t = thumb.getBoundingClientRect(), cs = getComputedStyle(thumb);
     return { lane: bar.width, width: t.width, inset: t.left - bar.left, colour: cs.backgroundColor, round: parseFloat(cs.borderTopLeftRadius) >= t.width / 2 };
   }
-  /** Everything pressed or read in `dock` that shows, each {what, el, at}. */
+  /** Everything pressed or read in `dock` and in the top row above it that shows, each {what, el, at}. */
   function things(dock) {
-    const out = [];
+    const out = [], whole = dock.parentElement;
     const add = (what, el, at) => some(at) && out.push({ what, el, at });
-    for (const el of dock.querySelectorAll(PRESSED)) add(`${el.tagName.toLowerCase()} "${(el.getAttribute('aria-label') ?? el.textContent).trim().slice(0, 30)}"`, el, shown(el, box(el.getBoundingClientRect()), dock));
-    const walk = document.createTreeWalker(dock, NodeFilter.SHOW_TEXT);
+    for (const el of whole.querySelectorAll(PRESSED)) add(`${el.tagName.toLowerCase()} "${(el.getAttribute('aria-label') ?? el.textContent).trim().slice(0, 30)}"`, el, shown(el, box(el.getBoundingClientRect()), dock));
+    const walk = document.createTreeWalker(whole, NodeFilter.SHOW_TEXT);
     for (let node; (node = walk.nextNode()); ) {
       if (!node.data.trim() || getComputedStyle(node.parentElement).visibility === 'hidden') continue;
       const range = document.createRange();

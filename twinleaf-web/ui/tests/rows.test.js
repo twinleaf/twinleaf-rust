@@ -81,10 +81,11 @@ describe('a property row', () => {
     const favorites = page.history.favorites;
     const seen = { across: 0, docks: 0, pastFolded: 0, dropped: 0, rightUnpicked: 0, rightPicked: 0, rightButton: 0, buttons: 0, hidden: 0, starredAway: 0, anchorHidden: 0, copy: 0, bar: 0 };
     const hidden = () => !!document.querySelector('.dock-side.right.rail');
-    /** Clicks `el` with Shift held, which keeps the selection, and waits for the dock to slide. */
+    /** Clicks the dock's button `el` with Shift held, which keeps the selection, and waits for the dock to slide as the button said it would. */
     async function shiftPress(el) {
+      const hides = el.getAttribute('aria-label').startsWith('Hide');
       await clickOn(el, { shift: true });
-      for (let i = 0; i < 90 && hidden() !== el.getAttribute('aria-label').startsWith('Hide'); i++) await frames();
+      for (let i = 0; i < 90 && hidden() !== hides; i++) await frames();
       await frames(2);
     }
     try {

@@ -1,12 +1,16 @@
 <script>
   // One dock, left or right: its panels in a column, each under a header
   // that drags it, within this dock or to the other, and folds it with its
-  // chevron. A button in the row of its first panel's header hides it, and
-  // scrolls with that header, so it lies over no row. A dock that shows
-  // no panels, as it has none or is hidden, is a rail along the page's
-  // edge: a panel dropped on it joins the dock's panels, at the end, and
-  // shows the dock, and a click on a hidden dock's rail shows it. Only
-  // docks take panels, so none lands on the tiles.
+  // chevron. A dock that shows no panels, as it has none or is hidden, is a
+  // rail along the page's edge: a panel dropped on it joins the dock's
+  // panels, at the end, and shows the dock, and a click on a hidden dock's
+  // rail shows it. Only docks take panels, so none lands on the tiles.
+  //
+  // A dock that has panels has one button, which hides it and shows it
+  // again, in the dock's top corner at the page's edge: the one place that
+  // is the dock's whether it is shown or is its rail. Shown, the dock has a
+  // top row there, which holds the button and what `top` draws beside it,
+  // and its panels scroll beneath that row, so nothing is under the button.
   //
   // The header's menu moves a panel without dragging, and the header folds
   // it on Enter, so the keyboard reaches all of it.
@@ -41,9 +45,9 @@
 
   /**
    * `docks` is the page's Docks, `side` this dock's, and `content(id)` draws
-   * a panel's body. `top(side)` draws what the dock holds above its panels,
-   * which they scroll below. `railed` draws the rail in the panels' place:
-   * the page says when, as a dock sliding shut keeps its panels until it has.
+   * a panel's body. `top(side)` draws what the dock's top row holds beside
+   * its button. `railed` draws the rail in the panels' place: the page says
+   * when, as a dock sliding shut keeps its panels until it has.
    */
   let { docks, side, content, top = undefined, railed } = $props();
 
@@ -52,9 +56,8 @@
   /** How long to wait for a hidden dock's rail, which appears once the dock has slid shut, in ms. */
   const RAIL_WAIT_MS = 600;
   /**
-   * Hides or shows the dock. The dock is drawn anew either way, so focus
-   * that was in it moves to the new one: to its rail's show button once
-   * the rail is there, into its panels once shown.
+   * Hides or shows the dock. Focus that was in it moves to what it shows
+   * next: to its button once it is the rail, into its panels once shown.
    */
   function setHidden(hidden) {
     const had = root?.contains(document.activeElement);
@@ -127,7 +130,7 @@
   }
 </script>
 
-<!-- The drag zone holds the panels alone: the rail's button sits beside it, and the button that hides the dock in its first panel. -->
+<!-- The drag zone holds the panels alone: the dock's button and its top row sit beside it. -->
 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
 <div
   class="dock-side {side}"
@@ -140,12 +143,18 @@
   bind:this={root}
   onclick={() => rail && docks[side].length && setHidden(false)}
 >
-  {#if rail && docks[side].length}
-    <Tip text="Show the {side} dock">
-      {#snippet children(tip)}<button {...tip} class="dock-button" aria-label="Show the {side} dock"><ShowIcon /></button>{/snippet}
+  {#if docks[side].length}
+    {@const does = docks.hidden[side] ? 'Show' : 'Hide'}
+    <Tip text="{does} the {side} dock">
+      {#snippet children(tip)}
+        <!-- Shown, the dock keeps it out of the Tab order, which steps between the panels; the panels' menu and the commands hide the dock too. -->
+        <button {...tip} class="dock-button" aria-label="{does} the {side} dock" data-focus-skip={rail ? undefined : ''} onclick={(e) => (e.stopPropagation(), setHidden(!docks.hidden[side]))}>
+          {#if docks.hidden[side]}<ShowIcon />{:else}<HideIcon />{/if}
+        </button>
+      {/snippet}
     </Tip>
   {/if}
-  {#if top && !rail}<div class="dock-top">{@render top(side)}</div>{/if}
+  {#if !rail}<div class="dock-top">{@render top?.(side)}</div>{/if}
 <div
   class="dock"
   role="list"
@@ -195,14 +204,6 @@
           <ContextMenu.Item onSelect={() => docks.reset()}><RiReset class="menu-icon" />Reset every panel</ContextMenu.Item>
         </ContextMenu.Content>
       </ContextMenu.Root>
-      {#if i === 0 && !rail}
-        <Tip text="Hide the {side} dock">
-          {#snippet children(tip)}
-            <!-- Out of the Tab order, which steps between the panels; the panels' menu and the commands hide the dock too. -->
-            <button {...tip} class="dock-button" aria-label="Hide the {side} dock" data-focus-skip onclick={(e) => (e.stopPropagation(), setHidden(true))}><HideIcon /></button>
-          {/snippet}
-        </Tip>
-      {/if}
       {#if p.open && !p[SHADOW]}
         <div class="dock-body" data-focus-group="panel-{p.id}">{@render content(p.id)}</div>
       {/if}
