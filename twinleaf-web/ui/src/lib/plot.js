@@ -449,6 +449,9 @@ export class PlotView {
     this.yAxes = []; // the y axes, as last drawn: {key, lane, range, side, slot, x0, x1, color, plans}
     this.tabs = []; // the tabs a cursor is dragged out of, as last drawn: those cursors not yet placed rest as, and the tags of those out of view
     this.tagsPlaced = [];
+    this.tickLabels = []; // the box of each tick label, {x, y, w, h} in client px, as last drawn
+    this.cursorTags = []; // the box of each placed cursor's tag: its name, its value, or its tag at the edge when out of view
+    this.cursorStubs = []; // each cursor line's run past the plot's edge into the axis, {x0, y0, x1, y1}
     this.axisHover = null; // clientX over the x axis, where a drag seeks
     this.phosphor = new Map(); // signal key -> the shares its axis column shows, eased frame to frame
     this.drawnLevel = new Map(); // trace -> the level of it the plot drew last, see `pickLevel`
@@ -831,6 +834,7 @@ export class PlotView {
     const labelled = (f) => decade(f) || (fewDecades && [2, 5].includes(Math.round(f / 10 ** Math.floor(Math.log10(f) + 1e-9))));
     ctx.fillStyle = T.axisText;
     ctx.textAlign = 'center';
+    this.tickLabels = [];
     // With no room beside the plot, the X cursors' tabs rest on the axis's left end.
     const xTabsBeside = P.x - body.x >= 2 * TAB.w + 6;
     let labelEnd = xTabsBeside ? -Infinity : P.x + 2 * TAB.w + 4;
@@ -849,6 +853,7 @@ export class PlotView {
       const half = ctx.measureText(label).width / 2;
       if (px - half < labelEnd + X_LABEL_GAP || px + half > body.x + body.w) continue;
       ctx.fillText(label, px, P.y + P.h + 15);
+      this.tickLabels.push({ x: px - half, y: P.y + P.h + 15 - LABEL.up, w: 2 * half, h: LABEL.up + LABEL.down });
       labelEnd = px + half;
     }
 
@@ -929,9 +934,11 @@ export class PlotView {
         }
         const label = fmt(tv);
         if (!label) continue;
-        widest[ax.side][ax.slot] = Math.max(widest[ax.side][ax.slot] ?? 0, ctx.measureText(label).width);
+        const w = ctx.measureText(label).width;
+        widest[ax.side][ax.slot] = Math.max(widest[ax.side][ax.slot] ?? 0, w);
         ctx.fillStyle = ax.color;
         ctx.fillText(label, ax.side === 'left' ? ax.x1 - GUTTER.gap : ax.x0 + GUTTER.gap, py + 4);
+        this.tickLabels.push({ x: ax.side === 'left' ? ax.x1 - GUTTER.gap - w : ax.x0 + GUTTER.gap, y: py + 4 - LABEL.up, w, h: LABEL.up + LABEL.down });
       }
     });
     for (const side of ['left', 'right'])
@@ -1239,11 +1246,14 @@ export class PlotView {
 
   /**
    * Draws the placed cursors, and the tabs of those not yet placed. X1 and
-   * X2 are lines through every lane, named on the x axis, their place at the
-   * top of the plot; Y1 and Y2 lines across their axis's lane, named in its
-   * gutter, their level just inside it; the span between a pair shaded. One
-   * out of view is named at the edge it lies beyond, with an arrow, by a tag
-   * to drag it back into view by. A cursor
+   * X2 are lines through every lane, named just above the x axis, their
+   * place at the top of the plot; Y1 and Y2 lines across their axis's lane,
+   * named just inside it beside the axis, their level next to the name; the
+   * span between a pair shaded. Every tag is inside the plot, so none
+   * covers a tick label, and each line runs on CURSOR_STUB px past the
+   * plot's edge into its axis, as a tick mark does, to be set against one.
+   * A cursor out of view is named at the edge it lies beyond, with an
+   * arrow, by a tag to drag it back into view by. A cursor
    * not yet placed rests as a tab to drag out, X1 and X2 at the x axis's
    * left end and Y1 and Y2 at the top of each y axis, shown while the
    * pointer is on that axis; a pull across an axis draws one out too.
@@ -1266,6 +1276,8 @@ export class PlotView {
     };
     // The tags of the placed cursors out of view, each a tab to drag its cursor back in by.
     const tabs = [];
+    this.cursorTags = [];
+    this.cursorStubs = [];
     if (marks.a !== null && marks.b !== null) {
       const l = Math.max(P.x, sx(Math.min(marks.a, marks.b))), r = Math.min(P.x + P.w, sx(Math.max(marks.a, marks.b)));
       if (r > l) {
@@ -1283,7 +1295,8 @@ export class PlotView {
         ctx.fillRect(a.lane.x, t, a.lane.w, b - t);
       }
     }
-    const xTagY = P.y + P.h + 3 + TAB.h / 2;
+    const xTagY = P.y + P.h - TAB.h / 2 - 1;
+    const within = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
     for (const name of ['a', 'b']) {
       const v = marks[name];
       if (v === null) continue;
@@ -1296,20 +1309,27 @@ export class PlotView {
           ctx.lineTo(px, lane.y + lane.h);
           ctx.stroke();
         }
-        tag(px, xTagY, xName[name], color[name]);
+        ctx.beginPath();
+        ctx.moveTo(px, P.y + P.h);
+        ctx.lineTo(px, P.y + P.h + CURSOR_STUB);
+        ctx.stroke();
+        this.cursorStubs.push({ x0: px, y0: P.y + P.h, x1: px, y1: P.y + P.h + CURSOR_STUB });
+        this.cursorTags.push(tag(within(px, P.x + TAB.w / 2, P.x + P.w - TAB.w / 2), xTagY, xName[name], color[name]));
         const text = fx(v), right = px + ctx.measureText(text).width + 10 > P.x + P.w;
-        tag(right ? px - 2 : px + 2, P.y + TAB.h / 2 + 2, text, color[name], right ? 'right' : 'left');
+        this.cursorTags.push(tag(right ? px - 2 : px + 2, P.y + TAB.h / 2 + 2, text, color[name], right ? 'right' : 'left'));
       } else {
         const step = name === 'b' ? TAB.w + 10 : 0;
         const box = v < xd[0] ? tag(P.x + TAB.w / 2 + 4 + step, xTagY, `‹${xName[name]}`, color[name]) : tag(P.x + P.w - TAB.w / 2 - 4 - step, xTagY, `${xName[name]}›`, color[name]);
         tabs.push({ kind: 'x', name, placed: true, ...box });
+        this.cursorTags.push(box);
       }
     }
     for (const a of axes) {
       const yc = this.yPair(a.key);
       if (!yc) continue;
       const sy = this.axisScale(a);
-      const tx = a.side === 'left' ? a.x1 - TAB.w / 2 - 1 : a.x0 + TAB.w / 2 + 1;
+      // The lane's edge on the axis's side, which its tags sit just inside and its lines run on past.
+      const left = a.side === 'left', edge = left ? a.lane.x : a.lane.x + a.lane.w;
       const units = a.plans[0]?.t.meta.units ?? '';
       const fv = this.spectrum ? (v) => v.toExponential(3) : (v) => si(v, units);
       for (const name of ['a', 'b']) {
@@ -1320,16 +1340,21 @@ export class PlotView {
           const y = Math.round(py) + 0.5;
           ctx.strokeStyle = color[name];
           ctx.beginPath();
-          ctx.moveTo(a.lane.x, y);
-          ctx.lineTo(a.lane.x + a.lane.w, y);
+          ctx.moveTo(a.lane.x - (left ? CURSOR_STUB : 0), y);
+          ctx.lineTo(a.lane.x + a.lane.w + (left ? 0 : CURSOR_STUB), y);
           ctx.stroke();
-          tag(tx, py, yName[name], color[name]);
+          this.cursorStubs.push({ x0: edge, y0: y, x1: edge + (left ? -CURSOR_STUB : CURSOR_STUB), y1: y });
+          // Its name, then its level, side by side from the axis inward, kept within the lane.
+          const cy = within(py, a.lane.y + TAB.h / 2, a.lane.y + a.lane.h - TAB.h / 2);
+          this.cursorTags.push(tag(this.tagSlot(a.lane, a.side, cy, TAB.w, TAB.h), cy, yName[name], color[name], 'left'));
           const text = fv(v), w = Math.max(TAB.w, ctx.measureText(text).width + 6);
-          tag(this.tagSlot(a.lane, a.side, py, w, TAB.h), py, text, color[name], 'left');
+          this.cursorTags.push(tag(this.tagSlot(a.lane, a.side, cy, w, TAB.h), cy, text, color[name], 'left'));
         } else {
           const step = name === 'b' ? TAB.h + 2 : 0;
-          const box = py < a.lane.y ? tag(tx, a.lane.y + TAB.h / 2 + 1 + step, `${yName[name]}˄`, color[name]) : tag(tx, a.lane.y + a.lane.h - TAB.h / 2 - 1 - step, `${yName[name]}˅`, color[name]);
+          const inside = left ? [edge + 1, 'left'] : [edge - 1, 'right'];
+          const box = py < a.lane.y ? tag(inside[0], a.lane.y + TAB.h / 2 + 1 + step, `${yName[name]}˄`, color[name], inside[1]) : tag(inside[0], a.lane.y + a.lane.h - TAB.h / 2 - 1 - step, `${yName[name]}˅`, color[name], inside[1]);
           tabs.push({ kind: 'y', key: a.key, axis: a, name, placed: true, ...box });
+          this.cursorTags.push(box);
         }
       }
     }
@@ -1923,8 +1948,16 @@ const GUTTER = { gap: 6, pad: 6, min: 24, slack: 10 };
  * least width only keeps it in sight.
  */
 const SEEK_BAR = 4, SEEK_MIN = 2;
+/**
+ * How far a cursor's line runs past the plot's edge into its axis, in px:
+ * as a tick mark would, short of the tick labels, which begin GUTTER.gap px
+ * from the plot beside it and further below it.
+ */
+const CURSOR_STUB = 4;
 /** A cursor's tab, in px: its name, on the axis it reads, or resting where it is dragged out of. */
 const TAB = { w: 22, h: 14 };
+/** How far a tick label's digits reach above and below the line they are written on, in px, in the axes' 11 px type. */
+const LABEL = { up: 9, down: 2 };
 /** The least room, in px, between two x axis labels. */
 const X_LABEL_GAP = 8;
 /** How far into the plot, in px, a signal dropped beside an axis still joins that side's axes. */
