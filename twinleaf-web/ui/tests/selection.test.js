@@ -28,7 +28,7 @@ const LIST = [
   ['the eraser', () => [...document.querySelectorAll('button[aria-label="Clear the cursors"]')], true],
   ['File', () => [...document.querySelectorAll('button')].filter((b) => b.textContent.trim() === 'File'), true],
   ['Commands', () => [...document.querySelectorAll('button.search')], true],
-  ['the Signals panel: its search, its signals and its list', () => [...document.querySelectorAll('input[type=search], .palette .chip, .palette')], true],
+  ['the Signals panel: its search, its signals and its list', () => [...document.querySelectorAll('[data-keeps-selection] input[type=search], .palette .chip, .palette')], true],
 ];
 
 /** A press and its release on `el`, as a click's are, so whatever it starts ends. */

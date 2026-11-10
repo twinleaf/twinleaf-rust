@@ -6,7 +6,7 @@
 // - Scrollbars and the dock-width handles deselect, but the Signals panel's.
 // - Escape during a box or a plot move puts it away, puts nothing down,
 //   records nothing and deselects everything; Escape never changes a cursor.
-// - A key pressed in an open menu stays there.
+// - A key pressed in an open menu that none of its rows shows stays there.
 // - The Live button pauses every plot, and Space after it has them follow.
 // - Space on a dock header the keyboard moved to folds its panel, and a
 //   header dragged moves its panel.
@@ -230,14 +230,14 @@ describe('Escape', () => {
 });
 
 describe('a key', () => {
-  it('pressed in an open menu stays in it, and acts on no plot', async () => {
+  it('pressed in an open menu, and shown by none of its rows, stays in it and acts on no plot', async () => {
     const page = await mountPage(KEYS, 'grid');
     try {
       const ids = plotIds(page.ws.layout);
       page.ws.selection.only(ids.slice(0, 2));
       flushSync();
       await plotMenu(ids[0]);
-      for (const key of ['l', 'f', '|', 'Delete', 'Backspace']) await commands.key(key);
+      for (const key of ['l', 'y', 'Backspace']) await commands.key(key);
       flushSync();
       expect(plotIds(page.ws.layout)).toEqual(ids);
       for (const id of ids) expect(page.ws.plots[id].legend, id).toBe(false);
