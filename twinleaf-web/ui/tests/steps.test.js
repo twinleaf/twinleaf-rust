@@ -8,7 +8,7 @@
 // the plots that are gone, the property rows picked too, less those whose
 // property went; redo puts back both as they were just after it.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, drag, dropped, editCursors, feed, focusPage, frames, glide, leafOf, mountPage, pickItem, plotMenu, settle, until, withExamples } from './harness/page.js';

@@ -6,7 +6,7 @@
 // the hub holds its full history, the widest view is that history's length
 // exactly, as the History setting reads.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, feed, frames, leafOf, mountPage, withExamples } from './harness/page.js';

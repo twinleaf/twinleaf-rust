@@ -11,7 +11,7 @@
 // follows live, is an edit: exactly one undo step on however many plots,
 // which undo takes back and redo makes again.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, closeAll, editCursors, feed, leafOf, mountPage, rightClick, settle, wait, withExamples, withYPair } from './harness/page.js';

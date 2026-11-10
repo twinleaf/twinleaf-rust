@@ -4,7 +4,7 @@ import { withY } from '../../src/lib/cursors.js';
 import { flushSync, mount, unmount } from 'svelte';
 import fc from 'fast-check';
 import { expect, vi } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import App from '../../src/App.svelte';
 import { Hub } from '../../src/lib/hub.svelte.js';
 import { Workspace } from '../../src/lib/workspace.svelte.js';

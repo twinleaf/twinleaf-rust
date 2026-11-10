@@ -46,7 +46,7 @@
 // tooltip shows over one (class 9): an invariant of the runs above too, and
 // of runs of its own, of what opens and closes popup layers.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, quietApi, showing, until, withExamples } from './harness/page.js';

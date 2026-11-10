@@ -4,7 +4,7 @@
 // its way out. Every menu of the page is held to it.
 // A menu opened again before it has gone works as any does.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { MENUS, menuPage, settle } from './harness/menus.js';
 import { centre, frames } from './harness/page.js';
 

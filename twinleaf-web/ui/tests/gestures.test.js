@@ -15,7 +15,7 @@
 //   the drag library's, and after a click on the item the page hears the
 //   key (class 2).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, drag, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pickItem, plotMenu, quietApi, until, withExamples } from './harness/page.js';

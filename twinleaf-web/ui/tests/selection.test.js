@@ -6,7 +6,7 @@
 // Escape leaves a maximized view first, the selection kept, then deselects;
 // and the plot keys act on no plot from a property table.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, focusPage, frames, mountPage, pickItem, plotMenu, withExamples } from './harness/page.js';

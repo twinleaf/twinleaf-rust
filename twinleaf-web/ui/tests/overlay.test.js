@@ -5,7 +5,7 @@
 // every step at most one of them is open, a list or a submenu opened from
 // inside it aside, and a tooltip shows only for a control inside it.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import fc from 'fast-check';
 import { centre, mountPage, wait, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';

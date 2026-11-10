@@ -11,7 +11,7 @@
 // count is the count of the window shown now, whichever count the hub
 // answers last (class 7).
 import { describe, expect, it, vi } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, feed, focusPage, frames, leafOf, mountPage, pickItem, plotMenu, quietApi, showing, until, wait, withExamples } from './harness/page.js';

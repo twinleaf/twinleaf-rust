@@ -20,7 +20,7 @@
 // notice, as Back's views do. A kind switch is an edit and a view step:
 // Back crosses it and goes on, whatever undo and redo do between.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, frames, mountPage, pickItem, plotMenu, until, wait } from './harness/page.js';

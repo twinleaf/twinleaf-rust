@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import tailwindcss from '@tailwindcss/vite';
+import { playwright } from '@vitest/browser-playwright';
 import path from 'node:path';
 import { key, mouse } from './tests/harness/commands.js';
 
@@ -50,17 +51,17 @@ export default defineConfig({
           // tries few; each property's `examples` are always tried.
           provide: fc(20),
           include: ['tests/**/*.test.js'],
+          api: { host: '127.0.0.1', port: testPort, strictPort: true },
           browser: {
             enabled: true,
-            provider: 'playwright',
+            // Edge comes with Windows; elsewhere Playwright's own Chromium.
+            provider: playwright({ launchOptions: process.platform === 'win32' ? { channel: 'msedge' } : {} }),
             headless: true,
-            api: { host: '127.0.0.1', port: testPort, strictPort: true },
             viewport: { width: 1200, height: 900 },
             // A property's failure prints its case to replay; a picture adds nothing.
             screenshotFailures: false,
             commands: { key, mouse },
-            // Edge comes with Windows; elsewhere Playwright's own Chromium.
-            instances: [{ browser: 'chromium', launch: process.platform === 'win32' ? { channel: 'msedge' } : {} }],
+            instances: [{ browser: 'chromium' }],
           },
         },
       },

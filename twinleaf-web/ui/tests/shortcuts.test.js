@@ -6,7 +6,7 @@
 // typed in. The menus are found on the page, so a row added to one is held
 // to this without being named here.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { MENUS, click, closeAll, menuPage, settle } from './harness/menus.js';
 import { OPEN, centre, until } from './harness/page.js';
 

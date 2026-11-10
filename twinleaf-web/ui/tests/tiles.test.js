@@ -5,7 +5,7 @@
 // of the layout is in one tile, at the box layout.js `rects` gives it, with
 // a gap for every split.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { centre, drag, focusPage, frames, mountPage, wait, withExamples } from './harness/page.js';

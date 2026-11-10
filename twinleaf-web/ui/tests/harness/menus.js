@@ -2,7 +2,7 @@
 // every one of them has its rows: plots with signals, a legend, cursors,
 // another tab and properties.
 import { expect } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { centre, click, editCursors, feed, leafOf, mountPage, rightClick, settle, wait, withYPair } from './page.js';
 import { plotIds } from '../../src/lib/layout.js';
 

@@ -3,7 +3,7 @@
 // made outside an undo step throws, so a control that edits outside one
 // fails here.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import { centre, frames, mountPage, wait } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';

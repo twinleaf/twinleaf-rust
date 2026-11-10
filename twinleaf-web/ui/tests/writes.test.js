@@ -8,7 +8,7 @@
 // are the stub hub's, which answer as the server does. Every control is
 // pressed with the real mouse, and the field typed into from the keyboard.
 import { describe, expect, it } from 'vitest';
-import { commands } from '@vitest/browser/context';
+import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import { clickOn, frames, mountPage, typeInto, wait } from './harness/page.js';
 

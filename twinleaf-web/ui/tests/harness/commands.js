@@ -1,5 +1,5 @@
 // Browser commands the tests call through `commands` from
-// '@vitest/browser/context'. They run in node, on the Playwright page, so the
+// 'vitest/browser'. They run in node, on the Playwright page, so the
 // page gets trusted input as a person's would make it.
 
 /**
