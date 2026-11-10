@@ -79,14 +79,15 @@ const menus = new Set();
 /** How long a menu's copy stays if its fade never ends, in ms. */
 const FADE_MS = 400;
 /**
- * A press on `target`, seen before anything it does. A menu shows what its
+ * A press on `target`, seen before anything it does: this module listens
+ * for presses from when it loads, ahead of the page. A menu shows what its
  * commands act on, live, while it is open; the press that closes it can
  * change that, and the menu would show the new words as it fades. So each
  * menu the press is outside of is hidden, and a copy of it as it reads now
  * fades in its place. The menu itself is untouched: opened again before it
  * has gone, or left open by the press, it shows again.
  */
-export function freezeMenus(target) {
+function freezeMenus(target) {
   // A press in a menu or a submenu is no press outside.
   if (target.closest?.('[data-slot$=-menu-content], [data-slot$=-menu-sub-content]')) return;
   for (const el of menus) {
@@ -94,6 +95,8 @@ export function freezeMenus(target) {
     else if (el.dataset.state === 'open' && el.dataset.frozen === undefined) fadeCopy(el);
   }
 }
+if (typeof window !== 'undefined') window.addEventListener('pointerdown', (e) => e.target instanceof Element && freezeMenus(e.target), true);
+
 function fadeCopy(el) {
   const copy = el.cloneNode(true);
   copy.removeAttribute('id');
