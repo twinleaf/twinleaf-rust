@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, focusPage, frames, mountPage, pickItem, plotMenu, withExamples } from './harness/page.js';
+import { centre, focusPage, frames, mountPage, pickItem, plotMenu, pressKey, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine']];
@@ -132,7 +132,7 @@ describe('Escape', () => {
           if (picked.length) steps.push({ maximized: null, selected: [] });
           steps.push({ maximized: null, selected: [] });
           for (const want of steps) {
-            await commands.key('Escape');
+            await pressKey('Escape');
             flushSync();
             expect(page.ws.maximized).toEqual(want.maximized);
             expect([...page.ws.selected].sort()).toEqual([...want.selected].sort());
@@ -157,7 +157,7 @@ describe('keyboard focus', () => {
       page.ws.selected.add(a);
       page.ws.selected.add(c);
       flushSync();
-      await commands.key('2');
+      await pressKey('2');
       flushSync();
       await frames();
       expect([...page.ws.selected]).toEqual([b]);
@@ -171,11 +171,11 @@ describe('keyboard focus', () => {
     try {
       const ids = plotIds(page.ws.layout);
       document.body.focus();
-      await commands.key('Control+a');
+      await pressKey('Control+a');
       flushSync();
       expect(page.ws.selected.size).toBe(ids.length);
       expect(page.ws.focusedId).toBe(null);
-      await commands.key('l');
+      await pressKey('l');
       flushSync();
       for (const id of ids) expect(page.ws.plots[id].legend, id).toBe(true);
     } finally {
@@ -216,10 +216,10 @@ describe('Escape, pressed again', () => {
       const [a] = plotIds(page.ws.layout);
       page.ws.selected.add(a);
       flushSync();
-      await commands.key('Shift');
+      await pressKey('Shift');
       document.querySelector(`.leaf[data-plot="${a}"] .plot-head button`).focus();
       for (let i = 0; i < 3; i++) {
-        await commands.key('Escape');
+        await pressKey('Escape');
         flushSync();
         expect(page.ws.selected.size, `after Escape ${i + 1}`).toBe(0);
       }
@@ -239,10 +239,10 @@ describe('F from the keys', () => {
       page.ws.selection.point(b);
       flushSync();
       document.body.focus();
-      await commands.key('f');
+      await pressKey('f');
       flushSync();
       expect([...page.ws.maximized].sort()).toEqual([a, c].sort());
-      await commands.key('f');
+      await pressKey('f');
       flushSync();
       expect(page.ws.maximized).toBe(null);
     } finally {
@@ -278,10 +278,10 @@ describe('a click on one of several selected plots', () => {
     try {
       const ids = plotIds(page.ws.layout);
       document.body.focus();
-      await commands.key('Control+a');
+      await pressKey('Control+a');
       const [x, y] = centre(document.querySelector(`.leaf[data-plot="${ids[0]}"] .plot-body`));
       await commands.mouse([['move', x, y], ['down'], ['up']]);
-      await commands.key('Escape');
+      await pressKey('Escape');
       await new Promise((done) => setTimeout(done, 400));
       flushSync();
       expect(page.ws.selected.size).toBe(0);
@@ -296,11 +296,11 @@ describe('a digit', () => {
     const page = await mountPage(KEYS, 'columns');
     try {
       const [a] = plotIds(page.ws.layout);
-      await commands.key('1');
+      await pressKey('1');
       flushSync();
       await frames();
-      await commands.key('Control+a');
-      await commands.key('1');
+      await pressKey('Control+a');
+      await pressKey('1');
       flushSync();
       expect([...page.ws.selected]).toEqual([a]);
     } finally {
@@ -358,9 +358,9 @@ describe('property rows', () => {
         const ids = plotIds(page.ws.layout);
         reach(page);
         flushSync();
-        await commands.key('Shift');
+        await pressKey('Shift');
         row('gain').closest('[role=grid]').focus();
-        for (const key of ['l', 'y', 'k', 'f', 'Delete']) await commands.key(key);
+        for (const key of ['l', 'y', 'k', 'f', 'Delete']) await pressKey(key);
         flushSync();
         expect(plotIds(page.ws.layout)).toEqual(ids);
         for (const id of ids) expect(page.ws.plots[id].legend, id).toBe(false);
@@ -384,7 +384,7 @@ describe('Space after a click on a dock header', () => {
       flushSync();
       await frames();
       expect(document.activeElement).toBe(head('Settings'));
-      await commands.key(' ');
+      await pressKey(' ');
       flushSync();
       await frames();
       expect(live(), 'Space pauses').not.toBe(was);
@@ -405,11 +405,11 @@ describe('a split from the keys', () => {
     const page = await mountPage(KEYS, 'columns');
     try {
       const ids = plotIds(page.ws.layout);
-      await commands.key('1');
+      await pressKey('1');
       flushSync();
       page.ws.selection.only([ids[0], ids[2]]);
       flushSync();
-      await commands.key('|');
+      await pressKey('|');
       flushSync();
       await frames();
       const made = plotIds(page.ws.layout).filter((p) => !ids.includes(p));

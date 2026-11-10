@@ -4,7 +4,7 @@ import { withY } from '../../src/lib/cursors.js';
 import { flushSync, mount, unmount } from 'svelte';
 import fc from 'fast-check';
 import { expect, vi } from 'vitest';
-import { commands } from 'vitest/browser';
+import { commands, userEvent } from 'vitest/browser';
 import App from '../../src/App.svelte';
 import { Hub } from '../../src/lib/hub.svelte.js';
 import { Workspace } from '../../src/lib/workspace.svelte.js';
@@ -192,12 +192,25 @@ export async function click(at) {
   await settle();
 }
 
+/**
+ * Presses and lets go of keyboard key `name` as Playwright names it, 'l',
+ * 'Escape' or 'Control+z', any modifiers before the last `+` held through
+ * it.
+ */
+export function pressKey(name) {
+  const parts = name.length > 1 ? name.split('+') : [name];
+  const mods = parts.slice(0, -1), last = parts.at(-1);
+  // A character stands for itself, `[` and `{` written twice; a name is in braces.
+  const key = last.length === 1 ? last.replace(/[[{]/, '$&$&') : `{${last}}`;
+  return userEvent.keyboard(mods.map((m) => `{${m}>}`).join('') + key + mods.reverse().map((m) => `{/${m}}`).join(''));
+}
+
 /** What an open menu, dropdown, popover or list is. */
 export const OPEN = '[data-slot$=-menu-content], [data-slot$=-menu-sub-content], [data-slot=popover-content], [data-slot=select-content]';
 /** Closes whatever menu or popover is open, by Escape, and waits until it has gone. */
 export async function closeAll() {
   for (let i = 0; i < 5 && document.querySelector(OPEN); i++) {
-    await commands.key('Escape');
+    await pressKey('Escape');
     await wait(150);
     flushSync();
   }
@@ -231,9 +244,9 @@ export async function clickOn(el, { ctrl = false, shift = false, right = false }
 /** Types `text` into field `el` from the keyboard, in place of what it held, after a click in it. */
 export async function typeInto(el, text) {
   await clickOn(el);
-  await commands.key('Control+a');
-  await commands.key('Backspace');
-  for (const ch of text) await commands.key(ch);
+  await pressKey('Control+a');
+  await pressKey('Backspace');
+  for (const ch of text) await pressKey(ch);
 }
 
 export const centre = (el) => {

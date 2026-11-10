@@ -3,7 +3,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import tailwindcss from '@tailwindcss/vite';
 import { playwright } from '@vitest/browser-playwright';
 import path from 'node:path';
-import { key, mouse } from './tests/harness/commands.js';
+import { mouse } from './tests/harness/commands.js';
 
 /** A count from the environment, `fallback` when unset; anything but a positive integer is refused. */
 function count(name, fallback) {
@@ -60,7 +60,7 @@ export default defineConfig({
             viewport: { width: 1200, height: 900 },
             // A property's failure prints its case to replay; a picture adds nothing.
             screenshotFailures: false,
-            commands: { key, mouse },
+            commands: { mouse },
             instances: [{ browser: 'chromium' }],
           },
         },

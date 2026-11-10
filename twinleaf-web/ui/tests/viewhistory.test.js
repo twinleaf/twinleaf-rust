@@ -23,7 +23,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, frames, mountPage, pickItem, plotMenu, until, wait } from './harness/page.js';
+import { centre, frames, mountPage, pickItem, plotMenu, pressKey, until, wait } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { GONE, IDLE_MS } from '../src/lib/viewhistory.svelte.js';
 
@@ -102,7 +102,7 @@ describe('a plot’s header', () => {
       await frames();
       const items = [...document.querySelectorAll('[role=menuitem]')].map((m) => m.textContent.trim());
       expect(items.some((t) => t.startsWith('Split right')) && items.some((t) => t.startsWith('Split down'))).toBe(true);
-      await commands.key('Escape');
+      await pressKey('Escape');
     } finally {
       p.dispose();
     }
@@ -183,7 +183,7 @@ describe('view history on the page', () => {
               // Following live then removes the cursors, which is an edit: no Back brings them back.
               if (g.t === 'addXFollow') await act({ t: 'follow', at: g.at });
             } else if (g.t === 'all') {
-              await commands.key(g.on ? 'Control+a' : 'Escape');
+              await pressKey(g.on ? 'Control+a' : 'Escape');
               flushSync();
               check('select');
             } else {
@@ -230,11 +230,11 @@ describe('view history on the page', () => {
       // Every plot's window moved: none was selected, so the slider set them all.
       expect(new Set(ids.map((i) => p.views.get(i).window)).size).toBe(1);
       track.focus();
-      for (const k of ['ArrowLeft', 'ArrowLeft', 'ArrowLeft']) await commands.key(k);
+      for (const k of ['ArrowLeft', 'ArrowLeft', 'ArrowLeft']) await pressKey(k);
       flushSync();
       const keyed = shown(p);
       expect(keyed).not.toBe(dragged);
-      await commands.key('Escape');
+      await pressKey('Escape');
       await press(id, 'Back');
       expect(shown(p), 'Back past the keys').toBe(dragged);
       await press(id, 'Back');
@@ -269,7 +269,7 @@ describe('view history on the page, each kind of gesture', () => {
       const id = plotIds(p.ws.layout)[0], start = shown(p);
       p.ws.selection.only([id]);
       leaf(id).querySelector('.plot-card').focus();
-      for (const k of ['ArrowLeft', 'ArrowLeft', 'ArrowLeft']) await commands.key(k);
+      for (const k of ['ArrowLeft', 'ArrowLeft', 'ArrowLeft']) await pressKey(k);
       flushSync();
       expect(shown(p)).not.toBe(start);
       await press(id, 'Back');
@@ -298,10 +298,10 @@ describe('view history on the page, each kind of gesture', () => {
       const live = () => [...document.querySelectorAll('.top-bar button')].some((b) => b.textContent.trim() === 'Live');
       await dragOn(plotIds(p.ws.layout)[0], 120);
       expect(live(), 'a plot paused').toBe(false);
-      await commands.key(']');
+      await pressKey(']');
       flushSync();
       expect(live(), 'an empty tab follows live').toBe(true);
-      await commands.key('[');
+      await pressKey('[');
       flushSync();
       expect(live(), 'back, the plot is paused still').toBe(false);
       toolbar('Follow live');
@@ -320,7 +320,7 @@ describe('view history on the page, each kind of gesture', () => {
       const start = shown(p);
       p.ws.selection.only(ids);
       leaf(ids[0]).querySelector('.plot-card').focus();
-      await commands.key('y');
+      await pressKey('y');
       flushSync();
       expect(ids.every((id) => !JSON.stringify(p.views.get(id).state().yRanges).includes('[5,6]'))).toBe(true);
       await press(ids[2], 'Back');
@@ -354,7 +354,7 @@ describe('view history on the page, each kind of gesture', () => {
       expect(button(id, 'Back').disabled, 'no view moved, so Back has nowhere to go').toBe(true);
       // Once the menu has closed and given the page its keys back.
       await until(() => !document.querySelector('[role=menu]'));
-      await commands.key('Control+z');
+      await pressKey('Control+z');
       flushSync();
       expect(p.ws.plots[id].cursors, 'undone').toBeUndefined();
     } finally {
@@ -473,9 +473,9 @@ describe('view history on the page, each kind of gesture', () => {
       await dragOn(id, 120, true);
       const dragged = one(p, id);
       expect(JSON.parse(dragged).live).toBe(false);
-      await commands.key(']');
+      await pressKey(']');
       await commands.mouse([['up']]);
-      await commands.key('[');
+      await pressKey('[');
       flushSync();
       await frames();
       await press(id, 'Follow live');
@@ -508,7 +508,7 @@ describe('a plot closed and brought back by Ctrl+Z', () => {
           expect(p.hub.holding, 'a closed plot holds no history').toBe(false);
           const read = [];
           p.hub.session.fetchWindow = (plot, what) => read.push([plot, what]);
-          await commands.key('Control+z');
+          await pressKey('Control+z');
           flushSync();
           await frames();
           expect(p.ws.plots[id], 'back').toBeDefined();
@@ -537,7 +537,7 @@ describe('a plot closed and brought back by Ctrl+Z', () => {
       const v = p.views.get(id), start = v.right - v.span;
       await press(id, 'Close plot');
       memory(start + 1);
-      await commands.key('Control+z');
+      await pressKey('Control+z');
       flushSync();
       await frames();
       expect(v.right - v.span).toBeCloseTo(start + 1);
@@ -554,7 +554,7 @@ describe('a kind switch', () => {
     const p = await page();
     try {
       const id = plotIds(p.ws.layout)[0], kind = () => p.ws.plots[id].kind;
-      const keys = async (k) => (await until(() => !document.querySelector('[role=menu]')), await commands.key(k), flushSync(), await frames());
+      const keys = async (k) => (await until(() => !document.querySelector('[role=menu]')), await pressKey(k), flushSync(), await frames());
       const start = one(p, id);
       await dragOn(id, 120);
       const panned = one(p, id);

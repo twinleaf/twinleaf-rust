@@ -8,10 +8,9 @@
 // keys act as anywhere, and the plots' keys do nothing. Every press is the
 // real mouse's.
 import { describe, expect, it } from 'vitest';
-import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { clickOn, frames, mountPage, withExamples } from './harness/page.js';
+import { clickOn, frames, mountPage, pressKey, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { KEY as DOCKS_KEY, PANELS } from '../src/lib/docks.svelte.js';
 
@@ -69,7 +68,7 @@ async function rightClick(el) {
 /** Closes an open menu with Escape, and waits until it has gone. */
 async function closeMenu() {
   if (!document.querySelector('[role=menu]')) return;
-  await commands.key('Escape');
+  await pressKey('Escape');
   for (let i = 0; i < 20 && document.querySelector('[role=menu]'); i++) await frames();
 }
 const menuItems = () => [...document.querySelectorAll('[role=menu] [role=menuitem]')];
@@ -123,9 +122,9 @@ describe('a property row', () => {
                 // Folding from the keys presses nothing: the picks in the panel only stop showing.
                 // Focus arrives from the keys, as the header had none: it is the header's Space then.
                 document.activeElement?.blur();
-                await commands.key('Shift');
+                await pressKey('Shift');
                 panelHead(a.panel).focus();
-                await commands.key(' ');
+                await pressKey(' ');
                 flushSync();
                 await frames();
                 if (picks.some((k) => k.startsWith(`${a.panel}:`))) seen.hidden++;
@@ -316,7 +315,7 @@ describe('a key pressed in a table', () => {
           const tab = page.ws.activeId, tabs = page.ws.tabs, steps = page.history.undos.length;
           const live = () => [...document.querySelectorAll('button')].find((b) => /^(Live|Follow live)$/.test(b.textContent.trim())).textContent.trim();
           const wasLive = live();
-          await commands.key(key);
+          await pressKey(key);
           flushSync();
           await frames();
           const picks = [...page.ws.selection.rows];

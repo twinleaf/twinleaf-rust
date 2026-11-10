@@ -10,10 +10,9 @@
 // rows picked. Every control is pressed with the real mouse, and the field
 // typed into from the keyboard. The devices are the stub hub's.
 import { describe, expect, it } from 'vitest';
-import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { clickOn, frames, mountPage, typeInto, wait, withExamples } from './harness/page.js';
+import { clickOn, frames, mountPage, pressKey, typeInto, wait, withExamples } from './harness/page.js';
 import { KEY as DOCKS_KEY, PANELS } from '../src/lib/docks.svelte.js';
 
 const ROUTES = ['/0', '/1'];
@@ -103,7 +102,7 @@ describe('the edit bar on the rows picked', () => {
             expect(bar.querySelectorAll('button, input').length).toBe(0);
             if (grid) {
               grid.focus();
-              await commands.key('Enter');
+              await pressKey('Enter');
               await settle();
               expect(notices().some((t) => t.includes('Pick one kind to edit'))).toBe(true);
             }
@@ -121,7 +120,7 @@ describe('the edit bar on the rows picked', () => {
             if (how === 'key' && grid) {
               seen.enter++;
               grid.focus();
-              await commands.key('Enter');
+              await pressKey('Enter');
               to = state === 'On' ? 'false' : 'true';
             } else {
               to = yes ? 'true' : 'false';
@@ -161,7 +160,7 @@ describe('the edit bar on the rows picked', () => {
             }
             if (how === 'key' && grid) {
               grid.focus();
-              await commands.key('Enter');
+              await pressKey('Enter');
             } else await clickOn(button(bar, `Run ${names.length}…`));
             await settle();
             const dialog = document.querySelector('[role=alertdialog]');
@@ -227,7 +226,7 @@ describe('the edit bar on the rows picked', () => {
             page.hub.answer = (name, value) => ({ state: 'ok', value: bare ? null : value === 'true' });
             page.hub.calls = [];
             tr.closest('[role=grid]').focus();
-            await commands.key('Enter');
+            await pressKey('Enter');
             await settle();
             const to = shows === true ? 'false' : 'true';
             expect(page.hub.calls).toEqual([{ name: 'latch', value: to, routes: ROUTES }]);
@@ -255,7 +254,7 @@ describe('the edit bar on the rows picked', () => {
       // The Other panel's table, whose first row is a switch, focused with no row picked there.
       const other = shown().find((r) => r.key === 'other:arm').el.closest('[role=grid]');
       other.focus();
-      await commands.key('Enter');
+      await pressKey('Enter');
       await settle();
       expect(page.hub.calls).toEqual([]);
       expect(bars().map(panelOf)).toEqual(['settings']);

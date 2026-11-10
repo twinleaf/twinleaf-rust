@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, feed, focusPage, frames, leafOf, mountPage, pickItem, plotMenu, quietApi, showing, until, wait, withExamples } from './harness/page.js';
+import { centre, feed, focusPage, frames, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, showing, until, wait, withExamples } from './harness/page.js';
 import { GUTTER, plotIds, rects, restrict } from '../src/lib/layout.js';
 import { api } from '../src/lib/protocol.js';
 
@@ -145,7 +145,7 @@ describe('a key', () => {
             flushSync();
             await frames();
             const undos = page.history.undos.length;
-            await commands.key(key === ' ' ? 'Space' : key);
+            await pressKey(key === ' ' ? 'Space' : key);
             flushSync();
             await frames();
             const { scope, acted } = KEYED[key];
@@ -195,7 +195,7 @@ describe('maximized plots', () => {
           page.ws.selection.only(max.map((i) => ids[i]));
           flushSync();
           document.activeElement?.blur();
-          await commands.key('f');
+          await pressKey('f');
           flushSync();
           expect([...page.ws.maximized].sort()).toEqual(max.map((i) => ids[i]).sort());
           for (const s of steps) {
@@ -203,12 +203,12 @@ describe('maximized plots', () => {
             if (s.t === 'close' && shown.length) {
               page.ws.selection.only([shown[s.k % shown.length]]);
               flushSync();
-              await commands.key('Delete');
+              await pressKey('Delete');
             } else if (s.t === 'toTab' && shown.length) {
               await plotMenu(shown[s.k % shown.length]);
               await pickItem('Move to tab', 'Layout 2');
-            } else if (s.t === 'undo') await commands.key('Control+z');
-            else if (s.t === 'redo') await commands.key('Control+y');
+            } else if (s.t === 'undo') await pressKey('Control+z');
+            else if (s.t === 'redo') await pressKey('Control+y');
             flushSync();
             await frames();
             // What shows is the maximized plots of the tab while any are, else every plot.
@@ -237,7 +237,7 @@ describe('a paused plot', () => {
     try {
       feed(page.hub);
       await focusPage();
-      await commands.key('Space');
+      await pressKey('Space');
       const [id] = plotIds(page.ws.layout), body = leafOf(id).querySelector('.plot-body'), [x, y] = centre(body);
       // Two zooms at once: the second's read waits its turn.
       for (const deltaY of [120, -120]) body.querySelector('canvas').dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY, clientX: x, clientY: y }));
@@ -277,7 +277,7 @@ describe('the count a plot’s menu shows for a copy', () => {
           feed(page.hub);
           await focusPage();
           // Paused, so the window holds still but for the zooms.
-          await commands.key('Space');
+          await pressKey('Space');
           const [id] = plotIds(page.ws.layout), body = leafOf(id).querySelector('.plot-body');
           const asked = () => api.rows.mock.calls.length;
           const answer = async (i) => {
@@ -286,7 +286,7 @@ describe('the count a plot’s menu shows for a copy', () => {
           };
           for (const s of steps) {
             if (s.t === 'open') await plotMenu(id);
-            else if (s.t === 'close') await commands.key('Escape');
+            else if (s.t === 'close') await pressKey('Escape');
             else if (s.t === 'zoom') {
               const [x, y] = centre(body), was = asked(), open = openPlotMenu();
               body.querySelector('canvas').dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: s.out ? 120 : -120, clientX: x, clientY: y }));
@@ -305,7 +305,7 @@ describe('the count a plot’s menu shows for a copy', () => {
           const shown = item.querySelector('.menu-value')?.textContent.trim();
           // The window shown now, as the hub is asked it afresh.
           const was = asked();
-          await commands.key('Escape');
+          await pressKey('Escape');
           await until(() => !openPlotMenu());
           await plotMenu(id);
           expect(await until(() => asked() > was)).toBe(true);

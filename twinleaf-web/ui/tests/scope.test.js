@@ -14,7 +14,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, closeAll, editCursors, feed, leafOf, mountPage, rightClick, settle, wait, withExamples, withYPair } from './harness/page.js';
+import { centre, closeAll, editCursors, feed, leafOf, mountPage, pressKey, rightClick, settle, wait, withExamples, withYPair } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { SAVE_KEY } from '../src/lib/tabs.js';
 
@@ -358,7 +358,7 @@ describe('the command palette’s Add to the selected plots', () => {
           const before = Object.fromEntries(ids.map((id) => [id, page.ws.plots[id].items.map((i) => i.key)]));
           page.ws.selection.only(picked);
           await settle();
-          await commands.key('Control+k');
+          await pressKey('Control+k');
           await settle();
           const item = document.querySelector(`[data-slot=command-item][data-value="add ${key}"]`);
           expect(item, `the palette's add ${key}`).toBeTruthy();

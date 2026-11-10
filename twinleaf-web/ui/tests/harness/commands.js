@@ -1,6 +1,6 @@
-// Browser commands the tests call through `commands` from
-// 'vitest/browser'. They run in node, on the Playwright page, so the
-// page gets trusted input as a person's would make it.
+// The browser command the tests call through `commands` from
+// 'vitest/browser'. It runs in node, on the Playwright page, so the page
+// gets trusted input as a person's would make it.
 
 /**
  * Moves the real mouse through `steps`: ['move', x, y], x and y in the test
@@ -27,9 +27,4 @@ export async function mouse(ctx, steps) {
     else if (type === 'let go') await ctx.page.keyboard.up(x);
     else if (type === 'wait') await new Promise((done) => setTimeout(done, x));
   }
-}
-
-/** Presses and lets go of keyboard key `key`, as Playwright names it. */
-export async function key(ctx, name) {
-  await ctx.page.keyboard.press(name);
 }

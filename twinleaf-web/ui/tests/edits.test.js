@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
-import { centre, frames, mountPage, wait } from './harness/page.js';
+import { centre, frames, mountPage, pressKey, wait } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const KEYS = [['sine.sine', 'sine.cosine'], ['aux.triangle']];
@@ -49,7 +49,7 @@ describe('a control that edits', () => {
     oneStep(/legend/i, async (page) => {
       page.ws.selection.only([plotIds(page.ws.layout)[0]]);
       plotEl(page).querySelector('.plot-card').focus();
-      await commands.key('l');
+      await pressKey('l');
     }));
 
   it('a chip’s × removes its signal', () =>

@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
-import { centre, mountPage, wait, withExamples } from './harness/page.js';
+import { centre, mountPage, pressKey, wait, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { toast } from '../src/lib/toast.svelte.js';
 import { closeAll, menuPage, plotArea, settle } from './harness/menus.js';
@@ -70,7 +70,7 @@ const KEYS = ['Escape', 'Tab', 'Enter', 'Space', 'ArrowDown', 'ArrowLeft', 'Arro
 /** Closes every layer open, a dialog too, by Escape, and waits until they have gone. */
 async function closeLayers() {
   for (let i = 0; i < 6 && document.querySelector(LAYER); i++) {
-    await commands.key('Escape');
+    await pressKey('Escape');
     await wait(150);
   }
   await closeAll();
@@ -91,7 +91,7 @@ const STEP = fc.oneof(
 /** Takes step `s` on the page, as a person would; a step on what the page does not show now does nothing. */
 async function take(page, s) {
   const target = (name) => TARGETS[name](page);
-  if (s.key) return commands.key(s.key);
+  if (s.key) return pressKey(s.key);
   const t = target(s.press ?? s.hover ?? s.twice ?? s.closing);
   if (!t) return;
   const [at, button] = t;
@@ -102,7 +102,7 @@ async function take(page, s) {
   // Opens it, closes it with Escape, and presses the next while it fades.
   await pressAt(at, button);
   await wait(60);
-  await commands.key('Escape');
+  await pressKey('Escape');
   const next = target(s.then);
   if (next) await pressAt(...next);
 }
@@ -157,7 +157,7 @@ describe('a layer the keys go on from', () => {
           // Or its menu, opened by a right-click, that the keys go on from.
           if (menu) await pressAt(plotArea(page, page.ids[1]), 'right');
           for (let i = 0; i < keys.length; i++) {
-            await commands.key(keys[i]);
+            await pressKey(keys[i]);
             await wait(150);
             await settle();
             if (openLayers().length) continue;
@@ -199,7 +199,7 @@ describe('the confirmation before running several actions', () => {
       await commands.mouse([['move', ...centre(button('Display settings'))], ['wait', 450]]);
       check('a hover over Display settings');
       // The palette, opened over it, takes its place.
-      await commands.key('Control+k');
+      await pressKey('Control+k');
       await wait(150);
       await settle();
       check('the palette');

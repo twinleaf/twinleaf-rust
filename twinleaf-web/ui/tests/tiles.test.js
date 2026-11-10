@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, focusPage, frames, mountPage, wait, withExamples } from './harness/page.js';
+import { centre, drag, focusPage, frames, mountPage, pressKey, wait, withExamples } from './harness/page.js';
 import { GUTTER, dock, gutters, plotIds, rects } from '../src/lib/layout.js';
 import { OUTER_INSET, STEP } from '../src/lib/moves.js';
 
@@ -152,9 +152,9 @@ describe('a gap drag', () => {
       const [x, y] = centre(document.querySelector('.tiles .separator'));
       await commands.mouse([['move', x, y], ['down'], ['move', x + 40, y]]);
       // The next tab, and back: the tiles the drag was in are gone.
-      await commands.key(']');
+      await pressKey(']');
       expect(page.ws.activeId).not.toBe(tab);
-      await commands.key('[');
+      await pressKey('[');
       expect(page.ws.activeId).toBe(tab);
       await commands.mouse([['up']]);
       flushSync();
@@ -162,7 +162,7 @@ describe('a gap drag', () => {
       // Escape is the page's again: it deselects.
       page.ws.selection.only([a]);
       flushSync();
-      await commands.key('Escape');
+      await pressKey('Escape');
       flushSync();
       expect(page.ws.selected.size).toBe(0);
     } finally {
@@ -205,7 +205,7 @@ describe('a plot move', () => {
     const [tx, ty] = centre(document.querySelector(`.leaf[data-plot="${plotIds(layout)[1]}"]`));
     await commands.mouse([['move', x, y], ['down'], ['move', x + 8, y + 8], ['move', tx, ty - STEP], ['wait', 100]]);
     expect(document.querySelector('.drop-preview')).not.toBe(null);
-    await commands.key('Escape');
+    await pressKey('Escape');
     await commands.mouse([['up']]);
     flushSync();
     await frames();

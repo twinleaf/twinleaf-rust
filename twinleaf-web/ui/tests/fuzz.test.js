@@ -49,7 +49,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, quietApi, showing, until, withExamples } from './harness/page.js';
+import { centre, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pressKey, quietApi, showing, until, withExamples } from './harness/page.js';
 import { GUTTER, plotIds, rects, restrict } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
 
@@ -135,7 +135,7 @@ async function play(s, page) {
     const [x, y] = s.at === 'header' ? [el.getBoundingClientRect().left + 12, centre(el)[1]] : centre(el);
     const button = s.t === 'right' ? 'right' : 'left';
     await commands.mouse(holding(s.mod ? [{ shift: 'Shift', ctrl: 'Control' }[s.mod]] : [], [['move', x, y], ['down', button], ['up', button]]));
-  } else if (s.t === 'key') await commands.key(s.key);
+  } else if (s.t === 'key') await pressKey(s.key);
   else if (s.t === 'move' || s.t === 'toTab') {
     const shown = ws.shownIds();
     if (shown.length < 2 && s.t === 'move') return false;
@@ -162,7 +162,7 @@ async function play(s, page) {
     // Where the preview is set, not where its slide there has got to.
     const set = document.querySelector('.drop-preview')?.style;
     const preview = set && { left: parseFloat(set.left), top: parseFloat(set.top), width: parseFloat(set.width), height: parseFloat(set.height) };
-    if (s.escape) await commands.key('Escape');
+    if (s.escape) await pressKey('Escape');
     const steps = history.undos.length, layout = ws.layout;
     await commands.mouse([['up']]);
     flushSync();
@@ -204,7 +204,7 @@ async function play(s, page) {
     const to = [r.left + 2 + s.fx * (r.width - 4), r.top + 2 + s.fy * (r.height - 4)];
     if (s.shift) await commands.mouse([['hold', 'Shift']]);
     await commands.mouse([['move', ...from], ['down'], ...glide(from, to, 5)]);
-    if (s.escape) await commands.key('Escape');
+    if (s.escape) await pressKey('Escape');
     await commands.mouse([['up'], ...(s.shift ? [['let go', 'Shift']] : [])]);
   } else if (s.t === 'wheel') {
     const body = TARGETS.plot(s.i);

@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { MENUS, menuPage, settle } from './harness/menus.js';
-import { centre, frames } from './harness/page.js';
+import { centre, frames, pressKey } from './harness/page.js';
 
 describe('a menu closed by a press outside it', () => {
   it('says what it said until it is gone, whatever the press changed', async () => {
@@ -55,7 +55,7 @@ describe('a menu opened again while it fades', () => {
       }
       // Its rows are the page's own: one of them still does what it says.
       const before = page.ws.maximized;
-      await commands.key('f');
+      await pressKey('f');
       await settle();
       expect(page.ws.maximized, 'Maximize ran').not.toEqual(before);
     } finally {

@@ -8,9 +8,8 @@
 // are the stub hub's, which answer as the server does. Every control is
 // pressed with the real mouse, and the field typed into from the keyboard.
 import { describe, expect, it } from 'vitest';
-import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
-import { clickOn, frames, mountPage, typeInto, wait } from './harness/page.js';
+import { clickOn, frames, mountPage, pressKey, typeInto, wait } from './harness/page.js';
 
 const RPCS = [
   { name: 'gain', channel: 'setting', value: 5 },
@@ -47,7 +46,7 @@ describe('a write to devices', () => {
       expect(noticeText()).toContain('Set gain to 10 (was 5) · 2 devices');
       expect(button(notices()[0], 'Revert')).toBeTruthy();
       document.activeElement?.blur();
-      await commands.key('Control+z');
+      await pressKey('Control+z');
       await settle();
       expect(page.hub.calls.length, 'Ctrl+Z writes nothing').toBe(1);
       page.hub.announce('/1', { gain: 7 });

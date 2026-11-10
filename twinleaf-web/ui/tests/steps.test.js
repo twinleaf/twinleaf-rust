@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, dropped, editCursors, feed, focusPage, frames, glide, leafOf, mountPage, pickItem, plotMenu, settle, until, withExamples } from './harness/page.js';
+import { centre, drag, dropped, editCursors, feed, focusPage, frames, glide, leafOf, mountPage, pickItem, plotMenu, pressKey, settle, until, withExamples } from './harness/page.js';
 import { xOf, yOf } from '../src/lib/cursors.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
@@ -36,11 +36,11 @@ const fromMenu = async (id, ...labels) => (await plotMenu(id), () => pickItem(..
  * makes it.
  */
 const COMMANDS = {
-  Delete: () => () => commands.key('Delete'),
-  l: () => () => commands.key('l'),
-  '|': () => () => commands.key('|'),
-  _: () => () => commands.key('_'),
-  f: () => () => commands.key('f'),
+  Delete: () => () => pressKey('Delete'),
+  l: () => () => pressKey('l'),
+  '|': () => () => pressKey('|'),
+  _: () => () => pressKey('_'),
+  f: () => () => pressKey('f'),
   'Split right': (page, id) => fromMenu(id, 'Split right'),
   'Close plot': (page, id) => fromMenu(id, 'Close plot'),
   'Kind Spectrum': (page, id) => fromMenu(id, 'Kind', 'Spectrum'),
@@ -52,7 +52,7 @@ const COMMANDS = {
   'a signal clicked': () => () => document.querySelector('.palette [data-key="vector.x"]').click(),
   // Commands on the cursors, which are edits; every plot has some placed first.
   'the eraser': (page) => (cursorsEverywhere(page), () => document.querySelector('button[aria-label="Clear the cursors"]').click()),
-  'End, which follows live': (page) => (cursorsEverywhere(page), () => commands.key('End')),
+  'End, which follows live': (page) => (cursorsEverywhere(page), () => pressKey('End')),
   'Clear cursors': (page, id) => (cursorsEverywhere(page), fromMenu(id, 'Clear cursors')),
 };
 /** Places X1, X2 and a Y1 on every plot, as steps made before the case. */

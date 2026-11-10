@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pickItem, plotMenu, quietApi, until, withExamples } from './harness/page.js';
+import { centre, drag, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, until, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
 
@@ -164,7 +164,7 @@ describe('Escape during a gesture', () => {
             await commands.mouse(pressTo(from, to));
             // Under way: the box drawn, or the plot lifted.
             await until(() => document.querySelector(kind === 'box' ? '.marquee' : '.move-ghost'), 2000);
-            await commands.key('Escape');
+            await pressKey('Escape');
             // What comes after Escape, the pointer still down, starts nothing again.
             await commands.mouse([['move', to[0] + 20, to[1] + 10], ['move', to[0] - 10, to[1] + 30], ['up']]);
             flushSync();
@@ -214,7 +214,7 @@ describe('Escape', () => {
           if (focus !== null && shown.includes(ids[focus])) leafOf(ids[focus]).querySelector('.plot-card').focus();
           else document.activeElement?.blur();
           flushSync();
-          for (let i = 0; i < presses; i++) await commands.key('Escape');
+          for (let i = 0; i < presses; i++) await pressKey('Escape');
           // Every plot shown again, so each draws its readout.
           page.ws.maximized = null;
           await until(() => withCursors().length >= want.length, 3000);
@@ -237,7 +237,7 @@ describe('a key', () => {
       page.ws.selection.only(ids.slice(0, 2));
       flushSync();
       await plotMenu(ids[0]);
-      for (const key of ['l', 'y', 'Backspace']) await commands.key(key);
+      for (const key of ['l', 'y', 'Backspace']) await pressKey(key);
       flushSync();
       expect(plotIds(page.ws.layout)).toEqual(ids);
       for (const id of ids) expect(page.ws.plots[id].legend, id).toBe(false);
@@ -260,7 +260,7 @@ describe('the Live button', () => {
       await commands.mouse([['move', ...centre(live)], ['down'], ['up']]);
       await frames();
       for (const id of ids) expect(paused(id), id).toBe(true);
-      await commands.key('Space');
+      await pressKey('Space');
       flushSync();
       await frames();
       for (const id of ids) expect(paused(id), id).toBe(false);
@@ -282,9 +282,9 @@ describe('Space', () => {
       for (const head of document.querySelectorAll('.dock-head')) {
         const was = open(head);
         // A key pressed first, so the focus that follows is the keyboard's.
-        await commands.key('Shift');
+        await pressKey('Shift');
         head.focus();
-        await commands.key('Space');
+        await pressKey('Space');
         flushSync();
         await frames();
         expect(open(head), head.textContent).toBe(!was);
@@ -346,12 +346,12 @@ async function ownKeys(zones) {
         if (how === 'click') await commands.mouse([['move', ...centre(ZONES[zone].click(el))], ['down'], ['up']]);
         else {
           // A key pressed first, so the focus that follows is the keyboard's.
-          await commands.key('Shift');
+          await pressKey('Shift');
           ZONES[zone].reach(el).focus();
         }
         await frames();
         heard.length = 0;
-        await commands.key(key);
+        await pressKey(key);
         await frames();
         expect(drags, `${how}, ${key} on a ${zone}: a keyboard drag`).toEqual([]);
         if (how === 'click') expect(heard, `${key} after a click on a ${zone}: heard by the page`).toEqual([key === 'Space' ? ' ' : key]);
@@ -360,7 +360,7 @@ async function ownKeys(zones) {
         window.removeEventListener('consider', consider, true);
         window.removeEventListener('keydown', hear);
         // A drag left running ends with the page.
-        await commands.key('Escape');
+        await pressKey('Escape');
         page.dispose();
       }
     }),

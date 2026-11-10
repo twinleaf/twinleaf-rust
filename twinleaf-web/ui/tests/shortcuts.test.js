@@ -6,9 +6,8 @@
 // typed in. The menus are found on the page, so a row added to one is held
 // to this without being named here.
 import { describe, expect, it } from 'vitest';
-import { commands } from 'vitest/browser';
 import { MENUS, click, closeAll, menuPage, settle } from './harness/menus.js';
-import { OPEN, centre, until } from './harness/page.js';
+import { OPEN, centre, pressKey, until } from './harness/page.js';
 
 /** The keys a row's `<kbd>`s name, as the keyboard command takes them. */
 const NAMES = { '⇧': 'Shift', Ctrl: 'Control', '|': '|', _: '_' };
@@ -69,10 +68,10 @@ async function after(menu, label, keys, closed = false) {
     if (keys !== null) {
       if (closed) {
         // One Escape closes the menu; a second would deselect.
-        await commands.key('Escape');
+        await pressKey('Escape');
         expect(await until(() => !document.querySelector(OPEN)), 'the menu closed').toBe(true);
       }
-      await commands.key(keys);
+      await pressKey(keys);
       if (!closed) await until(() => !m.isConnected);
     }
     await settle(6);
