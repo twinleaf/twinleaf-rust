@@ -3,7 +3,7 @@
 // plot's edge of one out of view), each tick label's box, and the stub
 // each cursor line runs on by past the plot's edge. For any cursors, on
 // plots of every mode and kind, with axes on either side: no tag lies over
-// a tick label, every tag is inside the plot area, and each stub is in the
+// another tag or a tick label, every tag is inside the plot area, and each stub is in the
 // axis's gutter beside the plot, short of the tick labels, so the line can
 // be set against a tick.
 import { describe, expect, it } from 'vitest';
@@ -58,6 +58,7 @@ describe('a plot’s cursors, as drawn', () => {
               expect(tag.x >= P.x - 0.5 && tag.x + tag.w <= P.x + P.w + 0.5 && tag.y >= P.y - 0.5 && tag.y + tag.h <= P.y + P.h + 0.5, `plot ${n}: tag ${JSON.stringify(tag)} inside the plot ${JSON.stringify(P)}`).toBe(true);
               count.tags++;
             }
+            tags.forEach((a, i) => tags.slice(i + 1).forEach((b) => expect(overlap(a, b), `plot ${n}: tag ${a.text} at ${[a.x, a.y]} over tag ${b.text} at ${[b.x, b.y]}`).toBe(false)));
             count.edge += tags.filter((t) => t.edge).length;
             for (const s of pv.cursorStubs) {
               const box = { x: Math.min(s.x0, s.x1) - 0.5, y: Math.min(s.y0, s.y1) - 0.5, w: Math.abs(s.x1 - s.x0) + 1, h: Math.abs(s.y1 - s.y0) + 1 };

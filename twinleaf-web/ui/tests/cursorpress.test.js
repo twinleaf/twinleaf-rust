@@ -148,7 +148,8 @@ describe('a press on a plot', () => {
         }),
         { examples: EXAMPLES, numRuns: EXAMPLES.length + Math.ceil(fc.readConfigureGlobal().numRuns / 4) },
       );
-      for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(what === 'covered' ? -1 : 10);
+      // Tags are laid clear of one another, so few lie under another; some are under what the page lays over the plot.
+      for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(what === 'covered' || what === 'underAnother' ? -1 : 10);
     } finally {
       await commands.mouse([['up']]);
       page.dispose();

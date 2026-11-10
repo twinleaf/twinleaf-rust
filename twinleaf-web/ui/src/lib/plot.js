@@ -1307,6 +1307,17 @@ export class PlotView {
       const x = align === 'left' ? cx : align === 'right' ? cx - w : cx - w / 2;
       return { x: Math.round(x), y: Math.round(cy - TAB.h / 2), w, h: TAB.h, text };
     };
+    // An X cursor's tag where it is laid: at `box`, or, where that would cover
+    // a tag laid before it, `row` px further into the plot, a row at a time.
+    // The tags laid along the lanes' sides after it stand clear of it (`tagSlot`).
+    const laid = (box, row) => {
+      const covers = (b) => this.tagsPlaced.some((t) => b.x < t.x + t.w && t.x < b.x + b.w && b.y < t.cy + t.h / 2 && t.cy - t.h / 2 < b.y + b.h);
+      while (covers(box) && box.y + row >= P.y && box.y + row + box.h <= P.y + P.h) box = { ...box, y: box.y + row };
+      const cy = box.y + box.h / 2;
+      this.tagsPlaced.push({ lane: this.geo.lanes.find((l) => cy >= l.y && cy <= l.y + l.h), side: null, cy, x: box.x, w: box.w, h: box.h });
+      return box;
+    };
+    const ROW = TAB.h + 2;
     const lines = [], tags = [], tabs = [];
     this.cursorStubs = [];
     if (marks.a !== null && marks.b !== null) {
@@ -1337,13 +1348,13 @@ export class PlotView {
         const runs = [...this.geo.lanes.map((lane) => [px, lane.y, px, lane.y + lane.h]), [px, P.y + P.h, px, P.y + P.h + CURSOR_STUB]];
         lines.push({ part: 'line', ...cursor, at: px, runs, x: px - CURSOR_GRAB, y: P.y, w: 2 * CURSOR_GRAB, h: P.h + CURSOR_STUB });
         this.cursorStubs.push({ x0: px, y0: P.y + P.h, x1: px, y1: P.y + P.h + CURSOR_STUB });
-        tags.push({ part: 'tag', ...cursor, at: px, ...tag(within(px, P.x + TAB.w / 2, P.x + P.w - TAB.w / 2), xTagY, xName[name]) });
+        tags.push({ part: 'tag', ...cursor, at: px, ...laid(tag(within(px, P.x + TAB.w / 2, P.x + P.w - TAB.w / 2), xTagY, xName[name]), -ROW) });
         const text = fx(v), right = px + ctx.measureText(text).width + 10 > P.x + P.w;
-        tags.push({ part: 'tag', ...cursor, at: px, ...tag(right ? px - 2 : px + 2, P.y + TAB.h / 2 + 2, text, right ? 'right' : 'left') });
+        tags.push({ part: 'tag', ...cursor, at: px, ...laid(tag(right ? px - 2 : px + 2, P.y + TAB.h / 2 + 2, text, right ? 'right' : 'left'), ROW) });
       } else {
         const step = name === 'b' ? TAB.w + 10 : 0;
         const box = v < xd[0] ? tag(P.x + TAB.w / 2 + 4 + step, xTagY, `‹${xName[name]}`) : tag(P.x + P.w - TAB.w / 2 - 4 - step, xTagY, `${xName[name]}›`);
-        tags.push({ part: 'tag', ...cursor, edge: true, ...box });
+        tags.push({ part: 'tag', ...cursor, edge: true, ...laid(box, -ROW) });
       }
     }
     for (const a of axes) {
@@ -1371,9 +1382,9 @@ export class PlotView {
           tags.push({ part: 'tag', ...cursor, at: py, ...tag(this.tagSlot(a.lane, a.side, cy, w, TAB.h), cy, text, 'left') });
         } else {
           const step = name === 'b' ? TAB.h + 2 : 0;
-          const inside = left ? [edge + 1, 'left'] : [edge - 1, 'right'];
-          const box = py < a.lane.y ? tag(inside[0], a.lane.y + TAB.h / 2 + 1 + step, `${yName[name]}˄`, inside[1]) : tag(inside[0], a.lane.y + a.lane.h - TAB.h / 2 - 1 - step, `${yName[name]}˅`, inside[1]);
-          tags.push({ part: 'tag', ...cursor, edge: true, ...box });
+          const [cy, text] = py < a.lane.y ? [a.lane.y + TAB.h / 2 + 1 + step, `${yName[name]}˄`] : [a.lane.y + a.lane.h - TAB.h / 2 - 1 - step, `${yName[name]}˅`];
+          const w = Math.max(TAB.w, ctx.measureText(text).width + 6);
+          tags.push({ part: 'tag', ...cursor, edge: true, ...tag(this.tagSlot(a.lane, a.side, cy, w, TAB.h), cy, text, 'left') });
         }
       }
     }
@@ -1476,7 +1487,7 @@ export class PlotView {
    */
   tagSlot(lane, side, cy, w, h) {
     let x = side === 'left' ? lane.x + 1 : lane.x + lane.w - 1 - w;
-    const near = this.tagsPlaced.filter((t) => t.lane === lane && t.side === side && Math.abs(t.cy - cy) < (t.h + h) / 2);
+    const near = this.tagsPlaced.filter((t) => t.lane === lane && (t.side === side || t.side === null) && Math.abs(t.cy - cy) < (t.h + h) / 2);
     for (let moved = true; moved; ) {
       moved = false;
       for (const t of near)

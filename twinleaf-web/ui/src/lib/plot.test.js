@@ -378,6 +378,14 @@ describe('Tags along a lane', () => {
     expect(pv.tagSlot(lane, 'right', 50, 40, 14)).toBe(259);
     expect(pv.tagSlot(lane, 'right', 50, 20, 14)).toBe(237);
   });
+  it('stand clear of a tag laid across the plot at their height, from either side', () => {
+    const lane = { x: 0, y: 0, w: 300, h: 100 };
+    const pv = Object.assign(Object.create(PlotView.prototype), { tagsPlaced: [{ lane, side: null, cy: 93, x: 0, w: 22, h: 14 }, { lane, side: null, cy: 93, x: 150, w: 22, h: 14 }] });
+    expect(pv.tagSlot(lane, 'left', 90, 22, 14)).toBe(24);
+    expect(pv.tagSlot(lane, 'left', 90, 40, 14)).toBe(48);
+    expect(pv.tagSlot(lane, 'right', 90, 22, 14)).toBe(277);
+    expect(pv.tagSlot(lane, 'left', 60, 22, 14)).toBe(1);
+  });
 });
 
 describe('timeAxis', () => {
