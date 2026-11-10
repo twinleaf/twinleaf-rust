@@ -120,7 +120,7 @@
 <ContextMenu.Root bind:open={menuOpen}>
 <ContextMenu.Trigger>
 {#snippet child({ props })}
-<ScrollArea class="palette-scroll">
+<ScrollArea class="palette-scroll" type="auto">
   <div
     {...props}
     oncontextmenucapture={(e) => {

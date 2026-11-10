@@ -18,7 +18,7 @@
 </script>
 
 <div class="devices">
-  <ScrollArea class="device-list">
+  <ScrollArea class="device-list" type="auto">
     <div role="list" aria-label="Devices">
       {#each devices as d (d.route)}
         <label class="device" role="listitem" title="{d.serial ?? ''} {d.firmware ?? ''}">

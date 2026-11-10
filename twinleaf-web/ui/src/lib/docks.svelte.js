@@ -12,19 +12,20 @@ export const KEY = 'tl-docks-v1';
 
 /**
  * Every panel, by id. `channels` names the RPC channels a Properties panel
- * shows (null for entries with none). A panel is as tall as what it shows;
- * one that `shrinks` gives up height when the dock runs short and scrolls
- * inside, and the rest keep theirs.
+ * shows (null for entries with none). A panel is as tall as what it shows,
+ * up to a share of its dock's height that plot.css gives every panel, past
+ * which its list scrolls inside it; the dock scrolls the panels that do not
+ * fit.
  */
 export const PANELS = {
-  devices: { title: 'Devices', shrinks: false },
-  signals: { title: 'Signals', shrinks: true },
-  settings: { title: 'Settings', shrinks: true, channels: ['setting'] },
-  reports: { title: 'Reports', shrinks: true, channels: ['report'] },
-  actions: { title: 'Actions', shrinks: false, channels: ['action'] },
-  diagnostics: { title: 'Diagnostics', shrinks: true, channels: ['diagnostic'] },
-  other: { title: 'Other', shrinks: true, channels: [null] },
-  favorites: { title: 'Favorites', shrinks: true, channels: ['favorite'] },
+  devices: { title: 'Devices' },
+  signals: { title: 'Signals' },
+  settings: { title: 'Settings', channels: ['setting'] },
+  reports: { title: 'Reports', channels: ['report'] },
+  actions: { title: 'Actions', channels: ['action'] },
+  diagnostics: { title: 'Diagnostics', channels: ['diagnostic'] },
+  other: { title: 'Other', channels: [null] },
+  favorites: { title: 'Favorites', channels: ['favorite'] },
 };
 
 export const SIDES = ['left', 'right'];

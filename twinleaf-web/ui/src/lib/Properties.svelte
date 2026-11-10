@@ -306,7 +306,7 @@
 {#if !rows.length}
   <div class="props-empty">{filter.trim() ? 'No property matches' : starredOnly ? 'Star a property to add it here' : 'Nothing here on the checked devices'}</div>
 {:else if buttons}
-  <ScrollArea class="props">
+  <ScrollArea class="props" type="auto">
     <div class="action-grid" data-rows>
       {#each rows as row (row.name)}
         {@const reach = writersOf(row, devices)}
@@ -340,7 +340,7 @@
   const i = Number(e.target.closest?.('tr[id^=prop-]')?.id.slice(5));
   if (Number.isInteger(i) && rows[i]) selection.rowMenu(prefix + rows[i].name);
 }}>
-<ScrollArea class="props">
+<ScrollArea class="props" type="auto">
   <Table.Root
     class="props-table"
     role="grid"

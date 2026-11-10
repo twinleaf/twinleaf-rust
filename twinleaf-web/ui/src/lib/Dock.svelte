@@ -139,8 +139,8 @@
 >
   {#each items as p, i (p.id)}
     <!-- The drag library's placeholder for a panel from the other dock has an id of its own. -->
-    {@const panel = PANELS[p.id] ?? { title: '', shrinks: false }}
-    <section class="dock-panel" class:shadow={p[SHADOW]} class:open={p.open} class:shrinks={panel.shrinks} role="listitem" aria-label={panel.title} animate:flip={{ duration: dragging ? FLIP_MS : 0 }}>
+    {@const panel = PANELS[p.id] ?? { title: '' }}
+    <section class="dock-panel" class:shadow={p[SHADOW]} class:open={p.open} role="listitem" aria-label={panel.title} animate:flip={{ duration: dragging ? FLIP_MS : 0 }}>
       <ContextMenu.Root>
         <ContextMenu.Trigger>
           {#snippet child({ props })}
