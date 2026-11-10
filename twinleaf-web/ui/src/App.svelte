@@ -498,15 +498,15 @@
   }
   /**
    * What the Signals list's Add to plot says of signal `key`, as {text,
-   * can}: the plot it would join, or how many, from the same selection the
-   * command acts on; or why it joins none. Where every selected plot shows
+   * can}: how many plots it would join when more than one, from the same
+   * selection the command acts on; or why it joins none. Where every selected plot shows
    * it already, `remove` is true and the row takes it out of them instead.
    */
   function addsTo(key) {
     const ids = selection.pageTargets('plot'), lacking = ids.filter((id) => !ws.plots[id].items.some((i) => i.key === key));
     if (!ids.length) return { text: 'No plot selected', can: false };
-    if (!lacking.length) return { text: ids.length > 1 ? plotsText(ids.length) : labelOf(ids[0]), can: true, remove: true };
-    return { text: lacking.length > 1 ? plotsText(lacking.length) : labelOf(lacking[0]), can: true };
+    if (!lacking.length) return { text: ids.length > 1 ? plotsText(ids.length) : '', can: true, remove: true };
+    return { text: lacking.length > 1 ? plotsText(lacking.length) : '', can: true };
   }
   /** Moves keyboard focus to plot `id`, once it is on the page. */
   async function focusPlot(id) {

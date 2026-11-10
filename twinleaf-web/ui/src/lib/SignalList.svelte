@@ -148,7 +148,7 @@
         id="pal-{item.id}"
         data-key={item.key}
         class="chip"
-        class:active={focused && i === active}
+        class:active={(focused && i === active) || (menuOpen && item.key === menuKey)}
         role="option"
         aria-selected={focused && i === active}
         tabindex="-1"

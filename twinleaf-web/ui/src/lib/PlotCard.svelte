@@ -125,11 +125,11 @@
       return [`${a !== null ? 'X1' : 'X2'} ${cursorText(p.xKind()).at(at, between)}`];
     }));
   }
-  /** The signals of the axis Add Y cursors would land on, on each plot it acts on from this plot's y axis `key` (`eachAxis`), or null on none. */
+  /** The signals of the axis Add Y cursors would land on, on each plot it acts on from this plot's y axis `key` (`eachAxis`); null on none, and where each plot has the one axis. */
   const yLands = (key) => {
     const names = [];
-    eachAxis(key, (p, axis) => names.push(p.axisName(axis)));
-    return common(names);
+    eachAxis(key, (p, axis) => names.push(p.yAxes.length > 1 ? p.axisName(axis) : null));
+    return names.some(Boolean) ? common(names) : null;
   };
   /** How many cursors the plots a command here acts on have placed, or null with none. */
   const placed = () => {
@@ -547,6 +547,19 @@
     setTimeout(() => card?.focus());
   }
   let active = $state(0); // the signal the arrows are on, while the signals have focus
+  /**
+   * Makes signal `key` the one the signals' keys act on, the signals
+   * focused: what a right-click on its chip or its legend row does, so the
+   * keys its menu shows act on it once the menu has closed. Returns `key`.
+   */
+  function makeCurrent(key) {
+    const at = plot.items.findIndex((i) => i.key === key);
+    if (at < 0) return key;
+    active = at;
+    zoneFocused = true;
+    zone?.focus();
+    return key;
+  }
   let zoneFocused = $state(false);
   let addFromKeys = false;
   /** Opens the add-a-signal menu under the plot's signals. */
@@ -703,9 +716,11 @@
   {@const item = plot.items.find((i) => i.key === key)}
   {@const side = slots ? (slots.left.includes(key) ? 'left' : slots.right.includes(key) ? 'right' : 'none') : null}
   {@const hides = plot.items.filter((i) => i.key !== key && !i.hidden).length}
-  <ContextMenu.Item onSelect={() => showOnly(key)}><RiShowOnly class="menu-icon" />Show only this{@render value(hides ? `hides ${hides}` : null)}</ContextMenu.Item>
-  {#if plot.items.some((i) => i.hidden)}
+  <!-- Two rows: this signal alone or every signal, whichever it is not showing; and this signal hidden or shown. -->
+  {#if !hides && !item?.hidden && plot.items.some((i) => i.hidden)}
     <ContextMenu.Item onSelect={showAll}><RiShowOnly class="menu-icon" />Show all</ContextMenu.Item>
+  {:else}
+    <ContextMenu.Item onSelect={() => showOnly(key)}><RiShowOnly class="menu-icon" />Show only this{@render value(hides ? `Hides ${hides}` : null)}</ContextMenu.Item>
   {/if}
   <ContextMenu.Item onSelect={() => toggleHidden(key)}>{#if item?.hidden}<RiShowOnly class="menu-icon" />Show{:else}<RiHide class="menu-icon" />Hide{/if}</ContextMenu.Item>
   <ContextMenu.Separator />
@@ -780,7 +795,7 @@
             use:dndzone={{ items: zoneItems, type: 'trace', flipDurationMs: 0, dropTargetStyle: {}, dropTargetClasses: [], delayTouchStart: true, zoneTabIndex: -1, zoneItemTabIndex: -1, autoAriaDisabled: true, useCursorForDetection: true, morphDisabled: true }}
             onconsider={consider}
             onfinalize={finalize}
-            oncontextmenucapture={(e) => ((signalFilter = ''), (addActive = 0), (menuChip = e.target.closest?.('.trace-chip')?.dataset.key ?? null))}
+            oncontextmenucapture={(e) => ((signalFilter = ''), (addActive = 0), (menuChip = makeCurrent(e.target.closest?.('.trace-chip')?.dataset.key ?? null)))}
             onkeydowncapture={signalsKey}
             onfocus={(e) => (zoneFocused = e.currentTarget.matches(':focus-visible'))}
             onblur={() => (zoneFocused = false)}
@@ -1011,7 +1026,7 @@
               <ContextMenu.Root bind:open={legendMenuOpen}>
                 <ContextMenu.Trigger>
                   {#snippet child({ props })}
-                    <div {...props} class="pinned-legend" data-focus-skip role="list" aria-label="Legend: drag to move" style="--x: {at.x}; --y: {at.y}" onpointerdowncapture={(e) => dragOverlay(e, 'legendAt')} oncontextmenucapture={(e) => (legendKey = e.target.closest?.('.row')?.dataset.key ?? null)}>
+                    <div {...props} class="pinned-legend" data-focus-skip role="list" aria-label="Legend: drag to move" style="--x: {at.x}; --y: {at.y}" onpointerdowncapture={(e) => dragOverlay(e, 'legendAt')} oncontextmenucapture={(e) => (legendKey = makeCurrent(e.target.closest?.('.row')?.dataset.key ?? null))}>
                       {#each plot.items as item (item.id)}
                         <div class="row" role="listitem" data-key={item.key} style="--c:{colorFor(item.key)}" title={item.key}>
                           <Swatch key={item.key} /><span class="name">{item.key}</span><span class="val">{legend.rows[item.key]?.value ?? ''}</span><span class="units">{unitsShown(item.key)}</span>

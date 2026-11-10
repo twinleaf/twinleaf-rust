@@ -81,8 +81,8 @@ const CASES = [
     Layout: 'Independent Y',
     'Close plot': '2 signals',
   }],
-  [['A', 'B'], 'a chip’s menu', 'A', { 'Show only this': 'hides 1', Colour: 'Auto', 'Move to': '3 plots' }],
-  [['A', 'B'], 'a chip’s menu', 'B', { 'Show only this': 'hides 1', Axis: 'Left', 'Move to': '3 plots' }],
+  [['A', 'B'], 'a chip’s menu', 'A', { 'Show only this': 'Hides 1', Colour: 'Auto', 'Move to': '3 plots' }],
+  [['A', 'B'], 'a chip’s menu', 'B', { 'Show only this': 'Hides 1', Axis: 'Left', 'Move to': '3 plots' }],
   [['A', 'B'], 'the readout’s menu', 'A', {
     // X, A's two signals, and the shared axis's Y.
     'Copy table': '4 rows',
@@ -94,8 +94,8 @@ const CASES = [
   [['A', 'B'], 'the add-signal menu', 'A', { 'Remove every signal': '4 signals' }],
   // The Signals list's first signal is aux.triangle.
   [[], 'the Signals list’s menu', null, { 'Add to plot': 'No plot selected', 'New plot': 'Time · Overlay' }],
-  [['A'], 'the Signals list’s menu', null, { 'Remove from plot': 'sine.sine, aux.triangle' }],
-  [['B'], 'the Signals list’s menu', null, { 'Add to plot': 'sine.sine, mag.x' }],
+  [['A'], 'the Signals list’s menu', null, { 'Remove from plot': null }],
+  [['B'], 'the Signals list’s menu', null, { 'Add to plot': null }],
   [['B', 'D'], 'the Signals list’s menu', null, { 'Add to plot': '2 plots' }],
   [[], 'a tab’s menu', null, { Duplicate: '4 plots', Close: '4 plots' }],
   [[], 'the File dropdown', null, { 'Export every tab': '2 tabs', 'Export data': '4 plots' }],

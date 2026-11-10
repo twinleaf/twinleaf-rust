@@ -1,6 +1,7 @@
 <script>
 	import { ContextMenu as ContextMenuPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils.js";
+	import { runShownKey } from "$lib/menus.js";
 	import { overlayContent } from "$lib/overlay.svelte.js";
 	import ContextMenuPortal from "./context-menu-portal.svelte";
 	let {
@@ -29,6 +30,7 @@
 			className
 		)}
 		{...restProps}
+		onkeydowncapture={runShownKey}
 		onInteractOutside={(e) => (layer.outside(), onInteractOutside?.(e))}
 		onCloseAutoFocus={(e) => (layer.closing(e), onCloseAutoFocus?.(e))}
 	/>

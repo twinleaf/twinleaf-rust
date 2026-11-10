@@ -1,6 +1,7 @@
 <script>
 	import { ContextMenu as ContextMenuPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils.js";
+	import { runShownKey } from "$lib/menus.js";
 	import ContextMenuPortal from "./context-menu-portal.svelte";
 	let {
 		ref = $bindable(null),
@@ -23,5 +24,6 @@
 			className
 		)}
 		{...restProps}
+		onkeydowncapture={runShownKey}
 	/>
 </ContextMenuPortal>
