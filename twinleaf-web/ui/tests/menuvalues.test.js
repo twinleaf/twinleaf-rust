@@ -5,10 +5,14 @@
 // of known plots, for selections of one plot, several and none, each value
 // is the one worked out by hand below. A row that cannot be chosen says why,
 // and a warning shows, whatever the hints; and Copy data's count follows the
-// view of every plot it would copy.
+// view of every plot it would copy. A signal's menu in the Signals list
+// offers Remove from plot where every selected plot shows the signal and
+// Add to plot otherwise, and the row's count is the plots its click
+// changes, for every signal of the list and any plots selected.
 import { describe, expect, it } from 'vitest';
-import { MENUS, closeAll, openMenu, settle } from './harness/menus.js';
-import { editCursors, feed, mountPage, wait, withYPair } from './harness/page.js';
+import fc from 'fast-check';
+import { MENUS, click, closeAll, openMenu, rightClick, settle } from './harness/menus.js';
+import { centre, editCursors, feed, mountPage, wait, withExamples, withYPair } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { prefs } from '../src/lib/prefs.svelte.js';
 
@@ -171,4 +175,48 @@ describe('a menu row’s value', () => {
       page.dispose();
     }
   });
+
+  it('of a signal’s Add to plot or Remove from plot is the plots its click changes: Remove where every selected plot shows the signal, Add for the ones that lack it otherwise', async () => {
+    const page = await fixture();
+    const shows = (key) => Object.fromEntries(page.ids.map((id) => [id, page.ws.plots[id].items.some((i) => i.key === key)]));
+    const seen = { removeSeveral: 0, addSome: 0, addNone: 0 };
+    try {
+      prefs.setHints(false);
+      // The signals are the list's own, found on the page.
+      const keys = [...document.querySelectorAll('.palette .chip')].map((c) => c.dataset.key);
+      expect([...keys].sort()).toEqual(Object.keys(UNITS).sort());
+      const { A, B, C, D } = page.plots;
+      await fc.assert(
+        fc.asyncProperty(fc.subarray(page.ids, { minLength: 1 }), fc.constantFrom(...keys), async (picks, key) => {
+          await closeAll();
+          page.ws.selection.only(picks);
+          await settle();
+          const before = shows(key), lacking = picks.filter((id) => !before[id]);
+          const remove = !lacking.length, acts = remove ? picks : lacking;
+          await rightClick(centre(document.querySelector(`.palette .chip[data-key="${key}"]`)));
+          const menu = openMenu(), said = `${key} with ${picks.length} selected, ${lacking.length} lacking it`;
+          const offered = [...menu.querySelectorAll('[role^=menuitem]')].map((r) => r.textContent.trim()).filter((t) => /^(Add to|Remove from) plot/.test(t));
+          expect(offered.length, `${said}: ${offered}`).toBe(1);
+          const row = rowOf(menu, remove ? 'Remove from plot' : 'Add to plot');
+          expect(valueOf(row), said).toBe(acts.length > 1 ? `${acts.length} plots` : null);
+          await click(centre(row));
+          const after = shows(key);
+          // The plots it counted are the ones that changed, each to the other state, and no other plot did.
+          expect(page.ids.filter((id) => after[id] !== before[id]), said).toEqual(page.ids.filter((id) => acts.includes(id)));
+          page.history.undo();
+          await settle();
+          expect(shows(key), 'undone').toEqual(before);
+          if (remove && picks.length > 1) seen.removeSeveral++;
+          else if (!remove && lacking.length < picks.length) seen.addSome++;
+          else if (!remove) seen.addNone++;
+        }),
+        withExamples([[[A, B], 'aux.triangle'], [[A, B, C], 'sine.sine'], [[B, D], 'aux.triangle'], [[A], 'aux.triangle'], [[A, B, C, D], 'mag.x']]),
+      );
+    } finally {
+      prefs.setHints(true);
+      page.dispose();
+    }
+    // Several plots that all show it, some that do and some that do not, and none that do.
+    for (const [which, n] of Object.entries(seen)) expect(n, which).toBeGreaterThan(0);
+  }, 120_000);
 });

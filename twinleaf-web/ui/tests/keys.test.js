@@ -9,6 +9,9 @@
 //   (the user's verdicts, round 2 Selection #17 and #18, and the follow-up
 //   of 2026-11-09).
 // - What is typed in a field is the field's: no claimant takes it.
+// - A Space the page takes, to pause, presses nothing as it is let go,
+//   whatever button a click left focus on; a Space on a button the keyboard
+//   moved focus to is the button's, and presses it once.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
@@ -202,5 +205,60 @@ describe('a key typed in a field', () => {
     } finally {
       page.dispose();
     }
+  }, 600_000);
+});
+
+describe('Space on a button', () => {
+  it('a click left focus on pauses and presses nothing as it is let go, on every button of the page; on one the keyboard moved focus to, presses it once', async () => {
+    const seen = { pause: 0, button: 0 }, where = new Set();
+    await fc.assert(
+      fc.asyncProperty(fc.nat(), fc.constantFrom('press', 'keys'), fc.boolean(), async (at, how, picked) => {
+        const page = await mountPage(KEYS, 'columns', 1, [...KEYS.flat(), ...SIGNALS], RPCS);
+        const clicks = [], note = (e) => clicks.push(e.target);
+        try {
+          feed(page.hub);
+          await focusPage();
+          const ids = plotIds(page.ws.layout);
+          if (picked) page.ws.selection.only(ids.slice(0, 2));
+          await settle();
+          // Every button of the page a key can be pressed on, as a click leaves focus on it; and each plot's Pause, as the keyboard does.
+          const all = places().filter((el) => el.matches('button'));
+          expect(all.length).toBeGreaterThan(10);
+          const buttons = how === 'press' ? all : all.filter((el) => el.matches('.plot-head [data-command=pause]'));
+          expect(buttons.length).toBeGreaterThan(0);
+          const el = buttons[at % buttons.length], said = `Space on ${named(el)}, focused by ${how}`;
+          if (how === 'keys') await pressKey('Shift');
+          el.focus();
+          await settle();
+          const live = () => ids.map((id) => page.views.of(id).live);
+          const before = live();
+          window.addEventListener('click', note, true);
+          await pressKey(' ');
+          flushSync();
+          await frames();
+          const by = lastKey().by;
+          if (how === 'keys') {
+            expect(by, `${said}: the button keeps it`).toBe(null);
+            expect(clicks, `${said}: pressed once`).toEqual([el]);
+            const own = ids.indexOf(el.closest('.leaf').dataset.plot);
+            expect(live()[own], `${said}: its plot paused`).toBe(!before[own]);
+            seen.button++;
+          } else if (by === 'pause') {
+            expect(clicks, `${said}: the page took it, and letting it go presses nothing`).toEqual([]);
+            expect(live(), `${said}: paused`).not.toEqual(before);
+            seen.pause++;
+            where.add(named(el));
+          }
+        } finally {
+          window.removeEventListener('click', note, true);
+          page.dispose();
+        }
+      }),
+      withExamples([[0, 'press', false], [3, 'press', true], [7, 'keys', false], [12, 'press', false], [19, 'keys', true], [25, 'press', true], [31, 'press', false]]),
+    );
+    // The page took Space from buttons of several kinds, and a button kept it.
+    expect(seen.pause).toBeGreaterThan(3);
+    expect(where.size).toBeGreaterThan(3);
+    expect(seen.button).toBeGreaterThan(0);
   }, 600_000);
 });
