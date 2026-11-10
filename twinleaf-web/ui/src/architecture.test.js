@@ -37,9 +37,7 @@ import path from 'node:path';
 const UPDATED = 1 << 2, BINDABLE = 1 << 3;
 
 /** The writes the page still makes, as `file prop`, each with what it writes. */
-const PENDING = new Map([
-  ['lib/Dock.svelte docks', 'whether a panel is being dragged'],
-]);
+const PENDING = new Map([]);
 
 /** State one module owns: `writes` matches a line that changes it, and `once`, where there is one, the owner's one line that sets it. */
 const OWNED = [
@@ -53,6 +51,12 @@ const OWNED = [
     what: 'the selection of plots and rows',
     owner: 'lib/selection.svelte.js',
     writes: /\.selected\.(add|delete|clear)\(|\bfocusedId\s*=[^=]|\.selection\.(plots\.(add|delete|clear)\(|last\s*=[^=]|rows\s*=[^=])/,
+  },
+  {
+    what: 'which dock holds a panel, whether a dock is hidden, and whether a panel is dragged',
+    owner: 'lib/docks.svelte.js',
+    writes: /\bdocks\.(left|right|hidden|dragging)\b[\w.[\]]*\s*=[^=>]|\.#(places|hidden|dragging)\s*=[^=>]/,
+    once: /\.#places\s*=[^=>]/,
   },
   {
     what: 'a plot’s cursors',

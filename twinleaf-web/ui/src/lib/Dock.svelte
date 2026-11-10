@@ -15,10 +15,15 @@
   // The header's menu moves a panel without dragging, and the header folds
   // it on Enter, so the keyboard reaches all of it.
   //
-  // During a drag the panels shown are this dock's own copy, which the drag
-  // library rearranges, and the drop hands them to `docks`. Where the
-  // dragged panel would land shows its header alone, and the place is read
-  // from the cursor, as the panel dragged is its header too.
+  // While a panel is dragged, by `docks.dragging`, the panels shown are a
+  // copy the drag library rearranges; at any other time they are the dock's
+  // own, as `docks` has them. The drag is the page's, not this dock's: it
+  // ends for both docks at once, so a dock the panel only passed over
+  // follows `docks` again as the one it left and the one it landed in do.
+  // The drop tells `docks` the one panel that moved and where it landed,
+  // never a dock's panels as a list. Where the dragged panel would land
+  // shows its header alone, and the place is read from the cursor, as the
+  // panel dragged is its header too.
   import { onDestroy, tick } from 'svelte';
   import { PAGE, claim } from './keyrouter.js';
   import * as clock from './clock.js';
@@ -105,28 +110,24 @@
     }),
   );
   let items = $state([]);
-  let dragging = $state(false);
   const rail = $derived(railed);
   $effect(() => {
-    const committed = rail ? [] : docks[side];
-    if (!dragging) items = committed.map((p) => ({ ...p }));
+    const own = rail ? [] : docks[side];
+    if (!docks.dragging) items = own.map((p) => ({ ...p }));
   });
   const other = $derived(side === 'left' ? 'right' : 'left');
   const [HideIcon, ShowIcon] = side === 'left' ? [RiHideLeft, RiShowLeft] : [RiHideRight, RiShowRight];
 
   function consider(e) {
-    if (e.detail.info.trigger === TRIGGERS.DRAG_STARTED) docks.dragging = true;
-    dragging = true;
+    if (e.detail.info.trigger === TRIGGERS.DRAG_STARTED) docks.startDrag();
     items = e.detail.items;
   }
+  /** The drag ended. The dock the panel was let go in, or went back to, says where it landed; the dock it left for another only hears that it went. */
   function finalize(e) {
-    dragging = false;
-    docks.dragging = false;
-    if (!rail) return docks.set(side, e.detail.items);
-    // A rail holds none of its dock's panels, so what lands on it joins them.
-    const kept = docks[side].filter((p) => !e.detail.items.some((q) => q.id === p.id));
-    docks.set(side, [...kept, ...e.detail.items]);
-    if (e.detail.items.length) docks.hide(side, false);
+    const { id, trigger } = e.detail.info;
+    if (trigger === TRIGGERS.DROPPED_INTO_ANOTHER) return docks.endDrag();
+    // A rail draws none of its dock's panels, so what lands on it joins them at the end.
+    docks.drop(id, side, rail ? docks[side].length : e.detail.items.findIndex((p) => p.id === id));
   }
 </script>
 
@@ -166,7 +167,7 @@
   {#each items as p, i (p.id)}
     <!-- The drag library's placeholder for a panel from the other dock has an id of its own. -->
     {@const panel = PANELS[p.id] ?? { title: '' }}
-    <section class="dock-panel" class:shadow={p[SHADOW]} class:open={p.open} role="listitem" aria-label={panel.title} animate:flip={{ duration: dragging ? FLIP_MS : 0 }}>
+    <section class="dock-panel" class:shadow={p[SHADOW]} class:open={p.open} role="listitem" aria-label={panel.title} animate:flip={{ duration: docks.dragging ? FLIP_MS : 0 }}>
       <ContextMenu.Root>
         <ContextMenu.Trigger>
           {#snippet child({ props })}

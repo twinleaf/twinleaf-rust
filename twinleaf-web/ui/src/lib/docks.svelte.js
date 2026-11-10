@@ -3,9 +3,16 @@
 // header or its menu, and never onto the tiles, which hold plots alone. A
 // dock hides whole, to give the tiles its width, and keeps its panels.
 //
-// The arrangement is kept under KEY. A saved one keeps the panels this page
-// knows, once each, and a panel it lacks joins its default dock, so a page
-// that adds a panel shows it to someone who arranged the old ones.
+// Where the panels are is one record, a place for each panel by its id: its
+// side, its rank among that side's panels, and whether it is open. A panel
+// has one place, so it is in one dock, and a dock's panels are read from
+// the places: no dock keeps a list of its own that could disagree. A move
+// gives one panel a new place; nothing writes a dock's panels as a list.
+//
+// The arrangement is kept under KEY, as each side's panels in order. A
+// saved one keeps the panels this page knows, once each, and a panel it
+// lacks joins its default dock, so a page that adds a panel shows it to
+// someone who arranged the old ones.
 
 /** The localStorage key of the arrangement. */
 export const KEY = 'tl-docks-v1';
@@ -50,39 +57,51 @@ export const DEFAULT = {
 };
 
 /**
- * The arrangement `saved` holds, made whole: unknown and repeated panels
- * dropped, and each missing one appended to its default side.
+ * The arrangement `saved` holds, made whole, as {places, hidden}: `places`
+ * a place {side, rank, open} for every panel by id, and `hidden` whether
+ * each side is hidden. A panel `saved` names more than once is where it
+ * names it first, one it does not know is left out, and one it lacks is
+ * last on its default side.
  */
 export function normalize(saved) {
-  const seen = new Set();
-  const out = { left: [], right: [], hidden: { left: saved?.hidden?.left === true, right: saved?.hidden?.right === true } };
-  for (const side of SIDES) {
-    for (const p of Array.isArray(saved?.[side]) ? saved[side] : []) {
-      if (!PANELS[p?.id] || seen.has(p.id)) continue;
-      seen.add(p.id);
-      out[side].push({ id: p.id, open: p.open !== false });
-    }
-  }
-  for (const side of SIDES) for (const p of DEFAULT[side]) if (!seen.has(p.id)) out[side].push({ ...p });
-  return out;
+  const places = {};
+  let rank = 0;
+  const place = (side, p) => {
+    if (PANELS[p?.id] && !places[p.id]) places[p.id] = { side, rank: rank++, open: p.open !== false };
+  };
+  for (const side of SIDES) for (const p of Array.isArray(saved?.[side]) ? saved[side] : []) place(side, p);
+  for (const side of SIDES) for (const p of DEFAULT[side]) place(side, p);
+  return { places, hidden: { left: saved?.hidden?.left === true, right: saved?.hidden?.right === true } };
 }
 
-/** `docks` with panel `id` moved to `index` of `side`, the rest in order. */
-export function move(docks, id, side, index) {
-  const panel = SIDES.flatMap((s) => docks[s]).find((p) => p.id === id);
-  if (!panel) return docks;
-  const out = { ...docks, left: docks.left.filter((p) => p.id !== id), right: docks.right.filter((p) => p.id !== id) };
-  out[side].splice(Math.max(0, Math.min(index, out[side].length)), 0, panel);
+/** The panels `places` has on `side`, each {id, open}, in order. */
+export function panelsOn(places, side) {
+  return Object.keys(places)
+    .filter((id) => places[id].side === side)
+    .sort((a, b) => places[a].rank - places[b].rank)
+    .map((id) => ({ id, open: places[id].open }));
+}
+
+/** `places` with panel `id` at `index` of `side`'s panels, the others of that side around it in the order they had. */
+export function move(places, id, side, index) {
+  if (!places[id]) return places;
+  const ids = panelsOn(places, side).map((p) => p.id).filter((other) => other !== id);
+  ids.splice(Math.max(0, Math.min(index, ids.length)), 0, id);
+  const out = { ...places, [id]: { ...places[id], side } };
+  ids.forEach((other, rank) => (out[other] = { ...out[other], rank }));
   return out;
 }
 
 export class Docks {
-  left = $state([]);
-  right = $state([]);
+  /** Where every panel is, by id: {side, rank, open}. */
+  #places = $state.raw({});
   /** Whether each dock is hidden, by side. */
-  hidden = $state({ left: false, right: false });
-  /** Whether a panel is being dragged, so an empty dock shows where it would go. */
-  dragging = $state(false);
+  #hidden = $state.raw({ left: false, right: false });
+  #dragging = $state(false);
+  /** The left dock's panels, each {id, open}, in order. */
+  left = $derived(panelsOn(this.#places, 'left'));
+  /** The right dock's panels, each {id, open}, in order. */
+  right = $derived(panelsOn(this.#places, 'right'));
 
   /** `storage` is localStorage, or anything with its getItem and setItem. */
   constructor(storage) {
@@ -91,41 +110,51 @@ export class Docks {
     try {
       saved = JSON.parse(storage?.getItem(KEY) ?? 'null');
     } catch {}
-    Object.assign(this, normalize(saved));
+    this.#arrange(normalize(saved), false);
   }
 
-  save() {
+  /** Whether each dock is hidden, by side. */
+  get hidden() {
+    return this.#hidden;
+  }
+
+  /** Whether a panel is being dragged: each dock then shows where it would go, an empty one too. */
+  get dragging() {
+    return this.#dragging;
+  }
+
+  /**
+   * The one write of the arrangement: every panel's place, `places`, and
+   * whether each dock is hidden, `hidden`, each as it was unless given. It
+   * saves the arrangement unless `save` is false, as for one just read.
+   */
+  #arrange({ places = this.#places, hidden = this.#hidden }, save = true) {
+    this.#places = places;
+    this.#hidden = hidden;
+    if (!save) return;
     try {
-      this.storage?.setItem(KEY, JSON.stringify({ left: this.left, right: this.right, hidden: this.hidden }));
+      this.storage?.setItem(KEY, JSON.stringify({ left: this.left, right: this.right, hidden }));
     } catch {}
   }
 
   /** Whether `side` shows its panels: it has some, and is not hidden. */
   shown(side) {
-    return this[side].length > 0 && !this.hidden[side];
+    return this[side].length > 0 && !this.#hidden[side];
   }
 
   /** Hides `side`, or shows it, by `hidden`. */
   hide(side, hidden) {
-    this.hidden = { ...this.hidden, [side]: hidden };
-    this.save();
+    this.#arrange({ hidden: { ...this.#hidden, [side]: hidden } });
   }
 
   /** The side panel `id` is on. */
   sideOf(id) {
-    return SIDES.find((s) => this[s].some((p) => p.id === id));
+    return this.#places[id]?.side;
   }
 
-  /** Replaces the panels of `side` with `panels`, as a drop leaves them. */
-  set(side, panels) {
-    this[side] = panels.map(({ id, open }) => ({ id, open }));
-    this.save();
-  }
-
+  /** Moves panel `id` to `index` of `side`'s panels, and shows that dock. */
   moveTo(id, side, index) {
-    Object.assign(this, move({ left: this.left, right: this.right, hidden: this.hidden }, id, side, index));
-    this.hidden = { ...this.hidden, [side]: false };
-    this.save();
+    this.#arrange({ places: move(this.#places, id, side, index), hidden: { ...this.#hidden, [side]: false } });
   }
 
   /** Moves panel `id` by `step` places within its side. */
@@ -134,15 +163,30 @@ export class Docks {
     this.moveTo(id, side, this[side].findIndex((p) => p.id === id) + step);
   }
 
+  /** Folds panel `id`, or unfolds it. */
   toggle(id) {
-    const side = this.sideOf(id);
-    this[side] = this[side].map((p) => (p.id === id ? { ...p, open: !p.open } : p));
-    this.save();
+    const at = this.#places[id];
+    this.#arrange({ places: { ...this.#places, [id]: { ...at, open: !at.open } } });
   }
 
-  /** Puts every panel back where it starts. */
+  /** Puts every panel back where it starts, and shows both docks. */
   reset() {
-    Object.assign(this, normalize(null));
-    this.save();
+    this.#arrange(normalize(null));
+  }
+
+  /** A drag of a panel begins. */
+  startDrag() {
+    this.#dragging = true;
+  }
+
+  /** The drag ends with panel `id` let go at `index` of `side`'s panels: it moves there, and that dock shows. */
+  drop(id, side, index) {
+    this.#dragging = false;
+    this.moveTo(id, side, index);
+  }
+
+  /** The drag ends with nothing more to move. */
+  endDrag() {
+    this.#dragging = false;
   }
 }
