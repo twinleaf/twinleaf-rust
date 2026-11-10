@@ -489,6 +489,13 @@ describe('a plot closed and brought back by undo', () => {
 // always the edit history's, and always the entry's the model is at.
 describe('a kind switch', () => {
   const act = fc.constantFrom('switch', 'switch', 'pan', 'legend', 'back', 'back', 'forward', 'undo', 'undo', 'redo');
+  const times = (n, acts) => Array.from({ length: n }, () => acts).flat();
+  /**
+   * Runs that reach every count the test asks of its cases, whatever the
+   * random ones do: a switch undone and redone, four times; and a pan then a
+   * switch, gone back across the switch and on past the pan, four times.
+   */
+  const EXAMPLES = [times(4, ['switch', 'undo', 'redo']), times(4, ['pan', 'switch', 'back', 'back'])];
   it('is a step Back and Forward cross, going on through the steps before it, whatever undo and redo do between', () => {
     const count = { crossed: 0, wentOn: 0, undone: 0, redone: 0 };
     fc.assert(
@@ -533,6 +540,8 @@ describe('a kind switch', () => {
         // Then all the way back, through every step made.
         while (at > 0) run('back');
       }),
+      // The examples come on top of the random runs.
+      { examples: EXAMPLES.map((acts) => [acts]), numRuns: EXAMPLES.length + fc.readConfigureGlobal().numRuns },
     );
     for (const [rule, n] of Object.entries(count)) expect(n, rule).toBeGreaterThan(3);
   });
