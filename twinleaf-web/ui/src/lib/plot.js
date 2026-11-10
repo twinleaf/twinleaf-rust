@@ -2033,13 +2033,13 @@ export class View {
 
   /**
    * Moves the view by `fraction` of its span, later for a positive one, and
-   * pauses it, within what it captured. A live view is at the newest
-   * samples already, so a pan later leaves it live.
+   * pauses it, within what it captured and never past the newest samples. A
+   * live view is at the newest samples already, so a pan later leaves it live.
    */
   pan(fraction, perf) {
     if (this.live && fraction >= 0) return;
     this.pause(perf);
-    this.right += fraction * this.span;
+    this.right = Math.min(this.hub.now(perf) - this.delay, this.right + fraction * this.span);
     this.keepWithin();
     this.notify();
   }

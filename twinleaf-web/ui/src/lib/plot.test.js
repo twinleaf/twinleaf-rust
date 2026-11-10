@@ -174,6 +174,17 @@ describe('A live view panned', () => {
   });
 });
 
+describe('A paused view panned later', () => {
+  it('stops at the newest samples, whatever its plot has drawn', () => {
+    let now = 1000;
+    const v = new View({ now: () => now });
+    v.pause(0);
+    now = 1001;
+    v.pan(0.5, 0);
+    expect(v.right).toBe(1001 - v.delay);
+  });
+});
+
 describe('A paused view, given the history its plot captured', () => {
   const capture = () => {
     let now = 1000;
