@@ -54,7 +54,6 @@ describe('the tab strip', () => {
         }
       }),
       {
-        numRuns: Math.ceil(fc.readConfigureGlobal().numRuns / 10),
         // The first tab dragged behind the second, held, then undone.
         examples: [[[{ t: 'tab', from: 0, to: 1 }, { t: 'undo' }]]],
       },

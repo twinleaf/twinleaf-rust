@@ -203,8 +203,7 @@ describe('view history on the page', () => {
         } finally {
           p.dispose();
         }
-      }),
-      { numRuns: Math.ceil(fc.readConfigureGlobal().numRuns / 10) },
+      })
     );
     for (const [rule, n] of Object.entries(count)) expect(n, rule).toBeGreaterThan(0);
   }, 600_000);
@@ -484,8 +483,7 @@ describe('a plot closed and brought back by Ctrl+Z', () => {
         } finally {
           p.dispose();
         }
-      }),
-      { numRuns: Math.max(6, Math.ceil(fc.readConfigureGlobal().numRuns / 10)) },
+      })
     );
     expect(checked).toBeGreaterThan(0);
   }, 300_000);

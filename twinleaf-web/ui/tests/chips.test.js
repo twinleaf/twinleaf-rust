@@ -69,7 +69,6 @@ describe('chip rows', () => {
         }
       }),
       {
-        numRuns: Math.ceil(fc.readConfigureGlobal().numRuns / 10),
         // A chip dragged from the top plot through the middle plot's row into its body.
         examples: [[[{ t: 'chip', a: 0, i: 0, b: 1, onto: 'body' }, { t: 'chip', a: 1, i: 0, b: 1, onto: 'chips' }]]],
       },

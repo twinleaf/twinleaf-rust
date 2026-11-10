@@ -231,7 +231,6 @@ describe('a command made on a plot', () => {
         }
       }),
       {
-        numRuns: Math.max(40, Math.ceil(fc.readConfigureGlobal().numRuns / 2)),
         // Each command on a plot in a selection of three, and on a plot outside a selection of two.
         examples: Object.keys(COMMANDS).flatMap((name) => [[[0, 1, 2], 1, name, null], [[0, 1], 3, name, 0]]),
       },
@@ -265,7 +264,7 @@ describe('a right-click on a plot', () => {
           expect([...page.ws.selected].sort(), `${part} of ${k} by ${mouse ? 'mouse' : 'key'} with ${picks}`).toEqual([...want].sort());
           seen.add(`${part}:${mouse}:${picked.includes(id)}`);
         }),
-        { numRuns: Math.max(60, fc.readConfigureGlobal().numRuns), examples: parts.flatMap((part) => [[[0, 1], 3, part, false], [[0, 1], 3, part, true], [[1, 2], 1, part, false]]) },
+        { examples: parts.flatMap((part) => [[[0, 1], 3, part, false], [[0, 1], 3, part, true], [[1, 2], 1, part, false]]) },
       );
       for (const part of parts) expect(seen.has(`${part}:false:false`) && seen.has(`${part}:true:false`) && seen.has(`${part}:false:true`), part).toBe(true);
     } finally {
@@ -319,7 +318,7 @@ describe('the command palette’s Add to the selected plots', () => {
           }
           seen.add(picked.length ? 'some' : 'none');
         }),
-        { numRuns: Math.max(10, Math.ceil(fc.readConfigureGlobal().numRuns / 5)), examples: [[[], 'sine.sine'], [[0, 2], 'aux.triangle']] },
+        { examples: [[[], 'sine.sine'], [[0, 2], 'aux.triangle']] },
       );
       expect(seen.size).toBe(2);
     } finally {

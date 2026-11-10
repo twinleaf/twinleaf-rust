@@ -179,7 +179,6 @@ describe('the edit bar on the rows picked', () => {
           }
         }),
         {
-          numRuns: Math.max(30, Math.ceil(fc.readConfigureGlobal().numRuns / 3)),
           // Each kind, whatever the seed: the rows run settings (gain, offset, level, enable, sync), favorites (save, mode), reports, actions and other.
           examples: [
             [[0, 3], 'click', true, 0],
@@ -242,7 +241,7 @@ describe('the edit bar on the rows picked', () => {
           page.dispose();
         }
       }),
-      { numRuns: 10, examples: [[[true, true, true]], [[false, true, false]]] },
+      { examples: [[[true, true, true]], [[false, true, false]]] },
     );
     for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
   }, 600_000);

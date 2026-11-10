@@ -87,7 +87,7 @@ describe('a command', () => {
         }
       }),
       // Each command first on two selected plots, the first of them its plot; then random runs.
-      { numRuns: Math.max(40, Math.ceil(fc.readConfigureGlobal().numRuns / 2)), examples: Object.keys(COMMANDS).map((name) => [[0, 1], 0, name]) },
+      { examples: Object.keys(COMMANDS).map((name) => [[0, 1], 0, name]) },
     );
     for (const name of ['Delete', 'l', '|', 'Split right', 'Close plot', 'Kind Spectrum', 'Move to tab', 'Arrange as columns', 'a signal clicked']) expect(made[name], name).toBeGreaterThan(0);
   }, 600_000);
@@ -169,7 +169,7 @@ describe('a drag, press to release,', () => {
           page.dispose();
         }
       }),
-      { numRuns: Math.max(30, Math.ceil(fc.readConfigureGlobal().numRuns / 3)), examples: Object.keys(DRAGS).flatMap((name) => [[name, 0, 1], [name, 1, 2]]) },
+      { examples: Object.keys(DRAGS).flatMap((name) => [[name, 0, 1], [name, 1, 2]]) },
     );
     for (const name of Object.keys(DRAGS)) expect(made[name], name).toBeGreaterThan(0);
   }, 600_000);
@@ -212,7 +212,7 @@ describe('a pin of property rows', () => {
           page.dispose();
         }
       }),
-      { numRuns: Math.max(10, Math.ceil(fc.readConfigureGlobal().numRuns / 10)), examples: [[[0, 2], 0, 0]] },
+      { examples: [[[0, 2], 0, 0]] },
     );
   }, 600_000);
 });

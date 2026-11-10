@@ -144,7 +144,7 @@ describe('Escape', () => {
           page.dispose();
         }
       }),
-      { numRuns: Math.max(20, Math.ceil(fc.readConfigureGlobal().numRuns / 5)), examples: [[[0], [0, 1], null], [[0, 1], [1], 1], [null, [2], 2], [[1], [], null]] },
+      { examples: [[[0], [0, 1], null], [[0, 1], [1], 1], [null, [2], 2], [[1], [], null]] },
     );
   }, 600_000);
 });

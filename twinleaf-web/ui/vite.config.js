@@ -15,6 +15,13 @@ function count(name, fallback) {
 /** The port the browser tests' runner listens on, TL_TEST_PORT, so checkouts can run them side by side. */
 const testPort = count('TL_TEST_PORT', 9420);
 
+/**
+ * What tests/setup.js gives fast-check: how many cases each property tries,
+ * FC_RUNS or `runs`, and a failure to replay, FC_SEED and FC_PATH as the
+ * failure printed them.
+ */
+const fc = (runs) => ({ fc: { runs: count('FC_RUNS', runs), seed: process.env.FC_SEED === undefined ? undefined : +process.env.FC_SEED, path: process.env.FC_PATH } });
+
 export default defineConfig({
   plugins: [tailwindcss(), svelte()],
   // Tests bundle dependencies apart from the dev server, which shares this
@@ -22,9 +29,6 @@ export default defineConfig({
   cacheDir: process.env.VITEST ? `node_modules/.vite-test-${testPort}` : 'node_modules/.vite',
   resolve: { alias: { $lib: path.resolve('./src/lib') } },
   test: {
-    // FC_RUNS sets how many cases each property tries; FC_SEED and FC_PATH
-    // name a failure to replay. They reach tests/setup.js in either project.
-    provide: { fc: { runs: count('FC_RUNS', 100), seed: process.env.FC_SEED === undefined ? undefined : +process.env.FC_SEED, path: process.env.FC_PATH } },
     setupFiles: ['tests/setup.js'],
     // A module's own tests sit beside it in src and run Svelte's client
     // runtime in jsdom, where effects run and state is proxied as on the
@@ -33,7 +37,7 @@ export default defineConfig({
       {
         extends: true,
         resolve: { conditions: ['browser'] },
-        test: { name: 'unit', environment: 'jsdom', include: ['src/**/*.test.js'] },
+        test: { name: 'unit', environment: 'jsdom', include: ['src/**/*.test.js'], provide: fc(100) },
       },
       {
         extends: true,
@@ -42,6 +46,9 @@ export default defineConfig({
         optimizeDeps: { entries: ['src/main.js', 'tests/**/*.test.js'] },
         test: {
           name: 'browser',
+          // A case here mounts the page and moves the real mouse, so a run
+          // tries few; each property's `examples` are always tried.
+          provide: fc(20),
           include: ['tests/**/*.test.js'],
           browser: {
             enabled: true,

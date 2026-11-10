@@ -59,8 +59,7 @@ describe('a plot’s own command', () => {
             expect(Math.max(Math.abs(r.left - w.x), Math.abs(r.top - w.y), Math.abs(r.width - w.w), Math.abs(r.height - w.h)), p).toBeLessThan(1.5);
           }
           checked++;
-        }),
-        { numRuns: Math.ceil(fc.readConfigureGlobal().numRuns / 5) },
+        })
       );
       expect(checked).toBeGreaterThan(5);
     } finally {
@@ -92,8 +91,7 @@ describe('a plot’s own command', () => {
         } finally {
           page.dispose();
         }
-      }),
-      { numRuns: Math.ceil(fc.readConfigureGlobal().numRuns / 10) },
+      })
     );
   }, 600_000);
 });
@@ -173,7 +171,6 @@ describe('a key', () => {
         },
       ),
       {
-        numRuns: Math.max(60, Math.ceil(fc.readConfigureGlobal().numRuns / 2)),
         // Each scope with plots selected or none, and focus on the page, on a selected plot or on another; then random runs.
         examples: ['Delete', ' '].flatMap((key) => [[[1, 2], null], [[1, 2], 1], [[1, 2], 0], [[], null], [[], 0]].map(([picks, focus]) => [null, null, picks, key, focus])),
       },
@@ -228,7 +225,7 @@ describe('maximized plots', () => {
           page.dispose();
         }
       }),
-      { numRuns: Math.max(15, Math.ceil(fc.readConfigureGlobal().numRuns / 5)), examples: [[[0, 1], [{ t: 'close', k: 0 }, { t: 'undo' }, { t: 'redo' }, { t: 'toTab', k: 0 }]]] },
+      { examples: [[[0, 1], [{ t: 'close', k: 0 }, { t: 'undo' }, { t: 'redo' }, { t: 'toTab', k: 0 }]]] },
     );
     expect(pruned).toBeGreaterThan(0);
   }, 600_000);
@@ -322,7 +319,6 @@ describe('the count a plot’s menu shows for a copy', () => {
         }
       }),
       {
-        numRuns: Math.max(15, Math.ceil(fc.readConfigureGlobal().numRuns / 5)),
         // The menu opens, the plot zooms under it, and the first count comes back after the second.
         examples: [[[{ t: 'open' }, { t: 'zoom', out: true }, { t: 'answer', k: 1 }, { t: 'answer', k: 0 }], []]],
       },

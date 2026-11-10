@@ -118,7 +118,7 @@ async function tilesFollow(numRuns, ...runs) {
 describe('the tiles', () => {
   it('show the layout after any run of moves, gap drags, undos and edits', async () => {
     await tilesFollow(
-      Math.ceil(fc.readConfigureGlobal().numRuns / 5),
+      fc.readConfigureGlobal().numRuns,
       // A layout an undo put back, changed again: the tiles once kept showing the one before.
       [{ t: 'dock', a: 2, b: 1, edge: 'left' }, { t: 'wait' }, { t: 'undo' }, { t: 'dock', a: 0, b: 1, edge: 'bottom' }],
       [{ t: 'move', a: 2, b: 1, cell: 'left' }, { t: 'undo' }, { t: 'move', a: 0, b: 0, cell: 'bottom' }, { t: 'redo' }],

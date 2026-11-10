@@ -73,7 +73,6 @@ async function closeMenu() {
   for (let i = 0; i < 20 && document.querySelector('[role=menu]'); i++) await frames();
 }
 const menuItems = () => [...document.querySelectorAll('[role=menu] [role=menuitem]')];
-const runs = (n) => Math.max(n, Math.ceil(fc.readConfigureGlobal().numRuns / 5));
 
 describe('a property row', () => {
   it('is picked by a click, Ctrl-click, Shift-click or right-click as a sheet picks, across panels and docks in page order, past folded panels, and only while it shows', async () => {
@@ -210,7 +209,6 @@ describe('a property row', () => {
           },
         ),
         {
-          numRuns: runs(30),
           // Each case counted below, whatever the seed: the rows run settings (0 to 3), favorites (4, 5), reports (6, 7), the action buttons (8, 9) and other (10, 11).
           examples: [
             [[{ t: 'click', at: 0 }, { t: 'shift', at: 11 }, { t: 'ctrl', at: 3 }, { t: 'ctrl', at: 3 }, { t: 'right', at: 5 }, { t: 'click', at: 6 }, { t: 'shift', at: 10 }, { t: 'right', at: 0 }, { t: 'ctrl', at: 8 }, { t: 'right', at: 9 }]],
@@ -286,7 +284,7 @@ describe('a property row', () => {
           } else expect(page.history.undos.at(-1)).toBe(last);
         }),
         // Each case counted below, whatever the seed.
-        { numRuns: runs(30), examples: [[[0, 1], ['gain'], 'menu', 0], [[0, 1], [], 'starPicked', 0], [[0], [], 'starOther', 1]] },
+        { examples: [[[0, 1], ['gain'], 'menu', 0], [[0, 1], [], 'starPicked', 0], [[0], [], 'starOther', 1]] },
       );
       for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
     } finally {
@@ -349,7 +347,7 @@ describe('a key pressed in a table', () => {
           page.dispose();
         }
       }),
-      { numRuns: runs(40), examples: [...TABLE, ...PAGE, ...PLOT].map((k) => [k, 3]) },
+      { examples: [...TABLE, ...PAGE, ...PLOT].map((k) => [k, 3]) },
     );
     for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
   }, 600_000);

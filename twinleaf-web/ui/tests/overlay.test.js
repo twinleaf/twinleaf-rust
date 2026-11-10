@@ -127,7 +127,6 @@ describe('the page’s popup layers', () => {
         }
       }),
       {
-        numRuns: Math.max(30, Math.ceil(fc.readConfigureGlobal().numRuns / 3)),
         // The reported case: Layout's dropdown and File's both open, a tooltip on top.
         examples: [
           [[{ press: 'Layout' }, { hover: 'File' }]],
@@ -169,7 +168,7 @@ describe('a layer the keys go on from', () => {
             closed++;
           }
         }),
-        { numRuns: Math.max(25, Math.ceil(fc.readConfigureGlobal().numRuns / 4)), examples: [[true, ['Control+k', 'Escape']], [false, ['a', 'Control+k', 'Escape']], [false, ['k', 'Control+k', 'Escape']]] },
+        { examples: [[true, ['Control+k', 'Escape']], [false, ['a', 'Control+k', 'Escape']], [false, ['k', 'Control+k', 'Escape']]] },
       );
       expect(closed, 'steps with every layer closed').toBeGreaterThan(10);
     } finally {

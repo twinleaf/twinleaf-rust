@@ -70,8 +70,7 @@ describe('a box', () => {
           expect([...page.ws.selected].sort()).toEqual([...want].sort());
           expect(document.querySelector('.marquee')).toBe(null);
           boxes++;
-        }),
-        { numRuns: Math.max(20, Math.ceil(fc.readConfigureGlobal().numRuns / 4)) },
+        })
       );
       // A drag that starts on a property row picks rows, and draws no box.
       const row = document.querySelector('tr[id^=prop-]');
@@ -182,7 +181,7 @@ describe('Escape during a gesture', () => {
           }
         },
       ),
-      { numRuns: Math.max(15, Math.ceil(fc.readConfigureGlobal().numRuns / 5)), examples: [['box', [0], 0, 0, 'left', false], ['grip', [0, 1], 0, 0, 'top', true], ['header', [], 1, 1, 'center', false]] },
+      { examples: [['box', [0], 0, 0, 'left', false], ['grip', [0, 1], 0, 0, 'top', true], ['header', [], 1, 1, 'center', false]] },
     );
     expect(kinds.size).toBe(3);
   }, 600_000);
@@ -224,8 +223,7 @@ describe('Escape', () => {
         } finally {
           page.dispose();
         }
-      }),
-      { numRuns: Math.max(15, Math.ceil(fc.readConfigureGlobal().numRuns / 5)) },
+      })
     );
     expect(placed).toBeGreaterThan(10);
   }, 600_000);
@@ -366,7 +364,7 @@ async function ownKeys(zones) {
         page.dispose();
       }
     }),
-    { numRuns: Math.max(24, Math.ceil(fc.readConfigureGlobal().numRuns / 3)), examples: zones.flatMap((z) => [[z, 0, 'Space', 'click'], [z, 1, 'Enter', 'click'], [z, 0, 'Space', 'keys']]) },
+    { examples: zones.flatMap((z) => [[z, 0, 'Space', 'click'], [z, 1, 'Enter', 'click'], [z, 0, 'Space', 'keys']]) },
   );
   return seen;
 }

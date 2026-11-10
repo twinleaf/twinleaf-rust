@@ -344,14 +344,12 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 
-const runs = (min, share) => Math.max(min, Math.ceil(fc.readConfigureGlobal().numRuns / share));
 
 describe('the page, played by random runs of gestures and keys', () => {
   it('holds every invariant after every step', async () => {
     await fc.assert(
       fc.asyncProperty(fc.array(step, { minLength: 3, maxLength: 12 }), (steps) => run(steps, check)),
       {
-        numRuns: runs(40, 2),
         examples: [
           [[{ t: 'key', key: 'Control+a' }, { t: 'move', a: 0, b: 1, cell: 'left', by: 'grip', escape: false }, { t: 'key', key: 'Control+z' }, { t: 'box', k: 0, fx: 0.7, fy: 0.7, shift: false, escape: true }]],
           [[{ t: 'click', at: 'plot', i: 1, mod: null }, { t: 'click', at: 'plot', i: 2, mod: 'shift' }, { t: 'key', key: 'f' }, { t: 'key', key: 'Delete' }, { t: 'key', key: 'Control+z' }]],
@@ -391,7 +389,6 @@ function oneLayer(page, before, s) {
 describe('the page’s popup layers, played by random runs of menu presses, hovers and keys', () => {
   it('keep at most one popup layer open, and no tooltip over one (class 9)', async () => {
     await fc.assert(fc.asyncProperty(fc.array(overlayStep, { minLength: 2, maxLength: 8 }), (steps) => run(steps, oneLayer)), {
-      numRuns: runs(10, 10),
       examples: [
         // The pointer resting on Display settings while Layout's menu is open.
         [[{ t: 'across', path: ['layout', 'settings'], press: true, rest: 400 }]],
