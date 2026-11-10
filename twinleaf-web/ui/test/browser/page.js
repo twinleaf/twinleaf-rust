@@ -1,7 +1,7 @@
 // The whole page, mounted for a browser test with state of its own, and the
 // gestures the tests make on it with the real mouse.
 import { flushSync, mount, unmount } from 'svelte';
-import { expect } from 'vitest';
+import { expect, vi } from 'vitest';
 import { commands } from '@vitest/browser/context';
 import App from '../../src/App.svelte';
 import { Hub } from '../../src/lib/hub.svelte.js';
@@ -11,6 +11,7 @@ import { Favorites } from '../../src/lib/favorites.svelte.js';
 import { Views } from '../../src/lib/views.js';
 import { presets } from '../../src/lib/layout.js';
 import { emptyTab, makeTab, newPlot } from '../../src/lib/tabs.js';
+import { api } from '../../src/lib/protocol.js';
 import '../../src/app.css';
 import '../../src/plot.css';
 
@@ -242,4 +243,88 @@ export async function drag(from, to, via = [], rest = 0) {
   }
   path.push(['up']);
   await commands.mouse(path);
+}
+
+/** The moves from `from` to `to` in `n` steps, for `commands.mouse`. */
+export const glide = (from, to, n = 4) => Array.from({ length: n }, (_, k) => ['move', from[0] + ((to[0] - from[0]) * (k + 1)) / n, from[1] + ((to[1] - from[1]) * (k + 1)) / n]);
+
+/** Waits, a frame at a time, until `ready()` holds or `ms` have passed; says whether it holds. */
+export async function until(ready, ms = 5000) {
+  const end = performance.now() + ms;
+  for (;;) {
+    flushSync();
+    if (ready()) return true;
+    if (performance.now() > end) return false;
+    await frames(1);
+  }
+}
+
+/** Waits until no drag of the drag library is under way, as one lets go and its drop lands. */
+export const dropped = () => until(() => !document.getElementById('dnd-action-dragged-el'));
+
+/** The plots whose tiles show, by id, in page order: hidden ones, as behind maximized plots, left out. */
+export const showing = () => [...document.querySelectorAll('.tiles .leaf[data-plot]')].filter((l) => getComputedStyle(l).visibility !== 'hidden').map((l) => l.dataset.plot);
+
+/** A click on the status bar, which gives the page the keys and deselects, as the first thing a person does. */
+export async function focusPage() {
+  await commands.mouse([['move', ...centre(document.querySelector('.status-bar'))], ['down'], ['up']]);
+  flushSync();
+}
+
+/** Right-clicks plot `id`'s body, which opens its menu, and waits for it. */
+export async function plotMenu(id) {
+  await commands.mouse([['move', ...centre(leafOf(id).querySelector('.plot-body'))], ['down', 'right'], ['up', 'right']]);
+  await until(() => document.querySelector('[data-slot=context-menu-content][data-state=open]'));
+}
+
+/** Picks the menu item whose text starts with each of `labels` in turn, a submenu's trigger then an item in it, each once it shows. */
+export async function pickItem(...labels) {
+  for (const label of labels) {
+    const item = () => [...document.querySelectorAll('[role^=menuitem]')].find((m) => m.textContent.trim().startsWith(label));
+    await until(item, 2000);
+    item()?.click();
+    flushSync();
+    await frames();
+  }
+}
+
+/** Empty dock or panel space, where a box starts: a dock's frame, a dock below its panels, a panel's body, a list's space below its items. */
+export const EMPTY = '.dock-frame, .dock-side, .dock, .dock-body, .palette, [data-slot=scroll-area-viewport]';
+
+/** Points in the docks where a press lands on empty space, each [x, y]. */
+export function emptySpots() {
+  const out = [];
+  for (const frame of document.querySelectorAll('.dock-frame')) {
+    const r = frame.getBoundingClientRect();
+    for (let y = r.top + 4; y < r.bottom - 2; y += 6) {
+      for (const x of [r.left + 3, r.left + r.width / 2, r.right - 3]) {
+        const el = document.elementFromPoint(x, y);
+        if (el && frame.contains(el) && el.matches(EMPTY)) out.push([x, y]);
+      }
+    }
+  }
+  return out;
+}
+
+/** A point on plot `leaf`'s header where a press picks the plot up: the header's own empty space or its chip row's. */
+export function headerSpot(leaf) {
+  const head = leaf.querySelector('.plot-head'), r = head.getBoundingClientRect(), y = r.top + r.height / 2;
+  for (let x = r.right - 4; x > r.left; x -= 4) {
+    const el = document.elementFromPoint(x, y);
+    if (el === head || el?.classList.contains('trace-zone')) return [x, y];
+  }
+  return null;
+}
+
+/** `steps` for `commands.mouse` with keyboard keys `keys` held through them, as Playwright names them. */
+export const holding = (keys, steps) => [...keys.map((k) => ['hold', k]), ...steps, ...keys.map((k) => ['let go', k])];
+
+/**
+ * Keeps the page from the hub's /api, which a test has none of: a window
+ * read waits for ever, and a count is `rows(query)`, none by default.
+ * Undone by `vi.restoreAllMocks()`.
+ */
+export function quietApi(rows = () => Promise.resolve({ count: 0, oldest: null, x: [], y: [] })) {
+  vi.spyOn(api, 'window').mockImplementation(() => new Promise(() => {}));
+  vi.spyOn(api, 'rows').mockImplementation(rows);
 }

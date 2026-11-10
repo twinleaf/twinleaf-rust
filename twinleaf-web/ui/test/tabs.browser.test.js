@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, frames, mountPage } from './browser/page.js';
+import { centre, drag, dropped, frames, mountPage } from './browser/page.js';
 
 const stripOrder = () => [...document.querySelectorAll('[role=tablist] [data-tab]')].map((e) => e.dataset.tab);
 
@@ -29,7 +29,7 @@ async function run(s, { ws, history }) {
     // Picked up by its name, as a person does; its buttons start no drag.
     const from = centre(a.querySelector('span'));
     await drag(from, [bx + (r.width / 3) * Math.sign(bx - from[0]), by], [[bx, by]], 500);
-    await new Promise((done) => setTimeout(done, 300));
+    await dropped();
     if (ws.tabs.map((t) => t.id).join() !== before) moved++;
   } else if (s.t === 'undo') history.undo();
   else if (s.t === 'redo') history.redo();

@@ -7,11 +7,10 @@
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, frames, mountPage } from './browser/page.js';
+import { centre, drag, dropped, frames, mountPage } from './browser/page.js';
 import { plotIds } from '../src/lib/layout.js';
+import { STEP } from '../src/lib/moves.js';
 
-/** The distance from a plot's middle to its compass's side cells, in px. */
-const STEP = 42;
 const KEYS = [['sine.sine', 'sine.cosine'], ['aux.triangle'], ['aux.sawtooth', 'sine.sine']];
 
 const rowOf = (id) => [...document.querySelectorAll(`.leaf[data-plot="${id}"] .trace-zone [id^="chip-"]`)].map((e) => e.id.slice('chip-'.length));
@@ -45,7 +44,7 @@ async function run(s, { ws, history }) {
     const from = centre(el);
     const via = s.onto === 'chips' ? [(from[0] + to[0]) / 2, (from[1] + to[1]) / 2] : centre(leaf.querySelector('.trace-zone'));
     await drag(from, to, [via], 200);
-    await new Promise((done) => setTimeout(done, 250));
+    await dropped();
     if (JSON.stringify(ws.tabs) !== before) moved++;
   } else if (s.t === 'undo') history.undo();
   else if (s.t === 'redo') history.redo();
