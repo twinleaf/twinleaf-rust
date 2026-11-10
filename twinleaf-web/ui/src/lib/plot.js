@@ -82,7 +82,7 @@ export function timeAxis(epoch) {
   }
   return {
     ticks: (x0, x1, n) => scaleLinear().domain([x0, x1]).ticks(n),
-    label: (t) => `${+t.toFixed(4)} s`,
+    label: (t) => `${+t.toFixed(6)} s`,
     readout: (t) => `${t.toFixed(3)} s`,
   };
 }

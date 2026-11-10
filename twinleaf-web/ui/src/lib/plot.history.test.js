@@ -9,10 +9,12 @@
 //   `restore` where a zoom or a pan left it, unmoved by `startHeld`, which
 //   moves only a view whose start the hub has dropped;
 // - a zoom from the narrowest view to the widest and back about one point
-//   ends where it began.
+//   ends where it began;
+// - the time axis's ticks and labels, and the texts that name a span, from
+//   2 ms to a day.
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { oldestShown, View } from './plot.js';
+import { oldestShown, timeAxis, View } from './plot.js';
 import { HISTORY_SPANS } from './constants.js';
 import { WINDOW_LIMITS, windowText } from './window.js';
 import { spanText } from './units.js';
@@ -261,6 +263,81 @@ describe('a view on a hub that holds hours', () => {
         expect(v.span).toBe(WINDOW_LIMITS[0]);
         // The same moment, to what a double at that time resolves over the turns made.
         expect(Math.abs(v.right - narrowest.right)).toBeLessThanOrEqual(100 * step(now));
+      }),
+    );
+  });
+});
+
+/** A span from the narrowest view to a day, spread evenly over its decades. */
+const spanShown = fc.double({ min: Math.log10(WINDOW_LIMITS[0]), max: Math.log10(86400), noNaN: true }).map((e) => 10 ** e);
+/** How many ticks a time axis asks for: a plot's width in px over 120, from a narrow plot to one across a 4K screen. */
+const tickCount = fc.integer({ min: 240, max: 3840 }).map((w) => Math.max(2, w / 120));
+
+describe('the time axis, from 2 ms to a day', () => {
+  it('in a device’s own seconds, has ticks in order within the view, each with a label of its own that reads as its time', () => {
+    fc.assert(
+      fc.property(fc.double({ min: 0, max: 1e6, noNaN: true }), spanShown, tickCount, (x0, span, n) => {
+        const axis = timeAxis('zero'), ticks = axis.ticks(x0, x0 + span, n), labels = ticks.map(axis.label);
+        for (let i = 0; i < ticks.length; i++) {
+          expect(ticks[i]).toBeGreaterThanOrEqual(x0);
+          expect(ticks[i]).toBeLessThanOrEqual(x0 + span);
+          if (i) expect(ticks[i]).toBeGreaterThan(ticks[i - 1]);
+          expect(labels[i]).toMatch(/^\d+(\.\d+)? s$/);
+        }
+        expect(new Set(labels).size, labels.join(' | ')).toBe(labels.length);
+        // A label is its tick's time, to well within the step between ticks.
+        const between = ticks.length > 1 ? ticks[1] - ticks[0] : span;
+        labels.forEach((l, i) => expect(Math.abs(parseFloat(l) - ticks[i])).toBeLessThan(between / 100));
+        expect(ticks.length).toBeLessThanOrEqual(2 * n + 1);
+        if (n >= 4) expect(ticks.length).toBeGreaterThanOrEqual(2);
+      }),
+      { examples: [[90000.1234, 0.002, 32], [0, 86400, 10], [86399.5, 1, 4]] },
+    );
+  });
+
+  it('by the clock, has ticks in order within the view, each named by what changed at it, and two that read the same only with a coarser one between', () => {
+    /** How coarse a label is: 0 for milliseconds, 1 for seconds, 2 for the hour and minute. */
+    const rank = (label) => (label.startsWith('.') ? 0 : label.startsWith(':') ? 1 : 2);
+    fc.assert(
+      fc.property(fc.double({ min: 1.7e9, max: 1.8e9, noNaN: true }), spanShown, tickCount, (x0, span, n) => {
+        const axis = timeAxis('unix'), ticks = axis.ticks(x0, x0 + span, n), labels = ticks.map(axis.label);
+        const last = new Map();
+        for (let i = 0; i < ticks.length; i++) {
+          // To the millisecond the clock reads to.
+          expect(ticks[i]).toBeGreaterThanOrEqual(x0 - 0.0005);
+          expect(ticks[i]).toBeLessThanOrEqual(x0 + span + 0.0005);
+          if (i) expect(ticks[i]).toBeGreaterThan(ticks[i - 1]);
+          expect(labels[i]).toMatch(/^(\.\d{3}|:\d\d|\d\d:\d\d)$/);
+          const d = new Date(Math.round(ticks[i] * 1000));
+          expect(rank(labels[i]), `${labels[i]} at ${d.toISOString()}`).toBe(d.getMilliseconds() ? 0 : d.getSeconds() ? 1 : 2);
+          const before = last.get(labels[i]);
+          // The hour and minute of ticks a day apart read the same: the axis names no date.
+          if (before !== undefined && rank(labels[i]) < 2) {
+            expect(labels.slice(before + 1, i).some((l) => rank(l) > rank(labels[i])), labels.join(' | ')).toBe(true);
+          }
+          if (before !== undefined && rank(labels[i]) === 2) expect(ticks[i] - ticks[before]).toBeGreaterThanOrEqual(86400 - 3600);
+          last.set(labels[i], i);
+        }
+        expect(ticks.length).toBeLessThanOrEqual(2 * n + 2);
+        if (n >= 4 && span >= 0.01) expect(ticks.length).toBeGreaterThanOrEqual(2);
+      }),
+      { examples: [[1.7e9, 0.002, 32], [1.7e9 + 0.5, 1, 10], [1.7e9, 86400, 10], [1.7e9, 90, 10]] },
+    );
+  });
+
+  it('names a span in the unit that reads shortest: seconds under two minutes, minutes under two hours, then hours', () => {
+    fc.assert(
+      fc.property(fc.double({ min: 1, max: 86400, noNaN: true }), fc.double({ min: 1, max: 86400, noNaN: true }), (a, b) => {
+        const read = (text) => {
+          const [, n, unit] = text.match(/^(\d{1,3}(?:\.\d)?) (s|min|h)$/) ?? [];
+          expect(unit, text).toBeDefined();
+          return [Number(n) * { s: 1, min: 60, h: 3600 }[unit], { s: 1, min: 60, h: 360 }[unit]];
+        };
+        const [back, to] = read(spanText(a));
+        // It reads back as the span, to the last digit shown.
+        expect(Math.abs(back - a)).toBeLessThanOrEqual(to / 2 + 1e-9);
+        // A longer span never reads as a shorter one.
+        if (a <= b) expect(read(spanText(b))[0]).toBeGreaterThanOrEqual(back);
       }),
     );
   });
