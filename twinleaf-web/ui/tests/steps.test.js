@@ -1,17 +1,18 @@
 // Undo steps on the whole page (round 1 #24 to #26). A command on any
-// selection, from a key, a plot's menu, the Layout menu or the Signals list,
-// is at most one undo step; so is each drag, press to release, of a plot, a
+// selection, from a key, a plot's menu, the Layout menu or the Signals list
+// (a double-click on a signal, and Enter, Shift+Enter and Delete on the
+// signals picked), is at most one undo step; so is each drag, press to release, of a plot, a
 // gap, a signal's chip, a tab, a legend or a cursor: one pulled out of its
 // tab, moved, dragged off its plot, which removes it, or, out of view,
 // dragged back in by the tag that names it at the plot's edge. Undo puts back the
 // tabs as they were and the selection as it was just before the step, less
-// the plots that are gone, the property rows picked too, less those whose
-// property went; redo puts back both as they were just after it.
+// the plots that are gone, the property rows and the signals picked too,
+// less those whose property went; redo puts back both as they were just after it.
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, dropped, editCursors, feed, focusPage, frames, glide, leafOf, mountPage, pickItem, plotMenu, pressKey, settle, until, withExamples } from './harness/page.js';
+import { centre, clickOn, drag, dropped, editCursors, feed, focusPage, frames, glide, leafOf, mountPage, pickItem, plotMenu, pressKey, settle, until, withExamples } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { xOf, yOf } from '../src/lib/cursors.js';
 import { plotIds } from '../src/lib/layout.js';
@@ -25,8 +26,15 @@ const RPCS = [
   { name: 'temp', channel: 'report' },
 ];
 
-/** What undo and redo put back of the selection: the plots, sorted, and the rows picked, sorted. */
-const chosen = (ws) => ({ plots: [...ws.selected].sort(), rows: [...ws.selection.rows].sort() });
+/** What undo and redo put back of the selection: the plots, the property rows picked and the signals picked, each sorted. */
+const chosen = (ws) => ({ plots: [...ws.selected].sort(), rows: [...ws.selection.rows].sort(), signals: [...ws.selection.signals].sort() });
+const signal = (key) => document.querySelector(`.palette [data-key="${key}"]`);
+/** Picks both signals of the list, as a click and a Ctrl+click do, which leaves the keys in the list. */
+async function pickSignals() {
+  await clickOn(signal('vector.x'));
+  await clickOn(signal('vector.y'), { ctrl: true });
+  flushSync();
+}
 
 /** The act that picks the plot menu's items `labels`, once a right-click on plot `id` has opened it. */
 const fromMenu = async (id, ...labels) => (await plotMenu(id), () => pickItem(...labels));
@@ -50,7 +58,11 @@ const COMMANDS = {
     await commands.mouse([['move', ...centre([...document.querySelectorAll('.top-bar button')].find((b) => b.textContent.trim() === 'Layout'))], ['down'], ['up']]);
     return () => pickItem('Columns');
   },
-  'a signal clicked': () => () => document.querySelector('.palette [data-key="vector.x"]').click(),
+  // A signal, picked, then double-clicked; the signals picked, then the list's keys. Delete takes out what Enter put in.
+  'a signal double-clicked': async () => (await clickOn(signal('vector.x')), () => commands.mouse([['dblclick', ...centre(signal('vector.x'))]])),
+  'Enter on two signals': async () => (await pickSignals(), () => pressKey('Enter')),
+  'Shift+Enter on two signals': async () => (await pickSignals(), () => pressKey('Shift+Enter')),
+  'Delete on two signals': async () => (await pickSignals(), await pressKey('Enter'), () => pressKey('Delete')),
   // Commands on the cursors, which are edits; every plot has some placed first.
   'the eraser': (page) => (cursorsEverywhere(page), () => document.querySelector('button[aria-label="Clear the cursors"]').click()),
   'End, which follows live': (page) => (cursorsEverywhere(page), () => pressKey('End')),
@@ -90,7 +102,7 @@ describe('a command', () => {
           flushSync();
           expect(page.ws.tabs, `${name} undone`).toBe(tabs);
           const exists = (id) => !!page.ws.plots[id];
-          expect(chosen(page.ws), `${name} undone`).toEqual({ plots: before.plots.filter(exists), rows: before.rows });
+          expect(chosen(page.ws), `${name} undone`).toEqual({ ...before, plots: before.plots.filter(exists) });
           page.history.redo();
           flushSync();
           expect(page.ws.tabs, `${name} done again`).toBe(after);
@@ -102,7 +114,7 @@ describe('a command', () => {
       // Each command first on two selected plots, the first of them its plot; then random runs.
       withExamples(Object.keys(COMMANDS).map((name) => [[0, 1], 0, name])),
     );
-    for (const name of ['Delete', 'l', '|', 'Split right', 'Close plot', 'Kind Spectrum', 'Move to tab', 'Arrange as columns', 'a signal clicked', 'the eraser', 'End, which follows live', 'Clear cursors']) expect(made[name], name).toBeGreaterThan(0);
+    for (const name of ['Delete', 'l', '|', 'Split right', 'Close plot', 'Kind Spectrum', 'Move to tab', 'Arrange as columns', 'a signal double-clicked', 'Enter on two signals', 'Shift+Enter on two signals', 'Delete on two signals', 'the eraser', 'End, which follows live', 'Clear cursors']) expect(made[name], name).toBeGreaterThan(0);
   }, 600_000);
 });
 
@@ -318,10 +330,10 @@ describe('a pin of property rows', () => {
           flushSync();
           page.history.undo();
           flushSync();
-          expect(chosen(page.ws)).toEqual({ plots: [], rows: kept(before.rows) });
+          expect(chosen(page.ws)).toEqual({ plots: [], rows: kept(before.rows), signals: [] });
           page.history.redo();
           flushSync();
-          expect(chosen(page.ws)).toEqual({ plots: [], rows: kept(then.rows) });
+          expect(chosen(page.ws)).toEqual({ plots: [], rows: kept(then.rows), signals: [] });
         } finally {
           page.dispose();
         }

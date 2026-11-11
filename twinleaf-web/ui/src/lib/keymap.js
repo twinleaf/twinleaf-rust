@@ -1,8 +1,8 @@
 // Every key and gesture the page reads, by where focus is. The keys sheet
 // lists this table, and the key router (keyrouter.js) finds each key's
 // action here with `actionFor`, so what the sheet says is what the keys do.
-// A plot's keys, Space and Ctrl+C are plot commands, listed here from their
-// table (commands.js).
+// A plot's keys, Space, Ctrl+C and the Signals list's keys that put signals
+// on plots are commands, listed here from their table (commands.js).
 //
 // An entry is {show, on, keys, ctrl, shift, action, what}: `show` is how the
 // sheet writes the keys, and an entry without it is not on the sheet; `on`
@@ -19,7 +19,7 @@
 import { COMMANDS, commandOf } from './commands.js';
 
 /** Plot command `c`'s keys as an entry, its id the action of its keys where it has any. */
-const keysOf = (c) => ({ show: c.show, ...(c.keys && { keys: c.keys, action: c.id }), scope: c.scope, what: c.what });
+const keysOf = (c) => ({ show: c.show, ...(c.keys && { keys: c.keys, action: c.id }), ...(c.shift !== undefined && { shift: c.shift }), scope: c.scope, what: c.what });
 
 const digits = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
 const MOVE = { show: ['Arrows', 'Home', 'End'], action: 'move', what: 'Move' };
@@ -63,8 +63,10 @@ export const KEYMAP = [
     title: 'Lists',
     entries: [
       { ...MOVE, keys: ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'] },
-      { show: ['Enter'], keys: ['Enter'], shift: false, action: 'add', what: 'Add to the selected plots' },
-      { show: ['Shift', 'Enter'], keys: ['Enter'], shift: true, action: 'newPlot', what: 'New plot with it' },
+      { show: ['Click'], on: 'signal', what: 'Pick it; with Ctrl or Shift, as rows are picked' },
+      { show: ['Double-click'], on: 'signal', what: 'Add to the selected plots' },
+      { show: ['Ctrl', 'A'], on: 'signals', keys: ['a'], ctrl: true, action: 'pickAll', what: 'Pick every signal shown' },
+      ...COMMANDS.filter((c) => c.place === 'list').map(keysOf),
     ],
   },
   {

@@ -27,7 +27,7 @@
 import { Selection } from './selection.svelte.js';
 import { append, equal, plotIds, presets, removePlot, setRatio, splitBeside } from './layout.js';
 import { ARRANGEMENTS } from './constants.js';
-import { VIEW_FIELDS, chip, defaultContent, emptyTab, newPlot, remapIds } from './tabs.js';
+import { VIEW_FIELDS, defaultContent, emptyTab, newPlot, remapIds } from './tabs.js';
 
 /** `v` with every object in it frozen, in development; as it is otherwise. */
 function frozen(v) {
@@ -262,22 +262,6 @@ export class Workspace {
   /** Lays the open tab out as `layout`. */
   setLayout(layout) {
     if (layout !== this.layout) this.#edit((t) => ({ ...t, layout }));
-  }
-
-  /** Adds signal `key` to each plot of `ids` that does not show it. */
-  addTo(ids, key) {
-    for (const id of ids) {
-      const plot = this.plots[id];
-      if (plot && !plot.items.some((i) => i.key === key)) this.setPlot(id, { items: [...plot.items, chip(key)] });
-    }
-  }
-
-  /** Takes signal `key` out of each of plots `ids` that shows it. */
-  removeFrom(ids, key) {
-    for (const id of ids) {
-      const plot = this.plots[id];
-      if (plot?.items.some((i) => i.key === key)) this.setPlot(id, { items: plot.items.filter((i) => i.key !== key) });
-    }
   }
 
   /** Sets the open tab's split at `path` (as layout.js `gutters` names it) to `ratio`. */

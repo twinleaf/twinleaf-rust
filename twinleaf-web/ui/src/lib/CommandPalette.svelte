@@ -1,12 +1,14 @@
 <script>
   // The command palette, on Ctrl+K or ⌘K: add a signal, open a tab, arrange
   // the tab, the plot commands that have plots to act on now (commands.js),
-  // and the toolbar's actions, by typing part of a name.
+  // and the toolbar's actions, by typing part of a name. A signal named
+  // here goes onto the selected plots, or into a new one, alone, by the
+  // commands the Signals list runs.
   import { getContext } from 'svelte';
   import * as Command from '$lib/components/ui/command/index.js';
   import { ARRANGEMENTS } from './constants.js';
 
-  /** `act` holds the page's actions: toggleDock(side), dockShown(side), addSignal(key), newPlot(keys), exportTabs(), importTabs(). */
+  /** `act` holds the page's actions: toggleDock(side), dockShown(side), exportTabs(), importTabs(). */
   let { open = $bindable(false), session, ws, act } = $props();
   const history = getContext('history');
   const commands = getContext('commands');
@@ -24,12 +26,12 @@
     <Command.Empty>Nothing matches.</Command.Empty>
     <Command.Group heading="Add to the selected plots">
       {#each session.signals as t (t.key)}
-        <Command.Item value={`add ${t.key}`} onSelect={() => run(() => act.addSignal(t.key))}>{t.key}</Command.Item>
+        <Command.Item value={`add ${t.key}`} data-command="addToPlots" onSelect={() => run(() => commands.run('addToPlots', { signals: [t.key], from: 'palette' }))}>{t.key}</Command.Item>
       {/each}
     </Command.Group>
     <Command.Group heading="New plot with">
       {#each session.signals as t (t.key)}
-        <Command.Item value={`new plot ${t.key}`} onSelect={() => run(() => act.newPlot([t.key]))}>{t.key}</Command.Item>
+        <Command.Item value={`new plot ${t.key}`} data-command="newPlot" onSelect={() => run(() => commands.run('newPlot', { signals: [t.key], from: 'palette' }))}>{t.key}</Command.Item>
       {/each}
     </Command.Group>
     <Command.Separator />

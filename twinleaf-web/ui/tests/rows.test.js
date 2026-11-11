@@ -2,7 +2,9 @@
 // 1, #8 to #11, #13 and #27; round 2, Selection #13 and #15). A click picks
 // a row alone, Ctrl drops or adds one, Shift picks the run from the row
 // clicked last in page order, across panels and docks and past folded
-// panels, and a right-click on a row not picked picks it alone. Add to and
+// panels and past the Signals list, whose signals are rows of another kind
+// that no pick of property rows takes in, and a right-click on a row not
+// picked picks it alone. Add to and
 // Remove from Favorites, from the menu or a picked row's star, act on every picked row as
 // one undo step. In a table, the table's keys act on its rows, the page's
 // keys act as anywhere, and the plots' keys do nothing. Every press is the
@@ -28,13 +30,14 @@ const RPCS = [
   { name: 'misc', channel: null, type: 'u8' },
   { name: 'note', channel: null, type: 'u8' },
 ];
-/** Panels of rows in both docks, one folded between two open ones. */
+/** Panels of rows in both docks, one folded between two open ones, and the Signals list open after the left dock's rows, so a run from them to the right dock's passes it. */
+const SIGNALS = ['vector.x', 'vector.y'];
 const DOCKS = {
-  left: [{ id: 'devices', open: true }, { id: 'signals', open: false }, { id: 'settings', open: true }],
+  left: [{ id: 'devices', open: true }, { id: 'settings', open: true }, { id: 'signals', open: true }],
   right: [{ id: 'favorites', open: true }, { id: 'reports', open: true }, { id: 'diagnostics', open: false }, { id: 'actions', open: true }, { id: 'other', open: true }],
   hidden: { left: false, right: false },
 };
-const mount = (more = 0) => mountPage(KEYS, 'columns', more, [], RPCS, { saved: { [DOCKS_KEY]: DOCKS } });
+const mount = (more = 0) => mountPage(KEYS, 'columns', more, SIGNALS, RPCS, { saved: { [DOCKS_KEY]: DOCKS } });
 
 /** The panel id of the dock panel `el` is in. */
 const panelOf = (el) => Object.entries(PANELS).find(([, p]) => p.title === el.closest('.dock-panel')?.getAttribute('aria-label'))?.[0];
@@ -192,6 +195,9 @@ describe('a property row', () => {
               expect([...page.ws.selection.rows], JSON.stringify(a)).toEqual(shownPicks());
               expect(marked().sort()).toEqual(shownPicks().sort());
               expect(page.ws.selected.size).toBe(0);
+              // The signals on the page are no part of a pick of property rows, a run past them too.
+              expect(document.querySelectorAll('.palette .chip').length).toBe(SIGNALS.length);
+              expect([page.ws.selection.signals.size, document.querySelectorAll('.palette .chip[aria-selected=true]').length]).toEqual([0, 0]);
               // The edit bar shows only under the row picked last, while it shows, and counts the rows it edits.
               const bars = [...document.querySelectorAll('.write-bar')];
               if (!shown().includes(at)) expect(bars.length, 'no bar for a row that does not show').toBe(0);

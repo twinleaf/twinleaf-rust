@@ -395,6 +395,11 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 /* The signal Enter adds while the search has focus is highlighted, as the
    row a filter field chooses is in a menu. */
 .palette .chip.chosen { background: var(--accent); color: var(--accent-foreground); }
+/* A signal picked has the look of a property row picked, on its own ground
+   and within its border, hovered or not. Lifted from the list, it counts
+   the signals that go with it. */
+.palette .chip.picked, .palette .chip.picked:hover { background: color-mix(in oklch, var(--primary) 12%, var(--secondary)); border-color: var(--primary); }
+.chip[data-count]::after { content: attr(data-count); flex: none; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: var(--primary); color: var(--primary-foreground); font: 600 10px/16px var(--font-data); text-align: center; font-variant-numeric: tabular-nums; }
 
 /* The keys sheet (KeysDialog.svelte): as many columns as the window has
    room for, each section kept whole, its keys in a column as wide as its

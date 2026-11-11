@@ -4,9 +4,9 @@
 // plot's own buttons all run a command through `run`, so each origin does
 // the same thing to the same plots.
 //
-// An entry is {id, scope, kinds, needs, place, show, keys, what, label,
-// icon, active, activeIcon, value, disabled, destructive, empty, check,
-// run}:
+// An entry is {id, scope, kinds, needs, place, show, keys, shift, what,
+// label, icon, active, activeIcon, when, value, disabled, destructive,
+// empty, check, run}:
 // - `scope` is 'view' or 'plot': made from the page or the keys with no
 //   plot selected, a 'view' command acts on every plot shown and a 'plot'
 //   command on none (selection.svelte.js `pageTargets`). Made on a plot, from
@@ -15,14 +15,22 @@
 // - `kinds` lists the kinds of plot it acts on, or null for every kind; the
 //   plots of other kinds are dropped from what it acts on.
 // - `needs` lists what it needs beyond plots: 'workspace', a plot placed in
-//   a tab's layout; 'axis', a y axis it is made on, which its `how` names.
-// - `show`, `keys` and `what` are its keys as keymap.js takes them; `place`
-//   'page' puts them among the page's keys, not a plot's.
+//   a tab's layout; 'axis', a y axis it is made on, which its `how` names;
+//   'signals', the signals of the Signals list it puts on the plots or
+//   takes off them. Made on a signal's row, from its menu, its keys or a
+//   double-click, a command acts on the signals picked when the row is one
+//   of them, or else on that signal alone (selection.svelte.js
+//   `signalTargets`); the palette names the one signal. With no signal it
+//   does not run.
+// - `show`, `keys`, `shift` and `what` are its keys as keymap.js takes
+//   them; `place` 'page' puts them among the page's keys and 'list' among
+//   the Signals list's, not a plot's.
 // - `label`, `icon`, `value`, `disabled` and `destructive` are how its row
 //   reads: `label` is text or a function of the context, and a command with
 //   no label has no row and is not in the palette; the icon is
 //   `activeIcon` while `active` holds, else `icon`. `value` is null, text,
-//   or {text, icon, warn, title}.
+//   or {text, icon, warn, title}. `when`, where there is one, says whether
+//   a menu has the row at all; its key runs the command either way.
 // - `empty` true runs it with no plots to act on too.
 // - `check(ctx)`, where there is one, asks, as a menu opens, what its row
 //   then reads as `how`.
@@ -32,15 +40,22 @@
 // Each of `label`, `value`, `disabled` and `run` takes the context `ctx`
 // and `how`, what the origin adds: the axis a y axis command is made on,
 // or the count a menu holds. `ctx` is what the command acts on, made by
-// `context`: {plots, on, lead, from, svc}. `plots` is each plot it acts on,
-// as {id, plot, view, pv}: its settings, its view and its PlotView, which
-// is all a command reaches of a plot. `on` is the plot it was made on, or
-// null; `lead` that plot, or else the one clicked last among `plots`, or the
-// first. `from` is the origin: 'menu', 'button', 'key', 'palette' or
-// 'toolbar'. `svc` is the page's services, as `commands` takes them.
+// `context`: {plots, on, lead, signals, from, svc}. `plots` is each plot it
+// acts on, as {id, plot, view, pv}: its settings, its view and its
+// PlotView, which is all a command reaches of a plot. `on` is the plot it
+// was made on, or null; `lead` that plot, or else the one clicked last
+// among `plots`, or the first. `signals` is the keys of the signals it acts
+// on, none for a command that needs none. `from` is the origin: 'menu',
+// 'button', 'key', 'palette', 'toolbar' or 'row', a double-click on a
+// signal. `svc` is the page's services, as `commands` takes them.
 import { common, counted } from './menus.js';
 import { cursorText } from './plot.js';
+import { chip } from './tabs.js';
+import { kindLabel } from './constants.js';
 import * as clock from './clock.js';
+import RiAdd from '@lucide/svelte/icons/plus';
+import RiTrash from '@lucide/svelte/icons/trash-2';
+import RiNewPlot from '@lucide/svelte/icons/square-plus';
 import RiSplitH from '@lucide/svelte/icons/columns-2';
 import RiSplitV from '@lucide/svelte/icons/rows-2';
 import RiFullscreen from '@lucide/svelte/icons/maximize-2';
@@ -107,6 +122,14 @@ function burst(ctx, kind, fn) {
   const perf = clock.now(), views = ctx.plots.map((t) => t.view);
   ctx.svc.viewHistory.burst(kind, views, () => views.forEach((v) => fn(v, perf)));
 }
+
+const shows = (plot, key) => plot.items.some((i) => i.key === key);
+/** The plots of `ctx` that lack any of its signals. */
+const lacking = (ctx) => ctx.plots.filter((t) => ctx.signals.some((key) => !shows(t.plot, key)));
+/** How many signals `ctx` acts on and how many of `plots`, as a row's value: each when more than one. */
+const signalsValue = (ctx, plots) => [ctx.signals.length > 1 && counted(ctx.signals.length, 'signal'), plots.length > 1 && counted(plots.length, 'plot')].filter(Boolean).join(', ') || null;
+/** The signals of `ctx` as an edit names them: the one signal, or how many. */
+const signalsNamed = (ctx) => (ctx.signals.length > 1 ? counted(ctx.signals.length, 'signal') : ctx.signals[0]);
 
 /** Every plot command, the plot keys first in the order the keys sheet lists them. */
 export const COMMANDS = [
@@ -224,6 +247,33 @@ export const COMMANDS = [
     },
     run: (ctx) => void ctx.svc.cursors.clear(ids(ctx)),
   },
+  {
+    // Each selected plot gets those of the signals it lacks. A menu has its row unless every selected plot shows them all.
+    id: 'addToPlots', scope: 'plot', needs: ['signals'], place: 'list', show: ['Enter'], keys: ['Enter'], shift: false, what: 'Add to the selected plots',
+    icon: RiAdd, label: 'Add to plot',
+    when: (ctx) => !ctx.plots.length || lacking(ctx).length > 0,
+    value: (ctx) => (ctx.plots.length ? signalsValue(ctx, lacking(ctx)) : 'No plot selected'),
+    disabled: (ctx) => !ctx.plots.length,
+    run: (ctx) => ctx.svc.edit(lacking(ctx).map((t) => t.id), `Add ${signalsNamed(ctx)}`, (plot) => ({ items: [...plot.items, ...ctx.signals.filter((key) => !shows(plot, key)).map(chip)] })),
+  },
+  {
+    // Each selected plot loses those of the signals it shows. A menu has its row, in place of Add to plot, where every selected plot shows them all.
+    id: 'removeFromPlots', scope: 'plot', needs: ['signals'], place: 'list', show: ['Delete'], keys: ['Delete', 'Backspace'], what: 'Remove from the selected plots',
+    icon: RiTrash, label: 'Remove from plot', destructive: true,
+    when: (ctx) => ctx.plots.length > 0 && !lacking(ctx).length,
+    value: (ctx) => signalsValue(ctx, ctx.plots),
+    run: (ctx) => {
+      const having = ctx.plots.filter((t) => ctx.signals.some((key) => shows(t.plot, key)));
+      ctx.svc.edit(having.map((t) => t.id), `Remove ${signalsNamed(ctx)}`, (plot) => ({ items: plot.items.filter((i) => !ctx.signals.includes(i.key)) }));
+    },
+  },
+  {
+    // A time plot of the signals, whatever is selected.
+    id: 'newPlot', scope: 'plot', needs: ['signals'], place: 'list', show: ['Shift', 'Enter'], keys: ['Enter'], shift: true, what: 'New plot with them', empty: true,
+    icon: RiNewPlot, label: 'New plot',
+    value: (ctx) => (ctx.signals.length > 1 ? counted(ctx.signals.length, 'signal') : kindLabel('time', 'overlay')),
+    run: (ctx) => ctx.svc.newPlot(ctx.signals),
+  },
 ];
 
 /** The command `id`. */
@@ -235,38 +285,46 @@ const read = (f, ctx, how) => (typeof f === 'function' ? f(ctx, how) : f);
  * The page's commands over `svc`, its services: `targets(id)` and
  * `pageTargets(scope)`, the plots a command made on plot `id` or from the
  * page acts on, by id; `plotOf(id)`, plot `id` as {id, plot, view, pv};
- * `last()`, the plot clicked last; and what the commands write through:
- * `ws`, `selection`, `viewHistory`, `cursors`, `toast`, `edit(ids, what,
- * fn)`, `split(ids, dir, fromKeys)`, `close(ids, fromKeys)`, `copy(plots)`,
+ * `signalTargets(key)`, the signals a command made on signal `key`'s row,
+ * or from the page with null, acts on, by key; `last()`, the plot clicked
+ * last; and what the commands write through: `ws`, `selection`,
+ * `viewHistory`, `cursors`, `toast`, `edit(ids, what, fn)`, `split(ids,
+ * dir, fromKeys)`, `close(ids, fromKeys)`, `newPlot(keys)`, `copy(plots)`,
  * `copyCheck(plots)`, `openExport(plots)` and `picker(id, action)`.
+ *
+ * Where a command is made is {on, signal, signals, from}: `on` the plot it
+ * is made on, or null for the page; `signal` the signal whose row it is
+ * made on, or null, or else `signals`, the very signals it acts on; and
+ * `from`, its origin.
  */
 export function commands(svc) {
-  /** What command `id`, made on plot `on` or from the page, acts on: its context. */
-  function context(id, { on = null, from = 'menu' } = {}) {
+  /** What command `id`, made at `where`, acts on: its context. */
+  function context(id, { on = null, signal = null, signals, from = 'menu' } = {}) {
     const c = commandOf(id);
     const all = (on !== null ? svc.targets(on) : svc.pageTargets(c.scope)).map(svc.plotOf).filter((t) => t.plot);
     const plots = c.kinds ? all.filter((t) => c.kinds.includes(t.plot.kind)) : all;
     const made = on !== null ? svc.plotOf(on) : null;
     const lead = made ?? plots.find((t) => t.id === svc.last()) ?? plots[0] ?? null;
-    return { plots, all, on: made, lead, from, svc };
+    return { plots, all, on: made, lead, signals: c.needs?.includes('signals') ? (signals ?? svc.signalTargets(signal)) : [], from, svc };
   }
   return {
     context,
     /**
-     * Runs command `id`, made on plot `on` or from the page, from origin
-     * `from` with `how`. Says whether it was taken: it had plots to act on,
-     * of any kind, or runs with none, and did not decline. It runs on those
-     * of its kinds.
+     * Runs command `id`, made at `where`, with `how`. Says whether it was
+     * taken: it had plots to act on, of any kind, or runs with none, had
+     * the signals it needs, and did not decline. It runs on the plots of
+     * its kinds.
      */
-    run(id, { on = null, from = 'menu', how } = {}) {
-      const c = commandOf(id), ctx = context(id, { on, from });
+    run(id, { how, ...where } = {}) {
+      const c = commandOf(id), ctx = context(id, where);
+      if (c.needs?.includes('signals') && !ctx.signals.length) return false;
       if (!ctx.all.length && !c.empty) return false;
       if (!ctx.plots.length && !c.empty) return true;
       return c.run(ctx, how) !== false;
     },
-    /** How command `id`'s row reads, made on plot `on` with `how`: {label, icon, value, disabled, destructive, show}. */
-    row(id, { on = null, how } = {}) {
-      const c = commandOf(id), ctx = context(id, { on });
+    /** How command `id`'s row reads, made at `where` with `how`: {label, icon, value, disabled, destructive, show, offered}, `offered` whether a menu has the row. */
+    row(id, { how, ...where } = {}) {
+      const c = commandOf(id), ctx = context(id, where);
       return {
         label: read(c.label, ctx, how),
         icon: c.active?.(ctx, how) ? c.activeIcon : c.icon,
@@ -274,6 +332,7 @@ export function commands(svc) {
         disabled: !!c.disabled?.(ctx, how),
         destructive: !!c.destructive,
         show: c.show ?? null,
+        offered: !c.when || !!c.when(ctx, how),
       };
     },
     /** What command `id`'s `check` answers, made on plot `on`, or null for a command with none. */
@@ -281,9 +340,9 @@ export function commands(svc) {
       const c = commandOf(id);
       return c.check ? c.check(context(id, { on })) : Promise.resolve(null);
     },
-    /** The commands the palette offers now, as {id, label}: each with a row that needs no axis and with plots to act on now, or else one that runs with none and is on, as Restore is while plots are maximized. */
+    /** The commands the palette offers now, as {id, label}: each with a row that needs no axis and no signal, and with plots to act on now, or else one that runs with none and is on, as Restore is while plots are maximized. */
     offered() {
-      return COMMANDS.filter((c) => c.label && !c.needs?.includes('axis')).flatMap((c) => {
+      return COMMANDS.filter((c) => c.label && !c.needs?.some((n) => n === 'axis' || n === 'signals')).flatMap((c) => {
         const ctx = context(c.id, { from: 'palette' });
         return (ctx.plots.length || (c.empty && c.active?.(ctx))) && !c.disabled?.(ctx) ? [{ id: c.id, label: read(c.label, ctx) }] : [];
       });

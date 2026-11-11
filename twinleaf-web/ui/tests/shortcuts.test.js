@@ -41,12 +41,15 @@ function snapshot(page) {
   });
 }
 
-/** The rows of each menu that show a key, as [menu, label, keys]. */
+/** The rows of each menu that show a key, as [menu, label, keys], each menu opened with nothing selected, as on a page just mounted. */
 async function rowsWithKeys() {
   const page = await menuPage();
   const found = [];
   try {
     for (const [name, open] of Object.entries(MENUS)) {
+      // The menu before may have selected its plot, and a menu's rows go by what is selected.
+      page.ws.selection.clear();
+      await settle();
       const menu = await open(page, page.ids[1]);
       expect(menu, `${name} opens`).toBeTruthy();
       for (const row of menu.querySelectorAll('[role^=menuitem]:not([data-disabled])')) {

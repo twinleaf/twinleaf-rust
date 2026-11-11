@@ -39,8 +39,8 @@
   import Dock from './lib/Dock.svelte';
   import { Docks, PANELS, SIDES } from './lib/docks.svelte.js';
   import { byRoute, panelRows } from './lib/properties.js';
-  import { ROWS } from './lib/selection.svelte.js';
-  import SignalList from './lib/SignalList.svelte';
+  import { ROWS, SIGNAL } from './lib/selection.svelte.js';
+  import SignalList, { matching } from './lib/SignalList.svelte';
   import TabStrip from './lib/TabStrip.svelte';
   import DragOverlay from './lib/DragOverlay.svelte';
   import FocusRing from './lib/FocusRing.svelte';
@@ -164,6 +164,7 @@
   const commands = plotCommands({
     targets: (on) => selection.targets(on),
     pageTargets: (scope) => selection.pageTargets(scope),
+    signalTargets: (key) => selection.signalTargets(key),
     plotOf: (id) => ({ id, plot: ws.plots[id], view: views.of(id), pv: [...registry].find((p) => p.plotId === id) }),
     last: () => ws.focusedId,
     ws,
@@ -174,6 +175,7 @@
     edit: (ids, what, fn) => eachPlot(ids, what, fn),
     split: (ids, dir, fromKeys) => splitPlots(ids, dir, fromKeys),
     close: (ids, fromKeys) => closePlots(ids, fromKeys),
+    newPlot: (keys) => newPlotWith(keys),
     copy: (plots) => copyData(plots),
     copyCheck: (plots) => copyCheck(plots),
     openExport: (plots) => openExport(plots),
@@ -348,13 +350,21 @@
   }
   /** Whether dock `side` has a panel of properties, open or folded, and so holds the filter's field, in its top row. */
   const holdsFilter = (side) => docks[side].some((p) => PANELS[p.id].channels);
-  // The property rows the page shows, in page order, which a Shift pick runs
-  // along: each open panel of rows or action buttons of the docks shown,
-  // left then right, top to bottom.
+  /** What the Signals list's search holds: the signals it shows are those that match. */
+  let signalQuery = $state('');
+  // The rows the page shows, in page order, which a Shift pick runs along:
+  // each open panel of rows or action buttons, and the Signals list, of the
+  // docks shown, left then right, top to bottom.
   selection.rowOrder = () =>
     SIDES.filter((side) => docks.shown(side))
-      .flatMap((side) => docks[side].filter((p) => p.open && PANELS[p.id].channels))
-      .flatMap(({ id }) => panelRows(checked, PANELS[id].channels, history.favorites, propertyFilter).map((r) => `${id}:${r.name}`));
+      .flatMap((side) => docks[side].filter((p) => p.open))
+      .flatMap(({ id }) =>
+        SIGNAL === `${id}:`
+          ? matching(hub.session.signals, signalQuery).map((t) => SIGNAL + t.key)
+          : PANELS[id].channels
+            ? panelRows(checked, PANELS[id].channels, history.favorites, propertyFilter).map((r) => `${id}:${r.name}`)
+            : [],
+      );
 
   // Each dock's width, a share of the page, dragged at its edge or moved
   // with the arrows there, and kept for the next visit. A double-click puts
@@ -521,32 +531,6 @@
   function newPlotWith(keys) {
     history.group('New plot', () => ws.addPlot(newPlot('time', 'overlay', keys)));
   }
-  /**
-   * Adds signal `key`, from the Signals list or the command palette, to
-   * every selected plot. With none selected it does nothing: a signal goes
-   * to a plot by drag there.
-   */
-  function addSignal(key) {
-    const ids = selection.pageTargets('plot');
-    if (ids.length) history.group(ids.length > 1 ? `Add ${key} (${plotsText(ids.length)})` : `Add ${key}`, () => ws.addTo(ids, key));
-  }
-  /** Takes signal `key` out of every selected plot, as one step. */
-  function removeSignal(key) {
-    const ids = selection.pageTargets('plot');
-    if (ids.length) history.group(ids.length > 1 ? `Remove ${key} (${plotsText(ids.length)})` : `Remove ${key}`, () => ws.removeFrom(ids, key));
-  }
-  /**
-   * What the Signals list's Add to plot says of signal `key`, as {text,
-   * can}: how many plots it would join when more than one, from the same
-   * selection the command acts on; or why it joins none. Where every selected plot shows
-   * it already, `remove` is true and the row takes it out of them instead.
-   */
-  function addsTo(key) {
-    const ids = selection.pageTargets('plot'), lacking = ids.filter((id) => !ws.plots[id].items.some((i) => i.key === key));
-    if (!ids.length) return { text: 'No plot selected', can: false };
-    if (!lacking.length) return { text: ids.length > 1 ? plotsText(ids.length) : '', can: true, remove: true };
-    return { text: lacking.length > 1 ? plotsText(lacking.length) : '', can: true };
-  }
   /** Moves keyboard focus to plot `id`, once it is on the page. */
   async function focusPlot(id) {
     if (!ws.plots[id]) return;
@@ -646,7 +630,7 @@
     delayMs = ms;
     views.setDelay(ms / 1000);
   }
-  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), addSignal, newPlot: newPlotWith, exportTabs, importTabs: () => importInput.click() };
+  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), exportTabs, importTabs: () => importInput.click() };
 
   let paletteOpen = $state(false);
   let keysOpen = $state(false);
@@ -795,7 +779,7 @@
       on: plotKey,
     },
     restore: { when: () => !!ws.maximized, on: { escape: () => void ws.restoreLayout() } },
-    deselect: { when: () => ws.selected.size > 0 || selection.rows.size > 0, on: { escape: () => void selection.clear() } },
+    deselect: { when: () => ws.selected.size > 0 || selection.rows.size > 0 || selection.signals.size > 0, on: { escape: () => void selection.clear() } },
     // Tab, the arrows, Enter, Escape and F6 move through the page's tree
     // (focus.js); a move that brings focus into another plot selects it.
     navigation: {
@@ -888,7 +872,7 @@
   {:else if id === 'signals'}
     <!-- The whole panel keeps the plot selection: its search, its list and its scrollbar. -->
     <div class="contents" data-keeps-selection>
-      <SignalList session={hub.session} {drags} onAdd={addSignal} onRemove={removeSignal} onNewPlot={newPlotWith} {addsTo} />
+      <SignalList session={hub.session} {drags} bind:query={signalQuery} />
     </div>
   {:else}
     {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} panel={id} filter={propertyFilter} />{/key}

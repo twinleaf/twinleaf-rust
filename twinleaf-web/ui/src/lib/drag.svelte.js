@@ -62,6 +62,8 @@ export class Drags {
   axisDropAt = null;
   /** Where the last signal drag was let go, as `drop` names it, read as its drop lands. */
   traceDrop = null;
+  /** The signals dragged with the one held, by key, which land with it. */
+  traceWith = [];
   traceDragging = false;
   /** Closes plot `id`: set by the page, which also lets go of what the plot holds. */
   closePlot = (id) => this.ws.closePlot(id);
@@ -237,12 +239,14 @@ export class Drags {
    * outer cell opens one along that edge of the layout. On an empty tab,
    * anywhere on the tiles opens the tab's first plot. The cell is read at
    * pointerup, before the drag library finalizes, and the drop lands
-   * through `landSignal`.
+   * through `landSignal`. `others` is the keys of the signals dragged with
+   * it, as the signals picked are with one of them.
    */
-  traceDragStart() {
+  traceDragStart(others = []) {
     if (this.traceDragging) return;
     this.traceDragging = true;
     this.traceDrop = null;
+    this.traceWith = others;
     // The cells over each plot, and along the edge, as the layout lays them out when the drag begins.
     const tiles = document.querySelector('.tile-box')?.getBoundingClientRect();
     const box = tiles && { x: tiles.left, y: tiles.top, w: tiles.width, h: tiles.height };
@@ -297,15 +301,20 @@ export class Drags {
    * those chips as dropped, or null when the drop is in no plot's chips.
    * Where the pointer was let go decides where it goes, as the drag library
    * can name the zone the pointer was over a moment before; the zone's
-   * chips give its place only when they are of that plot. Returns the id of
-   * the plot it went to, or null.
+   * chips give its place only when they are of that plot. The signals
+   * dragged with it join the plot it went to, after it, as the same step.
+   * Returns the id of that plot, or null.
    */
   landSignal(item, into = null, items = null) {
-    const drop = this.traceDrop;
+    const drop = this.traceDrop, others = this.traceWith;
     this.traceDrop = null;
+    this.traceWith = [];
     if (!drop) return null;
-    if (drop.edge !== 'add') return this.moveSignal(item, drop);
-    return this.moveSignal(item, { plotId: drop.plotId, items: into === drop.plotId ? items : null });
+    return this.group(others.length ? `Move ${others.length + 1} signals` : 'Move signal', () => {
+      const id = this.moveSignal(item, drop.edge !== 'add' ? drop : { plotId: drop.plotId, items: into === drop.plotId ? items : null });
+      if (id) for (const key of others) this.moveSignal({ id: `pal:${key}`, key }, { plotId: id });
+      return id;
+    });
   }
 
   /**

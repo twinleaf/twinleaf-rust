@@ -1,14 +1,21 @@
-// Which plots are selected, the plot clicked last, and which property rows
-// are picked, and every rule of how a press, a click, a key or an undo
-// changes them. This class holds them and is their only writer: the page,
-// the drags, the Workspace (as plots go) and History (as it restores a step)
-// all go through its methods. Plots and rows are never chosen together:
-// choosing either lets go of the other. A row pick spans every panel, each
-// row named by its panel and its name, and a Shift pick runs along the rows
-// in page order. The rows picked are those of the picks the page shows: a
-// pick whose panel folds, whose dock hides or that leaves Favorites stops
-// being picked while it is not shown, and the next pick starts from those
-// that are.
+// Which plots are selected, the plot clicked last, and which rows of the
+// panels' lists are picked, and every rule of how a press, a click, a key
+// or an undo changes them. This class holds them and is their only writer:
+// the page, the drags, the Workspace (as plots go) and History (as it
+// restores a step) all go through its methods.
+//
+// The rows picked are one pick, made one way for every list: each row is
+// named by its panel and its name, a click picks it alone, Ctrl adds it or
+// drops it, and a Shift pick runs along the rows in page order. They are of
+// one kind at a time: property rows, of every panel of properties together,
+// or signals, the rows of the Signals list (`rows`, `signals`). Picking a
+// row of one kind lets go of the rows of the other. Plots and property rows
+// are never chosen together: choosing either lets go of the other. Plots
+// and signals are, as the signals picked are what goes onto the plots
+// selected. The rows picked are those of the picks the page shows: a pick
+// whose panel folds, whose dock hides, that leaves Favorites or that the
+// Signals list's search leaves out stops being picked while it is not
+// shown, and the next pick starts from those that are.
 //
 // A press anywhere clears them, but in what works on the plots: the plots
 // themselves, a menu or popover, and what is marked data-keeps-selection
@@ -29,34 +36,45 @@ import * as clock from './clock.js';
 export const KEEPS = '.leaf, [data-keeps-selection], [data-slot$=-content], [role=menu], [role=dialog], [role=listbox]';
 /** A table of property rows, a panel's action buttons, or the edit bar under them: a press in one picks rows or acts on those picked, so lets go of the plots only. */
 export const ROWS = '[role=grid], [data-rows]';
+/** What a signal's row is named by, before its key: the Signals panel. */
+export const SIGNAL = 'signals:';
 /** How long a click on one of several selected plots waits before it narrows the selection to that plot, so a double-click acts on them all. */
 export const DOUBLE_CLICK_MS = 300;
+
+const isSignal = (key) => key.startsWith(SIGNAL);
 
 export class Selection {
   /** The selected plots, by id. */
   plots = new SvelteSet();
   /** The plot clicked or focused last, or null. */
   last = $state(null);
-  /** The property rows picked, shown or not, as `${panel}:${name}` keys, in the order picked. */
+  /** The rows picked, shown or not, as `${panel}:${name}` keys, in the order picked: property rows, or signals. */
   #picks = $state.raw([]);
-  /** The property row picked or moved to last, shown or not. */
+  /** The row picked or moved to last, shown or not. */
   #at = $state(null);
   /** The row a Shift pick runs from: the row last picked without Shift, while any row is picked. */
   #anchor = null;
   /**
-   * Every property row the page shows, as keys, in page order: the page's
-   * to set, a function whose reads are tracked. With none, as with no page,
-   * every row picked shows.
+   * Every row the page shows, of properties and of signals, as keys, in
+   * page order: the page's to set, a function whose reads are tracked. With
+   * none, as with no page, every row picked shows.
    */
   rowOrder = $state.raw(null);
   /** The rows the page shows, or null for every row. */
   #shown = $derived(this.rowOrder ? new Set(this.rowOrder()) : null);
-  #rows = $derived(new Set(this.#shown ? this.#picks.filter((k) => this.#shown.has(k)) : this.#picks));
+  /** The rows picked that the page shows, in the order picked. */
+  #picked = $derived(this.#shown ? this.#picks.filter((k) => this.#shown.has(k)) : this.#picks);
+  #rows = $derived(new Set(this.#picked.filter((k) => !isSignal(k))));
+  #signals = $derived(new Set(this.#picked.filter(isSignal).map((k) => k.slice(SIGNAL.length))));
   /** The property rows picked that the page shows, in the order picked: what every act on the rows picked acts on. */
   get rows() {
     return this.#rows;
   }
-  /** The property row the arrows are on, picked or moved to last, while the page shows it, or null: where the page edits the rows picked. */
+  /** The signals picked that the Signals list shows, by key, in the order picked: what goes onto the plots selected. */
+  get signals() {
+    return this.#signals;
+  }
+  /** The row the arrows are on, picked or moved to last, while the page shows it, or null: where the page edits the rows picked. */
   get rowAt() {
     return this.#shown && !this.#shown.has(this.#at) ? null : this.#at;
   }
@@ -82,7 +100,7 @@ export class Selection {
     else this.clear();
   }
 
-  /** Clears the selection, the plot clicked last and the rows picked. */
+  /** Clears the selection, the plot clicked last and the rows picked, signals among them. */
   clear() {
     this.#setPlots([], null);
     this.#setRows([]);
@@ -90,13 +108,13 @@ export class Selection {
 
   /** Makes plots `ids` the selection, and `last` the plot clicked last: the first of them unless named. */
   only(ids, last = ids[0] ?? null) {
-    if (ids.length) this.#setRows([]);
+    if (ids.length) this.#dropRows();
     this.#setPlots(ids, last);
   }
 
   /** Selects plot `id` alone, unless it is selected already, and makes it the plot clicked last. */
   pressOn(id) {
-    this.#setRows([]);
+    this.#dropRows();
     this.#setPlots(this.plots.has(id) ? [...this.plots] : [id], id);
   }
 
@@ -119,7 +137,7 @@ export class Selection {
    * changes the selection meanwhile, or the plot going, stops that.
    */
   click(id, shift, clicks) {
-    this.#setRows([]);
+    this.#dropRows();
     if (shift) {
       const next = new Set(this.plots);
       if (!next.delete(id)) next.add(id);
@@ -130,38 +148,56 @@ export class Selection {
     if (clicks === 1) this.#narrowing = clock.after(DOUBLE_CLICK_MS, () => this.exists(id) && this.#setPlots([id], id));
   }
 
-  /** Makes `keys` (`${panel}:${name}`) the rows picked, letting go of the plots, and `at` the row the arrows are on. */
+  /**
+   * Makes `keys` (`${panel}:${name}`), rows of one kind, the rows picked,
+   * and `at` the row the arrows are on. It lets go of the plots, unless
+   * the rows are signals.
+   */
   pickRows(keys, at = this.#at) {
-    this.#setPlots([], null);
+    if (!keys.length || !keys.every(isSignal)) this.#setPlots([], null);
     this.#setRows(keys);
     this.#at = at;
   }
 
   /**
-   * A click on property row `key` with `mods`' keys, or an arrow moving to
-   * it: it picks the row alone; with Shift, the run to it from the row a
-   * pick started at, in page order (`rowOrder`), or the row alone when that
-   * row is not shown; with Ctrl or ⌘, it adds the row or drops it.
+   * A click on row `key` with `mods`' keys, or an arrow moving to it: it
+   * picks the row alone; with Shift, the run to it from the row a pick
+   * started at, in page order (`rowOrder`), or the row alone when that row
+   * is not shown; with Ctrl or ⌘, it adds the row or drops it. The rows of
+   * the other kind, property rows or signals, are no part of it: a run
+   * passes over them, and none of them stays picked.
    */
   pickRow(key, { shiftKey = false, ctrlKey = false, metaKey = false } = {}) {
-    const order = this.rowOrder?.() ?? [];
+    const like = (k) => isSignal(k) === isSignal(key);
+    const order = (this.rowOrder?.() ?? []).filter(like);
+    // A signal's click leaves the plots selected, the last signal dropped too.
+    if (!isSignal(key)) this.#setPlots([], null);
     if (shiftKey && order.includes(this.#anchor) && order.includes(key)) {
       const [a, b] = [order.indexOf(this.#anchor), order.indexOf(key)].sort((x, y) => x - y);
-      this.pickRows(order.slice(a, b + 1));
+      this.#setRows(order.slice(a, b + 1));
     } else {
       if (ctrlKey || metaKey) {
-        const next = new Set(this.rows);
+        const next = new Set(this.#picked.filter(like));
         if (!next.delete(key)) next.add(key);
-        this.pickRows([...next]);
-      } else this.pickRows([key]);
+        this.#setRows([...next]);
+      } else this.#setRows([key]);
       this.#anchor = key;
     }
     this.#at = key;
   }
 
-  /** A right-click on property row `key`: it picks the row alone, unless it is picked already. */
+  /** A right-click on row `key`: it picks the row alone, unless it is picked already. */
   rowMenu(key) {
-    if (!this.rows.has(key)) this.pickRow(key);
+    if (!this.#picked.includes(key)) this.pickRow(key);
+  }
+
+  /**
+   * The signals a command acts on, by key: made on signal `key`'s row,
+   * every signal picked when it is one of them, else it alone; made from
+   * the page, with null, the signals picked.
+   */
+  signalTargets(key = null) {
+    return key === null || this.signals.has(key) ? [...this.signals] : [key];
   }
 
   /** The plots a command made on plot `id`, from its menu or its header, acts on: every selected plot when `id` is one of them, else `id` alone. */
@@ -185,13 +221,15 @@ export class Selection {
   }
 
   /**
-   * Puts back what `snapshot` gave, less the plots that do not show: its plots,
-   * or else its row picks, of which those the page shows are the rows picked.
+   * Puts back what `snapshot` gave, less the plots that do not show: its
+   * plots, and its row picks, of which those the page shows are the rows
+   * picked; but with a plot back, no property row.
    */
   restore(s) {
     const ids = s.selected.filter((id) => this.exists(id));
-    this.#setRows(ids.length ? [] : (s.rows ?? []));
-    if (!ids.length && s.rows?.length) this.#at = s.rowAt ?? null;
+    const rows = (s.rows ?? []).filter((k) => !ids.length || isSignal(k));
+    this.#setRows(rows);
+    if (rows.length) this.#at = s.rowAt ?? null;
     this.#setPlots(ids, this.exists(s.focusedId) ? s.focusedId : null);
   }
 
@@ -215,5 +253,9 @@ export class Selection {
   #setRows(keys) {
     if (!keys.length) this.#anchor = null;
     if (keys.length || this.#picks.length) this.#picks = [...new Set(keys)];
+  }
+  /** Lets go of the rows picked where they are property rows: signals stay with the plots. */
+  #dropRows() {
+    if (!this.#picks.every(isSignal)) this.#setRows([]);
   }
 }

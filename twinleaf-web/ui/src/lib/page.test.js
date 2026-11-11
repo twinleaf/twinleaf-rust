@@ -33,7 +33,9 @@ describe('the keymap', () => {
     expect(actionFor('plot', { key: 'a' })).toBe('addSignals');
     expect(actionFor('page', { key: '3' })).toBe('goToPlot');
     expect(actionFor('list', { key: 'Enter', shiftKey: true })).toBe('newPlot');
-    expect(actionFor('list', { key: 'Enter', shiftKey: false })).toBe('add');
+    expect(actionFor('list', { key: 'Enter', shiftKey: false })).toBe('addToPlots');
+    expect(actionFor('list', { key: 'Backspace' })).toBe('removeFromPlots');
+    expect(actionFor('list', { key: 'a', ctrlKey: true })).toBe('pickAll');
     expect(actionFor('plot', { key: 'a', ctrlKey: true })).toBeNull();
   });
 
@@ -46,7 +48,7 @@ describe('the keymap', () => {
 
   it('sheets the places of one title as one section, a row per keys', () => {
     const lists = sheet().find((s) => s.title === 'Lists');
-    expect(lists.rows.find((r) => r.id === 'Delete ').what).toBe('Remove signal, close tab');
+    expect(lists.rows.find((r) => r.id === 'Delete ').what).toBe('Remove signal, Remove from the selected plots, close tab');
     expect(lists.rows.filter((r) => r.what === 'Move')).toHaveLength(1);
     expect(sheet().filter((s) => s.title === 'Lists')).toHaveLength(1);
   });

@@ -9,11 +9,14 @@
 // none every plot for a view command and none for a plot command; less the
 // plots of kinds the command does not take. Then every origin that runs the
 // command on the same plots does the same thing, as it runs the one entry.
+// A command made on a signal is made from the page as far as plots go: its
+// origins are the Signals list's menu, its keys pressed in the list, and the
+// palette's rows that name a signal.
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
 import { MENUS, closeAll, openMenu } from './harness/menus.js';
-import { centre, click, editCursors, feed, focusPage, leafOf, mountPage, pressKey, rightClick, settle, until, wait, withExamples, withYPair } from './harness/page.js';
+import { centre, click, clickOn, editCursors, feed, focusPage, leafOf, mountPage, pressKey, rightClick, settle, until, wait, withExamples, withYPair } from './harness/page.js';
 import { COMMANDS } from '../src/lib/commands.js';
 import { plotIds } from '../src/lib/layout.js';
 
@@ -21,11 +24,11 @@ const SIGNALS = ['sine.sine', 'aux.triangle'];
 
 /**
  * Four plots in rows, each of both signals with its legend and cursors
- * placed, the last a spectrum, and another tab: every origin of every
- * command shows on it.
+ * placed, the last a spectrum, another tab, and a signal in the Signals
+ * list that no plot shows: every origin of every command shows on it.
  */
 async function commandPage() {
-  const page = await mountPage([SIGNALS, SIGNALS, SIGNALS, SIGNALS], 'rows', 1, SIGNALS);
+  const page = await mountPage([SIGNALS, SIGNALS, SIGNALS, SIGNALS], 'rows', 1, [...SIGNALS, 'mag.x']);
   feed(page.hub);
   const ids = plotIds(page.ws.layout);
   page.history.group('Prepare', () => ids.forEach((id, i) => page.ws.setPlot(id, { legend: true, ...(i === 3 && { kind: 'spectrum' }) })));
@@ -73,15 +76,38 @@ const ON_PLOT = {
   'the x axis': (page, id) => axisPopover(page, id, 'x'),
   'the y axis': (page, id) => axisPopover(page, id, 'y'),
 };
-/** The origins made from the page: each opens what holds its control and returns it. */
+const listSignals = () => [...document.querySelectorAll('.palette .chip[data-key]')];
+const palette = () => document.querySelector('[data-slot=dialog-overlay]');
+/** Closes the command palette, if it is open, and waits until it has gone: it takes every press until then. */
+async function closePalette() {
+  if (document.querySelector('[data-slot=command-item]')) await pressKey('Escape');
+  return until(() => !palette(), 2000);
+}
+/**
+ * The origins made from the page: each opens what holds its control and
+ * returns it. One that takes the command's id opens what holds that
+ * command's control, where what it holds differs by what it is opened on.
+ */
 const ON_PAGE = {
   'the toolbar': async () => document.querySelector('.top-bar'),
   'the File dropdown': () => MENUS['the File dropdown'](),
+  // A signal's menu has Add to plot or Remove from plot by what the selected plots show: the first signal whose menu names the command, or else the last.
+  'the Signals list’s menu': async (page, on, id) => {
+    let menu = null;
+    for (const signal of listSignals()) {
+      await closeAll();
+      await rightClick(centre(signal.querySelector('.sig-key')));
+      menu = openMenu();
+      if (naming(menu, id).length) break;
+    }
+    return menu;
+  },
+  'the palette’s signals': async () => (await pressKey('Control+k'), await settle(), document.querySelector('[data-slot=command-list]')),
 };
 
 /** The key that runs command `c`, as the keyboard command names it, or null. */
 function keyOf(c) {
-  if (c.keys) return { ' ': 'Space' }[c.keys[0]] ?? c.keys[0];
+  if (c.keys) return (c.shift ? 'Shift+' : '') + ({ ' ': 'Space' }[c.keys[0]] ?? c.keys[0]);
   return c.show?.includes('Ctrl') ? c.show.map((k) => (k === 'Ctrl' ? 'Control' : k.toLowerCase())).join('+') : null;
 }
 
@@ -101,14 +127,22 @@ describe('a plot command', () => {
     const reached = new Map(COMMANDS.map((c) => [c.id, new Set()]));
     try {
       const named = new Set();
+      // One plot selected, so a signal's menu has both of its rows, each on a signal.
+      page.ws.selection.only([page.ids[0]]);
+      await settle();
       for (const [name, open] of [...Object.entries(ON_PLOT), ...Object.entries(ON_PAGE)]) {
-        await closeAll();
-        const el = await open(page, page.ids[0]);
-        expect(el, `${name} opens`).toBeTruthy();
-        for (const row of el.querySelectorAll('[data-command]')) named.add(row.dataset.command);
-        for (const c of COMMANDS) if (naming(el, c.id).length) offers.get(c.id).push(name);
+        // An origin that opens by command is opened for each.
+        for (const c of open.length > 2 ? COMMANDS : [null]) {
+          await closeAll();
+          expect(await closePalette(), 'the palette gone').toBe(true);
+          const el = await open(page, page.ids[0], c?.id);
+          expect(el, `${name} opens`).toBeTruthy();
+          for (const row of el.querySelectorAll('[data-command]')) named.add(row.dataset.command);
+          for (const x of c ? [c] : COMMANDS) if (naming(el, x.id).length) offers.get(x.id).push(name);
+        }
       }
       await closeAll();
+      await closePalette();
       // Every control that names a command names one of the table.
       expect([...named].filter((id) => !offers.has(id))).toEqual([]);
 
@@ -140,16 +174,18 @@ describe('a plot command', () => {
           for (const name of offers.get(id)) {
             const open = ON_PLOT[name] ?? ON_PAGE[name];
             await check(name, ON_PLOT[name] ? fromPlot : fromPage, async () => {
-              const el = await open(page, on);
+              const el = await open(page, on, id);
               const control = naming(el, id)[0];
-              // A control the plot shows only for some plots, as a time axis's pause, is not this plot's.
+              // A control the plot shows only for some plots, as a time axis's pause, is not this plot's; nor is a signal's row the menu has only for some selections.
               if (!control) return false;
+              control.scrollIntoView({ block: 'nearest' });
               await click(centre(control));
             });
           }
           const key = keyOf(c);
-          if (key) await check('its key', fromPage, () => pressKey(key));
-          if (c.label && !c.needs?.includes('axis')) {
+          // A key of the Signals list is pressed there, on a signal a click picked.
+          if (key) await check('its key', fromPage, async () => (c.place === 'list' && (await clickOn(listSignals()[0])), pressKey(key)));
+          if (c.label && !c.needs?.some((n) => n === 'axis' || n === 'signals')) {
             await check('the palette', fromPage, async () => {
               await pressKey('Control+k');
               await settle();
@@ -175,7 +211,7 @@ describe('a plot command', () => {
     }
     // Each command is reached, and from every origin that offers it.
     for (const c of COMMANDS) {
-      const want = [...offers.get(c.id), ...(keyOf(c) ? ['its key'] : []), ...(c.label && !c.needs?.includes('axis') ? ['the palette'] : [])];
+      const want = [...offers.get(c.id), ...(keyOf(c) ? ['its key'] : []), ...(c.label && !c.needs?.some((n) => n === 'axis' || n === 'signals') ? ['the palette'] : [])];
       expect([...reached.get(c.id)].sort(), c.id).toEqual(want.sort());
     }
   }, 600_000);

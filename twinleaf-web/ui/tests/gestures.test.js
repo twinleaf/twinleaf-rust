@@ -343,17 +343,18 @@ describe('a dock header', () => {
   });
 });
 
-/** Each drag zone's items, what a click lands on, and where the keys reach for one: the item, or the zone it is an option of. */
+/** Each drag zone's items, what a click lands on, and where the keys reach for one: the item, or the zone it is an option of. `own` is the claimant that takes a key after a click there: a click on a signal picks it, and Enter then puts it on the selected plots. */
 const ZONES = {
   tab: { items: () => [...document.querySelectorAll('[role=tablist] [data-tab]')], click: (el) => el.querySelector('span'), reach: (el) => el },
   chip: { items: () => [...document.querySelectorAll('.tiles .trace-zone .trace-chip')], click: (el) => el.querySelector('.name') ?? el, reach: (el) => el.closest('.trace-zone') },
-  signal: { items: () => [...document.querySelectorAll('.palette [data-key]')], click: (el) => el.querySelector('.sig-key') ?? el, reach: (el) => el.closest('.palette') },
+  signal: { items: () => [...document.querySelectorAll('.palette [data-key]')], click: (el) => el.querySelector('.sig-key') ?? el, reach: (el) => el.closest('.palette'), own: { Enter: 'list' } },
   'dock header': { items: () => [...document.querySelectorAll('.dock-head')], click: (el) => el.querySelector('.dock-title') ?? el, reach: (el) => el },
 };
 
 /**
  * Space or Enter on an item of `zones`, clicked or reached from the keys:
- * no keyboard drag starts, and after a click the page hears the key.
+ * no keyboard drag starts, and after a click the page hears the key, or
+ * the zone's own claimant takes it where the zone has one for it.
  * Returns the zones and ways tried.
  */
 async function ownKeys(zones) {
@@ -382,7 +383,8 @@ async function ownKeys(zones) {
         await frames();
         expect(drags, `${how}, ${key} on a ${zone}: a keyboard drag`).toEqual([]);
         // The key router says who was offered the key pressed last: after a click, the page's claimants.
-        if (how === 'click') expect(lastKey(), `${key} after a click on a ${zone}: heard by the page`).toMatchObject({ key: key === 'Space' ? ' ' : key, page: true });
+        const own = ZONES[zone].own?.[key];
+        if (how === 'click') expect(lastKey(), `${key} after a click on a ${zone}: heard by ${own ?? 'the page'}`).toMatchObject({ key: key === 'Space' ? ' ' : key, ...(own ? { by: own } : { page: true }) });
         seen.add(`${zone}:${how}`);
       } finally {
         window.removeEventListener('consider', consider, true);
