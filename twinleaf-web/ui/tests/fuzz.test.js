@@ -50,7 +50,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pressKey, quietApi, showing, until, withExamples } from './harness/page.js';
+import { centre, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pressKey, quietApi, rested, showing, until, withExamples } from './harness/page.js';
 import { GUTTER, plotIds, rects, restrict } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
 
@@ -286,6 +286,8 @@ function listen() {
 const chosen = (ws) => JSON.stringify({ tab: ws.activeId, plots: [...ws.selected].sort(), rows: [...ws.selection.rows].sort() });
 /** Each dock frame's width, in px. */
 const dockWidths = () => [...document.querySelectorAll('.dock-frame')].map((f) => Math.round(f.getBoundingClientRect().width));
+/** Whether step `s` may hide or show a dock, by a menu's command: a dock slides as it does. */
+const movesDocks = (s) => (s.t === 'click' && s.at === 'menuItem') || (s.t === 'key' && s.key === 'Enter');
 
 /** Checks the invariants after step `s`, which began with `steps` undo steps and the docks `widths` wide. */
 function check(page, { steps, widths }, s) {
@@ -298,7 +300,7 @@ function check(page, { steps, widths }, s) {
   expect(showing().sort(), `the plots showing, after ${at}`).toEqual([...shown].sort());
   expect(misplaced(ws), `tiles away from the layout, after ${at}`).toEqual([]);
   oneLayer(page, null, s);
-  if (!(s.t === 'click' && s.at === 'menuItem') && !(s.t === 'key' && s.key === 'Enter')) expect(dockWidths(), `dock widths, after ${at}`).toEqual(widths);
+  if (!movesDocks(s)) expect(dockWidths(), `dock widths, after ${at}`).toEqual(widths);
   // Undo then redo gives back the tabs; after a step that made one, what the step left of the selection too.
   // A quick is two presses: its second may deselect after its first made the step, as a chip's Remove then Layout.
   if (history.undos.length) {
@@ -333,6 +335,8 @@ async function run(steps, after) {
       await frames(2);
       expect(seen.errors, `errors after ${JSON.stringify(s)}`).toEqual([]);
       after(page, before, s);
+      // The next step starts with the docks where a slide brings them to rest.
+      if (movesDocks(s)) await rested(() => dockWidths().join());
     }
   } finally {
     seen.stop();
@@ -370,6 +374,8 @@ describe('the page, played by random runs of gestures and keys', () => {
           [[{ t: 'move', a: 1, b: 0, cell: 'center', by: 'grip', escape: false }, { t: 'key', key: 'f' }, { t: 'quick', a: 'layout', b: 'layout', i: 0 }, { t: 'quick', a: 'header', b: 'layout', i: 0 }]],
           // A plot docked beside another, by its grip and by its header.
           [[{ t: 'move', a: 0, b: 0, cell: 'bottom', by: 'grip', escape: false }, { t: 'move', a: 1, b: 1, cell: 'right', by: 'header', escape: false }]],
+          // The left dock hidden from its header's menu, which slides it to its rail, then a box from the dock space left.
+          [[{ t: 'right', at: 'dockHead', i: 0 }, { t: 'click', at: 'menuItem', i: 523181528, mod: null }, { t: 'box', k: 0, fx: 0, fy: 0, shift: false, escape: false }, { t: 'move', a: 0, b: 0, cell: 'center', by: 'grip', escape: false }, { t: 'chip', a: 0, b: 0, onto: 'chips' }]],
         ]),
     );
     // A replay of one failure runs that case alone.
