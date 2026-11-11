@@ -398,8 +398,13 @@
       if (settled && !slide[side] && Math.abs(size - target) >= 0.01) dockPanes[side]?.resize(target);
     }
   }
-  /** Whether dock `side`'s handle is moving its pane: a drag of it under way, or the keys on it. */
-  const byHandle = (side) => dragFrom[side] !== null || (!!dockHandles[side] && document.activeElement === dockHandles[side]);
+  /**
+   * Whether dock `side`'s handle is moving its pane: a drag of it under way
+   * in the pane group it began in, or the keys on it. A group going, as the
+   * window's narrowness changes, lays its panes out from their first sizes,
+   * which no handle moved.
+   */
+  const byHandle = (side) => dragFrom[side]?.narrow === narrow.current || (!!dockHandles[side] && document.activeElement === dockHandles[side]);
   /** Keeps `size` as dock `side`'s width, the one it shows at. */
   function keepDockSize(side, size) {
     dockSize[side] = size;
@@ -410,10 +415,11 @@
   /** Each dock's handle, the element. */
   const dockHandles = $state({ left: null, right: null });
   /**
-   * Each dock as a drag of its handle began, {width, pane, ends}: its width,
-   * which it opens to again when that drag collapsed it; its pane's size,
-   * which Escape puts back; and what ends the drag. Null while none is
-   * under way.
+   * Each dock as a drag of its handle began, {width, hidden, narrow, ends}:
+   * its width, which it opens to again when that drag collapsed it, and
+   * which Escape puts back with whether it was hidden; the window's
+   * narrowness, which the pane group it drags in is keyed on; and what ends
+   * the drag's hold on Escape. Null while none is under way.
    */
   const dragFrom = { left: null, right: null };
   /**
@@ -440,42 +446,49 @@
    * it where it began. Every end goes through the pane library's release,
    * which takes its resize cursor off the page. A drag lasts no longer than
    * the pane group it drags in (`$effect.pre` below), and a press that
-   * begins one ends any other of the same handle, so the pane Escape puts
-   * back is always one the group lays out.
+   * begins one ends any other of the same handle.
    */
   function dockDragging(side, dragging) {
     dragFrom[side]?.ends();
     dragFrom[side] = null;
     if (!dragging) return;
-    const pane = dockPanes[side];
-    const from = { width: dockSize[side], pane: pane.getSize() };
-    const unclaim = claim('drag', {
-      on: {
-        cancel: () => {
-          pane.resize(from.pane);
-          keepDockSize(side, from.width);
-          release();
-        },
-      },
-    });
-    window.addEventListener('blur', release);
+    const from = { width: dockSize[side], hidden: !docks.shown(side), narrow: narrow.current };
+    const unclaim = claim('drag', { on: { cancel: () => (putBack(side, from), release(), from.ends()) } });
+    const blur = () => (release(), from.ends());
+    window.addEventListener('blur', blur);
     from.ends = () => {
       unclaim();
-      window.removeEventListener('blur', release);
+      window.removeEventListener('blur', blur);
+      window.removeEventListener('pointerup', from.ends);
     };
     dragFrom[side] = from;
+  }
+  /**
+   * Puts dock `side` back as a drag of its handle found it, `from`: at its
+   * width, hidden or shown, in the panes there are now. With none, as the
+   * page has gone, there is nothing to put back.
+   */
+  function putBack(side, from) {
+    const pane = dockPanes[side];
+    if (!pane) return;
+    keepDockSize(side, from.width);
+    pane.resize(from.hidden ? railPct[side] : from.width);
+    docks.hide(side, from.hidden);
   }
   /** The pane library's release of a drag of a handle, as the pointer let go. */
   const release = () => window.dispatchEvent(new MouseEvent('mouseup'));
   // The pane group lives as long as the page and the window's narrowness
   // (the `{#key}` about it): before it goes, a drag of its handles ends
-  // where it is, released while its handle still hears it, and ended here
-  // whether or not it did, so no drag outlives the panes it moves.
+  // where it is, released while its handle still hears it, so no drag
+  // outlives the panes it moves. Escape still puts the dock back until the
+  // pointer that held the drag is let go, as during the drag.
   $effect.pre(() => {
     void narrow.current;
     return () => {
-      if (dragFrom.left || dragFrom.right) release();
-      for (const side of ['left', 'right']) dockDragging(side, false);
+      const held = ['left', 'right'].map((side) => dragFrom[side]).filter(Boolean);
+      dragFrom.left = dragFrom.right = null;
+      if (held.length) release();
+      for (const from of held) window.addEventListener('pointerup', from.ends);
     };
   });
   /** Puts dock `side` back to the width it starts at, showing it if hidden. */

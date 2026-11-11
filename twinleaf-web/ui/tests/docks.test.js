@@ -740,7 +740,7 @@ describe('a drag of the handle beside a dock', () => {
     expect(Object.entries(seen).filter(([, n]) => n < 1).map(([what]) => what), 'not seen').toEqual([]);
   }, 600_000);
 
-  it('ends on Escape with its dock put back on a page mounted again under a drag held, and ends where it is as a narrowing window lays the panes out anew; nothing thrown, and Escape is no drag’s after it', async () => {
+  it('ends on Escape with its dock put back on a page mounted again under a drag held, and ends where it is as a narrowing window lays the panes out anew, Escape before the pointer is let go putting the dock back still; nothing thrown, and Escape is no drag’s once it is let go', async () => {
     const errors = [];
     const onError = (e) => errors.push(String(e.error?.message ?? e.message ?? e.reason));
     window.addEventListener('error', onError);
@@ -765,28 +765,34 @@ describe('a drag of the handle beside a dock', () => {
           await commands.mouse([['up']]);
           page = await mounted();
           await atRest();
+        } else {
+          // A drag let go first, so the width the drag begins at is not the one the panes were mounted at.
+          await hold(-40);
+          await commands.mouse([['up']]);
+          await atRest();
         }
         const said = `the page ${how}`, was = { width: widthOf('left'), hidden: hidden('left'), kept: localStorage.getItem(KEPT[0]) };
         const at = await hold(80);
         await settle();
-        expect(Math.abs(widthOf('left') - was.width), `${said}: the drag moved the dock`).toBeGreaterThan(20);
+        const dragged = widthOf('left');
+        expect(Math.abs(dragged - was.width), `${said}: the drag moved the dock`).toBeGreaterThan(20);
         if (how === 'narrowed') {
           // The panes are laid out anew, one above another, under the drag, and again side by side.
           await browser.viewport(700, 900);
           await atRest();
           await browser.viewport(1200, 900);
           await atRest();
+          // The drag ended where it was.
+          expect(Math.abs(widthOf('left') - dragged), `${said}: px from the width dragged to`).toBeLessThan(1.5);
         }
         await pressKey('Escape');
         await commands.mouse([['move', at[0] + 30, at[1]], ['up']]);
         await atRest();
         expect(errors, `${said}: nothing thrown`).toEqual([]);
         expect(hidden('left'), `${said}: hidden`).toBe(was.hidden);
-        // Escape puts back what a drag still under way moved; a narrowed window has ended it.
-        if (how === 'mounted again') {
-          expect(Math.abs(widthOf('left') - was.width), `${said}: px from its width before`).toBeLessThan(1.5);
-          expect(Number(localStorage.getItem(KEPT[0]) ?? 22), `${said}: its width kept`).toBe(Number(was.kept ?? 22));
-        }
+        // Escape puts back what the drag moved: one under way, or one a narrowed window ended while the pointer still held it.
+        expect(Math.abs(widthOf('left') - was.width), `${said}: px from its width before`).toBeLessThan(1.5);
+        expect(Number(localStorage.getItem(KEPT[0]) ?? 22), `${said}: its width kept`).toBe(Number(was.kept ?? 22));
         expect(document.querySelector('[data-pane-resizer][data-active=pointer]'), `${said}: a handle still dragged`).toBe(null);
         expect(cursors(), `${said}: the page's cursors after it`).not.toEqual(expect.arrayContaining([expect.stringMatching(RESIZE)]));
         // The drag is over: Escape is no drag's.
