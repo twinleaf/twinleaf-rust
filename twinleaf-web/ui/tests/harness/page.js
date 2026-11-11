@@ -23,6 +23,8 @@ import { Workspace } from '../../src/lib/workspace.svelte.js';
 import { History } from '../../src/lib/history.svelte.js';
 import { Favorites } from '../../src/lib/favorites.svelte.js';
 import { Views } from '../../src/lib/views.js';
+import { PlotHost } from '../../src/lib/plothost.js';
+import { colors } from '../../src/lib/colors.svelte.js';
 import { presets } from '../../src/lib/layout.js';
 import { emptyTab, loadTabs, makeTab, newPlot } from '../../src/lib/tabs.js';
 import { api } from '../../src/lib/protocol.js';
@@ -229,13 +231,16 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
     return reply({ error: 'no hub in a test' }, 503);
   };
   await noticesGone();
-  const app = mount(App, { target, context: new Map([['page', { hub, ws, history, registry, views }]]) });
+  const plots = new PlotHost({ hub, ws, history, views, registry, colors });
+  const app = mount(App, { target, context: new Map([['page', { hub, ws, history, views, plots }]]) });
   await frames();
   return {
     ws,
     history,
     hub,
     views,
+    /** The page's PlotHost, which its plots reach the page through. */
+    plots,
     /** The PlotView of plot `id` while it is on the page. */
     pv: (id) => [...registry].find((p) => p.plotId === id),
     dispose: () => {

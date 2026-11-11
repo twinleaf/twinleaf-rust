@@ -1,8 +1,9 @@
 <script>
-  // One plot of a tab: its header of signals and actions, the plot body the
-  // WebGL layer draws behind, and its menus. The drawing is plot.js's
-  // PlotView; this is the plot's controls.
-  import { getContext, onDestroy, onMount, tick } from 'svelte';
+  // One plot: its header of signals and actions, the plot body the WebGL
+  // layer draws behind, and its menus. The drawing is plot.js's PlotView;
+  // this is the plot's controls. It is a plot of a PlotHost (plothost.js),
+  // a tab's or a copy's, and reaches its surroundings through that alone.
+  import { onDestroy, onMount, setContext, tick } from 'svelte';
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
@@ -31,7 +32,6 @@
   import { AXIS_SETTINGS, axesLike, commandOf, cursorPeers, xSpan } from './commands.js';
   import { DIGITS, axisFormat } from './units.js';
   import KindPicker from './KindPicker.svelte';
-  import { plotPickers } from './keys.js';
   import { claim } from './keyrouter.js';
   import Tip from './Tip.svelte';
   import RiDraggable from '@lucide/svelte/icons/grip-vertical';
@@ -47,7 +47,6 @@
   import RiZoomTo from '@lucide/svelte/icons/zoom-in';
   import RiPeak from '@lucide/svelte/icons/mountain';
   import { PlotView, axisSlots, colorOf, cursorText, monitorOf } from './plot.js';
-  import { colors } from './colors.svelte.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, KINDS, MODES, kindLabel } from './constants.js';
   import { writeTables } from './copy.js';
@@ -57,15 +56,42 @@
   import WindowField from './WindowField.svelte';
   import * as clock from './clock.js';
 
-  let {
-    plot, hub, view, targets, hover, renderer, registry, focused, selected, otherTabs = [], tabName = '',
-    targetPlots = () => [plot],
-    onFocus, onPress, onSelect, onStartMove, onMoveToTab,
-    onTraceDragStart, onLandSignal, onEdit, onView, otherPlots = [], onMoveSignal,
-    onEach, targetIds = () => [plot.id], viewHistory, cursors,
-  } = $props();
-  /** The plot commands (commands.js): this plot's rows, buttons and keys run them, made on this plot. */
-  const commands = getContext('commands');
+  /** `plot` is the plot's settings, and `host` the PlotHost it is a plot of, the same one for as long as the plot is shown. */
+  let { plot, host } = $props();
+  /**
+   * What the host gives every plot of its: the hub, the time under the
+   * pointer, the surface and the PlotViews on it, the view steps, the
+   * cursors, the signals' colours, and the plot commands (commands.js),
+   * which this plot's rows, buttons and keys run, made on this plot.
+   */
+  // svelte-ignore state_referenced_locally
+  const { hub, hover, renderer, registry, viewHistory, cursors, colors, commands } = host;
+  // The rows and the colour pickers within the plot are this host's too.
+  setContext('commands', commands);
+  setContext('colors', colors);
+  /** The plot's View, and whether it is selected. */
+  const view = $derived(host.view(plot.id)), selected = $derived(host.selected(plot.id));
+  /** The plots a command or a gesture here acts on, by id; their views; and their settings. */
+  const targetIds = () => host.targets(plot.id);
+  const targets = () => targetIds().map((id) => host.view(id));
+  const targetPlots = () => targetIds().map((id) => host.plot(id));
+  /** Edits: `fn(plot)`'s fields on each plot a command here acts on, `patch` on this plot, and what a view shows on those of its kind. */
+  const onEach = (what, fn) => host.each(plot.id, what, fn);
+  const onEdit = (what, patch) => host.edit(plot.id, what, patch);
+  const onView = (patch) => host.setView(plot.id, patch);
+  /** The selection: focus or a press that lands here, a press on the plot's controls, and a click. */
+  const onFocus = () => host.point(plot.id);
+  const onPress = () => host.press(plot.id);
+  const onSelect = (shift, clicks) => host.select(plot.id, shift, clicks);
+  /** What a page that lays its plots out in tabs adds (PlotHost `place`), or null: moving the plot and its signals among the page's plots and tabs. */
+  // svelte-ignore state_referenced_locally
+  const place = host.place;
+  const otherTabs = $derived(place?.otherTabs() ?? []), tabName = $derived(place?.tabName() ?? ''), otherPlots = $derived(place?.otherPlots(plot.id) ?? []);
+  const onStartMove = (e) => place?.startMove(plot.id, e);
+  const onMoveToTab = (tabId) => place?.moveToTab(plot.id, tabId);
+  const onTraceDragStart = () => place?.traceDragStart();
+  const onLandSignal = (item, items) => place?.landSignal(plot.id, item, items);
+  const onMoveSignal = (key, to) => place?.moveSignal(plot.id, key, to);
   /** Runs plot command `id` made on this plot from its button, `how` as the command takes it. */
   const runHere = (id, how) => commands.run(id, { on: plot.id, from: 'button', how });
   /** The peak commands, as the readout's menu, the plot's menu and the x axis's popover offer them. */
@@ -137,7 +163,7 @@
   /** The signal `key`'s colour, units and rate, once the hub has its trace. */
   const colorFor = (key) => {
     const t = session.trace(key);
-    return t ? colorOf(t) : 'var(--muted-foreground)';
+    return t ? colorOf(t, colors) : 'var(--muted-foreground)';
   };
   const unitsOf = (key) => session.trace(key)?.meta.units ?? '';
   /** An independent plot's axes, {left, right}, each the signal keys from the plot outward. */
@@ -466,6 +492,7 @@
       targets,
       cursorTargets: (key) => cursorPeers(pv, targetPvs(), key),
       cursors,
+      colors,
       onFollow: () => runHere('follow'),
       hoverTime: hover,
       plotId: plot.id,
@@ -477,7 +504,7 @@
       config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null, yFormat: plot.yFormat ?? null, xFormat: plot.xFormat ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
     });
     registry.add(pv);
-    plotPickers.set(plot.id, openPicker);
+    host.pickers.set(plot.id, openPicker);
     const sizing = new ResizeObserver(([entry]) => {
       const { width, height } = entry.contentRect;
       size = { width, height };
@@ -492,7 +519,7 @@
       unwatch();
       sizing.disconnect();
       registry.delete(pv);
-      if (plotPickers.get(plot.id) === openPicker) plotPickers.delete(plot.id);
+      if (host.pickers.get(plot.id) === openPicker) host.pickers.delete(plot.id);
     };
   });
 
@@ -789,6 +816,7 @@
       </ContextMenu.SubContent>
     </ContextMenu.Sub>
   {/if}
+  {#if place}
   <ContextMenu.Sub>
     <ContextMenu.SubTrigger><RiMove class="menu-icon" />Move to{@render value(counted(otherPlots.length, 'plot'))}</ContextMenu.SubTrigger>
     <ContextMenu.SubContent class="max-w-72">
@@ -797,6 +825,7 @@
       {#each otherPlots as p (p.id)}<ContextMenu.Item onSelect={() => onMoveSignal?.(key, p.id)}><span class="truncate">{p.label}</span></ContextMenu.Item>{/each}
     </ContextMenu.SubContent>
   </ContextMenu.Sub>
+  {/if}
   <ContextMenu.Separator />
   <ContextMenu.Item variant="destructive" onSelect={() => item && remove(item.id)}><RiTrash class="menu-icon" />Remove<ContextMenu.Shortcut><kbd>Delete</kbd></ContextMenu.Shortcut></ContextMenu.Item>
 {/snippet}
@@ -933,7 +962,7 @@
               onpointerdown={(e) => e.preventDefault()}
               onclick={() => addSignal(t.key)}
             >
-              <span class="signal-option" style="--c:{colorOf(t)}"><i></i>{t.key}<small>{t.meta.units}</small></span>
+              <span class="signal-option" style="--c:{colorOf(t, colors)}"><i></i>{t.key}<small>{t.meta.units}</small></span>
               <span class="rate">{t.meta.rate} Hz</span>
             </div>
           {:else}
@@ -983,7 +1012,7 @@
     <Popover.Content customAnchor={axisAnchor} side="top" align="start" class="axis-pop w-auto gap-0 p-1.5">
       <div class="axis-head">
         {plot.kind === 'time' ? 'Time' : 'Frequency'}<span class="units">{plot.kind === 'time' ? 's' : 'Hz'}</span>
-        {#if plot.kind === 'time'}
+        {#if plot.kind === 'time' && host.live}
           <span class="axis-tools">
             <Tip text={view.live ? 'Pause' : 'Follow live'} keys={commandOf('pause').show}>
               {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={view.live ? 'Pause' : 'Follow live'} data-command="pause" onclick={() => runHere('pause')}>{#if view.live}<RiPause />{:else}<RiPlay />{/if}</button>{/snippet}
@@ -1226,7 +1255,7 @@
            plot's data, its cursors, how it shows its signals, and where it
            is; then closing it. Copy data says first when a copy would hold
            too much or come back short, from the hub's count of the rows. -->
-      {#if plot.items.length}
+      {#if plot.items.length && place}
         <ContextMenu.Label>Data</ContextMenu.Label>
         <CommandItem id="copyData" on={plot.id} how={copyCheck} />
         <CommandItem id="exportData" on={plot.id} />
@@ -1260,6 +1289,8 @@
           </ContextMenu.RadioGroup>
         </ContextMenu.SubContent>
       </ContextMenu.Sub>
+      <!-- Where the plot is among the page's plots and tabs, on a page that lays them out. -->
+      {#if place}
       <ContextMenu.Label>Arrange</ContextMenu.Label>
       <CommandItem id="splitRight" on={plot.id} />
       <CommandItem id="splitDown" on={plot.id} />
@@ -1272,6 +1303,7 @@
       </ContextMenu.Sub>
       <ContextMenu.Separator />
       <CommandItem id="close" on={plot.id} />
+      {/if}
     </ContextMenu.Content>
   </ContextMenu.Root>
 </div>

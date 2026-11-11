@@ -3,6 +3,12 @@
 html { overflow: hidden; }
 html, body { height: 100%; margin: 0; background: var(--background); color: var(--foreground); }
 .gl-layer { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 0; }
+/* A stage (PlotStage.svelte): one plot, bare, over a canvas of its own that
+   fills the stage. Its body is the whole stage: no header and no border. */
+.plot-stage { position: relative; display: flex; flex: none; }
+.plot-stage > .stage-gl { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.plot-stage > .plot-card { border: 0; }
+.plot-stage .plot-head { display: none; }
 /* The page is controls, not text: nothing but fields and readouts selects,
    so a click or drag never starts the browser's text selection or its menu. */
 .app { position: relative; z-index: 1; display: flex; flex-direction: column; height: 100vh; user-select: none; }

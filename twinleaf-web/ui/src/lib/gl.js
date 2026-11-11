@@ -1,4 +1,9 @@
-// The one WebGL canvas behind every plot on the page.
+// A WebGL canvas behind the plots drawn on it: the page's one, behind every
+// plot of its tabs, or a figure's own (plothost.js). A Renderer draws on the
+// canvas within its frame: where the canvas is on the page, how large, and
+// how many device pixels it gives a CSS px, which whoever makes the Renderer
+// says, so a figure is drawn at the size and pixel ratio asked of it and not
+// at the window's.
 //
 // Each trace has one GPU ring buffer of (x - base, y) points, uploaded once
 // and drawn by every plot that shows it. A frame sends only the points that
@@ -148,14 +153,32 @@ class GpuStatic {
   }
 }
 
+/** The frame of the page's canvas: the window, at the screen's pixel ratio. */
+export const windowFrame = () => ({ x: 0, y: 0, w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio || 1 });
+
+/** The frame of a canvas that fills element `el`, at `dpr()` device pixels a CSS px. */
+export const boxFrame = (el, dpr) => () => {
+  const r = el.getBoundingClientRect();
+  return { x: r.left, y: r.top, w: r.width, h: r.height, dpr: dpr() };
+};
+
 export class Renderer {
   /** Gives the context and every buffer back to the browser. */
   dispose() {
     this.gl.getExtension('WEBGL_lose_context')?.loseContext();
   }
 
-  constructor(canvas) {
+  /**
+   * `canvas` is drawn on within what `frame()` gives as each frame begins,
+   * {x, y, w, h, dpr}: the canvas's box in CSS px of the viewport, and the
+   * device pixels it gives each (`windowFrame`, `boxFrame`).
+   */
+  constructor(canvas, frame) {
     this.canvas = canvas;
+    this.frame = frame;
+    /** The frame as the last `begin` read it. */
+    this.box = frame();
+    this.dpr = this.box.dpr;
     const gl = canvas.getContext('webgl2', { antialias: false, alpha: true, premultipliedAlpha: true });
     if (!gl) throw new Error('WebGL2 is not available');
     this.gl = gl;
@@ -186,10 +209,10 @@ export class Renderer {
     this.gpu = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'unknown';
   }
 
-  /** Sizes the canvas to the window and clears it. Returns the device pixel ratio. */
+  /** Reads the frame, sizes the canvas to it and clears it. Returns the device pixel ratio. */
   begin() {
-    const gl = this.gl, dpr = window.devicePixelRatio || 1;
-    const w = Math.round(window.innerWidth * dpr), h = Math.round(window.innerHeight * dpr);
+    const gl = this.gl, box = (this.box = this.frame()), dpr = box.dpr;
+    const w = Math.round(box.w * dpr), h = Math.round(box.h * dpr);
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w;
       this.canvas.height = h;
@@ -206,11 +229,22 @@ export class Renderer {
     return dpr;
   }
 
-  /** Converts a CSS-pixel rect in the viewport to a GL rect in device pixels, or null when off screen. */
-  glRect(r) {
+  /** Whether a CSS-pixel rect in the viewport, {x, y, w, h}, has any height within the frame. */
+  shows(r) {
+    return r.y + r.h > this.box.y && r.y < this.box.y + this.box.h;
+  }
+
+  /** Where a CSS-pixel rect in the viewport lies on the canvas, as {x, y, w, h} in device pixels from its top left. */
+  deviceRect(r) {
     const dpr = this.dpr;
-    const x = Math.round(r.x * dpr), w = Math.round(r.w * dpr), h = Math.round(r.h * dpr);
-    const y = this.canvas.height - Math.round((r.y + r.h) * dpr);
+    return { x: Math.round((r.x - this.box.x) * dpr), y: Math.round((r.y - this.box.y) * dpr), w: Math.round(r.w * dpr), h: Math.round(r.h * dpr) };
+  }
+
+  /** Converts a CSS-pixel rect in the viewport to a GL rect in device pixels, or null when off the canvas. */
+  glRect(r) {
+    const dpr = this.dpr, box = this.box;
+    const x = Math.round((r.x - box.x) * dpr), w = Math.round(r.w * dpr), h = Math.round(r.h * dpr);
+    const y = this.canvas.height - Math.round((r.y - box.y + r.h) * dpr);
     if (w <= 0 || h <= 0 || x + w < 0 || y + h < 0 || x > this.canvas.width || y > this.canvas.height) return null;
     return { x, y, w, h };
   }

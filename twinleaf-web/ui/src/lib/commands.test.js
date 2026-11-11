@@ -17,7 +17,7 @@
 // rows say why.
 import { afterEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { COMMANDS, commandOf, commands } from './commands.js';
+import { COMMANDS, HOSTED, commandOf, commands } from './commands.js';
 import { KEYMAP, actionFor, scopeOf } from './keymap.js';
 import { KINDS } from './constants.js';
 import { SIGNAL, Selection } from './selection.svelte.js';
@@ -33,7 +33,7 @@ describe('the command table', () => {
     for (const c of COMMANDS) {
       expect(['view', 'plot'], c.id).toContain(c.scope);
       expect(c.kinds === undefined || c.kinds.every((k) => kinds.includes(k)), c.id).toBe(true);
-      expect((c.needs ?? []).every((n) => ['workspace', 'axis', 'signals'].includes(n)), c.id).toBe(true);
+      expect((c.needs ?? []).every((n) => [...HOSTED, 'axis', 'signals'].includes(n)), c.id).toBe(true);
       expect([undefined, 'page', 'list'], c.id).toContain(c.place);
       expect(typeof c.run, c.id).toBe('function');
       // A key is shown and named; a row has an icon to go with its label.
@@ -85,7 +85,7 @@ function plotOf(id, kind, log, live = true, items = ['s']) {
  * and the workspace holds only which plots are maximized, which a command
  * changes by `maximize` and `restoreLayout` alone.
  */
-function page(kinds, picked, last, log, maximized = null, signals = ['s'], items = ['s']) {
+function page(kinds, picked, last, log, maximized = null, signals = ['s'], items = ['s'], lacks = []) {
   const shown = IDS.slice(0, kinds.length);
   const selection = new Selection((id) => shown.includes(id), () => shown);
   selection.only(picked, last);
@@ -101,6 +101,7 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
   });
   const record = (name) => (...args) => (log.push(`${name} ${JSON.stringify(args[0]?.map?.((t) => t.id ?? t) ?? args[0])}`), name === 'picker' ? true : Promise.resolve(null));
   const svc = {
+    has: (need) => !lacks.includes(need),
     targets: (on) => selection.targets(on),
     pageTargets: (scope) => selection.pageTargets(scope),
     signalTargets: (key) => selection.signalTargets(key),
@@ -213,6 +214,28 @@ describe('a command', () => {
     expect(page(['time'], [], null, log, ['a']).cmds.offered()).toContainEqual({ id: 'maximize', label: 'Restore' });
   });
 
+  it('whose host has not what it needs does not run, has no row, asks nothing and is not in the palette, and every other command is as on a host that has it', async () => {
+    /** Where each is made: on a plot, from its menu, a y axis command on its axis. */
+    const at = (c) => ({ on: 'a', from: 'menu', how: c.needs?.includes('axis') ? 'shared' : undefined });
+    for (const need of HOSTED) {
+      const needing = COMMANDS.filter((c) => c.needs?.includes(need));
+      expect(needing.length, `commands that need ${need}`).toBeGreaterThan(0);
+      const log = [], full = page(['time', 'spectrum'], ['a'], 'a', []), p = page(['time', 'spectrum'], ['a'], 'a', log, null, ['s'], ['s'], [need]);
+      for (const c of COMMANDS) {
+        const seen = [];
+        spy(c, seen);
+        const lacks = needing.includes(c);
+        const taken = full.cmds.run(c.id, at(c)), ran = seen.length;
+        expect(p.cmds.run(c.id, at(c)), `${c.id} taken without ${need}`).toBe(lacks ? false : taken);
+        expect(seen.length - ran, `${c.id} run without ${need}`).toBe(lacks ? 0 : ran);
+        if (c.label) expect(p.cmds.row(c.id, at(c)).offered, `${c.id}'s row without ${need}`).toBe(!lacks && full.cmds.row(c.id, at(c)).offered);
+        if (c.check && lacks) expect(await p.cmds.check(c.id, at(c)), `${c.id}'s check without ${need}`).toBe(null);
+      }
+      if (need === 'workspace') expect(log.filter((l) => l.startsWith('copyCheck')), 'asked of the page without a workspace').toEqual([]);
+      expect(p.cmds.offered().map((o) => o.id), `the palette without ${need}`).toEqual(full.cmds.offered().map((o) => o.id).filter((id) => !needing.some((c) => c.id === id)));
+    }
+  });
+
   it('that needs signals acts on those its origin says, on the plots selected, and with no signal does not run', () => {
     const needing = COMMANDS.filter((c) => c.needs?.includes('signals'));
     expect(needing.length).toBeGreaterThan(0);
@@ -313,6 +336,7 @@ function peakPage(specs, selected) {
   const selection = new Selection((id) => !!plots[id], () => Object.keys(plots));
   selection.only(selected, null);
   const cmds = commands({
+    has: () => true,
     targets: (on) => selection.targets(on),
     pageTargets: (scope) => selection.pageTargets(scope),
     signalTargets: () => [],

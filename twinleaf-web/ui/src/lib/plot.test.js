@@ -4,6 +4,7 @@ import { Detail, Points, Trace } from './session.svelte.js';
 import { scaleLinear, scaleLog } from 'd3-scale';
 import { axisSlots, blurred, F_AUTO, laneTicks, onPixelGrid, pickLevel, pickSource, PlotView, rowCounts, tickTexts, timeAxis, View, Y_AUTO } from './plot.js';
 import { axisFormat, formOf, numberText, si } from './units.js';
+import { Colors } from './colors.svelte.js';
 
 const meta = { id: 0, route: '/', stream: 'sine', column: 'sine', units: 'V', rate: 1000 };
 
@@ -842,7 +843,7 @@ describe('a live plot drawn frame after frame', () => {
     view.span = span;
     view.delay = 0;
     const plot = { x: 0, y: 0, w: cssWidth, h: 100 }, cfg = { kind: 'time', mode: 'overlay' };
-    const pv = new PlotView({ body: document.createElement('div'), overlay: document.createElement('canvas'), config: () => cfg, hub, view, targets: () => [view], hoverTime: { t: null }, plotId: 'p', renderer });
+    const pv = new PlotView({ body: document.createElement('div'), overlay: document.createElement('canvas'), config: () => cfg, hub, view, targets: () => [view], hoverTime: { t: null }, plotId: 'p', renderer, colors: new Colors(null) });
     // The overlay's axes, labels and readouts are drawn on a 2D canvas, which jsdom has none of; the traces are what the GPU gets.
     pv.drawOverlay = () => {};
     /** The device columns drawn at device time `t`, by column from time zero: each [least, greatest]. */

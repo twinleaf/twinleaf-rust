@@ -91,6 +91,3 @@ export function escapeTyped(e, typed, filled, restore) {
 export function focusedByKeyboard(el) {
   return keyboardFocused.has(el);
 }
-
-/** Each plot's pickers the keys open, by plot id: `open(action)` opens the one for keymap.js plot action `action` and says whether it had one. */
-export const plotPickers = new Map();

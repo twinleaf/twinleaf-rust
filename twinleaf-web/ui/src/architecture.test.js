@@ -28,6 +28,16 @@
 // puts the clock in virtual mode holds all of the page's time. A page test
 // reads the time from the clock and lets it pass through its harness
 // (tests/harness/page.js), which alone waits real time.
+//
+// A plot reaches its surroundings through its PlotHost (plothost.js) alone,
+// so it is drawn and edited the same wherever it lives, in a tab or as a
+// copy on a stage of its own. PlotCard takes its settings and its host and
+// no other prop. The plot's own modules (PLOT) import none of the page's
+// (PAGE), nor the page's colours, and read the window's size and pixel
+// ratio nowhere but in gl.js's `windowFrame`, the page's frame: a plot is
+// drawn at the size and pixel ratio of the surface its host has. And the
+// host is the one maker of what its plots share (MADE): the cursors'
+// writer, the view steps, the commands and the surface's renderer.
 import { describe, expect, it } from 'vitest';
 import { compile, parse } from 'svelte/compiler';
 import fs from 'node:fs';
@@ -62,6 +72,27 @@ const OWNED = [
     what: 'a plot’s cursors',
     owner: 'lib/cursors.js',
     writes: /setPlot\([^)]*\bcursors\b|\.cursors\s*=[^=]|\.cursors\.[\w.[\]]+\s*=[^=]/,
+  },
+  {
+    what: 'the pickers the keys open on a plot',
+    owner: 'lib/PlotCard.svelte',
+    writes: /\.pickers\.(set|delete|clear)\(/,
+  },
+  {
+    what: 'whether the hub holds its history for a host’s paused plots',
+    owner: 'lib/plothost.js',
+    writes: /\.hold\(/,
+  },
+  {
+    what: 'the renderer of a host’s surface',
+    owner: 'lib/plothost.js',
+    writes: /\.renderer\s*=[^=>]/,
+  },
+  {
+    what: 'what the page serves its plots',
+    owner: 'App.svelte',
+    writes: /\.serve\(/,
+    once: /\.serve\(/,
   },
 ];
 
@@ -137,6 +168,60 @@ describe.each(OWNED)('$what', ({ owner, writes, once }) => {
       expect(matching([path.join(SRC, owner)], once)).toHaveLength(1);
     });
   }
+});
+
+/** The plot's own modules: what draws a plot and its controls, wherever it lives. */
+const PLOT = ['lib/PlotCard.svelte', 'lib/PlotStage.svelte', 'lib/plot.js', 'lib/gl.js', 'lib/commands.js', 'lib/CommandItem.svelte', 'lib/KindPicker.svelte', 'lib/Swatch.svelte', 'lib/ColorPicker.svelte'];
+/** The page's modules, by file name, which a plot reaches through its host alone. */
+const PAGE = ['App.svelte', 'main.js', 'plothost.js', 'workspace.svelte.js', 'selection.svelte.js', 'history.svelte.js', 'viewhistory.svelte.js', 'views.js', 'drag.svelte.js', 'docks.svelte.js', 'hub.svelte.js', 'session.svelte.js'];
+/** The one maker of what a host's plots share. */
+const HOST = 'lib/plothost.js';
+/** What a host makes for its plots: each of these is made there, once. */
+const MADE = ['new CursorEdits(', 'new ViewHistory(', 'new Renderer(', 'plotCommands('];
+/** A read of the window's size or its pixel ratio. */
+const WINDOW_READ = /\bdevicePixelRatio\b|\binner(Width|Height)\b/;
+
+/** The modules `source` imports, as written, each with the names it imports in braces. */
+const imported = (source) => [...source.matchAll(/^\s*import\s+(?:[\w*\s]+,?\s*)?(?:\{([^}]*)\})?\s*(?:from\s*)?['"]([^'"]+)['"]/gm)].map(([, names = '', from]) => ({ from, names: names.split(',').map((n) => n.trim().split(/\s+as\s+/)[0]).filter(Boolean) }));
+/** The props component `source` takes, by name. */
+const props = (source) => (source.match(/let\s*\{([^}]*)\}\s*=\s*\$props\(\)/)?.[1] ?? '').split(',').map((p) => p.trim().split(/[\s=:]/)[0]).filter(Boolean);
+
+describe('a plot', () => {
+  const read = (file) => fs.readFileSync(path.join(SRC, file), 'utf8');
+  /** The lines of `file` that `test(line)` holds of, comments left out, as `file:line`. */
+  const lines = (file, test) => read(file).split('\n').flatMap((line, i) => (test(line) && !/^\s*(\/\/|\*|\/\*)/.test(line) ? [`${file}:${i + 1}`] : []));
+
+  it('has its imports and its props found', () => {
+    expect(imported("import { a, b as c } from './x.js';\n  import D from './D.svelte';\nimport * as e from '$lib/e.js';\nimport './f.css';")).toEqual([
+      { from: './x.js', names: ['a', 'b'] },
+      { from: './D.svelte', names: [] },
+      { from: '$lib/e.js', names: [] },
+      { from: './f.css', names: [] },
+    ]);
+    expect(props('<script>\n  let { plot, host = null, other: renamed } = $props();\n</script>')).toEqual(['plot', 'host', 'other']);
+    expect(imported(read('lib/PlotCard.svelte')).map(({ from }) => from)).toContain('./plot.js');
+  });
+  it('takes its settings and its host, and no other prop', () => {
+    expect(props(read('lib/PlotCard.svelte'))).toEqual(['plot', 'host']);
+  });
+  it('imports none of the page’s modules, nor the page’s colours: it reaches them through its host', () => {
+    const found = PLOT.flatMap((file) =>
+      imported(read(file))
+        .filter(({ from, names }) => PAGE.includes(from.split('/').at(-1)) || (from.endsWith('/colors.svelte.js') && names.includes('colors')))
+        .map(({ from }) => `${file} ${from}`),
+    );
+    expect(found).toEqual([]);
+  });
+  it('is drawn at its surface’s size and pixel ratio: the window’s are read by the page’s frame alone', () => {
+    expect([...PLOT, HOST].flatMap((file) => lines(file, (line) => WINDOW_READ.test(line) && !line.includes('export const windowFrame')))).toEqual([]);
+    expect(lines('lib/gl.js', (line) => WINDOW_READ.test(line))).toHaveLength(1);
+  });
+  it('shares what its host makes, each made by the host alone, once', () => {
+    for (const made of MADE) {
+      const found = sources(SRC).flatMap((file) => lines(rel(file), (line) => line.includes(made)));
+      expect(found.map((at) => at.split(':')[0]), made).toEqual([HOST]);
+    }
+  });
 });
 
 /** The one module that listens for keys. */

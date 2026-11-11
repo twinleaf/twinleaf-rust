@@ -204,7 +204,7 @@
         role="option"
         aria-selected={picked.has(item.key)}
         tabindex="-1"
-        style="--c: {t ? colorOf(t) : 'var(--muted-foreground)'}"
+        style="--c: {t ? colorOf(t, colors) : 'var(--muted-foreground)'}"
         animate:flip={{ duration: FLIP_MS }}
         onclick={(e) => (pick(i, e, e.detail), list?.focus())}
         ondblclick={() => commands.run('addToPlots', { signal: item.key, from: 'row' })}
@@ -221,7 +221,7 @@
   {#if menuKey}
     {#each ON_SIGNAL as c (c.id)}<CommandItem id={c.id} signal={menuKey} />{/each}
     <ContextMenu.Sub>
-      <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value">{#if menuKeys.length > 1}{counted(menuKeys.length, 'signal')}{:else}<i style="--c: {colorOf({ key: menuKey })}"></i>{#if colors.picked[menuKey] === undefined}Auto{/if}{/if}</span></ContextMenu.SubTrigger>
+      <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value">{#if menuKeys.length > 1}{counted(menuKeys.length, 'signal')}{:else}<i style="--c: {colorOf({ key: menuKey }, colors)}"></i>{#if colors.picked[menuKey] === undefined}Auto{/if}{/if}</span></ContextMenu.SubTrigger>
       <ContextMenu.SubContent class="p-1.5"><ColorPicker key={menuKey} keys={menuKeys} ondone={() => (menuOpen = false)} /></ContextMenu.SubContent>
     </ContextMenu.Sub>
     <ContextMenu.Separator />

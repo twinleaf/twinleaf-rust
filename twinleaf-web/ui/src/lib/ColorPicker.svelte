@@ -9,9 +9,12 @@
   import { Checkbox } from '$lib/components/ui/checkbox/index.js';
   import RiPipette from '@lucide/svelte/icons/pipette';
   import RiBack from '@lucide/svelte/icons/chevron-left';
-  import { colors, NAMES, hexToHsv, hsvToHex } from './colors.svelte.js';
+  import { getContext } from 'svelte';
+  import { NAMES, hexToHsv, hsvToHex } from './colors.svelte.js';
   import { colorOf } from './plot.js';
 
+  /** The Colors it picks among: the page's, or within a plot, its host's. */
+  const colors = getContext('colors');
   /** `key` is the signal whose colour this shows, and `keys` those whose colour it picks, `key` alone unless given; `ondone` hears a colour chosen from the grid. */
   let { key, keys = null, ondone } = $props();
   /** Picks colour `color` for each of `keys`, or with a function, the colour it gives for each. */
@@ -34,7 +37,7 @@
   }
   /** Opens the custom picker on the signal's colour now. */
   function edit() {
-    const hex = colorOf({ key });
+    const hex = colorOf({ key }, colors);
     hsv = hexToHsv(hex);
     hexText = hex;
     editing = true;

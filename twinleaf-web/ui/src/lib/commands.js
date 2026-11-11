@@ -14,9 +14,13 @@
 //   or else on the plot alone (`targets`).
 // - `kinds` lists the kinds of plot it acts on, or null for every kind; the
 //   plots of other kinds are dropped from what it acts on.
-// - `needs` lists what it needs beyond plots: 'workspace', a plot placed in
-//   a tab's layout; 'axis', an axis it is made on, a y axis by the key its
-//   `how` names;
+// - `needs` lists what it needs beyond plots. Of where its plots are, which
+//   not every PlotHost has (plothost.js; `svc.has`): 'workspace', a plot
+//   placed in a tab's layout on the page, with the page's clipboard and
+//   dialogs; 'live', a plot that can follow the newest samples. Where a
+//   host has not what a command needs, the command does not run and has no
+//   row. Of its origin: 'axis', an axis it is made on, a y axis by the key
+//   its `how` names;
 //   'signals', the signals of the Signals list it puts on the plots or
 //   takes off them. Made on a signal's row, from its menu, its keys or a
 //   double-click, a command acts on the signals picked when the row is one
@@ -327,7 +331,7 @@ export const COMMANDS = [
     run: (ctx, how) => burst(ctx, 'zoom', (v, perf) => v.zoom(how.back ? ZOOM : 1 / ZOOM, v.live ? 1 : 0.5, perf)),
   },
   {
-    id: 'follow', scope: 'view', show: ['End'], keys: ['End'], what: 'Follow live',
+    id: 'follow', scope: 'view', needs: ['live'], show: ['End'], keys: ['End'], what: 'Follow live',
     icon: RiPlay, label: 'Follow live',
     run: (ctx) => follow(ctx, true),
   },
@@ -353,7 +357,7 @@ export const COMMANDS = [
   },
   {
     // Made on a plot it pauses while that plot follows live; from the page, while any it acts on does. Else they follow live.
-    id: 'pause', scope: 'view', place: 'page', show: ['Space'], keys: [' '], what: 'Pause, or follow live', empty: true,
+    id: 'pause', scope: 'view', needs: ['live'], place: 'page', show: ['Space'], keys: [' '], what: 'Pause, or follow live', empty: true,
     run: (ctx) => {
       const live = ctx.on ? ctx.on.view.live : ctx.plots.some((t) => t.view.live);
       if (!live) return void follow(ctx, false);
@@ -363,7 +367,7 @@ export const COMMANDS = [
   },
   {
     // Its row says first when a copy would hold too much or come back short, from the hub's count of the rows (`how`).
-    id: 'copyData', scope: 'view', place: 'page', show: ['Ctrl', 'C'], what: 'Copy data', empty: true,
+    id: 'copyData', scope: 'view', needs: ['workspace'], place: 'page', show: ['Ctrl', 'C'], what: 'Copy data', empty: true,
     icon: RiCopy, label: 'Copy data',
     check: (ctx) => ctx.svc.copyCheck(ctx.plots),
     value: (ctx, check) => (check ? { text: rowsText(check.rows), warn: check.state !== 'ok', title: check.reason } : null),
@@ -371,7 +375,7 @@ export const COMMANDS = [
     run: (ctx) => void ctx.svc.copy(ctx.plots).catch((error) => ctx.svc.toast.error(`Could not copy: ${error.message}`)),
   },
   {
-    id: 'exportData', scope: 'view', empty: true,
+    id: 'exportData', scope: 'view', needs: ['workspace'], empty: true,
     icon: RiExport, label: 'Export data…',
     value: (ctx) => (ctx.on ? plotsValue(ctx) : ctx.svc.selection.plots.size ? `${ctx.plots.length} selected` : counted(ctx.plots.length, 'plot')),
     run: (ctx) => ctx.svc.openExport(ctx.plots),
@@ -494,7 +498,7 @@ export const COMMANDS = [
   },
   {
     // A time plot of the signals, whatever is selected.
-    id: 'newPlot', scope: 'plot', needs: ['signals'], place: 'list', show: ['Shift', 'Enter'], keys: ['Enter'], shift: true, what: 'New plot with them', empty: true,
+    id: 'newPlot', scope: 'plot', needs: ['workspace', 'signals'], place: 'list', show: ['Shift', 'Enter'], keys: ['Enter'], shift: true, what: 'New plot with them', empty: true,
     icon: RiNewPlot, label: 'New plot',
     value: (ctx) => (ctx.signals.length > 1 ? counted(ctx.signals.length, 'signal') : kindLabel('time', 'overlay')),
     run: (ctx) => ctx.svc.newPlot(ctx.signals),
@@ -505,9 +509,12 @@ export const COMMANDS = [
 export const commandOf = (id) => COMMANDS.find((c) => c.id === id);
 /** What `label` field `f` of a command reads in `ctx`. */
 const read = (f, ctx, how) => (typeof f === 'function' ? f(ctx, how) : f);
+/** What a command may need of where its plots are (`needs`). */
+export const HOSTED = ['workspace', 'live'];
 
 /**
- * The page's commands over `svc`, its services: `targets(id)` and
+ * The commands of a PlotHost (plothost.js) over `svc`, its services:
+ * `has(need)`, whether its plots have `need` of HOSTED; `targets(id)` and
  * `pageTargets(scope)`, the plots a command made on plot `id` or from the
  * page acts on, by id; `plotOf(id)`, plot `id` as {id, plot, view, pv};
  * `signalTargets(key)`, the signals a command made on signal `key`'s row,
@@ -532,16 +539,20 @@ export function commands(svc) {
     const lead = made ?? plots.find((t) => t.id === svc.last()) ?? plots[0] ?? null;
     return { plots, all, on: made, lead, signals: c.needs?.includes('signals') ? (signals ?? svc.signalTargets(signal)) : [], from, svc };
   }
+  /** Whether the host has what command `c` needs of it. */
+  const hosted = (c) => !c.needs?.some((n) => HOSTED.includes(n) && !svc.has(n));
   return {
     context,
     /**
      * Runs command `id`, made at `where`, with `how`. Says whether it was
-     * taken: it had plots to act on, of any kind, or runs with none, had
-     * the signals it needs, and did not decline. It runs on the plots of
-     * its kinds.
+     * taken: the host has what it needs, it had plots to act on, of any
+     * kind, or runs with none, had the signals it needs, and did not
+     * decline. It runs on the plots of its kinds.
      */
     run(id, { how, ...where } = {}) {
-      const c = commandOf(id), ctx = context(id, where);
+      const c = commandOf(id);
+      if (!hosted(c)) return false;
+      const ctx = context(id, where);
       if (c.needs?.includes('signals') && !ctx.signals.length) return false;
       if (!ctx.all.length && !c.empty) return false;
       if (!ctx.plots.length && !c.empty) return true;
@@ -557,17 +568,17 @@ export function commands(svc) {
         disabled: !!c.disabled?.(ctx, how),
         destructive: !!c.destructive,
         show: c.show ?? null,
-        offered: !c.when || !!c.when(ctx, how),
+        offered: hosted(c) && (!c.when || !!c.when(ctx, how)),
       };
     },
-    /** What command `id`'s `check` answers, made on plot `on`, or null for a command with none. */
+    /** What command `id`'s `check` answers, made on plot `on`, or null for a command with none, or one the host has not what it needs. */
     check(id, { on = null } = {}) {
       const c = commandOf(id);
-      return c.check ? c.check(context(id, { on })) : Promise.resolve(null);
+      return c.check && hosted(c) ? c.check(context(id, { on })) : Promise.resolve(null);
     },
     /** The commands the palette offers now, as {id, label}: each with a row that needs no axis and no signal, and with plots to act on now, or else one that runs with none and is on, as Restore is while plots are maximized. */
     offered() {
-      return COMMANDS.filter((c) => c.label && !c.needs?.some((n) => n === 'axis' || n === 'signals')).flatMap((c) => {
+      return COMMANDS.filter((c) => c.label && hosted(c) && !c.needs?.some((n) => n === 'axis' || n === 'signals')).flatMap((c) => {
         const ctx = context(c.id, { from: 'palette' });
         return (ctx.plots.length || (c.empty && c.active?.(ctx))) && !c.disabled?.(ctx) ? [{ id: c.id, label: read(c.label, ctx) }] : [];
       });

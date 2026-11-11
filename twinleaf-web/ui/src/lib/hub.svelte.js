@@ -24,6 +24,8 @@ export class Hub {
   bytes = 0;
   /** Whether the page holds a plot paused, for which the hub keeps a capture of its history. */
   holding = false;
+  /** Who holds a plot paused now: each that `hold` heard so from last. */
+  holders = new Set();
   /** The number of the last change applied. */
   seq = 0;
   /** The signal keys the page shows as spectra, and the ids last sent for them. */
@@ -89,9 +91,15 @@ export class Hub {
     this.sentSpectra = message;
   }
 
-  /** Has the hub keep a capture of its history while `on`, as a scope's Stop does, for the page's paused plots. */
-  hold(on) {
-    this.holding = on;
+  /**
+   * Notes whether `who`, anything that shows plots, holds one paused: `on`.
+   * The hub keeps a capture of its history, as a scope's Stop does, while
+   * anyone does.
+   */
+  hold(who, on) {
+    if (on) this.holders.add(who);
+    else this.holders.delete(who);
+    this.holding = this.holders.size > 0;
     this.sendHold();
   }
 

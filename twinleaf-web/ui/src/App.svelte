@@ -3,7 +3,8 @@
   // tabs and their plots, and the dialogs. What it shows comes from the hub
   // (hub.svelte.js), what it lays out from the workspace
   // (workspace.svelte.js), and every plot is drawn on one WebGL canvas
-  // behind the page (gl.js), each by its PlotView (plot.js).
+  // behind the page (gl.js), each by its PlotView (plot.js). The plots reach
+  // the page through its PlotHost (plothost.js), which this serves.
   //
   // Each time plot has a View of its own (views.js). A gesture on a plot acts
   // on every selected plot when the plot is one of them, or else on it alone.
@@ -16,17 +17,13 @@
   // (viewhistory.svelte.js), which each plot's Back and Forward go through.
   import { getContext, onDestroy, onMount, setContext, tick, untrack } from 'svelte';
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
-  import { ViewHistory } from './lib/viewhistory.svelte.js';
-  import { CursorEdits } from './lib/cursors.js';
   import { Drags } from './lib/drag.svelte.js';
-  import { Renderer } from './lib/gl.js';
   import { plotIds } from './lib/layout.js';
   import { exportText, importText, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
   import { claim } from './lib/keyrouter.js';
-  import { commands as plotCommands } from './lib/commands.js';
   import CommandItem from './lib/CommandItem.svelte';
-  import { escapeTyped, keepsKey, plotPickers } from './lib/keys.js';
+  import { escapeTyped, keepsKey } from './lib/keys.js';
   import { api } from './lib/protocol.js';
   import { THEMES, TRACE_WIDTH, prefs } from './lib/prefs.svelte.js';
   import RiSun from '@lucide/svelte/icons/sun';
@@ -90,16 +87,16 @@
   import * as clock from './lib/clock.js';
   import './lib/scrolling.js';
 
-  // The hub, the tabs as the page edits them, their undo and redo, the
-  // PlotViews on the page, which the frame loop draws, and each plot's view,
-  // as main.js makes them: the panels reach the History to make a command
-  // one step.
-  const { hub, ws, history, registry, views } = getContext('page');
+  // The hub, the tabs as the page edits them, their undo and redo, each
+  // plot's view, and the plots' host, which draws the PlotViews on the page
+  // each frame, as main.js makes them: the panels reach the History to make
+  // a command one step.
+  const { hub, ws, history, views, plots } = getContext('page');
   setContext('history', history);
-  views.onChange = viewChanged;
-  // The plots' cursors, which are edits: placing, moving or removing any is one undo step (cursors.js).
-  const cursors = new CursorEdits(ws, history);
-  const viewHistory = new ViewHistory(ws, views, { notice: (text) => toast.warning(text), edit: (label, fn) => history.group(label, fn), cursors });
+  // The plots' cursors, which are edits (cursors.js), the steps Back and
+  // Forward go through, and the plot commands (commands.js), which every
+  // menu row, key, button and the palette run: the host's.
+  const { cursors, viewHistory, commands } = plots;
   // What a press, a click, a key or an undo does to the plot selection: the Workspace's.
   const selection = ws.selection;
   selection.changed = () => refreshToolbar();
@@ -124,10 +121,9 @@
   onMount(() => () => writeNotice.close());
   setContext('writes', writes);
   drags.closePlot = (id) => closePlot(id);
-  drags.axisDropAt = (plotId, x, y) => [...registry].find((pv) => pv.plotId === plotId)?.axisDropAt(x, y) ?? null;
-  /** The time under the pointer, which every time plot marks. */
-  const hover = { t: null };
-  let renderer = $state();
+  drags.axisDropAt = (plotId, x, y) => plots.pv(plotId)?.axisDropAt(x, y) ?? null;
+  /** Whether the host has its surface, the canvas behind the page, which the plots mount once it has. */
+  let surfaced = $state(false);
   let glCanvas;
 
   // The tabs are kept as they change, and so are the views of paused time plots as they move.
@@ -148,7 +144,7 @@
     untrack(() => {
       const back = [...ids].filter((id) => !placed.has(id));
       viewHistory.returned(back);
-      for (const id of back) if (views.get(id)?.live === false) requestDetail(id);
+      for (const id of back) if (views.get(id)?.live === false) plots.readWindows(id);
       placed = ids;
       refreshToolbar();
     });
@@ -159,66 +155,52 @@
   // plot reads its own again.
   $effect(() => {
     hub.session.detailsDropped;
-    untrack(() => {
-      overviewKeys.clear();
-      for (const id of ws.allPlotIds()) if (views.get(id)?.live === false) requestDetail(id);
-    });
+    untrack(() => plots.rereadWindows());
   });
 
-  // The plot commands (commands.js), which every menu row, key, button and
-  // the palette run, over the plots of the open tab and what writes them.
-  const commands = plotCommands({
-    targets: (on) => selection.targets(on),
-    pageTargets: (scope) => selection.pageTargets(scope),
-    signalTargets: (key) => selection.signalTargets(key),
-    plotOf: (id) => ({ id, plot: ws.plots[id], view: views.of(id), pv: [...registry].find((p) => p.plotId === id) }),
-    last: () => ws.focusedId,
-    ws,
-    selection,
-    viewHistory,
-    cursors,
-    toast,
-    edit: (ids, what, fn) => eachPlot(ids, what, fn),
-    split: (ids, dir, fromKeys) => splitPlots(ids, dir, fromKeys),
-    close: (ids, fromKeys) => closePlots(ids, fromKeys),
-    newPlot: (keys) => newPlotWith(keys),
-    copy: (plots) => copyData(plots),
-    copyCheck: (plots) => copyCheck(plots),
-    openExport: (plots) => openExport(plots),
-    picker: (id, action) => !!plotPickers.get(id)?.(action),
-  });
-  setContext('commands', commands);
-  const targetsOf = (id) => selection.targets(id).map((i) => views.of(i));
-  /** The plots a command made on plot `id` acts on, as the Selection says. */
-  const targetIdsOf = (id) => selection.targets(id);
   const plotsText = (n) => counted(n, 'plot');
   /** Plot `id`'s name in a list of plots: its signals, or Empty plot. */
   const labelOf = (id) => ws.plots[id]?.items.map((i) => i.key).join(', ') || 'Empty plot';
-  /**
-   * Gives each of plots `ids` the fields `fn(plot)` returns, if any, as
-   * one step undo names `what`.
-   */
-  function eachPlot(ids, what, fn) {
-    // A plot's kind is what one is looking at too: switching it is a view step, which Back crosses.
-    viewHistory.step(() =>
-      history.group(ids.length > 1 ? `${what} (${plotsText(ids.length)})` : what, () => {
-        for (const i of ids) {
-          const patch = fn(ws.plots[i]);
-          if (patch) ws.setPlot(i, patch);
-        }
-      }),
-    );
-  }
+  // What the page serves its plots: what the commands that need a workspace
+  // run through, and what a plot laid out in a tab can do there (PlotHost
+  // `serve`).
+  plots.serve({
+    split: (ids, dir, fromKeys) => splitPlots(ids, dir, fromKeys),
+    close: (ids, fromKeys) => closePlots(ids, fromKeys),
+    newPlot: (keys) => newPlotWith(keys),
+    copy: (targets) => copyData(targets),
+    copyCheck: (targets) => copyCheck(targets),
+    openExport: (targets) => openExport(targets),
+    viewChanged,
+    place: {
+      startMove: (id, e) => drags.startMove(id, e),
+      otherTabs: () => ws.tabs.filter((t) => t.id !== ws.activeId),
+      tabName: () => ws.tab.name,
+      moveToTab(id, tabId) {
+        const ids = plots.targets(id);
+        history.group(`Move ${plotsText(ids.length)} to ${ws.tabs.find((t) => t.id === tabId)?.name ?? 'a tab'}`, () => {
+          for (const i of ids) ws.movePlotToTab(i, tabId);
+        });
+      },
+      otherPlots: (id) =>
+        plotIds(ws.layout)
+          .filter((p) => p !== id)
+          .map((p) => ({ id: p, label: labelOf(p) })),
+      moveSignal: (id, key, to) => moveSignal(id, key, to),
+      traceDragStart: () => drags.traceDragStart(),
+      landSignal: (id, item, items) => drags.landSignal(item, items ? id : null, items),
+    },
+  });
+  setContext('commands', commands);
+  setContext('colors', plots.colors);
   /** The views the toolbar acts on: those of the time plots it acts on. */
   function chosen() {
     return timeViews(selection.pageTargets('view'));
   }
   /** The views of the time plots of `ids`. */
   const timeViews = (ids) => ids.filter((id) => ws.plots[id]?.kind === 'time').map((id) => views.of(id));
-  /** The plot of `id` in any tab. */
-  const plotAnywhere = (id) => ws.tabs.find((t) => t.plots[id])?.plots[id];
-  function viewChanged(id) {
-    requestDetail(id);
+  /** A plot's view moved: the toolbar shows it, and the tabs are kept with it. */
+  function viewChanged() {
     refreshToolbar();
     viewMoves++;
   }
@@ -255,50 +237,8 @@
   function refreshToolbar() {
     live = tabViews().every((v) => v.live);
     readWindow();
-    // A paused time plot in a tab holds its points: a paused spectrum holds
-    // the spectrum it shows, and a closed plot nothing.
-    hub.hold(views.anyPaused((id) => plotAnywhere(id)?.kind === 'time'));
+    plots.holdPaused();
   }
-  // Paused, every pan or zoom asks the server for the plot's view at full
-  // resolution, read from its raw buffer, which reaches back as far as the
-  // history kept. Live, the decimated stream is used.
-  // Every move asks, and the session paces the reads (`Session.fetchWindow`).
-  /**
-   * The share of the view's span asked for either side of it, so a pan or a
-   * zoom out stays within the window read until the next one lands.
-   */
-  const DETAIL_PAD = 1;
-  const overviewKeys = new Map(); // plot id -> what its overview was read for
-  function requestDetail(id) {
-    const v = views.get(id);
-    if (!v || v.live) {
-      overviewKeys.delete(id);
-      return hub.session.clearWindows(id);
-    }
-    requestOverview(id, v);
-    const plot = plotAnywhere(id);
-    if (!plot || plot.kind !== 'time') return;
-    const [x0, x1] = v.range(hub.now(clock.now()));
-    hub.session.fetchWindow(id, 'detail', tracesOf(plot), x0, x1, DETAIL_PAD * (x1 - x0), window.innerWidth * 2);
-  }
-  const tracesOf = (plot) => plot.items.map((i) => hub.session.byKey.get(i.key)).filter(Boolean);
-  // Each view reads the oldest time its plot can show from what the hub holds of these.
-  views.tracesOf = (id) => tracesOf(plotAnywhere(id) ?? { items: [] });
-  /** Reads paused plot `id`'s whole captured history once, again only when its signals or its pause change. */
-  function requestOverview(id, v) {
-    const plot = plotAnywhere(id);
-    if (!plot || plot.kind !== 'time') return;
-    const traces = tracesOf(plot);
-    const oldest = hub.session.memory?.oldest ?? {};
-    const lo = Math.min(...traces.map((t) => oldest[t.meta.id] ?? Infinity));
-    const hi = v.pausedAt;
-    if (!isFinite(lo) || hi === null) return;
-    const key = `${hi}|${traces.map((t) => t.meta.id).join(',')}`;
-    if (overviewKeys.get(id) === key) return;
-    overviewKeys.set(id, key);
-    hub.session.fetchWindow(id, 'overview', traces, lo, hi, 0, window.innerWidth * 2);
-  }
-
 
   // Closing a tab with plots asks first: `closing` is the tab the dialog
   // asks about, and shows it. The dialog's Close button closes the tab and
@@ -659,8 +599,7 @@
   }
   function closePlot(id) {
     ws.closePlot(id);
-    hub.session.clearWindows(id);
-    overviewKeys.delete(id);
+    plots.dropWindows(id);
   }
   /**
    * Closes plots `ids` as one step. From the keys, focus goes to the plot
@@ -690,16 +629,16 @@
   }
 
   onMount(() => {
-    renderer = new Renderer(glCanvas);
+    const release = plots.surface(glCanvas);
+    surfaced = true;
     hub.connect();
     const HUD_MS = 500;
     let frames = 0, cpu = 0, last = clock.now(), lastBytes = 0, upload = 0, raf;
     const loop = (perf) => {
       const start = clock.now();
       hub.session.tick(perf);
-      renderer.begin();
-      for (const pv of registry) pv.draw(perf);
-      const st = renderer.stats;
+      plots.draw(perf);
+      const st = plots.renderer.stats;
       upload += st.uploadBytes;
       cpu += clock.now() - start;
       frames++;
@@ -712,7 +651,7 @@
           drawCalls: st.drawCalls,
           uploadKBs: upload / 1e3 / (elapsed / 1000),
           rxKBs: (hub.bytes - lastBytes) / 1e3 / (elapsed / 1000),
-          gpu: renderer.gpu,
+          gpu: plots.renderer.gpu,
         };
         frames = 0; cpu = 0; upload = 0; last = perf; lastBytes = hub.bytes;
         readWindow();
@@ -725,7 +664,7 @@
     return () => {
       clock.cancel(raf);
       hub.close();
-      renderer.dispose();
+      release();
     };
   });
 
@@ -892,12 +831,13 @@
   // keymap.js.
   const claimed = Object.entries({
     palette: { on: { palette: () => void (paletteOpen = !paletteOpen) } },
-    // A key pressed in a plot is its plot command; but on a control inside
-    // it, the arrows move between the controls, and what keeps its own keys
-    // keeps them (keys.js).
+    // A key pressed in a plot of the tiles is its plot command; but on a
+    // control inside it, the arrows move between the controls, and what
+    // keeps its own keys keeps them (keys.js). A plot elsewhere, as a copy
+    // on a stage, is another host's: its keys are not the page's.
     plot: {
       when(e, at) {
-        const card = at?.closest?.('.plot-card');
+        const card = at?.closest?.('.tiles .plot-card');
         if (!card) return false;
         const inside = at !== card && !at.matches('.trace-zone');
         return !inside || (!e.key.startsWith('Arrow') && !keepsKey(e, at));
@@ -951,44 +891,7 @@
   <!-- Its own plot, so an edit to another plot does not reach this one. -->
   {@const plot = ws.plots[id]}
   {#key id}
-    {#if renderer && plot}
-      <PlotCard
-        {plot}
-        {hub}
-        view={views.of(id)}
-        {viewHistory}
-        {cursors}
-        targets={() => targetsOf(id)}
-        {hover}
-        {renderer}
-        {registry}
-        otherTabs={ws.tabs.filter((t) => t.id !== ws.activeId)}
-        tabName={ws.tab.name}
-        targetPlots={() => targetIdsOf(id).map((i) => ws.plots[i])}
-        focused={ws.focusedId === id}
-        selected={ws.selected.has(id)}
-        onSelect={(shift, clicks) => selection.click(id, shift, clicks)}
-        onFocus={() => selection.point(id)}
-        onPress={() => selection.pressOn(id)}
-        onEach={(what, fn) => eachPlot(targetIdsOf(id), what, fn)}
-        onEdit={(what, patch) => history.group(what, () => ws.setPlot(id, patch))}
-        onView={(patch) => viewHistory.step(() => targetIdsOf(id).forEach((i) => ws.plots[i]?.kind === ws.plots[id]?.kind && ws.setView(i, patch)))}
-        targetIds={() => targetIdsOf(id)}
-        onStartMove={(e) => drags.startMove(id, e)}
-        onMoveToTab={(tabId) => {
-          const ids = targetIdsOf(id);
-          history.group(`Move ${plotsText(ids.length)} to ${ws.tabs.find((t) => t.id === tabId)?.name ?? 'a tab'}`, () => {
-            for (const i of ids) ws.movePlotToTab(i, tabId);
-          });
-        }}
-        onTraceDragStart={() => drags.traceDragStart()}
-        onLandSignal={(item, items) => drags.landSignal(item, items ? id : null, items)}
-        otherPlots={plotIds(ws.layout)
-          .filter((p) => p !== id)
-          .map((p) => ({ id: p, label: labelOf(p) }))}
-        onMoveSignal={(key, to) => moveSignal(id, key, to)}
-      />
-    {/if}
+    {#if surfaced && plot}<PlotCard {plot} host={plots} />{/if}
   {/key}
 {/snippet}
 

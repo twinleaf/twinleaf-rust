@@ -6,6 +6,7 @@
   // one row apiece. Property rows carried to Favorites show as a card of
   // their names, which says what a drop there does.
   import { colorOf } from './plot.js';
+  import { colors } from './colors.svelte.js';
 
   let { drags, ws, session } = $props();
   /** The room a card of carried rows takes right of the pointer, in px: its widest and its offset. */
@@ -48,7 +49,7 @@
   {@const moving = drags.moving}
   {@const p = ws.plots[moving.plotId]}
   {@const kind = (q) => (q?.kind === 'spectrum' ? 'Spectrum' : 'Time')}
-  {@const swatch = (key) => { const t = session.trace(key); return t ? colorOf(t) : 'var(--muted-foreground)'; }}
+  {@const swatch = (key) => { const t = session.trace(key); return t ? colorOf(t, colors) : 'var(--muted-foreground)'; }}
   <div class="move-ghost" class:stack={moving.group.size > 1} style="left: {moving.x + 18}px; top: {moving.y + 18}px">
     {#if moving.group.size > 1}
       <div class="ghost-head">{moving.group.size} plots</div>

@@ -31,6 +31,13 @@ export class Colors {
     }
   }
 
+  /** A Colors with the colours as they are here now, kept nowhere: a colour picked on it changes it alone. */
+  copy() {
+    const c = new Colors(null);
+    Object.assign(c, { given: { ...this.given }, picked: { ...this.picked }, last: { ...this.last } });
+    return c;
+  }
+
   /** The colour of signal `key`: an index, or a picked '#rrggbb'. One never given reads as the first. */
   of(key) {
     return this.picked[key] ?? this.given[key] ?? 0;

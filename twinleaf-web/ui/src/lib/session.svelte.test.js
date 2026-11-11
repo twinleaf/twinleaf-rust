@@ -236,10 +236,21 @@ describe('the hub', () => {
     const { hub, socket } = hubOnFakeSocket();
     hub.text({ type: 'hub', id: 'a', seq: 0 });
     expect(socket.sent).toEqual([]);
-    hub.hold(true);
+    hub.hold('page', true);
     hub.text({ type: 'hub', id: 'b', seq: 0 });
-    hub.hold(false);
+    hub.hold('page', false);
     expect(socket.sent).toEqual([holdMessage(true), holdMessage(true), holdMessage(false)]);
+  });
+
+  it('holds its history while anyone holds a plot paused, and lets go once none does', () => {
+    const { hub, socket } = hubOnFakeSocket();
+    hub.text({ type: 'hub', id: 'a', seq: 0 });
+    hub.hold('page', true);
+    hub.hold('figure', true);
+    hub.hold('page', false);
+    expect(socket.sent, 'held while the figure holds').toEqual([holdMessage(true)]);
+    hub.hold('figure', false);
+    expect(socket.sent).toEqual([holdMessage(true), holdMessage(false)]);
   });
 
 });

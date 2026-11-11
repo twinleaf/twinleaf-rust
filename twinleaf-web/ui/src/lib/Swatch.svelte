@@ -1,11 +1,14 @@
 <script>
   // A signal's colour line, which opens its colour picker (ColorPicker.svelte).
+  import { getContext } from 'svelte';
   import * as Popover from '$lib/components/ui/popover/index.js';
   import ColorPicker from './ColorPicker.svelte';
-  import { colors, NAMES } from './colors.svelte.js';
+  import { NAMES } from './colors.svelte.js';
 
   /** `key` is the signal whose colour this shows and picks. */
   let { key } = $props();
+  /** The Colors it is shown among: the page's, or within a plot, its host's. */
+  const colors = getContext('colors');
   let open = $state(false);
   const current = $derived(colors.of(key));
 </script>

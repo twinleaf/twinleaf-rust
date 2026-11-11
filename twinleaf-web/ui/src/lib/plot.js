@@ -13,7 +13,6 @@
 
 import { scaleLinear, scaleLog, scaleTime } from 'd3-scale';
 import { DRAG_START } from './constants.js';
-import { colors } from './colors.svelte.js';
 import { prefs } from './prefs.svelte.js';
 import { axisFormat, formOf, numberText, rangeText, si, spanText } from './units.js';
 import { WINDOW_LIMITS, windowText } from './window.js';
@@ -534,14 +533,14 @@ export function theme() {
 }
 /** Each picked colour other than the theme's, as GL's rgba. */
 const customRgba = new Map();
-/** The trace's colour, as colors.svelte.js gives it or it was picked. */
-export const colorOf = (trace) => {
-  const c = colors.of(trace.key);
+/** The trace's colour among `from`, a Colors (colors.svelte.js), as it gives it or it was picked. */
+export const colorOf = (trace, from) => {
+  const c = from.of(trace.key);
   return typeof c === 'number' ? theme().traces[c] : c;
 };
-/** The trace's colour as GL's rgba. */
-const rgbaOf = (trace) => {
-  const c = colors.of(trace.key);
+/** The trace's colour among `from`, a Colors, as GL's rgba. */
+const rgbaOf = (trace, from) => {
+  const c = from.of(trace.key);
   if (typeof c === 'number') return theme().tracesRgba[c];
   if (!customRgba.has(c)) customRgba.set(c, cssRgba(c));
   return customRgba.get(c);
@@ -561,11 +560,14 @@ export class PlotView {
    * each as [pv, axis], that a drag of an X cursor, with no `key`, or of a Y
    * cursor on y axis `key` moves (commands.js `cursorPeers`), this one among
    * them. `onFollow()` has the page follow live on the plots of `targets`,
-   * back at the windows they had before they paused.
+   * back at the windows they had before they paused. `renderer` is the
+   * Renderer of the canvas its traces are drawn on (gl.js), whose pixel
+   * ratio its overlay is drawn at too. `colors` is the Colors its signals'
+   * colours are read from.
    */
-  constructor({ body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors }) {
+  constructor({ body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors, colors }) {
     cursorTargets ??= (key) => [[this, key]];
-    Object.assign(this, { body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors });
+    Object.assign(this, { body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors, colors });
     this.zoomBand = null; // [x0, x1] in client px while a Ctrl+drag marks a range to zoom to
     this.ctx = overlay.getContext('2d');
     this.specHover = null;
@@ -821,10 +823,10 @@ export class PlotView {
     const r = this.body.getBoundingClientRect();
     // Off screen, collapsed, or hidden behind a maximized plot: draw nothing.
     const shown = this.body.checkVisibility ? this.body.checkVisibility({ visibilityProperty: true }) : true;
-    const visible = shown && r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight;
+    const body = { x: r.left, y: r.top, w: r.width, h: r.height };
+    const visible = shown && r.width > 0 && r.height > 0 && this.renderer.shows(body);
     this.sizeOverlay(r);
     if (!visible) return;
-    const body = { x: r.left, y: r.top, w: r.width, h: r.height };
     this.drawnOn = body;
     this.renderer.fill(body, theme().bgRgba);
     const cfg = this.config();
@@ -919,7 +921,7 @@ export class PlotView {
   drawTime(cfg, traces, geo, body, perf) {
     // The range on the device pixel grid, which everything drawn below uses,
     // so a live plot scrolls by whole pixels and does not flicker.
-    const dpr = this.renderer.dpr ?? (typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1);
+    const dpr = this.renderer.dpr;
     const [x0, x1] = onPixelGrid(...this.view.range(this.hub.now(perf)), Math.max(1, Math.round(geo.plot.w * dpr)));
     const session = this.hub.session;
     const plans = traces.map((t, index) => {
@@ -955,12 +957,12 @@ export class PlotView {
       const [y0, y1] = ranges.get(this.rangeKey(cfg, p.t));
       if (p.fromWindow) {
         const st = this.renderer.detailBuffer(this.slotOf(p.t), p.src);
-        if (this.renderer.lane(lane, st.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t)))
+        if (this.renderer.lane(lane, st.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t, this.colors)))
           this.renderer.drawDetail(st, p.src, p.a0, p.a1);
         return;
       }
       const ring = this.renderer.ring(p.src);
-      if (this.renderer.lane(lane, ring.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t))) this.renderer.drawTrace(p.src, ring, p.a0, p.a1);
+      if (this.renderer.lane(lane, ring.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t, this.colors))) this.renderer.drawTrace(p.src, ring, p.a0, p.a1);
     });
     this.drawOverlay(cfg, geo, body, plans, ranges, [x0, x1], false);
   }
@@ -995,7 +997,7 @@ export class PlotView {
     for (const p of plans) {
       const lane = geo.lanes[this.laneOf(cfg, p.index)];
       const [y0, y1] = ranges.get(this.rangeKey(cfg, p.t));
-      if (!this.renderer.lane(lane, 0, lx0, lx1, y0, y1, prefs.traceWidth, rgbaOf(p.t))) continue;
+      if (!this.renderer.lane(lane, 0, lx0, lx1, y0, y1, prefs.traceWidth, rgbaOf(p.t, this.colors))) continue;
       this.renderer.drawStatic(this.slotOf(p.t, variant), p.s, () => {
         const pts = new Float32Array(p.s.f.length * 2);
         for (let i = 0; i < p.s.f.length; i++) {
@@ -1027,8 +1029,9 @@ export class PlotView {
     if (shift) this.onFrequencies?.(from(a + shift), from(b + shift));
   }
 
+  /** Sizes the overlay's canvas to the body's box `r` at the renderer's pixel ratio. */
   sizeOverlay(r) {
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = this.renderer.dpr;
     const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
     if (this.overlay.width !== w || this.overlay.height !== h) {
       this.overlay.width = w;
@@ -1081,7 +1084,7 @@ export class PlotView {
     ctx.fillRect(x, y, w, H);
     ctx.strokeStyle = T.tipBorder;
     ctx.strokeRect(x + 0.5, y + 0.5, w - 1, H - 1);
-    const color = colorOf(near.t);
+    const color = colorOf(near.t, this.colors);
     ctx.fillStyle = color;
     ctx.fillRect(x + PAD, y + H / 2 - 1.5, SWATCH, 3);
     ctx.textAlign = 'left';
@@ -1188,14 +1191,14 @@ export class PlotView {
     if (cfg.mode === 'stacked') {
       plans.forEach((p) => {
         const lane = geo.lanes[this.laneOf(cfg, p.index)];
-        axes.push({ key: p.t.key, lane, range: ranges.get(p.t.key), side: 'left', color: colorOf(p.t), plans: [p] });
+        axes.push({ key: p.t.key, lane, range: ranges.get(p.t.key), side: 'left', color: colorOf(p.t, this.colors), plans: [p] });
       });
     } else if (cfg.mode === 'independent') {
       const slots = axisSlots(plans.map((p) => p.t.key), cfg.sides);
       for (const side of ['left', 'right'])
         slots[side].forEach((key, slot) => {
           const p = plans.find((p) => p.t.key === key);
-          axes.push({ key, lane: geo.lanes[0], range: ranges.get(key), side, slot, color: colorOf(p.t), plans: [p], keys: [key] });
+          axes.push({ key, lane: geo.lanes[0], range: ranges.get(key), side, slot, color: colorOf(p.t, this.colors), plans: [p], keys: [key] });
         });
     } else {
       axes.push({ key: 'shared', lane: geo.lanes[0], range: ranges.get('shared'), side: 'left', color: T.axisText, plans });
@@ -1244,7 +1247,7 @@ export class PlotView {
         for (let r = 0; r < shown.length; r++) shown[r] += (target[r] - shown[r]) * AXIS_STRIP.ease;
         const out = i * AXIS_STRIP.step;
         const x = axis.side === 'left' ? axis.x1 - out - AXIS_STRIP.w : axis.x0 + out;
-        drawStrip(ctx, shown, colorOf(p.t), x, AXIS_STRIP.w, hoverLane.y, AXIS_STRIP.alpha);
+        drawStrip(ctx, shown, colorOf(p.t, this.colors), x, AXIS_STRIP.w, hoverLane.y, AXIS_STRIP.alpha);
       });
     }
     // Each axis's grid and numbers, as `laneTicks` picks them by its lane's
@@ -1470,7 +1473,7 @@ export class PlotView {
         const y = Math.round(yScale(ranges.get(this.rangeKey(cfg, p.t)), lane)(p.s.floor)) + 0.5;
         if (y < lane.y || y > lane.y + lane.h) continue;
         ctx.save();
-        ctx.strokeStyle = colorOf(p.t);
+        ctx.strokeStyle = colorOf(p.t, this.colors);
         ctx.globalAlpha = 0.75;
         ctx.setLineDash([5, 4]);
         ctx.beginPath();
@@ -1515,10 +1518,10 @@ export class PlotView {
         if (!near || d < near.d) near = { d, t: p.t, read };
       }
       if (span) {
-        ctx.fillStyle = colorOf(p.t);
+        ctx.fillStyle = colorOf(p.t, this.colors);
         ctx.fillRect(sx(marks.hover) - 1.5, sy(span.hi) - 1.5, 3, sy(span.lo) - sy(span.hi) + 3);
       }
-      for (const [name, color] of [['hover', colorOf(p.t)], ['a', T.cursorA], ['b', T.cursorB]]) {
+      for (const [name, color] of [['hover', colorOf(p.t, this.colors)], ['a', T.cursorA], ['b', T.cursorB]]) {
         const pt = pts[name];
         if (!pt || (name === 'hover' && span)) continue;
         ctx.fillStyle = color;
