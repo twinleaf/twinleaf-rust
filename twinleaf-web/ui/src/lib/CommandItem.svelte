@@ -4,21 +4,21 @@
   // whether it can be chosen, and its destructive look; no row where the
   // entry says the menu has none. A command of choices has a row that opens
   // a submenu of them, the one its plot has marked. Made on plot `on`, or
-  // from the page with none; on signal `signal`'s row; with `how` what the
-  // menu adds. `onran(e)`, where given, hears the row chosen, once the
-  // command has run.
+  // from the page with none; on signal `signal`'s row; on tab `tab`; with
+  // `how` what the menu adds. `onran(e)`, where given, hears the row
+  // chosen, once the command has run.
   import { getContext } from 'svelte';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
   import RiWarn from '@lucide/svelte/icons/triangle-exclamation-point';
 
-  let { id, on = null, signal = null, how = undefined, menu = 'context', onran = undefined } = $props();
+  let { id, on = null, signal = null, tab = null, how = undefined, menu = 'context', onran = undefined } = $props();
   const commands = getContext('commands');
   const Menu = $derived(menu === 'dropdown' ? DropdownMenu : ContextMenu);
-  const row = $derived(commands.row(id, { on, signal, how }));
+  const row = $derived(commands.row(id, { on, signal, tab, how }));
   const value = $derived(typeof row.value === 'string' ? { text: row.value } : row.value);
   /** Runs the command with `how`, from this row. */
-  const run = (how) => commands.run(id, { on, signal, how, from: 'menu' });
+  const run = (how) => commands.run(id, { on, signal, tab, how, from: 'menu' });
 </script>
 
 <!-- A row's value in its trailing column, when it has one. -->

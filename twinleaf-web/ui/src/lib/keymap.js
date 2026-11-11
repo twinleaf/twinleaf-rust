@@ -1,8 +1,9 @@
 // Every key and gesture the page reads, by where focus is. The keys sheet
 // lists this table, and the key router (keyrouter.js) finds each key's
 // action here with `actionFor`, so what the sheet says is what the keys do.
-// A plot's keys, Space, Ctrl+C and the Signals list's keys that put signals
-// on plots are commands, listed here from their table (commands.js).
+// A plot's keys, Space, Ctrl+C, the Signals list's keys that put signals
+// on plots and a tab's keys that rename and close it are commands, listed
+// here from their table (commands.js).
 //
 // An entry is {show, on, keys, ctrl, shift, action, what}: `show` is how the
 // sheet writes the keys, and an entry without it is not on the sheet; `on`
@@ -77,8 +78,7 @@ export const KEYMAP = [
     entries: [
       { ...MOVE, keys: ['ArrowLeft', 'ArrowRight', 'Home', 'End'] },
       { show: ['Enter'], keys: ['Enter', ' '], action: 'open', what: 'open tab' },
-      { show: ['F2'], keys: ['F2'], action: 'rename', what: 'Rename tab' },
-      { show: ['Delete'], keys: ['Delete'], action: 'close', what: 'close tab' },
+      ...COMMANDS.filter((c) => c.place === 'tabs').map(keysOf),
     ],
   },
   {

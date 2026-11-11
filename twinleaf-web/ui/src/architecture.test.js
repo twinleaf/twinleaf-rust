@@ -133,7 +133,6 @@ describe('props', () => {
 /** The menu rows that still write their own keys, as `file keys`, each with the row. */
 const OWN_KEYS = new Map([
   ['lib/PlotCard.svelte Delete', 'a signal’s Remove'],
-  ['lib/TabStrip.svelte F2', 'a tab’s Rename'],
   ['lib/Properties.svelte Ctrl C', 'the property rows’ Copy'],
 ]);
 

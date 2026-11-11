@@ -31,10 +31,12 @@ describe('the command table', () => {
     expect(new Set(COMMANDS.map((c) => c.id)).size).toBe(COMMANDS.length);
     const kinds = KINDS.map(([k]) => k);
     for (const c of COMMANDS) {
-      expect(['view', 'plot'], c.id).toContain(c.scope);
+      expect(['view', 'plot', 'tab'], c.id).toContain(c.scope);
+      // A tab command acts on no plot, so runs with none.
+      if (c.scope === 'tab') expect(c.empty && !c.kinds, c.id).toBe(true);
       expect(c.kinds === undefined || c.kinds.every((k) => kinds.includes(k)), c.id).toBe(true);
       expect((c.needs ?? []).every((n) => [...HOSTED, 'axis', 'signals'].includes(n)), c.id).toBe(true);
-      expect([undefined, 'page', 'list'], c.id).toContain(c.place);
+      expect([undefined, 'page', 'list', 'tabs'], c.id).toContain(c.place);
       expect(typeof c.run, c.id).toBe('function');
       // A key is shown and named; a row has an icon to go with its label.
       if (c.keys) expect(c.show?.length && c.what, c.id).toBeTruthy();
@@ -97,9 +99,11 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     maximized,
     maximize: (ids) => ((view.maximized = ids), void log.push(`maximize ${ids}`)),
     restoreLayout: () => ((view.maximized = null), void log.push('restoreLayout')),
-    tabs: [{ id: 'T', name: 'T' }, { id: 'U', name: 'U' }],
-    tab: { id: 'T', name: 'T' },
+    tabs: [{ id: 'T', name: 'T', layout: null }, { id: 'U', name: 'U', layout: null }],
+    tab: { id: 'T', name: 'T', layout: null },
     activeId: 'T',
+    duplicateTab: (t) => void log.push(`duplicateTab ${t.id}`),
+    addTab: () => void log.push('addTab'),
     setView: (id) => void log.push(`setView ${id}`),
     movePlotToTab: (id, tab) => void log.push(`movePlotToTab ${id} ${tab}`),
   };
@@ -129,6 +133,8 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     copyCheck: record('copyCheck'),
     openExport: record('openExport'),
     picker: record('picker'),
+    renameTab: (id) => void log.push(`renameTab ${id}`),
+    closeTab: (t) => void log.push(`closeTab ${t.id}`),
   };
   return { cmds: commands(svc) };
 }
@@ -163,7 +169,7 @@ describe('a command', () => {
         spy(c, seen);
         const p = page(kinds, picked, last === null ? null : IDS[last], []);
         // The oracle, from the rules alone.
-        const ids = made ? (picked.includes(made) ? picked : [made]) : picked.length ? picked : c.scope === 'view' ? shown : [];
+        const ids = c.scope === 'tab' ? [] : made ? (picked.includes(made) ? picked : [made]) : picked.length ? picked : c.scope === 'view' ? shown : [];
         const want = ids.filter((i) => !c.kinds || c.kinds.includes(kinds[IDS.indexOf(i)]));
         const taken = p.cmds.run(id, { on: made, from: made ? 'menu' : 'key', how: {} });
         expect(taken, `${id} taken`).toBe(ids.length > 0 || !!c.empty);

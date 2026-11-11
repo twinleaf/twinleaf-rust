@@ -5,13 +5,15 @@
 // the same thing to the same plots.
 //
 // An entry is {id, scope, kinds, needs, place, show, keys, ctrl, shift,
-// what, label, icon, active, activeIcon, when, value, disabled,
+// keyless, what, label, icon, active, activeIcon, when, value, disabled,
 // destructive, choices, chosen, palette, find, empty, check, run}:
-// - `scope` is 'view' or 'plot': made from the page or the keys with no
+// - `scope` is 'view', 'plot' or 'tab': made from the page or the keys with no
 //   plot selected, a 'view' command acts on every plot shown and a 'plot'
 //   command on none (selection.svelte.js `pageTargets`). Made on a plot, from
 //   its menu or its buttons, a command acts on the selection the plot is in,
-//   or else on the plot alone (`targets`).
+//   or else on the plot alone (`targets`). A 'tab' command acts on no plot
+//   but on a tab of the page: the one it is made on, from its menu, its
+//   buttons or its keys, or else the open one.
 // - `kinds` lists the kinds of plot it acts on, or null for every kind; the
 //   plots of other kinds are dropped from what it acts on.
 // - `needs` lists what it needs beyond plots. Of where its plots are, which
@@ -28,8 +30,9 @@
 //   `signalTargets`); the palette names the one signal. With no signal it
 //   does not run.
 // - `show`, `keys`, `ctrl`, `shift` and `what` are its keys as keymap.js
-//   takes them; `place` 'page' puts them among the page's keys and 'list'
-//   among the Signals list's, not a plot's.
+//   takes them; `place` 'page' puts them among the page's keys, 'list'
+//   among the Signals list's and 'tabs' among a layout tab's, not a plot's.
+//   Its row shows its keys, unless it is `keyless`.
 // - `label`, `icon`, `value`, `disabled` and `destructive` are how its row
 //   reads: `label` is text or a function of the context, and a command with
 //   no label has no row; the icon is `activeIcon` while `active` holds,
@@ -52,12 +55,13 @@
 // Each of `label`, `value`, `disabled` and `run` takes the context `ctx`
 // and `how`, what the origin adds: the axis a y axis command is made on,
 // or the count a menu holds. `ctx` is what the command acts on, made by
-// `context`: {plots, on, lead, signals, from, svc}. `plots` is each plot it
-// acts on, as {id, plot, view, pv}: its settings, its view and its
+// `context`: {plots, on, lead, signals, tab, from, svc}. `plots` is each
+// plot it acts on, as {id, plot, view, pv}: its settings, its view and its
 // PlotView, which is all a command reaches of a plot. `on` is the plot it
 // was made on, or null; `lead` that plot, or else the one clicked last
 // among `plots`, or the first. `signals` is the keys of the signals it acts
-// on, none for a command that needs none. `from` is the origin: 'menu',
+// on, none for a command that needs none. `tab` is the tab a 'tab' command
+// acts on, null for any other. `from` is the origin: 'menu',
 // 'button', 'key', 'palette', 'toolbar' or 'row', a double-click on a
 // signal. `svc` is the page's services, as `commands` takes them.
 import { common, counted } from './menus.js';
@@ -67,6 +71,7 @@ import { nearestPeak, peaks, stepPeak } from './snap.js';
 import { chip } from './tabs.js';
 import { KINDS, MODES, kindLabel } from './constants.js';
 import { writeTables } from './copy.js';
+import { plotIds } from './layout.js';
 import { DIGITS, axisFormat } from './units.js';
 import * as clock from './clock.js';
 import RiAdd from '@lucide/svelte/icons/plus';
@@ -97,6 +102,8 @@ import RiAxis from '@lucide/svelte/icons/arrow-right-left';
 import RiKind from '@lucide/svelte/icons/chart-line';
 import RiLayout from '@lucide/svelte/icons/layers';
 import RiTab from '@lucide/svelte/icons/app-window';
+import RiRename from '@lucide/svelte/icons/pencil';
+import RiDuplicate from '@lucide/svelte/icons/copy';
 
 /** How far an arrow pans, as a share of the span, and zooms, as a factor. */
 const PAN = 0.1, ZOOM = 1.25;
@@ -229,6 +236,9 @@ function copyReadout(ctx) {
     (error) => ctx.svc.toast.error(`Could not copy: ${error.message}`),
   );
 }
+
+/** How many plots tab `t` holds, as a row's value. */
+const plotsIn = (t) => counted(plotIds(t.layout).length, 'plot');
 
 /** The tabs of the page but the open one. */
 const otherTabs = (ctx) => ctx.svc.ws.tabs.filter((t) => t.id !== ctx.svc.ws.activeId);
@@ -702,6 +712,32 @@ export const COMMANDS = [
     value: (ctx) => (ctx.signals.length > 1 ? counted(ctx.signals.length, 'signal') : kindLabel('time', 'overlay')),
     run: (ctx) => ctx.svc.newPlot(ctx.signals),
   },
+  // A layout tab's commands.
+  {
+    // Opens the tab's name for editing.
+    id: 'renameTab', scope: 'tab', needs: ['workspace'], place: 'tabs', show: ['F2'], keys: ['F2'], what: 'Rename tab', empty: true,
+    icon: RiRename, label: 'Rename',
+    run: (ctx) => void ctx.svc.renameTab(ctx.tab.id),
+  },
+  {
+    id: 'duplicateTab', scope: 'tab', needs: ['workspace'], empty: true,
+    icon: RiDuplicate, label: 'Duplicate',
+    value: (ctx) => plotsIn(ctx.tab),
+    run: (ctx) => ctx.svc.group('Duplicate tab', () => ctx.svc.ws.duplicateTab(ctx.tab)),
+  },
+  {
+    // The page asks first when the tab has plots.
+    id: 'closeTab', scope: 'tab', needs: ['workspace'], place: 'tabs', show: ['Delete'], keys: ['Delete'], keyless: true, what: 'close tab', empty: true,
+    icon: RiClose, label: 'Close', destructive: true,
+    value: (ctx) => plotsIn(ctx.tab),
+    run: (ctx) => void ctx.svc.closeTab(ctx.tab),
+  },
+  {
+    // An empty tab after the others, which it opens.
+    id: 'newTab', scope: 'tab', needs: ['workspace'], empty: true,
+    icon: RiAdd, label: 'New layout',
+    run: (ctx) => ctx.svc.group('New tab', () => ctx.svc.ws.addTab()),
+  },
 ];
 
 /** The command `id`. */
@@ -724,22 +760,24 @@ export const HOSTED = ['workspace', 'live'];
  * `viewHistory`, `cursors`, `toast`, `edit(ids, what, fn)`, `group(what,
  * fn)`, which runs `fn` as one edit named `what`, `split(ids, dir,
  * fromKeys)`, `close(ids, fromKeys)`, `newPlot(keys)`, `copy(plots)`,
- * `copyCheck(plots)`, `openExport(plots)` and `picker(id, action)`.
+ * `copyCheck(plots)`, `openExport(plots)`, `picker(id, action)`,
+ * `renameTab(id)` and `closeTab(tab)`.
  *
- * Where a command is made is {on, signal, signals, from}: `on` the plot it
- * is made on, or null for the page; `signal` the signal whose row it is
- * made on, or null, or else `signals`, the very signals it acts on; and
- * `from`, its origin.
+ * Where a command is made is {on, signal, signals, tab, from}: `on` the
+ * plot it is made on, or null for the page; `signal` the signal whose row
+ * it is made on, or null, or else `signals`, the very signals it acts on;
+ * `tab` the tab it is made on, by id, or null; and `from`, its origin.
  */
 export function commands(svc) {
   /** What command `id`, made at `where`, acts on: its context. */
-  function context(id, { on = null, signal = null, signals, from = 'menu' } = {}) {
+  function context(id, { on = null, signal = null, signals, tab = null, from = 'menu' } = {}) {
     const c = commandOf(id);
+    if (c.scope === 'tab') return { plots: [], all: [], on: null, lead: null, signals: [], tab: svc.ws.tabs.find((t) => t.id === tab) ?? svc.ws.tab, from, svc };
     const all = (on !== null ? svc.targets(on) : svc.pageTargets(c.scope)).map(svc.plotOf).filter((t) => t.plot);
     const plots = c.kinds ? all.filter((t) => c.kinds.includes(t.plot.kind)) : all;
     const made = on !== null ? svc.plotOf(on) : null;
     const lead = made ?? plots.find((t) => t.id === svc.last()) ?? plots[0] ?? null;
-    return { plots, all, on: made, lead, signals: c.needs?.includes('signals') ? (signals ?? svc.signalTargets(signal)) : [], from, svc };
+    return { plots, all, on: made, lead, signals: c.needs?.includes('signals') ? (signals ?? svc.signalTargets(signal)) : [], tab: null, from, svc };
   }
   /** Whether the host has what command `c` needs of it. */
   const hosted = (c) => !c.needs?.some((n) => HOSTED.includes(n) && !svc.has(n));
@@ -769,7 +807,7 @@ export function commands(svc) {
         value: c.value?.(ctx, how) ?? null,
         disabled: !!c.disabled?.(ctx, how),
         destructive: !!c.destructive,
-        show: c.show ?? null,
+        show: c.keyless ? null : (c.show ?? null),
         choices: c.choices?.(ctx, how) ?? null,
         chosen: c.chosen?.(ctx, how),
         offered: hosted(c) && (!c.when || !!c.when(ctx, how)),

@@ -171,6 +171,8 @@
     copy: (targets) => copyData(targets),
     copyCheck: (targets) => copyCheck(targets),
     openExport: (targets) => openExport(targets),
+    renameTab: (id) => tabStrip.startRename(id),
+    closeTab: (t) => closeTab(t),
     viewChanged,
     place: {
       startMove: (id, e) => drags.startMove(id, e),
@@ -232,6 +234,8 @@
     plots.holdPaused();
   }
 
+  /** The tab strip, which opens a tab's name for editing. */
+  let tabStrip;
   // Closing a tab with plots asks first: `closing` is the tab the dialog
   // asks about, and shows it. The dialog's Close button closes the tab and
   // the dialog; its Cancel and Esc close the dialog only.
@@ -1067,7 +1071,7 @@
       {@render dockHandle('left')}
       <Resizable.Pane id="tiles" order={2} defaultSize={100 - startSize('left') - startSize('right')} class="flex min-h-0 min-w-0">
         <main class="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5">
-          <TabStrip {ws} {drags} onClose={closeTab} onReorder={(ids) => history.group('Move tab', () => ws.orderTabs(ids))} />
+          <TabStrip bind:this={tabStrip} {ws} {drags} onReorder={(ids) => history.group('Move tab', () => ws.orderTabs(ids))} />
           <div class="tiles" data-focus="plots" tabindex="-1" class:has-max={ws.maximized} class:drop-target={drags.drop?.outer && !drags.drop.edge}>
             {#key ws.activeId}
               {#if ws.layout}

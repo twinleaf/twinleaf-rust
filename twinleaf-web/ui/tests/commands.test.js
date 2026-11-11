@@ -11,7 +11,9 @@
 // command on the same plots does the same thing, as it runs the one entry.
 // A command made on a signal is made from the page as far as plots go: its
 // origins are the Signals list's menu, its keys pressed in the list, and the
-// palette's rows that name a signal.
+// palette's rows that name a signal. A tab command acts on no plot but on
+// a tab: made on a tab, from its menu, its buttons or its keys, on that
+// tab, here one that is not open; from the tab strip, on the open one.
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
@@ -78,6 +80,13 @@ const ON_PLOT = {
   'the y axis': (page, id) => axisPopover(page, id, 'y'),
 };
 const listSignals = () => [...document.querySelectorAll('.palette .chip[data-key]')];
+/** The last tab of the strip, which is not the open one. */
+const lastTab = () => [...document.querySelectorAll('[role=tab]')].at(-1);
+/** The origins made on a tab, the last: each opens what holds its control and returns it. A tab's menu and its buttons. */
+const ON_TAB = {
+  'a tab’s menu': async () => (await rightClick(centre(lastTab())), openMenu()),
+  'a tab’s buttons': async () => lastTab(),
+};
 const palette = () => document.querySelector('[data-slot=dialog-overlay]');
 /** Closes the command palette, if it is open, and waits until it has gone: it takes every press until then. */
 async function closePalette() {
@@ -92,6 +101,7 @@ async function closePalette() {
 const ON_PAGE = {
   'the toolbar': async () => document.querySelector('.top-bar'),
   'the File dropdown': () => MENUS['the File dropdown'](),
+  'the tab strip': async () => document.querySelector('[data-focus=tabs]'),
   // A signal's menu has Add to plot or Remove from plot by what the selected plots show: the first signal whose menu names the command, or else the last.
   'the Signals list’s menu': async (page, on, id) => {
     let menu = null;
@@ -105,6 +115,9 @@ const ON_PAGE = {
   },
   'the palette’s signals': async () => (await pressKey('Control+k'), await settle(), document.querySelector('[data-slot=command-list]')),
 };
+
+/** Every origin a control is found at, by name. */
+const ORIGINS = { ...ON_PLOT, ...ON_TAB, ...ON_PAGE };
 
 /** The key that runs command `c`, as the keyboard command names it, or null. */
 function keyOf(c) {
@@ -141,10 +154,10 @@ async function make(control, ran) {
   if (value) await click(centre(value));
 }
 
-/** Has every command record what it is run on into `calls`, in place of running; returns what puts them back. */
+/** Has every command record what it is run on, its plots and for a tab command its tab, into `calls`, in place of running; returns what puts them back. */
 function record(calls) {
   const runs = COMMANDS.map((c) => [c, c.run]);
-  for (const c of COMMANDS) c.run = (ctx) => void calls.push({ id: c.id, plots: ctx.plots.map((t) => t.id).sort() });
+  for (const c of COMMANDS) c.run = (ctx) => void calls.push({ id: c.id, plots: ctx.plots.map((t) => t.id).sort(), ...(ctx.tab && { tab: ctx.tab.id }) });
   return () => runs.forEach(([c, run]) => (c.run = run));
 }
 
@@ -163,7 +176,7 @@ describe('a plot command', () => {
       page.ws.selection.only([page.ids[0]]);
       await settle();
       // An origin made on a plot is opened on the first plot and on the last, the spectrum, as some controls are a time plot's or a spectrum's alone.
-      for (const [name, open] of [...Object.entries(ON_PLOT), ...Object.entries(ON_PAGE)]) {
+      for (const [name, open] of Object.entries(ORIGINS)) {
         for (const k of ON_PLOT[name] ? [0, 3] : [0]) {
           // An origin that opens by command is opened for each.
           for (const c of open.length > 2 ? COMMANDS : [null]) {
@@ -187,9 +200,9 @@ describe('a plot command', () => {
           const kinds = (list) => list.filter((p) => !c.kinds || c.kinds.includes(page.ws.plots[p].kind)).sort();
           // The rules, worked out here from the selection alone.
           const fromPlot = kinds(picked.includes(on) ? picked : [on]);
-          const fromPage = kinds(picked.length ? picked : c.scope === 'view' ? ids : []);
-          /** Makes an origin's gesture, `act`, on the selection, and checks that the command ran once on `want`, or with none and not `empty`, not at all. */
-          const check = async (origin, want, act) => {
+          const fromPage = c.scope === 'tab' ? [] : kinds(picked.length ? picked : c.scope === 'view' ? ids : []);
+          /** Makes an origin's gesture, `act`, on the selection, and checks that the command ran once on `want`, a tab command on the open tab or with `onLast` on the last, or with none and not `empty`, not at all. */
+          const check = async (origin, want, act, onLast = false) => {
             await closeAll();
             // The palette, closed, fades out over the page, and takes every press until it has gone.
             expect(await until(() => !document.querySelector('[data-slot=dialog-overlay]'), 2000), `the palette gone before ${id} from ${origin}`).toBe(true);
@@ -202,23 +215,23 @@ describe('a plot command', () => {
             if (made === false) return;
             await until(() => calls.length, 300);
             await settle();
-            const runsWith = want.length || c.empty ? [{ id, plots: want }] : [];
+            const runsWith = want.length || c.empty ? [{ id, plots: want, ...(c.scope === 'tab' && { tab: onLast ? page.ws.tabs.at(-1).id : page.ws.activeId }) }] : [];
             expect(calls, `${id} from ${origin}, made on ${k} with ${picks} selected`).toEqual(runsWith);
             reached.get(id).add(origin);
           };
           for (const name of offers.get(id)) {
-            const open = ON_PLOT[name] ?? ON_PAGE[name];
             await check(name, ON_PLOT[name] ? fromPlot : fromPage, async () => {
-              const el = await open(page, on, id);
+              const el = await ORIGINS[name](page, on, id);
               const control = naming(el, id)[0];
               // A control the plot shows only for some plots, as a time axis's pause, is not this plot's; nor is a signal's row the menu has only for some selections.
               if (!control) return false;
               await make(control, () => calls.length > 0);
-            });
+            }, !!ON_TAB[name]);
           }
           const key = keyOf(c);
-          // A key of the Signals list is pressed there, on a signal a click picked.
-          if (key) await check('its key', fromPage, async () => (c.place === 'list' && (await clickOn(listSignals()[0])), pressKey(key)));
+          // A key of the Signals list is pressed there, on a signal a click picked; a tab's, with focus on the last tab.
+          const before = { list: () => clickOn(listSignals()[0]), tabs: () => lastTab().focus() }[c.place];
+          if (key) await check('its key', fromPage, async () => (await before?.(), pressKey(key)), c.place === 'tabs');
           if (c.palette) {
             await check('the palette', fromPage, async () => {
               await pressKey('Control+k');
