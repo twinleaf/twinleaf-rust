@@ -1,6 +1,7 @@
 // Device writes on the whole page (round 2, Device writes #1 to #6): a
 // write from the edit bar shows a notice that offers Revert; Ctrl+Z never
-// writes to a device; Revert puts back the old value where the device
+// writes to a device, and while Revert is offered takes back no edit made
+// before the write, but says to use Revert; Revert puts back the old value where the device
 // still shows the value written and says which device it left; Revert goes
 // when a device reconnects; a Revert answered late gives way to a write
 // started after it; a device that refuses is named, with why, first; and
@@ -9,7 +10,9 @@
 // pressed with the real mouse, and the field typed into from the keyboard.
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
-import { clickOn, frames, mountPage, pressKey, typeInto, wait } from './harness/page.js';
+import { centre, clickOn, frames, mountPage, pressKey, typeInto, wait } from './harness/page.js';
+import { REVERT_MS } from '../src/lib/writes.svelte.js';
+import { USE_REVERT } from '../src/lib/words.js';
 
 const RPCS = [
   { name: 'gain', channel: 'setting', value: 5 },
@@ -57,6 +60,40 @@ describe('a write to devices', () => {
       expect(noticeText()).toContain('Put gain back to 5');
       expect(noticeText()).toContain('test (/1) changed since; left at 7');
       expect(notices().some((t) => button(t, 'Revert'))).toBe(false);
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('keeps Ctrl+Z from an edit made before it while Revert is offered: Ctrl+Z says to use Revert and marks it, and once Revert has gone, takes the edit back', async () => {
+    const page = await mountPage([['sine.sine'], []], 'columns', 0, [], RPCS, { routes: ROUTES });
+    try {
+      page.history.group('Resize', () => page.ws.setRatio('', 0.3));
+      flushSync();
+      const resized = page.ws.layout;
+      await writeRow('gain', '10');
+      expect(button(notices()[0], 'Revert')).toBeTruthy();
+      document.activeElement?.blur();
+      await pressKey('Control+z');
+      await settle();
+      expect(page.ws.layout, 'nothing undone').toBe(resized);
+      expect(page.history.undoLabel).toBe('Resize');
+      expect(page.hub.calls.length, 'nothing written').toBe(1);
+      // The write's notice says so, and marks its Revert, which nothing covers.
+      const notice = notices().find((t) => button(t, 'Revert'));
+      expect(notice.textContent).toContain(USE_REVERT);
+      expect(button(notice, 'Revert').classList.contains('pointed'), 'Revert marked').toBe(true);
+      const revert = button(notice, 'Revert');
+      expect(revert.contains(document.elementFromPoint(...centre(revert))), 'Revert is what the pointer hits').toBe(true);
+      // Revert goes after REVERT_MS: Ctrl+Z takes the edit back.
+      await wait(REVERT_MS + 100);
+      await settle();
+      expect(notices().some((t) => button(t, 'Revert')), 'Revert gone').toBe(false);
+      await pressKey('Control+z');
+      await settle();
+      expect(page.ws.layout, 'the resize undone').not.toBe(resized);
+      expect(page.history.undoLabel).toBe(null);
+      expect(noticeText()).toContain('Undo: Resize');
     } finally {
       page.dispose();
     }

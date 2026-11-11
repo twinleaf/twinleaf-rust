@@ -15,7 +15,9 @@
 // write or Revert starts, and when a device written disconnects or
 // reconnects, or the hub does. A run of actions reports with a notice of
 // its own, with no Revert. Nothing here is an undo step: Ctrl+Z never
-// writes to a device. What the notices say is words.js's.
+// writes to a device. Nor does it take back, while a write's Revert is
+// offered, an edit made before that write: the write's notice says to use
+// Revert, which it marks (`undo`). What the notices say is words.js's.
 
 import { SvelteMap } from 'svelte/reactivity';
 import { sameShown } from './properties.js';
@@ -28,6 +30,8 @@ export const REVERT_MS = 10_000;
 export const NOTICE_MS = 5_000;
 /** How long a cell shows that a call took, in ms. */
 export const OK_MS = 1500;
+/** How long Revert is marked after a Ctrl+Z it answers, in ms. */
+export const POINT_MS = 1500;
 
 const key = (route, name) => `${route}\u0000${name}`;
 /** Value `v` as a write sends it. */
@@ -168,8 +172,16 @@ class TimedNotice {
 export class DeviceWrites {
   /** The cells of the hub's session, or null before any. */
   #cells = $state.raw(null);
-  /** What Revert puts back: {session, rows, toggle, entries}, each entry {device, connections, name, old, wrote}. */
+  /**
+   * What Revert puts back: {session, rows, toggle, entries, edits, held},
+   * each entry {device, connections, name, old, wrote}, `edits` the steps
+   * undo could take back as the write started, and `held` whether a Ctrl+Z
+   * took nothing back since.
+   */
   #offer = $state.raw(null);
+  /** Whether Revert is marked, for POINT_MS after a Ctrl+Z that took nothing back. */
+  pointed = $state(false);
+  #pointing = null;
   /** The number of the write or Revert started last, whose notice shows. */
   #latest = 0;
   #notice;
@@ -180,11 +192,13 @@ export class DeviceWrites {
    * anew, `close()` takes it away, and `report(level, text, detail)` shows
    * a run's report as a notice of its own. `checked(route)` says whether
    * the panels show the device at `route`, as Revert writes to no other.
+   * `edits()` gives the steps undo can take back, History's `undos`.
    */
-  constructor(hub, present, { checked = () => true } = {}) {
+  constructor(hub, present, { checked = () => true, edits = () => [] } = {}) {
     this.hub = hub;
     this.present = present;
     this.checked = checked;
+    this.edits = edits;
     this.#notice = new TimedNotice(present, () => (this.#offer = null));
   }
 
@@ -247,7 +261,7 @@ export class DeviceWrites {
   async write(edits, text, toggle = false) {
     edits = edits.filter((e) => e.devices.length);
     if (!edits.length) return;
-    const session = this.hub.session, cells = this.#now(), mine = this.#begin();
+    const session = this.hub.session, cells = this.#now(), mine = this.#begin(), steps = this.edits();
     const before = edits.flatMap((e) => e.devices.map((d) => ({ device: d, connections: d.connections, name: e.name, old: cells.settled(d, e.name) })));
     const at = (r) => before.find((b) => b.device.route === r.route && b.name === r.name);
     const results = (await Promise.all(edits.map((e) => cells.call(this.hub, e.name, text, e.devices, true)))).flat().map((r) => ({ ...r, label: words.device(at(r).device) }));
@@ -258,9 +272,14 @@ export class DeviceWrites {
     const olds = unique(entries.map((e) => asText(e.old)));
     const was = edits.length === 1 && entries.length === ok.length && olds.length === 1 ? entries[0].old : undefined;
     const rows = edits.map((e) => e.name);
-    this.#offer = entries.length && session === this.hub.session ? { session, rows, toggle, entries } : null;
+    this.#offer = entries.length && session === this.hub.session ? { session, rows, toggle, entries, edits: steps, held: false } : null;
     const revert = !!this.#offer;
     this.#notice.show({ ...words.wrote({ rows, toggle, value: text, results, was, unknownOld, revert }), revert }, revert ? REVERT_MS : NOTICE_MS);
+  }
+
+  /** What the notice says of Ctrl+Z, while Revert can be pressed and a Ctrl+Z took nothing back since the write: to use Revert. Else null. */
+  get useRevert() {
+    return this.canRevert && this.#offer.held ? words.USE_REVERT : null;
   }
 
   /** Whether Revert is offered and can put the last write back: every device it wrote is connected as it was then. */
@@ -338,6 +357,28 @@ export class DeviceWrites {
     if (!done.length) return;
     const n = words.ran({ names, done, devices: reached.size });
     this.present.report(n.level, n.text, n.detail);
+  }
+
+  /**
+   * Ctrl+Z, whose `take()` takes back the last edit, `step` (or none), and
+   * returns its label. While the last write's Revert is offered, Ctrl+Z
+   * takes back no edit made before that write: when `step` is none or one
+   * undo could take back as the write started, nothing is taken back, the
+   * write's notice says to use Revert (`useRevert`) until a Ctrl+Z takes
+   * something back, Revert is marked for POINT_MS, and it returns {held:
+   * true}. Otherwise it returns {label},
+   * what `take()` returned. A step made after the write, or brought back
+   * by redo since, is taken back as ever, and so is any once Revert has
+   * gone.
+   */
+  undo(step, take) {
+    const holds = this.canRevert && (!step || this.#offer.edits.includes(step));
+    if (this.#offer && this.#offer.held !== holds) this.#offer = { ...this.#offer, held: holds };
+    if (!holds) return { label: take() };
+    this.pointed = true;
+    clock.cancel(this.#pointing);
+    this.#pointing = clock.after(POINT_MS, () => (this.pointed = false));
+    return { held: true };
   }
 
   /** The pointer came onto the notice, `on`, or left it: while it is on, the notice stays. */

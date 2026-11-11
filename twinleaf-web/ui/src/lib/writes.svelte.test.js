@@ -13,7 +13,12 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 import { Session } from './session.svelte.js';
-import { DeviceWrites, NOTICE_MS, REVERT_MS } from './writes.svelte.js';
+import { DeviceWrites, NOTICE_MS, POINT_MS, REVERT_MS } from './writes.svelte.js';
+import { History } from './history.svelte.js';
+import { Workspace } from './workspace.svelte.js';
+import { Favorites } from './favorites.svelte.js';
+import { makeTab } from './tabs.js';
+import { USE_REVERT } from './words.js';
 import * as clock from './clock.js';
 
 /** The virtual clock a test runs on. */
@@ -339,5 +344,109 @@ describe('device writes, against a model of them', () => {
     await w.run(['save', 'reboot'], all);
     expect(reports.at(-1)).toEqual({ level: 'error', text: 'Could not run save', detail: ['dev (/2) refused: no such RPC', 'Nothing was sent to the 2 other devices', 'Not run: reboot'] });
     expect(w.notice).toBe(null);
+  });
+});
+
+// Ctrl+Z right after a write (round 2, Device writes #1): random runs of
+// edits of the page (a star turned), writes (of a row whose old value is
+// known, which offer Revert, or of one whose old value is not, which offer
+// none), time passing, Ctrl+Z, redo and Revert. The model numbers every
+// act, and says each step on the undo stack was put there by the act that
+// made it or brought it back by redo. Ctrl+Z takes back the last step
+// exactly when Revert is not offered, or that step was put there after the
+// last write; else it takes back nothing, and the write's notice says to
+// use Revert, which it marks. It never does both, and the notice says so
+// only while Revert is offered.
+describe('Ctrl+Z after a write', () => {
+  const NAMES = ['a', 'b', 'c'];
+  const step = fc.oneof(
+    { weight: 3, arbitrary: fc.record({ t: fc.constant('edit'), name: fc.constantFrom(...NAMES) }) },
+    { weight: 2, arbitrary: fc.record({ t: fc.constant('write'), known: fc.boolean() }) },
+    { weight: 2, arbitrary: fc.record({ t: fc.constant('wait'), ms: fc.constantFrom(1_000, 4_000, REVERT_MS - 1, REVERT_MS + 1) }) },
+    { weight: 4, arbitrary: fc.record({ t: fc.constant('undo') }) },
+    fc.record({ t: fc.constant('redo') }),
+    fc.record({ t: fc.constant('revert') }),
+  );
+
+  it('takes back an edit exactly when Revert is not offered or the edit came after the write, and else says to use Revert, never both', async () => {
+    const seen = { held: 0, undone: 0, afterWrite: 0, expired: 0, noRevert: 0, empty: 0, redone: 0 };
+    await fc.assert(
+      fc.asyncProperty(fc.array(step, { minLength: 1, maxLength: 30 }), async (acts) => {
+        time = clock.virtual();
+        // gain is announced, so its old value is known; mode is not.
+        const hub = fakeHub(session(Object.fromEntries(ROUTES.map((r) => [r, { gain: 1, level: 1, enable: false }]))));
+        const tab = makeTab('A');
+        const ws = new Workspace({ tabs: [tab], activeId: tab.id });
+        const favorites = new Favorites(null);
+        const history = new History(ws, favorites);
+        const w = new DeviceWrites(hub, { open() {}, close() {}, report() {} }, { edits: () => history.undos });
+        // The model: the undo and redo stacks, each step {name, at}, `at` the act that put it on the undo stack; the last write's act, and until when its Revert is offered.
+        let undos = [], redos = [], n = 0, wrote = -1, until = -Infinity, v = 1;
+        const stars = () => [...favorites.names].sort().join();
+        for (const a of acts) {
+          n++;
+          if (a.t === 'edit') {
+            history.group(`Star ${a.name}`, () => favorites.toggle(a.name));
+            undos.push({ name: a.name, at: n });
+            redos = [];
+          } else if (a.t === 'write') {
+            // A row no device announces and none was written to has no old value known.
+            await w.write([{ name: a.known ? 'gain' : `mode${v}`, devices: [hub.session.devices.get('/0')] }], String(++v));
+            await settled();
+            wrote = n;
+            until = a.known ? clock.now() + REVERT_MS : -Infinity;
+          } else if (a.t === 'wait') {
+            time.advance(a.ms);
+          } else if (a.t === 'revert') {
+            await w.revert();
+            await settled();
+            until = -Infinity;
+          } else if (a.t === 'redo') {
+            const s = redos.pop();
+            history.redo();
+            if (s) (undos.push({ ...s, at: n }), seen.redone++);
+          } else {
+            const offered = clock.now() < until;
+            const top = undos.at(-1);
+            const takes = !offered || (top && top.at > wrote);
+            const before = stars(), steps = history.undos.length;
+            const { label, held } = w.undo(history.undos.at(-1), () => history.undo());
+            expect(!!held && label !== undefined, 'never both').toBe(false);
+            if (takes) {
+              expect([held, w.useRevert], `at ${n}: taken back, and the notice says nothing of Ctrl+Z`).toEqual([undefined, null]);
+              expect(label).toBe(top ? `Star ${top.name}` : null);
+              if (top) {
+                redos.push(undos.pop());
+                expect(stars()).not.toBe(before);
+                seen[!offered ? (wrote < 0 ? 'undone' : until === -Infinity ? 'noRevert' : 'expired') : 'afterWrite']++;
+              } else seen.empty++;
+            } else {
+              expect([held, w.useRevert], `at ${n}: held, and the notice says to use Revert`).toEqual([true, USE_REVERT]);
+              expect([stars(), history.undos.length], 'nothing taken back').toEqual([before, steps]);
+              expect(w.pointed, 'Revert marked').toBe(true);
+              time.advance(POINT_MS);
+              expect(w.pointed, 'for a moment').toBe(false);
+              seen.held++;
+            }
+          }
+          expect(history.undos.map((s) => s.label), 'the undo stack as the model has it').toEqual(undos.map((s) => `Star ${s.name}`));
+          // The notice says to use Revert only while Revert is offered.
+          if (w.useRevert) expect(clock.now() < until, `at ${n}: said only while Revert is offered`).toBe(true);
+        }
+      }),
+      {
+        examples: [
+          // Ctrl+Z with nothing to undo, then an edit taken back with nothing holding, redone, and taken back again.
+          [[{ t: 'undo' }, { t: 'edit', name: 'a' }, { t: 'undo' }, { t: 'redo' }, { t: 'undo' }]],
+          // An edit, a write, Ctrl+Z: held. Past the window: the edit is taken back.
+          [[{ t: 'edit', name: 'a' }, { t: 'write', known: true }, { t: 'undo' }, { t: 'wait', ms: REVERT_MS + 1 }, { t: 'undo' }]],
+          // An edit after the write is taken back; the one before it is not, until Revert is pressed.
+          [[{ t: 'edit', name: 'a' }, { t: 'write', known: true }, { t: 'edit', name: 'b' }, { t: 'undo' }, { t: 'undo' }, { t: 'revert' }, { t: 'undo' }]],
+          // A write with no Revert holds nothing back; a redo after a write is taken back.
+          [[{ t: 'edit', name: 'a' }, { t: 'write', known: false }, { t: 'undo' }, { t: 'write', known: true }, { t: 'redo' }, { t: 'undo' }, { t: 'undo' }]],
+        ],
+      },
+    );
+    for (const [what, k] of Object.entries(seen)) expect(k, what).toBeGreaterThan(0);
   });
 });

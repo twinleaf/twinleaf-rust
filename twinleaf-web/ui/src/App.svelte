@@ -111,13 +111,14 @@
   const drags = new Drags(ws, refreshToolbar, history);
   setContext('selection', selection);
   // What the panels write to devices and run on them, and its notices
-  // (writes.svelte.js). No device write is an undo step, and Revert writes
-  // only to the devices checked in the Devices panel.
+  // (writes.svelte.js). No device write is an undo step, Revert writes
+  // only to the devices checked in the Devices panel, and while it is
+  // offered Ctrl+Z takes back no edit made before the write.
   const writes = new DeviceWrites(hub, {
     open: () => writeNotice.open(),
     close: () => writeNotice.close(),
     report: (level, text, detail) => toast[level](text, [], detail),
-  }, { checked: (route) => !unchecked.has(route) });
+  }, { checked: (route) => !unchecked.has(route), edits: () => history.undos });
   const writeNotice = noticeOf('device-write', WriteNotice, { writes }, () => writes.closed());
   // The notice of device writes, whose Revert writes through this page, goes with it.
   onMount(() => () => writeNotice.close());
@@ -822,9 +823,15 @@
     if (fromKeys) focusPlot(made[0].id);
   }
 
-  /** Takes the last edit back, or with `redo` does it again. A plot's kind it changes is a view step, as the command's is. */
+  /**
+   * Takes the last edit back, or with `redo` does it again. A plot's kind it
+   * changes is a view step, as the command's is. Right after a device write
+   * it may take nothing back, and the write's notice says to use Revert
+   * (writes.svelte.js `undo`).
+   */
   function undo(redo) {
-    const label = viewHistory.edited(() => (redo ? history.redo() : history.undo()));
+    const edited = () => viewHistory.edited(() => (redo ? history.redo() : history.undo()));
+    const { label } = redo ? { label: edited() } : writes.undo(history.undos.at(-1), edited);
     if (label) toast(`${redo ? 'Redo' : 'Undo'}: ${label}`);
     refreshToolbar();
   }

@@ -1,6 +1,7 @@
 // Every word the page says about writing to devices and running their
 // actions: the notice of a write, which says what was set, on how many
-// devices and from what, and what Revert will leave out; the notice of a
+// devices and from what, and what Revert will leave out; what Ctrl+Z says
+// right after a write; the notice of a
 // Revert, which says what it put back and what it left; the report of a
 // run; the question a run of several actions asks first; and the edit
 // bar's labels. A notice is one function of what came back, each device's
@@ -35,6 +36,8 @@ const devicesOf = (results, state) => new Set(results.filter((r) => !state || r.
 
 /** The button that puts a write back. */
 export const REVERT = 'Revert';
+/** What Ctrl+Z says right after a write, while its Revert is offered, as it takes back no edit made before the write. */
+export const USE_REVERT = 'Nothing undone: press Revert to undo the write';
 
 /**
  * What each device made of a call, as lines: the devices that refused,

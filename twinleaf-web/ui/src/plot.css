@@ -644,6 +644,10 @@ label > [data-slot=checkbox]::after { content: none; }
 .write-notice-text { font-weight: 500; }
 .write-notice-detail { color: var(--muted-foreground); font-size: 12px; }
 .write-notice-revert { flex: none; height: 24px; padding: 0 8px; border-radius: 4px; background: var(--normal-text); color: var(--normal-bg); font-size: 12px; font-weight: 500; cursor: pointer; }
+/* What Ctrl+Z says to use, and Revert as it says so: a ring that beats twice. */
+.write-notice-undo { color: var(--normal-text); }
+.write-notice-revert.pointed { background: var(--primary); color: var(--primary-foreground); animation: revert-pointed 600ms ease-in-out 2; }
+@keyframes revert-pointed { 50% { box-shadow: 0 0 0 4px color-mix(in oklch, var(--primary) 40%, transparent); } }
 
 /* The device picker. */
 .picker { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
