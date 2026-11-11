@@ -356,23 +356,47 @@
   const monitor = $derived(monitorOf(size, plot.mode, plot.items.filter((i) => session.trace(i.key)).length));
 
   /**
+   * The row of chips as last measured, for the dashes under it while it runs
+   * past an edge: whether it does, where the strip of dashes lies in the
+   * header (its content box, `left` and `width` in px), and the ids of the
+   * chips out of view: not wholly in the row, nor, wider than the row,
+   * filling it.
+   */
+  let chipRow = $state.raw({ over: false, left: 0, width: 0, out: new Set() });
+  /** A dash under the row of chips, in px: its full width, its least, and the gap between two. */
+  const DASH = { w: 14, min: 4, gap: 3 };
+  /** How far in from an edge of the row, at most, a chip brought into view by its dash comes to rest: clear of the fade there. */
+  const REVEAL_CLEAR = 24;
+
+  /**
    * Marks a row of chips that runs past either edge, for the fade there, and
    * turns the wheel into a sideways scroll over it. The row is one line high
-   * however many signals it holds.
+   * however many signals it holds. While it runs past an edge, `chipRow`
+   * follows it as it scrolls, resizes and its chips change.
    */
   function overflowEdges(node) {
     const mark = () => {
       node.classList.toggle('more-left', node.scrollLeft > 1);
       node.classList.toggle('more-right', node.scrollLeft + node.clientWidth < node.scrollWidth - 1);
+      const over = node.scrollWidth > node.clientWidth + 1, pad = parseFloat(getComputedStyle(node).paddingLeft) || 0;
+      const box = node.getBoundingClientRect(), out = new Set();
+      if (over)
+        for (const c of node.querySelectorAll(':scope > .trace-chip')) {
+          const r = c.getBoundingClientRect();
+          if (!shows(r, box)) out.add(c.id);
+        }
+      chipRow = { over, left: node.offsetLeft + pad, width: node.clientWidth - 2 * pad, out };
     };
     const wheel = (e) => {
       if (node.scrollWidth <= node.clientWidth || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
       e.preventDefault();
       node.scrollLeft += e.deltaY;
     };
+    // The row's own size, its header's, and each chip's, as a value or a name changes its width.
     const sizing = new ResizeObserver(mark);
-    sizing.observe(node);
-    const chips = new MutationObserver(mark);
+    const watch = () => [node, node.parentElement, ...node.children].forEach((el) => el && sizing.observe(el));
+    watch();
+    const chips = new MutationObserver(() => (watch(), mark()));
     chips.observe(node, { childList: true });
     node.addEventListener('scroll', mark, { passive: true });
     node.addEventListener('wheel', wheel, { passive: false });
@@ -384,6 +408,24 @@
         node.removeEventListener('wheel', wheel);
       },
     };
+  }
+
+  /** Whether a chip at client box `r` is in view in a row at `box`: wholly in it, or, wider than the row, filling it. */
+  const shows = (r, box) => (r.left >= box.left - 0.5 && r.right <= box.right + 0.5) || (r.left <= box.left + 0.5 && r.right >= box.right - 0.5);
+
+  /**
+   * Scrolls the row of chips just far enough that chip `id` is wholly in
+   * view, clear of the fade at the edge when the row has room; a chip wider
+   * than the row comes to its start.
+   */
+  function reveal(id) {
+    const c = document.getElementById(`chip-${id}`);
+    if (!c || !zone) return;
+    const r = c.getBoundingClientRect(), box = zone.getBoundingClientRect();
+    const clear = Math.max(0, Math.min(REVEAL_CLEAR, (box.width - r.width) / 2));
+    if (r.width >= box.width) zone.scrollLeft += r.left - box.left;
+    else if (r.left < box.left + clear) zone.scrollLeft -= box.left + clear - r.left;
+    else if (r.right > box.right - clear) zone.scrollLeft += r.right - (box.right - clear);
   }
 
   // Whether the plot's view streams, for its play and pause button, and its window, for the time axis's window field.
@@ -802,6 +844,29 @@
           </div>
         {/snippet}
       </ContextMenu.Trigger>
+      <!-- While the row runs past an edge: a dash per signal under it, in its
+           colour and in its order, dim while its chip is out of view, as many
+           as there are signals. The dashes share the row's width, down to a
+           least width each, past which the strip fades at its end. A click
+           brings the dash's chip into view. It lies over the header's foot,
+           so it takes no room. -->
+      {#if chipRow.over}
+        {@const crowded = zoneItems.length * (DASH.min + DASH.gap) - DASH.gap > chipRow.width}
+        <div class="chip-dashes" class:crowded role="group" aria-label="Signals in this plot, in view or not" style="left:{chipRow.left}px;width:{chipRow.width}px;gap:{DASH.gap}px">
+          {#each zoneItems as item (item.id)}
+            <button
+              class="chip-dash"
+              class:out={chipRow.out.has(`chip-${item.id}`)}
+              class:hidden-signal={item.hidden}
+              data-key={item.key}
+              tabindex="-1"
+              aria-label="Show {item.key}"
+              style="--c:{colorFor(item.key)};flex-basis:{DASH.w}px;min-width:{DASH.min}px"
+              onclick={() => reveal(item.id)}
+            ></button>
+          {/each}
+        </div>
+      {/if}
       <ContextMenu.Content class={menuChip ? 'menu-icons' : 'menu-icons w-64'}>
         {#if menuChip}
           {@render signalMenu(menuChip, () => (signalsOpen = false))}

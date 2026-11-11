@@ -288,6 +288,16 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .trace-zone.more-right { mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent); }
 .trace-zone.more-left { mask-image: linear-gradient(to left, #000 calc(100% - 24px), transparent); }
 .trace-zone.more-left.more-right { mask-image: linear-gradient(to right, transparent, #000 24px, #000 calc(100% - 24px), transparent); }
+/* Under a row that runs past an edge, a dash per signal in its colour, dim
+   while its chip is out of view, on the header's foot below the chips. Each
+   is a 4 px band to press, its 2 px dash drawn in the middle. Too many to
+   fit at their least width, the strip fades at its end. */
+.chip-dashes { position: absolute; top: 24px; height: 4px; display: flex; overflow: hidden; }
+.chip-dashes.crowded { mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent); }
+.chip-dash { flex: 0 1 auto; height: 4px; padding: 0; border: 0; background: none; cursor: pointer; }
+.chip-dash::after { content: ''; display: block; height: 2px; margin-top: 1px; border-radius: 1px; background: var(--c); }
+.chip-dash.out::after { opacity: 0.25; }
+.chip-dash.hidden-signal { opacity: 0.45; }
 .trace-empty { color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
 .trace-chip { flex: none; display: inline-flex; align-items: baseline; gap: 5px; height: 20px; font: 11px/20px var(--font-data); white-space: nowrap; color: var(--foreground); cursor: grab; user-select: none; }
 .trace-chip .name { max-width: 18ch; overflow: hidden; text-overflow: ellipsis; }
