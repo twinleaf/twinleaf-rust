@@ -834,6 +834,7 @@ describe('a live plot drawn frame after frame', () => {
     const drawn = { lane: null, draws: [] };
     const renderer = {
       dpr,
+      grid: () => dpr,
       ring: () => ({ base: 0 }),
       lane: (rect, base, x0, x1) => ((drawn.lane = { x0, x1, width: Math.round(rect.w * dpr) }), true),
       drawTrace: (src, ring, a0, a1) => drawn.draws.push({ src, a0, a1 }),

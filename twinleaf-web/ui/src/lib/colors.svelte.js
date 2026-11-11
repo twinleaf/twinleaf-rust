@@ -17,6 +17,8 @@ export class Colors {
   picked = $state({});
   /** Signal key to the colour last picked for it, which unticking Automatic goes back to. */
   last = $state({});
+  /** The look the colours are drawn in: true dark, false light, null the page's (plot.js `theme`). */
+  dark = $state(null);
 
   /** `storage` is where the colours are kept, as localStorage; none keeps them for this page alone. */
   constructor(storage) {
@@ -31,10 +33,10 @@ export class Colors {
     }
   }
 
-  /** A Colors with the colours as they are here now, kept nowhere: a colour picked on it changes it alone. */
+  /** A Colors with the colours as they are here now, in the same look, kept nowhere: a colour picked on it, or a look given it, changes it alone. */
   copy() {
     const c = new Colors(null);
-    Object.assign(c, { given: { ...this.given }, picked: { ...this.picked }, last: { ...this.last } });
+    Object.assign(c, { given: { ...this.given }, picked: { ...this.picked }, last: { ...this.last }, dark: this.dark });
     return c;
   }
 

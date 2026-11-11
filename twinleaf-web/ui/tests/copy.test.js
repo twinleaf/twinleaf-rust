@@ -17,6 +17,14 @@
 // - Taking the stage down and ending the copy leaves nothing of them: no
 //   picker, no PlotView, no GL context, no window read, no hold on the
 //   hub, no listener on its view, no frame drawn.
+// - Shown at a scale, as a preview, a stage gives the picture its size and
+//   pixel ratio ask for, the same as at its own size, and shows that
+//   picture's layout: the same ticks and labels, finer or coarser.
+// - A picture holds what the page lays over the plot, its legend, where it
+//   shows, and never the hover's line, tip or values; with a figure, the
+//   figure's bands about the plot on its background, in the look its
+//   colours are drawn in. A size past the browser's largest canvas is
+//   refused, with why. A copy drawn small is never a monitor.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { commands, page as browser } from 'vitest/browser';
 import { flushSync, mount, unmount } from 'svelte';
@@ -25,7 +33,9 @@ import { centre, closeAll, feed, focusPage, frames, holdHistory, leafOf, mountPa
 import { plotIds } from '../src/lib/layout.js';
 import { COMMANDS, HOSTED } from '../src/lib/commands.js';
 import { SAVE_KEY } from '../src/lib/tabs.js';
-import { theme } from '../src/lib/plot.js';
+import { monitorOf, theme } from '../src/lib/plot.js';
+import { bandsOf } from '../src/lib/figure.js';
+import { prefs } from '../src/lib/prefs.svelte.js';
 import { colors } from '../src/lib/colors.svelte.js';
 
 /** Where VITE_TL_SHOTS names a folder, relative to this file, the screenshots go there. */
@@ -46,10 +56,10 @@ afterEach(() => {
   page = null;
 });
 
-/** Shows plot `host.id` of copy `host` on a stage `width` by `height` px at `pixelRatio`, at (`left`, `top`) of the page; `resize(to)` gives it another size or pixel ratio, and `end()` takes it down. */
-async function stage(host, { width, height, pixelRatio = 1, left = 8, top = 8 }) {
+/** Shows plot `host.id` of copy `host` on a stage `width` by `height` px at `pixelRatio`, at (`left`, `top`) of the page, with the `scale`, `screenRatio` and `figure` of `more` (PlotStage.svelte); `resize(to)` gives it another size, pixel ratio, scale or figure, and `end()` takes it down. */
+async function stage(host, { width, height, pixelRatio = 1, left = 8, top = 8, ...more }) {
   const target = document.body.appendChild(document.createElement('div'));
-  const app = mount(Stage, { target, props: { host, id: host.id, width, height, pixelRatio, left, top } });
+  const app = mount(Stage, { target, props: { host, id: host.id, width, height, pixelRatio, left, top, ...more } });
   const s = { el: null, ended: false, resize: (to) => app.resize(to), end: () => !s.ended && ((s.ended = true), unmount(app), target.remove()) };
   staged.push(s);
   await settle(6);
@@ -331,5 +341,126 @@ describe('a paused copy of a plot, on a stage of its own', () => {
     await settle();
     expect(page.hub.holding, 'the history let go once the copy has gone').toBe(false);
     expect(session.reads.has(copy.id) || session.windows.has(copy.id), 'the copy’s windows and reads').toBe(false);
+  });
+});
+
+describe('a picture of a paused copy', () => {
+  /** The page with one plot of SIGNALS, fed and paused, and a copy of it. */
+  async function copied() {
+    page = await mountPage([SIGNALS], 'grid', 0, SIGNALS);
+    quietApi();
+    feed(page.hub, 30);
+    await settle();
+    const [id] = plotIds(page.ws.layout);
+    page.plots.commands.run('pause', { on: id });
+    await focusPage();
+    await settle(6);
+    return { id, copy: page.plots.copy(id) };
+  }
+  /** The tick labels plot `pv` drew last, each its text and place across and down its body, in CSS px. */
+  const ticks = (pv) => pv.tickLabels.map((t) => `${t.text}@${Math.round(t.x - pv.drawnOn.x)},${Math.round(t.y - pv.drawnOn.y)}`);
+  afterEach(() => copies.splice(0).forEach((c) => c.dispose()));
+  const copies = [];
+
+  it('is the size and the layout asked for, however small the stage shows it', async () => {
+    const { copy } = await copied(), size = { width: 640, height: 360, pixelRatio: 2 };
+    copies.push(copy);
+    const whole = await stage(copy, size);
+    const full = copy.picture(copy.id), fullTicks = ticks(copy.pv(copy.id));
+    whole.end();
+    await settle(4);
+    // Shown at a quarter, on a screen of one device pixel a CSS px.
+    const shown = await stage(copy, { ...size, scale: 1 / 4, screenRatio: 1 });
+    const el = shown.el.querySelector('.stage-shown'), r = el.getBoundingClientRect();
+    expect([r.width, r.height], 'the stage shown at a quarter').toEqual([160, 90]);
+    expect([el.width, el.height], 'its canvas at a quarter').toEqual([160, 90]);
+    expect(ticks(copy.pv(copy.id)), 'the ticks and labels of the stage shown at a quarter').toEqual(fullTicks);
+    expect(shown.el.querySelector('.plot-body').getBoundingClientRect().width, 'its plot laid out at its own size').toBe(640);
+    const picture = copy.picture(copy.id);
+    expect([picture.width, picture.height], 'the picture at its size and ratio').toEqual([1280, 720]);
+    expect(differing(picture, full), 'pixels that differ from the stage’s at its own size').toBe(0);
+    // The canvas shown is the picture at a quarter.
+    const remove = sideBySide(el, picture);
+    await frames(2);
+    await shot('copy-shown-at-a-quarter');
+    remove();
+    const a = pixels(el), small = document.createElement('canvas');
+    [small.width, small.height] = [el.width, el.height];
+    small.getContext('2d').drawImage(picture, 0, 0, el.width, el.height);
+    const b = pixels(small);
+    let sum = 0;
+    for (let i = 0; i < a.data.length; i++) sum += Math.abs(a.data[i] - b.data[i]);
+    expect(sum / a.data.length, 'the mean difference of a channel, of 255, between the canvas shown and the picture scaled to it').toBeLessThan(6);
+  });
+
+  it('holds the legend where it shows, and never the hover’s line, tip or values', async () => {
+    const { id, copy } = await copied();
+    copies.push(copy);
+    // On the page: the pointer over the plot draws its hover; its picture is the one with the pointer away.
+    const still = page.plots.picture(id), body = leafOf(id).querySelector('.plot-body').getBoundingClientRect();
+    await commands.mouse([['move', body.left + body.width * 0.5, body.top + body.height * 0.4]]);
+    await settle(6);
+    expect(page.pv(id).hover, 'the pointer over the plot').toBeTruthy();
+    expect(differing(page.plots.picture(id), still), 'pixels of the picture the hover changes').toBe(0);
+    expect(page.pv(id).hover, 'the hover kept for the next frame').toBeTruthy();
+    await focusPage();
+    // The copy's legend, by its command: in the picture, where the stage shows it.
+    const s = await stage(copy, { width: 500, height: 300, pixelRatio: 1 });
+    const bare = copy.picture(copy.id);
+    copy.commands.run('legend', { on: copy.id });
+    await settle(6);
+    const legend = s.el.querySelector('.pinned-legend').getBoundingClientRect(), at = copy.pv(copy.id).drawnOn;
+    expect(s.el.querySelector('.pinned-legend .val'), 'a bare legend has no values').toBe(null);
+    const withLegend = copy.picture(copy.id), pa = pixels(withLegend).data, pb = pixels(bare).data;
+    let inside = 0, outside = 0;
+    for (let y = 0; y < withLegend.height; y++)
+      for (let x = 0; x < withLegend.width; x++) {
+        const i = (y * withLegend.width + x) * 4, changed = Math.abs(pa[i] - pb[i]) + Math.abs(pa[i + 1] - pb[i + 1]) + Math.abs(pa[i + 2] - pb[i + 2]) > 3 * SAME;
+        const over = x >= legend.left - at.x - 1 && x <= legend.right - at.x + 1 && y >= legend.top - at.y - 1 && y <= legend.bottom - at.y + 1;
+        if (changed) over ? inside++ : outside++;
+      }
+    expect(inside, 'pixels the legend changes within its box').toBeGreaterThan((legend.width * legend.height) / 4);
+    expect(outside, 'pixels it changes outside its box').toBe(0);
+  });
+
+  it('with a figure, is the figure’s bands about the plot, in the look its colours are drawn in', async () => {
+    const { copy } = await copied();
+    copies.push(copy);
+    const figure = { title: 'A title', xLabel: 'Time', caption: { left: 'a device', right: 'a time' } };
+    const s = await stage(copy, { width: 480, height: 320, pixelRatio: 2, figure });
+    const plain = s.el.querySelector('.plot-body').getBoundingClientRect(), bands = bandsOf(figure, 480);
+    expect(plain.height, 'the plot takes the room the bands leave').toBeCloseTo(320 - bands.top - bands.bottom, 6);
+    const picture = copy.picture(copy.id, { figure });
+    expect([picture.width, picture.height], 'the figure’s size at its ratio').toEqual([960, 640]);
+    const p = picture.getContext('2d').getImageData(0, 0, 960, Math.round(bands.top * 2)).data, bg = theme().bgRgba.map((v) => Math.round(v * 255));
+    let text = 0;
+    for (let i = 0; i < p.length; i += 4) if (Math.abs(p[i] - bg[0]) > CHANNEL_TOLERANCE || Math.abs(p[i + 1] - bg[1]) > CHANNEL_TOLERANCE) text++;
+    expect(text, 'the title’s pixels in its band').toBeGreaterThan(100);
+    expect(p[3], 'the band on the plot’s background, opaque').toBe(255);
+    // In the other look: the background and the traces in its colours.
+    copy.colors.dark = !prefs.dark;
+    await settle(6);
+    const other = copy.picture(copy.id, { figure }), look = theme(!prefs.dark);
+    const corner = other.getContext('2d').getImageData(1, 1, 1, 1).data;
+    expect([...corner.slice(0, 3)], 'the other look’s background').toEqual(look.bgRgba.slice(0, 3).map((v) => Math.round(v * 255)));
+    for (const key of SIGNALS) expect(coloured(other, look.tracesRgba[copy.colors.of(key)]), `${key} in the other look`).toBeGreaterThan(150);
+    expect(s.el.querySelector('.stage-box').classList.contains(prefs.dark ? 'light' : 'dark'), 'what the page lays over it in that look').toBe(true);
+    const remove = sideBySide(picture, other);
+    await frames(2);
+    await shot('copy-figure-both-looks');
+    remove();
+  });
+
+  it('is refused past the browser’s largest canvas, and a copy drawn small is never a monitor', async () => {
+    const { copy } = await copied();
+    copies.push(copy);
+    const s = await stage(copy, { width: 300, height: 140, pixelRatio: 1 });
+    expect(copy.pictureRefused(copy.id, { width: 300, height: 140, ratio: 1 }), 'its own size').toBe(null);
+    expect(copy.pictureRefused(copy.id, { width: 100_000, height: 140, ratio: 1 }), 'too wide').toBe('Too large for this browser');
+    expect(copy.pictureRefused(copy.id, { width: 20_000, height: 20_000, ratio: 1 }), 'too many pixels').toBe('Too large for this browser');
+    // 300 by 140 is a monitor's size on the page, where its header floats over the plot.
+    expect(monitorOf({ width: 300, height: 140 }, 'overlay', SIGNALS.length), 'a monitor’s size').toBe(true);
+    expect(s.el.querySelector('.plot-card').classList.contains('monitor'), 'the copy a monitor').toBe(false);
+    expect(copy.pv(copy.id).geo.head, 'a header the plot makes room for').toBe(-Infinity);
   });
 });

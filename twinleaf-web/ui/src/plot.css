@@ -4,11 +4,16 @@ html { overflow: hidden; }
 html, body { height: 100%; margin: 0; background: var(--background); color: var(--foreground); }
 .gl-layer { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 0; }
 /* A stage (PlotStage.svelte): one plot, bare, over a canvas of its own that
-   fills the stage. Its body is the whole stage: no header and no border. */
-.plot-stage { position: relative; display: flex; flex: none; }
-.plot-stage > .stage-gl { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-.plot-stage > .plot-card { border: 0; }
+   fills its box. Its body is the whole box: no header and no border. Shown
+   at a scale, the box is laid out apart, cut from sight and from the
+   pointer by a room of no size, and the stage shows its picture. */
+.plot-stage { position: relative; flex: none; }
+.plot-stage .stage-box { position: relative; display: flex; }
+.plot-stage .stage-box > .stage-gl { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.plot-stage .stage-box > .plot-card { flex: 1; border: 0; }
 .plot-stage .plot-head { display: none; }
+.plot-stage.apart > .stage-room { position: absolute; left: 0; top: 0; width: 0; height: 0; overflow: hidden; }
+.plot-stage > .stage-shown { display: block; }
 /* The page is controls, not text: nothing but fields and readouts selects,
    so a click or drag never starts the browser's text selection or its menu. */
 .app { position: relative; z-index: 1; display: flex; flex-direction: column; height: 100vh; user-select: none; }

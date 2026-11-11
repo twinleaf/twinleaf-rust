@@ -118,9 +118,17 @@ export function axisSlots(keys, sides = {}) {
  * seconds as the time of day, any other in the source's own seconds. Each
  * reads the same from visit to visit, as the time is the device's.
  * `ticks(x0, x1, n)` gives about n tick times, `label(t)` a tick's label,
- * and `readout(t)` a time to the millisecond.
+ * and `readout(t)` a time to the millisecond. With an `origin`, any
+ * timescale reads as the seconds from that time.
  */
-export function timeAxis(epoch) {
+export function timeAxis(epoch, origin = null) {
+  if (origin !== null) {
+    return {
+      ticks: (x0, x1, n) => scaleLinear().domain([x0 - origin, x1 - origin]).ticks(n).map((v) => v + origin),
+      label: (t) => `${+(t - origin).toFixed(6)} s`,
+      readout: (t) => `${(t - origin).toFixed(3)} s`,
+    };
+  }
   if (epoch === 'unix') {
     // To the nearest millisecond: seconds times 1000 can land a hair under a
     // whole millisecond, which a Date would cut down to the one before.
@@ -482,16 +490,23 @@ export function tickTexts(ticks, f, auto, { log = false, hz = false } = {}) {
  * background, also as GL's rgba, the axis text, grid, frame, gap marks,
  * crosshair, the span between cursors, the text on tags, the cursors, the
  * seek strip and the traces, each trace also as GL's rgba. They are kept
- * once every token has a value, until the page turns light or dark
- * (prefs.svelte.js), which a reader in an effect or a template follows. A
- * canvas ignores an empty colour and keeps the last one drawn with, so a
- * token the page has not loaded yet is read again on the next frame.
+ * once every token has a value. `dark` is the look, dark or light, and
+ * by default the page's (prefs.svelte.js), which a reader in an effect or
+ * a template follows; the other look's tokens are those of an element of
+ * class `dark` or `light` (app.css). A canvas ignores an empty colour and
+ * keeps the last one drawn with, so a token the page has not loaded yet is
+ * read again on the next frame.
  */
-let themed = null;
-export function theme() {
-  const dark = prefs.dark;
-  if (themed?.dark !== dark) {
-    const style = getComputedStyle(document.documentElement);
+const themed = new Map();
+export function theme(dark = prefs.dark) {
+  if (!themed.has(dark)) {
+    let probe = null;
+    if (dark !== prefs.dark) {
+      probe = document.body.appendChild(document.createElement('div'));
+      probe.className = dark ? 'dark' : 'light';
+      probe.hidden = true;
+    }
+    const style = getComputedStyle(probe ?? document.documentElement);
     let missing = false;
     const token = (name) => {
       const value = style.getPropertyValue(name).trim();
@@ -503,6 +518,7 @@ export function theme() {
       dark,
       bg: token('--plot-bg'),
       axisText: token('--plot-axis-text'),
+      text: token('--foreground'),
       grid: token('--plot-grid'),
       frame: token('--plot-frame'),
       gap: token('--plot-gap'),
@@ -526,22 +542,23 @@ export function theme() {
       tracesRgba: traces.map(cssRgba),
     };
     read.bgRgba = cssRgba(read.bg);
+    probe?.remove();
     if (missing) return read;
-    themed = read;
+    themed.set(dark, read);
   }
-  return themed;
+  return themed.get(dark);
 }
 /** Each picked colour other than the theme's, as GL's rgba. */
 const customRgba = new Map();
-/** The trace's colour among `from`, a Colors (colors.svelte.js), as it gives it or it was picked. */
+/** The trace's colour among `from`, a Colors (colors.svelte.js), as it gives it or it was picked, in the look its colours are drawn in. */
 export const colorOf = (trace, from) => {
   const c = from.of(trace.key);
-  return typeof c === 'number' ? theme().traces[c] : c;
+  return typeof c === 'number' ? theme(from.dark ?? undefined).traces[c] : c;
 };
 /** The trace's colour among `from`, a Colors, as GL's rgba. */
 const rgbaOf = (trace, from) => {
   const c = from.of(trace.key);
-  if (typeof c === 'number') return theme().tracesRgba[c];
+  if (typeof c === 'number') return theme(from.dark ?? undefined).tracesRgba[c];
   if (!customRgba.has(c)) customRgba.set(c, cssRgba(c));
   return customRgba.get(c);
 };
@@ -752,7 +769,7 @@ export class PlotView {
       const slots = axisSlots(cfg.keys, cfg.sides);
       axes = ['left', 'right'].flatMap((side) => slots[side].map((key, slot) => [key, traces.filter((t) => t.key === key), 0, side, slot]));
     }
-    this.ctx.font = `11px ${theme().dataFont}`;
+    this.ctx.font = `11px ${this.theme().dataFont}`;
     for (const [key, ts, i, side, slot] of axes) {
       const { label } = axisFormat(cfg.yFormat?.[key]), lane = ys[i];
       if (label === 'off' || !ts.length || !lane) continue;
@@ -819,7 +836,30 @@ export class PlotView {
     return st.range;
   }
 
-  draw(perf) {
+  /** The plot's colours, in the look its Colors are drawn in. */
+  theme() {
+    return theme(this.colors.dark ?? undefined);
+  }
+
+  /**
+   * Draws the plot at page time `perf`. A `still` frame is drawn as if no
+   * pointer were on any plot: no hover line, tip or value, and no window
+   * readout, as a picture of the plot has none.
+   */
+  draw(perf, still = false) {
+    if (still) {
+      const kept = { hover: this.hover, axisHover: this.axisHover, specHover: this.specHover, windowUntil: this.windowUntil, t: this.hoverTime.t };
+      Object.assign(this, { hover: null, axisHover: null, specHover: null, windowUntil: -Infinity });
+      this.hoverTime.t = null;
+      try {
+        this.draw(perf);
+      } finally {
+        this.hoverTime.t = kept.t;
+        delete kept.t;
+        Object.assign(this, kept);
+      }
+      return;
+    }
     const r = this.body.getBoundingClientRect();
     // Off screen, collapsed, or hidden behind a maximized plot: draw nothing.
     const shown = this.body.checkVisibility ? this.body.checkVisibility({ visibilityProperty: true }) : true;
@@ -828,7 +868,7 @@ export class PlotView {
     this.sizeOverlay(r);
     if (!visible) return;
     this.drawnOn = body;
-    this.renderer.fill(body, theme().bgRgba);
+    this.renderer.fill(body, this.theme().bgRgba);
     const cfg = this.config();
     const traces = this.traces();
     const geo = this.geometry(body, cfg, traces.length);
@@ -920,9 +960,9 @@ export class PlotView {
 
   drawTime(cfg, traces, geo, body, perf) {
     // The range on the device pixel grid, which everything drawn below uses,
-    // so a live plot scrolls by whole pixels and does not flicker.
-    const dpr = this.renderer.dpr;
-    const [x0, x1] = onPixelGrid(...this.view.range(this.hub.now(perf)), Math.max(1, Math.round(geo.plot.w * dpr)));
+    // so a live plot scrolls by whole pixels and does not flicker: the
+    // pixels of its pictures, so a preview drawn coarser shows their range.
+    const [x0, x1] = onPixelGrid(...this.view.range(this.hub.now(perf)), Math.max(1, Math.round(geo.plot.w * this.renderer.grid())));
     const session = this.hub.session;
     const plans = traces.map((t, index) => {
       // Live, it draws the level of the live points that suits the window.
@@ -1097,12 +1137,14 @@ export class PlotView {
   /**
    * Draws all but the traces: axes, grid, gaps, cursors, the hover and its
    * readouts. `spectrum` says the plot shows spectra, whose axes are each
-   * log or linear as the plot sets them; a time plot's are linear.
+   * log or linear as the plot sets them; a time plot's are linear. With
+   * `cfg.grid` false the grid is not drawn, and with `cfg.xTime`
+   * 'seconds' a time axis reads the seconds from its left end.
    */
   drawOverlay(cfg, geo, body, plans, ranges, xd, spectrum, allTraces) {
     const logX = spectrum && cfg.xLog, logY = spectrum && cfg.yLog, kind = spectrum ? 'spectrum' : 'time';
     const ctx = this.ctx;
-    const T = theme();
+    const T = cfg.grid === false ? { ...this.theme(), grid: 'rgb(0 0 0 / 0)' } : this.theme();
     ctx.setTransform(this.dpr, 0, 0, this.dpr, -body.x * this.dpr, -body.y * this.dpr);
     ctx.clearRect(body.x, body.y, body.w, body.h);
     ctx.font = `11px ${T.dataFont}`;
@@ -1119,7 +1161,7 @@ export class PlotView {
     }
     const P = geo.plot;
     const sx = (logX ? scaleLog() : scaleLinear()).domain(xd).range([P.x, P.x + P.w]);
-    const time = timeAxis(plans[0]?.t.meta.epoch);
+    const time = timeAxis(plans[0]?.t.meta.epoch, cfg.xTime === 'seconds' ? xd[0] : null);
 
     // The live edge, while the pointer is over it on a live time plot, where
     // a zoom keeps the plot live: a wash rising toward the newest edge, under

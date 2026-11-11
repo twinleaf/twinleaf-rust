@@ -471,6 +471,11 @@ export class Session {
     return this.windows.get(plotId)?.[layer].get(trace);
   }
 
+  /** Whether plot `plotId` has a window read in flight or still to send, of either layer. */
+  reading(plotId) {
+    return Object.values(this.reads.get(plotId) ?? {}).some((r) => r.flying || r.waiting || r.sent);
+  }
+
   // Each layer of each plot reads one window at a time, and sends at most
   // one read a frame, so a move asks at once and a run of moves asks once a
   // frame. An ask made while a read is in flight waits, in place of any ask

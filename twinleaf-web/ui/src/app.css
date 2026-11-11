@@ -9,8 +9,9 @@
 /* The design's one home. Every colour, font and radius the page and the
    plots use is a token here: the components through Tailwind, and the plot
    canvas through theme() in lib/plot.js. :root holds the light values, and
-   .dark on the page's root, which prefs.svelte.js sets, the dark. */
-:root {
+   .dark on the page's root, which prefs.svelte.js sets, the dark; .light
+   and .dark on an element give it and what is in it either look. */
+:root, .light {
 	color-scheme: light;
 	/* The page's own faces, shipped with it, so text is as wide on every
 	   system; the system's stand in until they load. Numbers that must line

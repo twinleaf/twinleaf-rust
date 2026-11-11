@@ -171,11 +171,14 @@ export class Renderer {
   /**
    * `canvas` is drawn on within what `frame()` gives as each frame begins,
    * {x, y, w, h, dpr}: the canvas's box in CSS px of the viewport, and the
-   * device pixels it gives each (`windowFrame`, `boxFrame`).
+   * device pixels it gives each (`windowFrame`, `boxFrame`). `grid()` is the
+   * pixel ratio whose pixels a plot keeps its time axis on (plot.js
+   * `onPixelGrid`): its pictures', the frame's own unless given.
    */
-  constructor(canvas, frame) {
+  constructor(canvas, frame, grid = () => this.dpr) {
     this.canvas = canvas;
     this.frame = frame;
+    this.grid = grid;
     /** The frame as the last `begin` read it. */
     this.box = frame();
     this.dpr = this.box.dpr;
@@ -209,9 +212,27 @@ export class Renderer {
     this.gpu = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'unknown';
   }
 
-  /** Reads the frame, sizes the canvas to it and clears it. Returns the device pixel ratio. */
-  begin() {
-    const gl = this.gl, box = (this.box = this.frame()), dpr = box.dpr;
+  /**
+   * Whether the canvas can be drawn on whole at `w` by `h` device pixels:
+   * within the largest viewport and render buffer GL has, and given a
+   * drawing buffer that size, which a browser makes smaller past what it
+   * allows. The canvas is cleared, and drawn again at the next frame.
+   */
+  fits(w, h) {
+    const gl = this.gl, [vw, vh] = gl.getParameter(gl.MAX_VIEWPORT_DIMS), most = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+    if (w > Math.min(vw, most) || h > Math.min(vh, most)) return false;
+    const { width, height } = this.canvas;
+    this.canvas.width = w;
+    this.canvas.height = h;
+    const whole = gl.drawingBufferWidth === w && gl.drawingBufferHeight === h;
+    this.canvas.width = width;
+    this.canvas.height = height;
+    return whole;
+  }
+
+  /** Reads the frame, sizes the canvas to it, at `ratio` device pixels a CSS px in place of the frame's when given, and clears it. Returns the device pixel ratio. */
+  begin(ratio = null) {
+    const gl = this.gl, read = this.frame(), box = (this.box = ratio === null ? read : { ...read, dpr: ratio }), dpr = box.dpr;
     const w = Math.round(box.w * dpr), h = Math.round(box.h * dpr);
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w;

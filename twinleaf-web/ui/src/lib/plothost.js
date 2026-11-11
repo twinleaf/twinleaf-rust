@@ -41,6 +41,8 @@ import { History } from './history.svelte.js';
 import { Favorites } from './favorites.svelte.js';
 import { commands as plotCommands } from './commands.js';
 import { Renderer, windowFrame } from './gl.js';
+import { theme } from './plot.js';
+import { bandsOf, canvasFits, drawFigure, paintElement } from './figure.js';
 import { leaf } from './layout.js';
 import { makeTab, uid } from './tabs.js';
 import { counted } from './menus.js';
@@ -54,6 +56,8 @@ import * as clock from './clock.js';
 const DETAIL_PAD = 1;
 /** The points a window read asks for, for each CSS px of the surface's width, at least. */
 const DETAIL_POINTS = 2;
+/** What the page lays over a plot's body that its picture holds: the legend and the cursors' table. */
+const LAID_OVER = '.pinned-legend, .cursor-readout';
 
 export class PlotHost {
   /** Each plot's pickers the keys open, by plot id: `open(action)` opens the one for keymap.js plot action `action` and says whether it had one. */
@@ -64,6 +68,8 @@ export class PlotHost {
   renderer = null;
   /** What the page adds for plots laid out in its tabs (`serve`), or null. */
   place = null;
+  /** Whether its plots are drawn bare, with no header, as a copy is: never a monitor (plot.js `monitorOf`), and a legend of names alone. */
+  bare = false;
   /** The page's services (`serve`), or null. */
   #page = null;
   /** Plot id to what its overview was read for. */
@@ -194,42 +200,84 @@ export class PlotHost {
   /**
    * Has the plots drawn on `canvas`, within `frame` when given (gl.js),
    * until the function it returns is called, which gives the canvas's
-   * context back. Whoever gives a frame of another width or pixel ratio
-   * has the paused plots' windows read again for it (`rereadWindows`).
+   * context back. `ratio()` is the pixel ratio its pictures are taken at
+   * (`picture`), and its windows read for, the frame's own unless given.
+   * Whoever gives a frame of another width, or another pixel ratio, has
+   * the paused plots' windows read again for it (`rereadWindows`).
    */
-  surface(canvas, frame = this.frame) {
+  surface(canvas, frame = this.frame, ratio = () => frame().dpr) {
     this.frame = frame;
-    const renderer = (this.renderer = new Renderer(canvas, frame));
+    this.#ratio = ratio;
+    const renderer = (this.renderer = new Renderer(canvas, frame, ratio));
     return () => {
       renderer.dispose();
       if (this.renderer === renderer) this.renderer = null;
     };
   }
 
-  /** Draws every plot on the surface, at page time `perf`: one frame. */
-  draw(perf) {
-    this.renderer.begin();
-    for (const pv of this.registry) pv.draw(perf);
+  /** The pixel ratio pictures are taken at: the surface's (`surface`). */
+  #ratio = () => this.frame().dpr;
+
+  /**
+   * Draws every plot on the surface, at page time `perf`: one frame; a
+   * `still` one as if no pointer were on them (PlotView `draw`), at
+   * `ratio` device pixels a CSS px in place of the frame's when given.
+   */
+  draw(perf, { still = false, ratio = null } = {}) {
+    this.renderer.begin(ratio);
+    for (const pv of this.registry) pv.draw(perf, still);
   }
 
   /**
-   * Plot `id`'s picture now, as a new canvas: its traces and, over them,
-   * its axes, cursors and readouts, the size of its body in CSS px times
-   * the surface's pixel ratio. The surface is drawn for it, as a frame is,
-   * and read before the browser takes that frame, since a WebGL canvas
-   * keeps no pixels after. What the page lays over the plot, as its legend,
-   * is not in it.
+   * Plot `id`'s picture now, as a canvas, `into` when given: its traces
+   * and, over them, its axes, cursors and readouts and what the page lays
+   * over them, its legend and its cursors' table, as they show on the
+   * page; no hover, tip or window readout, as no pointer is on it. It is
+   * the size of its body in CSS px at `ratio` device pixels each, the
+   * surface's picture ratio unless given, however large the surface shows
+   * it: the layout, ticks and text are the body's at its size, finer or
+   * coarser. With a `figure` (figure.js), it is that figure: the body with
+   * the figure's bands above and below it, on the plot's background. The
+   * surface is drawn for it, as a frame is, and read before the browser
+   * takes that frame, since a WebGL canvas keeps no pixels after.
    */
-  picture(id) {
+  picture(id, { ratio = this.#ratio(), into = null, figure = null } = {}) {
     const pv = this.pv(id);
-    this.draw(clock.now());
-    const at = this.renderer.deviceRect(pv.drawnOn), out = document.createElement('canvas');
-    out.width = pv.overlay.width;
-    out.height = pv.overlay.height;
-    const ctx = out.getContext('2d');
-    ctx.drawImage(this.renderer.canvas, at.x, at.y, out.width, out.height, 0, 0, out.width, out.height);
-    ctx.drawImage(pv.overlay, 0, 0);
+    this.draw(clock.now(), { still: true, ratio });
+    const body = pv.drawnOn, at = this.renderer.deviceRect(body), out = into ?? document.createElement('canvas');
+    const bands = figure ? bandsOf(figure, body.w) : { top: 0, bottom: 0 };
+    const w = pv.overlay.width, h = pv.overlay.height, top = Math.round(bands.top * ratio);
+    const height = figure ? Math.round((body.h + bands.top + bands.bottom) * ratio) : h;
+    if (out.width !== w || out.height !== height) [out.width, out.height] = [w, height];
+    const ctx = out.getContext('2d'), look = theme(this.colors.dark ?? undefined);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, w, height);
+    if (figure) {
+      ctx.fillStyle = look.bg;
+      ctx.fillRect(0, 0, w, height);
+    }
+    ctx.drawImage(this.renderer.canvas, at.x, at.y, w, h, 0, top, w, h);
+    ctx.drawImage(pv.overlay, 0, top);
+    // What the page lays over the plot, drawn where it shows over the body.
+    ctx.setTransform(ratio, 0, 0, ratio, -body.x * ratio, -body.y * ratio + top);
+    for (const el of pv.body.querySelectorAll(LAID_OVER)) paintElement(ctx, el);
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    if (figure) drawFigure(ctx, figure, { width: body.w, plotHeight: body.h, area: pv.geo ? { x: pv.geo.plot.x - body.x, w: pv.geo.plot.w } : { x: 0, w: body.w }, look });
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     return out;
+  }
+
+  /**
+   * Why plot `id` has no picture `width` by `height` CSS px with `figure`
+   * at `ratio`, or null when it can: past the largest canvas the browser
+   * draws, for the traces' surface or the picture.
+   */
+  pictureRefused(id, { width, height, ratio, figure = null }) {
+    const bands = figure ? bandsOf(figure, width) : { top: 0, bottom: 0 };
+    const w = Math.round(width * ratio), body = Math.round((height - bands.top - bands.bottom) * ratio), whole = Math.round(height * ratio);
+    if (body < 1 || w < 1) return 'Too small';
+    if (!this.renderer?.fits(w, body) || !canvasFits(w, whole)) return 'Too large for this browser';
+    return null;
   }
 
   /** The plot of `id` in any tab. */
@@ -242,10 +290,9 @@ export class PlotHost {
     return plot.items.map((i) => this.hub.session.byKey.get(i.key)).filter(Boolean);
   }
 
-  /** The most points a window read asks for: DETAIL_POINTS for each CSS px across the surface, a point for each device pixel at least. */
+  /** The most points a window read asks for: DETAIL_POINTS for each CSS px across the surface, a point for each device pixel of its pictures at least. */
   #points() {
-    const { w, dpr } = this.frame();
-    return w * Math.max(DETAIL_POINTS, dpr);
+    return this.frame().w * Math.max(DETAIL_POINTS, this.#ratio());
   }
 
   #viewChanged(id) {
@@ -308,7 +355,7 @@ export class PlotHost {
    * as this is called, its y ranges and a paused spectrum's spectra. The
    * copy does not follow live. Whatever is done to it changes it alone:
    * neither this host's plots, their views and undo steps, nor the page's
-   * colours. `dispose` ends it.
+   * colours. Its plot is drawn bare (`bare`). `dispose` ends it.
    */
   copy(id) {
     const from = this.plot(id), perf = clock.now();
@@ -319,6 +366,7 @@ export class PlotHost {
     views.setDelay(this.views.delay);
     const host = new PlotHost({ hub: this.hub, ws, history: new History(ws, new Favorites(null)), views, colors: this.colors.copy(), frame: this.frame, live: false });
     host.id = plot.id;
+    host.bare = true;
     const view = host.view(plot.id);
     view.restore(this.view(id).state(), perf);
     if (view.live) view.pause(perf);

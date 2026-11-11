@@ -289,7 +289,8 @@
   // A plot too small for its header becomes a monitor, as plot.js's
   // `monitorOf` decides from the traces it draws.
   let size = $state({ width: Infinity, height: Infinity });
-  const monitor = $derived(monitorOf(size, plot.mode, plot.items.filter((i) => session.trace(i.key)).length));
+  // A bare plot, as a copy is (PlotHost `bare`), has no header, and is never one.
+  const monitor = $derived(!host.bare && monitorOf(size, plot.mode, plot.items.filter((i) => session.trace(i.key)).length));
 
   /**
    * The row of chips as last measured, for the dashes under it while it runs
@@ -392,7 +393,7 @@
       onFrequencies: (lo, hi) => host.setView(plot.id, { fRange: [lo, hi] }),
       onFitY: (key) => runHere('fitYAxis', key),
       viewHistory,
-      config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null, yFormat: plot.yFormat ?? null, xFormat: plot.xFormat ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
+      config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null, yFormat: plot.yFormat ?? null, xFormat: plot.xFormat ?? null, grid: plot.grid ?? true, xTime: plot.xTime ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
     });
     registry.add(pv);
     host.pickers.set(plot.id, openPicker);
@@ -1019,10 +1020,13 @@
                     <div {...props} class="pinned-legend" data-focus-skip role="list" aria-label="Legend: drag to move" style="--x: {at.x}; --y: {at.y}" onpointerdowncapture={(e) => dragOverlay(e, 'legendAt')} oncontextmenucapture={(e) => (legendKey = makeCurrent(e.target.closest?.('.row')?.dataset.key ?? null))}>
                       {#each plot.items as item (item.id)}
                         <div class="row" role="listitem" data-key={item.key} style="--c:{colorFor(item.key)}" title={item.key}>
-                          <Swatch key={item.key} /><span class="name">{item.key}</span><span class="val">{legend.rows[item.key]?.value ?? ''}</span><span class="units">{unitsShown(item.key)}</span>
-                          <Tip text="Remove from this plot" keys={['Delete']}>
-                            {#snippet children(tip)}<button {...tip} class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>{/snippet}
-                          </Tip>
+                          <!-- A bare plot's legend names its signals, by the name given them where there is one, as a picture of it holds no values. -->
+                          <Swatch key={item.key} /><span class="name">{item.label || item.key}</span>{#if !host.bare}<span class="val">{legend.rows[item.key]?.value ?? ''}</span>{/if}<span class="units">{unitsShown(item.key)}</span>
+                          {#if !host.bare}
+                            <Tip text="Remove from this plot" keys={['Delete']}>
+                              {#snippet children(tip)}<button {...tip} class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>{/snippet}
+                            </Tip>
+                          {/if}
                         </div>
                       {/each}
                     </div>
