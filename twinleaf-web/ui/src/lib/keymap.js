@@ -20,7 +20,7 @@
 import { COMMANDS, commandOf } from './commands.js';
 
 /** Plot command `c`'s keys as an entry, its id the action of its keys where it has any. */
-const keysOf = (c) => ({ show: c.show, ...(c.keys && { keys: c.keys, action: c.id }), ...(c.shift !== undefined && { shift: c.shift }), scope: c.scope, what: c.what });
+const keysOf = (c) => ({ show: c.show, ...(c.keys && { keys: c.keys, action: c.id }), ...(c.ctrl && { ctrl: true }), ...(c.shift !== undefined && { shift: c.shift }), scope: c.scope, what: c.what });
 
 const digits = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
 const MOVE = { show: ['Arrows', 'Home', 'End'], action: 'move', what: 'Move' };
@@ -38,7 +38,7 @@ export const KEYMAP = [
       { show: ['[', ']'], keys: ['[', ']'], action: 'stepTab', what: 'Previous, next tab' },
       keysOf(commandOf('pause')),
       { show: ['Ctrl', 'A'], keys: ['a'], ctrl: true, action: 'selectAll', what: 'Select every plot' },
-      { ...keysOf(commandOf('copyData')), keys: ['c'], ctrl: true, shift: false, action: 'copyData' },
+      keysOf(commandOf('copyData')),
       { show: ['Ctrl', 'Z'], keys: ['z'], ctrl: true, shift: false, action: 'undo', what: 'Undo' },
       { show: ['Ctrl', 'Y'], keys: ['y', 'z'], ctrl: true, action: 'redo', what: 'Redo; or Ctrl Shift Z' },
       { show: ['Ctrl', 'K'], keys: ['k'], ctrl: true, action: 'palette', what: 'Commands' },

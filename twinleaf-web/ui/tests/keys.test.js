@@ -16,6 +16,8 @@
 // - A Space the page takes, to pause, presses nothing as it is let go,
 //   whatever button a click left focus on; a Space on a button the keyboard
 //   moved focus to is the button's, and presses it once.
+// - Ctrl+C copies the plots' data, but with text selected is the
+//   browser's, to copy the text: no claimant takes it.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
@@ -404,4 +406,32 @@ describe('Space on a button', () => {
       page.dispose();
     }
   }, 300_000);
+});
+
+describe('Ctrl+C', () => {
+  it('copies the plots’ data with no text selected, and with text selected is the browser’s, to copy the text', async () => {
+    const page = await mountPage(KEYS, 'columns', 0, KEYS.flat());
+    const write = navigator.clipboard.write, copied = [];
+    navigator.clipboard.write = (items) => (copied.push(items), Promise.resolve());
+    try {
+      feed(page.hub);
+      await focusPage();
+      await settle();
+      await pressKey('Control+c');
+      await settle();
+      expect([lastKey().by, copied.length], 'with no text selected, the page takes it and copies').toEqual(['page', 1]);
+      // The text of the page that can be selected, a plot's cursor readout, selected.
+      editCursors(page, plotIds(page.ws.layout)[0], (c) => ({ ...c, x: { a: 14, b: 16 } }));
+      expect(await until(() => document.querySelector('.cursor-readout table'), 2000), 'the readout shows').toBeTruthy();
+      getSelection().selectAllChildren(document.querySelector('.cursor-readout table'));
+      expect(String(getSelection()), 'text selected').toContain('sine.sine');
+      await pressKey('Control+c');
+      await settle();
+      expect([lastKey().by, copied.length], 'with text selected, no claimant takes it and nothing more is copied').toEqual([null, 1]);
+    } finally {
+      getSelection().removeAllRanges();
+      navigator.clipboard.write = write;
+      page.dispose();
+    }
+  });
 });

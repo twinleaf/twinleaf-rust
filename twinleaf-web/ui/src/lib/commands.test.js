@@ -51,7 +51,7 @@ describe('the command table', () => {
     const plot = KEYMAP.find((p) => p.place === 'plot').entries;
     expect(plot.map((e) => e.action)).toEqual(COMMANDS.filter((c) => c.keys && !c.place).map((c) => c.id));
     for (const c of COMMANDS.filter((c) => c.keys)) {
-      for (const key of c.keys) expect(actionFor(c.place ?? 'plot', { key, shiftKey: !!c.shift }), `${c.id} by ${key}`).toBe(c.id);
+      for (const key of c.keys) expect(actionFor(c.place ?? 'plot', { key, shiftKey: !!c.shift, ctrlKey: !!c.ctrl }), `${c.id} by ${key}`).toBe(c.id);
       expect(scopeOf(c.id)).toBe(c.scope);
     }
     // The Signals list's keys that are commands are the table's too, in its order.

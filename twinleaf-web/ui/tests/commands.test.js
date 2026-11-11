@@ -122,8 +122,7 @@ const ORIGINS = { ...ON_PLOT, ...ON_TAB, ...ON_PAGE };
 
 /** The key that runs command `c`, as the keyboard command names it, or null. */
 function keyOf(c) {
-  if (c.keys) return (c.shift ? 'Shift+' : '') + ({ ' ': 'Space' }[c.keys[0]] ?? c.keys[0]);
-  return c.show?.includes('Ctrl') ? c.show.map((k) => (k === 'Ctrl' ? 'Control' : k.toLowerCase())).join('+') : null;
+  return c.keys ? (c.ctrl ? 'Control+' : '') + (c.shift ? 'Shift+' : '') + ({ ' ': 'Space' }[c.keys[0]] ?? c.keys[0]) : null;
 }
 
 /** A list of values a control opens: a row's submenu, or a dropdown's list. */

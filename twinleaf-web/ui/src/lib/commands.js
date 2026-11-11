@@ -467,13 +467,13 @@ export const COMMANDS = [
     },
   },
   {
-    // Its row says first when a copy would hold too much or come back short, from the hub's count of the rows (`how`).
-    id: 'copyData', scope: 'view', palette: 'Plots', needs: ['workspace'], place: 'page', show: ['Ctrl', 'C'], what: 'Copy data', empty: true,
+    // Its row says first when a copy would hold too much or come back short, from the hub's count of the rows (`how`). Its key leaves text that is selected to the browser, to copy.
+    id: 'copyData', scope: 'view', palette: 'Plots', needs: ['workspace'], place: 'page', show: ['Ctrl', 'C'], keys: ['c'], ctrl: true, shift: false, what: 'Copy data', empty: true,
     icon: RiCopy, label: 'Copy data',
     check: (ctx) => ctx.svc.copyCheck(ctx.plots),
     value: (ctx, check) => (check ? { text: rowsText(check.rows), warn: check.state !== 'ok', title: check.reason } : null),
     disabled: (ctx, check) => check?.state === 'too-many',
-    run: (ctx) => void ctx.svc.copy(ctx.plots).catch((error) => ctx.svc.toast.error(`Could not copy: ${error.message}`)),
+    run: (ctx) => (ctx.from === 'key' && String(globalThis.getSelection?.() ?? '') ? false : void ctx.svc.copy(ctx.plots).catch((error) => ctx.svc.toast.error(`Could not copy: ${error.message}`))),
   },
   {
     id: 'exportData', scope: 'view', palette: 'Plots', needs: ['workspace'], empty: true,

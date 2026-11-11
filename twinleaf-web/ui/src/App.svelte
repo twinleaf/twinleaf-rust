@@ -773,9 +773,10 @@
   const plotAt = (el) => el?.closest?.('.leaf[data-plot]')?.dataset.plot ?? null;
 
   /**
-   * Runs plot command `action` of key `e` (keymap.js, place 'plot') on the
-   * plots it acts on (commands.js), and says whether it was taken: a command
-   * with no plots to act on is not, and its key goes on.
+   * Runs command `action` of key `e` (keymap.js, a plot's keys and the
+   * page's that are commands) on the plots it acts on (commands.js), and
+   * says whether it was taken: a command with no plots to act on, or that
+   * declines, is not, and its key goes on.
    */
   function plotKey(action, e) {
     const how = { back: e.key === 'ArrowLeft' || e.key === 'ArrowDown', shift: e.shiftKey };
@@ -842,8 +843,7 @@
       on: {
         undo: () => undo(false),
         redo: () => undo(true),
-        // With no text selected: selected text is the browser's to copy.
-        copyData: () => !String(window.getSelection() ?? '') && void commands.run('copyData', { from: 'key' }),
+        copyData: (e) => plotKey('copyData', e),
         // Every plot of the tab, not the page's text.
         selectAll: () => void selection.only(ws.shownIds(), null),
         goToPlot(e) {
@@ -859,7 +859,7 @@
     },
     // Among property rows, which are what is picked there, a plot's keys do nothing.
     plots: { when: (e, at) => !at?.closest?.(ROWS), on: plotKey },
-    pause: { on: { pause: () => void commands.run('pause', { from: 'key' }) } },
+    pause: { on: { pause: (e) => plotKey('pause', e) } },
   }).map(([id, claimant]) => claim(id, claimant));
   onDestroy(() => claimed.forEach((unclaim) => unclaim()));
 </script>
