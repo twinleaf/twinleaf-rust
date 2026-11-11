@@ -280,14 +280,11 @@ describe('maximized plots', () => {
               }
             } else if (s.t === 'select') page.ws.selection.only(shown.filter((_, i) => s.ks.includes(i)));
             else if (s.t === 'escape') {
-              // With focus in a plot's signals, as a press on its chip row leaves it, Escape is theirs first, and goes out to the plot (keys.test.js).
-              const theirs = document.activeElement?.matches('.trace-zone');
+              // Wherever focus is but a field, as in a plot's signals once a press on its chip row leaves it there, Escape leaves a
+              // maximized view with the selection kept, or with none deselects (keys.test.js).
               await pressKey('Escape');
-              // Else it leaves a maximized view with the selection kept, or with none deselects.
-              if (!theirs) {
-                left = null;
-                selected = was ? picked : [];
-              }
+              left = null;
+              selected = was ? picked : [];
             } else if (s.t === 'close' && on) {
               page.ws.selection.only([on]);
               flushSync();
@@ -333,6 +330,8 @@ describe('maximized plots', () => {
         [[0], [{ t: 'escape' }, { t: 'close', k: 1 }, { t: 'select', ks: [0] }, { t: 'max', by: 'key', k: 0 }, { t: 'undo' }]],
         // A split leaves the view; taken back, the view entered again, and made again, the view is left again and every plot shows.
         [[0], [{ t: 'split', k: 0 }, { t: 'undo' }, { t: 'select', ks: [0] }, { t: 'max', by: 'button', k: 0 }, { t: 'redo' }, { t: 'tab' }, { t: 'tab' }]],
+        // Restored by the key and maximized from a header, focus left in the plot's signals: Escape leaves the view.
+        [[3], [{ t: 'max', by: 'key', k: 0 }, { t: 'max', by: 'header', k: 0 }, { t: 'escape' }]],
       ]),
     );
     // A replay of one failure runs that case alone.
