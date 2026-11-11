@@ -301,6 +301,7 @@ impl StreamTracker {
             samples,
             expected: Some(expected),
             dropped_batches: 0,
+            dropped_samples: 0,
         };
 
         // Rows in the last rows' slot are of a later lap of the ring when

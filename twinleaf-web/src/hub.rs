@@ -17,12 +17,21 @@
 //! window costs by its width in pixels, whatever its span, and is never
 //! coarser than its rows decimated for it would be.
 //!
-//! The hub lives on a thread of its own, which alone touches it. Batches of
-//! samples and the pages' requests come to it as mail, in the order sent,
-//! and a request's answer goes back on a channel of its own. What takes long
-//! is done elsewhere: a read takes the rows it needs, which share the
-//! buffer's chunks, and copies them off the thread, and a change of
-//! decimation replays a frozen copy of the buffer on a thread of its own.
+//! The hub lives on a thread of its own, which alone touches it. It takes
+//! the batches of samples straight from its connection's queue, and the
+//! pages' requests from its mailbox as jobs, in the order sent, and a
+//! request's answer goes back on a channel of its own. What takes long is
+//! done elsewhere: a read takes the rows it needs, which share the buffer's
+//! chunks, and copies them off the thread, and a change of decimation
+//! replays a frozen copy of the buffer on a thread of its own.
+//!
+//! The connection's queue is the one place samples wait for the hub, and
+//! the one bound on them. It holds 1024 batches, and drops those that come
+//! while it is full, so the proxy's connection never waits on the hub. The
+//! batch after says how many rows of its stream the queue dropped, and the
+//! hub counts them by stream. The hub's thread runs at the priority the
+//! threads that carry packets do, so other work on a busy machine does not
+//! keep it from the queue.
 //!
 //! A run lasts across lost samples, and [`Run::boundaries`] says where they
 //! fell. The hub splits the points it sends there, so the page lifts the pen.
@@ -42,14 +51,14 @@ use crate::wire::{encode, encode_spectra, split_at_breaks, Chunk, Spectrum};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 use twinleaf::data::ops::{Fpcs, FpcsLevels, Welch};
 use twinleaf::data::{Buffer, ColumnKey, ColumnOp, ColumnProcessor, Run, StreamKey};
+use twinleaf::flume::{self, select::SelectError, Selector};
 use twinleaf::proxy::Layout;
-use twinleaf::{ColumnId, Connection, DeviceRoute, DeviceTree, RecvError, SampleBatch};
+use twinleaf::{ColumnId, Connection, DeviceRoute, DeviceTree, Receiver, RecvError, SampleBatch};
 
 /// How much of the finest decimation the hub keeps for the live view, as
 /// the page does. Each coarser level keeps LEVEL_FACTOR times as much.
@@ -135,10 +144,14 @@ pub(crate) struct Hub {
     history_seconds: f64,
     /// The hub's own mailbox, which the replay of a change of decimation
     /// posts its result to. A hub without one, as in a test, replays at once.
-    mailbox: Option<mpsc::Sender<Mail>>,
+    mailbox: Option<flume::Sender<Job>>,
     /// The number of the newest change of decimation, so the replay of an
     /// older one is dropped.
     decimation: u64,
+    /// The rows of each stream the connection's queue dropped while the hub
+    /// was behind, and how many of them all the log has said.
+    dropped: HashMap<StreamKey, u64>,
+    dropped_logged: u64,
 }
 
 /// A `memory` message as a page shows it: its bytes, budget, seconds,
@@ -184,7 +197,7 @@ pub(crate) struct Live {
     /// trace id is of.
     pub(crate) id: String,
     /// The hub's thread, which alone holds the hub.
-    mailbox: mpsc::Sender<Mail>,
+    mailbox: flume::Sender<Job>,
     pub(crate) devices: Arc<Devices>,
     /// The tree the connection sees, which the page's calls go through.
     pub(crate) tree: DeviceTree,
@@ -213,13 +226,6 @@ impl End {
 #[derive(Debug)]
 pub(crate) struct Ended;
 
-/// What the hub's thread is sent: the next batch of samples or why they
-/// ended, or a job to run with the hub.
-enum Mail {
-    Samples(Result<SampleBatch, RecvError>),
-    Job(Job),
-}
-
 /// Work for the hub's thread, named for the log when it runs long.
 struct Job {
     name: &'static str,
@@ -228,8 +234,8 @@ struct Job {
 
 impl Live {
     /// Opens `layout`, or the proxy's default for `None`, and starts the
-    /// hub's thread, the thread that takes its samples and the watchers of
-    /// its devices on `runtime`. Blocks until the proxy has opened it.
+    /// hub's thread and the watchers of its devices on `runtime`. Blocks
+    /// until the proxy has opened it.
     pub(crate) fn start(
         layout: Option<&Layout>,
         runtime: &tokio::runtime::Handle,
@@ -249,7 +255,7 @@ impl Live {
         runtime: &tokio::runtime::Handle,
     ) -> std::io::Result<Live> {
         let tree = connection.tree(DeviceRoute::root());
-        let (mailbox, mail) = mpsc::channel();
+        let (mailbox, mail) = flume::unbounded();
         let mut hub = Hub::new();
         hub.mailbox = Some(mailbox.clone());
         let devices = Devices::new(hub.feed.clone());
@@ -270,12 +276,13 @@ impl Live {
             connection: connection.clone(),
             retired: Arc::new(watch::channel(false).0),
         };
-        take_samples(&connection, mailbox.clone())?;
+        let samples = connection.samples();
         let ending = end.clone();
         std::thread::Builder::new()
             .name("twinleaf-web hub".to_string())
             .spawn(move || {
-                run(hub, &mail);
+                twinleaf::device::raise_thread_priority();
+                run(hub, &samples, &mail);
                 ending.retire();
             })?;
         let id = std::time::SystemTime::now()
@@ -295,10 +302,10 @@ impl Live {
     /// Runs `work` with the hub on its thread, after what was sent before it.
     fn tell(&self, name: &'static str, work: impl FnOnce(&mut Hub) + Send + 'static) {
         // A hub whose thread has ended drops the job, as it has no use for it.
-        let _ = self.mailbox.send(Mail::Job(Job {
+        let _ = self.mailbox.send(Job {
             name,
             run: Box::new(work),
-        }));
+        });
     }
 
     /// Runs `work` with the hub on its thread, after what was sent before it,
@@ -461,47 +468,54 @@ impl Drop for Page {
     }
 }
 
-/// Starts the thread that takes each batch of `connection`'s samples as it
-/// comes and posts it to the hub's thread. The connection queues 1024
-/// batches and drops those that come while it is full, so taking them never
-/// waits on the hub. A busy hub delays the samples and loses none.
-fn take_samples(connection: &Connection, mailbox: mpsc::Sender<Mail>) -> std::io::Result<()> {
-    let samples = connection.samples();
-    std::thread::Builder::new()
-        .name("twinleaf-web samples".to_string())
-        .spawn(move || loop {
-            let next = samples.recv();
-            if let Err(RecvError::Lagged(lost)) = next {
-                log::warn!("The web page lost {lost} batches of samples");
-                continue;
-            }
-            let ended = next.is_err();
-            if mailbox.send(Mail::Samples(next)).is_err() || ended {
-                return;
-            }
-        })?;
-    Ok(())
+/// What the hub's thread takes next.
+enum Next {
+    Samples(Result<SampleBatch, RecvError>),
+    Job(Result<Job, flume::RecvError>),
 }
 
-/// Runs the hub until its samples end: each batch and job in the order they
-/// come, and every FLUSH, SPECTRUM_EVERY and MEMORY_EVERY the new points,
-/// the spectra and what the buffer holds. Only this thread touches the hub,
-/// and whatever it does delays everything after it, so each job must be
-/// short. One that is not is logged.
-fn run(mut hub: Hub, mail: &mpsc::Receiver<Mail>) {
+/// Runs the hub until its samples end: each batch of `samples` and each job
+/// of `mail` as they come, and every FLUSH, SPECTRUM_EVERY and MEMORY_EVERY
+/// the new points, the spectra and what the buffer holds. Batches that
+/// wait are taken one after another until the next flush is due, and then
+/// a job that waits has its turn. Only this thread touches the hub, and
+/// whatever it does delays everything after it, so each job must be short.
+/// One that is not is logged.
+fn run(mut hub: Hub, samples: &Receiver<SampleBatch>, mail: &flume::Receiver<Job>) {
     let mut last_flush = Instant::now();
     let mut last_spectrum = Instant::now();
     let mut last_memory = Instant::now();
     loop {
-        match mail.recv_timeout(Duration::from_millis(5)) {
-            Ok(Mail::Samples(Ok(batch))) => timed("ingest", || hub.ingest(&batch)),
-            Ok(Mail::Samples(Err(error))) => {
-                log::warn!("The web page's samples ended: {error}");
-                return;
+        let next = Selector::new()
+            .recv(samples.as_flume(), |queued| {
+                Next::Samples(samples.resolve(queued))
+            })
+            .recv(mail, Next::Job)
+            .wait_timeout(Duration::from_millis(5));
+        match next {
+            Ok(Next::Samples(first)) => {
+                let mut taken = first.map(Some);
+                loop {
+                    match taken {
+                        Ok(Some(batch)) => timed("ingest", || hub.ingest(&batch)),
+                        Ok(None) => break,
+                        // The batch after says what the queue dropped of its
+                        // stream.
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(error) => {
+                            log::warn!("The web page's samples ended: {error}");
+                            return;
+                        }
+                    }
+                    if last_flush.elapsed() >= FLUSH {
+                        break;
+                    }
+                    taken = samples.try_recv();
+                }
             }
-            Ok(Mail::Job(job)) => timed(job.name, || (job.run)(&mut hub)),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+            Ok(Next::Job(Ok(job))) => timed(job.name, || (job.run)(&mut hub)),
+            Ok(Next::Job(Err(flume::RecvError::Disconnected))) => return,
+            Err(SelectError::Timeout) => {}
         }
         // Each period runs from the start of the last work, so the work's own
         // time does not stretch it.
@@ -516,6 +530,7 @@ fn run(mut hub: Hub, mail: &mpsc::Receiver<Mail>) {
         if last_memory.elapsed() >= MEMORY_EVERY {
             last_memory = Instant::now();
             timed("memory", || hub.send_memory());
+            hub.log_dropped();
         }
     }
 }
@@ -562,6 +577,8 @@ impl Hub {
             history_seconds: RAW_SECONDS,
             mailbox: None,
             decimation: 0,
+            dropped: HashMap::new(),
+            dropped_logged: 0,
         }
     }
 
@@ -578,6 +595,13 @@ impl Hub {
     }
 
     fn ingest(&mut self, batch: &SampleBatch) {
+        let loss = batch.boundary().and_then(|boundary| boundary.loss.as_ref());
+        if let Some(rows) = loss
+            .map(|loss| loss.dropped_samples)
+            .filter(|&rows| rows > 0)
+        {
+            *self.dropped.entry(batch.stream_key()).or_default() += rows;
+        }
         if batch.is_empty() {
             return;
         }
@@ -586,6 +610,17 @@ impl Hub {
         // costs more, and gives up its oldest to stay within the room left.
         self.trim_held();
         self.register(batch);
+    }
+
+    /// Logs how many rows the connection's queue dropped since the log last
+    /// said, if any.
+    fn log_dropped(&mut self) {
+        let dropped: u64 = self.dropped.values().sum();
+        if dropped > self.dropped_logged {
+            let rows = dropped - self.dropped_logged;
+            log::warn!("The web page's hub fell behind and dropped {rows} samples");
+            self.dropped_logged = dropped;
+        }
     }
 
     /// Adds a trace for each float column not seen before.
@@ -967,10 +1002,10 @@ impl Hub {
             .name("twinleaf-web decimation".to_string())
             .spawn(move || {
                 let levels = replay();
-                let _ = mailbox.send(Mail::Job(Job {
+                let _ = mailbox.send(Job {
                     name: "decimated",
                     run: Box::new(move |hub| hub.decimated(decimation, levels)),
-                }));
+                });
             });
         if let Err(error) = replaying {
             log::warn!("The web page's hub could not decimate anew: {error}");
@@ -1608,6 +1643,67 @@ mod tests {
         assert_eq!(lines[1], "1,99");
     }
 
+    /// A hub held up for longer than its connection's queue lasts counts
+    /// every row the queue dropped. The simulated device streams 5000 rows a
+    /// second and drops none, and the queue holds 1024 batches, under a
+    /// second of them. So of the rows the stream's time spans, each is in
+    /// the history or counted lost, and the hub's count is what the queue
+    /// dropped.
+    #[tokio::test]
+    async fn a_hub_held_up_counts_every_row_its_queue_dropped() {
+        use std::sync::atomic::AtomicBool;
+        use twinleaf::proxy::{HostOptions, Mount, Proxy};
+        const RATE: f64 = 5000.0;
+        let stop = Arc::new(AtomicBool::new(false));
+        let url = twinleaf_tools::tools::simulate::serve(
+            &["--no-drop", "--samplerate", "5000"],
+            stop.clone(),
+        );
+        let root = DeviceRoute::root();
+        let proxy = Proxy::host(HostOptions {
+            port: 0,
+            name: "a test".to_string(),
+            default: Some(Layout {
+                mounts: vec![Mount {
+                    url,
+                    source: root,
+                    prefix: root,
+                }],
+            }),
+            ..HostOptions::default()
+        })
+        .unwrap();
+        let connection = Connection::open(&proxy.endpoint()).unwrap();
+        let live = Live::over(connection, None, &tokio::runtime::Handle::current()).unwrap();
+        let stream = StreamKey::new(root, StreamId::new(1));
+        let held = move |hub: &mut Hub| {
+            let run = hub.buffer.run(&stream)?;
+            let losses = run.boundaries().filter_map(|(_, _, b)| b.loss.clone());
+            let (lost, dropped) = losses.fold((0, 0), |(lost, dropped), loss| {
+                (lost + loss.samples, dropped + loss.dropped_samples)
+            });
+            let rows = run.retained_rows();
+            let span = run.last_timestamp()? - run.first_timestamp()?;
+            let counted = hub.dropped.get(&stream).copied().unwrap_or(0);
+            Some((rows.end - rows.start, span, lost, dropped, counted))
+        };
+        // The stream flows before the hub is held up.
+        let started = Instant::now();
+        while live.ask("held", held).await.unwrap().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(30), "no samples");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        live.tell("held up", |_| std::thread::sleep(Duration::from_secs(3)));
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let (rows, span, lost, dropped, counted) = live.ask("held", held).await.unwrap().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        live.retire();
+        proxy.shutdown();
+        assert!(dropped > 0, "the queue held 3 s of batches");
+        assert_eq!(counted, dropped, "the hub counted what its queue dropped");
+        assert_eq!(rows + lost, (span * RATE).round() as u64 + 1);
+    }
+
     #[test]
     fn a_new_column_is_a_trace_named_by_its_stream_and_column() {
         let mut hub = Hub::new();
@@ -1725,9 +1821,9 @@ mod tests {
     }
 
     /// The job a hub with a mailbox posted to it, run with the hub.
-    fn run_posted(hub: &mut Hub, mail: &mpsc::Receiver<Mail>) -> &'static str {
+    fn run_posted(hub: &mut Hub, mail: &flume::Receiver<Job>) -> &'static str {
         match mail.recv_timeout(Duration::from_secs(10)) {
-            Ok(Mail::Job(job)) => {
+            Ok(job) => {
                 (job.run)(hub);
                 job.name
             }
@@ -1741,7 +1837,7 @@ mod tests {
     #[test]
     fn a_new_decimation_is_replayed_off_the_hubs_thread() {
         let mut hub = Hub::new();
-        let (mailbox, mail) = mpsc::channel();
+        let (mailbox, mail) = flume::unbounded();
         hub.mailbox = Some(mailbox);
         let mut parser = parser();
         for batch in samples(&mut parser, 0, 1000) {
@@ -1777,7 +1873,7 @@ mod tests {
     #[test]
     fn an_overtaken_decimation_is_dropped() {
         let mut hub = Hub::new();
-        let (mailbox, mail) = mpsc::channel();
+        let (mailbox, mail) = flume::unbounded();
         hub.mailbox = Some(mailbox);
         let mut parser = parser();
         for batch in samples(&mut parser, 0, 1000) {

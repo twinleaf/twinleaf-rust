@@ -390,8 +390,10 @@ struct Carried {
 /// What the batches of one stream that a lane dropped changed and lost.
 struct Pending {
     change: Option<Change>,
-    /// The rows dropped, and the rows the dropped batches said were lost.
-    samples: u64,
+    /// The rows of the batches dropped, and the rows those batches said were
+    /// lost before them.
+    rows: u64,
+    lost: u64,
     dropped: u64,
 }
 
@@ -437,11 +439,13 @@ impl Carried {
     fn miss(&mut self, batch: &SampleBatch) {
         let pending = self.pending.get_or_insert(Pending {
             change: None,
-            samples: 0,
+            rows: 0,
+            lost: 0,
             dropped: 0,
         });
         pending.dropped += 1;
-        pending.samples += batch.len() as u64 + lost(batch);
+        pending.rows += batch.len() as u64;
+        pending.lost += lost(batch);
         let change = batch.boundary().and_then(|b| b.change.clone());
         pending.change = higher(pending.change.take(), change);
     }
@@ -486,9 +490,10 @@ impl Pending {
         Boundary {
             change,
             loss: Some(Loss {
-                samples: self.samples + lost(batch),
+                samples: self.rows + self.lost + lost(batch),
                 expected,
                 dropped_batches: self.dropped,
+                dropped_samples: self.rows,
             }),
         }
     }

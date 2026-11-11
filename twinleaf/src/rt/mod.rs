@@ -383,6 +383,15 @@ impl Awake {
     }
 }
 
+/// Raises the priority of the calling thread for as long as the thread
+/// lives, to the priority of the runtime's workers. Only the first call on
+/// a thread tries. It does nothing where the runtime raises no worker, which
+/// is everywhere but Windows.
+pub(crate) fn raise_thread_priority() {
+    #[cfg(target_os = "windows")]
+    priority::raise();
+}
+
 #[cfg(target_os = "windows")]
 mod priority {
     use super::os::windows_helpers::ActivityGuard;
@@ -400,7 +409,11 @@ mod priority {
         GUARD.with(|guard| {
             guard.get_or_init(|| {
                 ActivityGuard::latency_critical()
-                    .map_err(|e| log::warn!("twinleaf-io: failed to raise thread priority: {e}"))
+                    .map_err(|e| {
+                        let thread = std::thread::current();
+                        let name = thread.name().unwrap_or("a thread");
+                        log::warn!("{name}: failed to raise thread priority: {e}");
+                    })
                     .ok()
             });
         });

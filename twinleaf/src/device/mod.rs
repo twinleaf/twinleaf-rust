@@ -117,3 +117,17 @@ pub use crate::session::{
 };
 pub use crate::session::{Receiver, RecvError};
 pub use connection::{Connection, Device, DeviceTree, MetadataError, NamedRoute};
+
+/// Raises the priority of the calling thread for as long as the thread
+/// lives, to that of the threads that carry packets between a device, its
+/// proxy and a [`Connection`].
+///
+/// A thread that takes a device's samples as they come, or sends them as a
+/// simulated device does, calls it once, so that other work on a busy
+/// machine does not hold the samples up. Such a thread must wait for its
+/// work and not spin, as it runs ahead of nearly every other thread. It
+/// does nothing where those threads run at no raised priority, which is
+/// everywhere but Windows.
+pub fn raise_thread_priority() {
+    crate::rt::raise_thread_priority();
+}

@@ -1054,6 +1054,7 @@ mod tests {
                     samples: 3,
                     expected: Some(SampleNumber::new(1)),
                     dropped_batches: 0,
+                    dropped_samples: 0,
                 }),
             })
         );
@@ -1096,6 +1097,7 @@ mod tests {
             samples: 3,
             expected: Some(SampleNumber::new(1)),
             dropped_batches: 0,
+            dropped_samples: 0,
         });
         let restarted = Change::Restarted {
             old_id: crate::proto::SegmentId::new(0),
@@ -1161,6 +1163,7 @@ mod tests {
                     samples: 2,
                     expected: Some(SampleNumber::new(1)),
                     dropped_batches: 0,
+                    dropped_samples: 0,
                 }),
             })
         );
@@ -1254,6 +1257,7 @@ mod tests {
                     samples: 2,
                     expected: Some(SampleNumber::new(1)),
                     dropped_batches: 0,
+                    dropped_samples: 0,
                 }),
             })
         );

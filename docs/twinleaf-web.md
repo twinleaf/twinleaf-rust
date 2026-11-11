@@ -243,8 +243,14 @@ canvas and its WebGL layer.
 
 ### A sample, to a pixel
 
-1. The proxy delivers a `SampleBatch` to the hub's connection. The hub's
-   thread puts it in the `Buffer` of raw rows (10 min of each stream in at
+1. The proxy delivers a `SampleBatch` to the hub's connection, whose queue
+   of 1024 batches is the one place samples wait for the hub. The hub's
+   thread, raised to the priority of the threads that carry packets
+   (`twinleaf::device::raise_thread_priority`), takes it from that queue. A
+   queue that fills drops the batches that come, and the next batch of
+   each stream says how many rows went (`Loss::dropped_samples`), which the
+   hub counts by stream. The hub's
+   thread puts the batch in the `Buffer` of raw rows (10 min of each stream in at
    most 1 GB at first, as `/api/history` sets; past the budget the chunk
    that arrived first goes) and makes a trace of each new float column
    (`Hub::register`, id = its index).

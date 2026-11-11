@@ -232,6 +232,7 @@ mod tests {
                     samples: 3,
                     expected: Some(crate::proto::SampleNumber::new(2)),
                     dropped_batches: 0,
+                    dropped_samples: 0,
                 }),
             }),
             generations(1),

@@ -304,4 +304,7 @@ pub struct Loss {
     /// add up over its batches to that stream's share of the counts
     /// [`RecvError::Lagged`](crate::RecvError::Lagged) reports.
     pub dropped_batches: u64,
+    /// The rows of those batches, which `samples` counts too. The rest of
+    /// `samples` never reached the receiver's queue.
+    pub dropped_samples: u64,
 }

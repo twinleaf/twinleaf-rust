@@ -845,6 +845,10 @@ fn reported(batch: &SampleBatch, gap: bool) -> (Option<Told>, Option<Loss>) {
     };
     let loss = boundary.loss.as_ref().map(|lost: &Lost| {
         assert!(lost.samples >= 1, "a loss of {lost:?} names no sample");
+        assert!(
+            lost.dropped_samples <= lost.samples,
+            "a loss of {lost:?} dropped more rows than it counts"
+        );
         assert_eq!(
             lost.dropped_batches > 0,
             gap,

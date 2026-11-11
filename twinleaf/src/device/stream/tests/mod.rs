@@ -325,6 +325,7 @@ fn a_device_that_reconnects_behind_the_proxy_goes_on_from_its_samples_before() {
                     samples: 2,
                     expected: Some(SampleNumber::new(1)),
                     dropped_batches: 0,
+                    dropped_samples: 0,
                 }),
             },
             _ => Boundary::of(Change::SessionChanged {
@@ -764,6 +765,7 @@ fn a_batch_lane_carries_each_streams_dropped_batches_onto_its_next_batch() {
         samples,
         expected: Some(SampleNumber::new(1)),
         dropped_batches,
+        dropped_samples: samples,
     };
     assert_eq!(loss(&batch_a), Some(lost(2, 2)));
     assert_eq!(loss(&batch_b), Some(lost(1, 1)));
@@ -831,6 +833,7 @@ fn a_batch_lane_that_dropped_a_streams_start_starts_it_with_the_loss() {
             samples: 1,
             expected: None,
             dropped_batches: 1,
+            dropped_samples: 1,
         })
     );
 }

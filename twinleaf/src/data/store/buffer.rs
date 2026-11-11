@@ -921,6 +921,7 @@ mod tests {
                 samples,
                 expected: None,
                 dropped_batches: 0,
+                dropped_samples: 0,
             }),
         }
     }
