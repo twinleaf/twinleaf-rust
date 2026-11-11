@@ -33,8 +33,9 @@
 //     pause       Space
 //
 // So Escape belongs first to a drag, then to an open menu, popover or
-// dialog, which closes, or a field something is typed in, which keeps it to
-// put back what it showed; then it leaves the
+// dialog, which closes, a question a popover asks going before it
+// (overlay.svelte.js `escapeFirst`), or a field something is typed in,
+// which keeps it to put back what it showed; then it leaves the
 // maximized view; then it deselects; then it goes out a level. That is its
 // order wherever focus is: the keymap gives Escape to no place before the
 // element but the drag's, and a list in the page keeps the other keys

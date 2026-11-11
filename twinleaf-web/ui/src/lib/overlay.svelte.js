@@ -22,6 +22,8 @@ import * as clock from './clock.js';
 
 const ROOT = Symbol('overlay root');
 const INSIDE = Symbol('overlay inside');
+/** The parts of a layer's content that take Escape before it closes (`escapeFirst`), oldest first. */
+const ESCAPE = Symbol('overlay escape');
 /** What a layer's content is, on the page. */
 const CONTENT = '[data-slot$=-content]';
 
@@ -166,9 +168,15 @@ export function overlayRoot(close) {
 export function overlayContent() {
   const layer = getContext(ROOT) ?? null;
   setContext(INSIDE, layer);
+  const firsts = [];
+  setContext(ESCAPE, firsts);
   return {
     outside() {
       if (layer) layer.keepFocus = true;
+    },
+    /** A popover's content calls it with Escape's event: the part inside it that takes Escape first (`escapeFirst`), the newest, takes it, and the layer stays open. */
+    escape(e) {
+      if (firsts.at(-1)?.()) e.preventDefault();
     },
     /** A menu's content gives its element, for `freezeMenus`. */
     element(el) {
@@ -184,6 +192,19 @@ export function overlayContent() {
       layer.returnTo = null;
     },
   };
+}
+
+/**
+ * Makes the calling component, inside a popover's content, a part that
+ * takes Escape before the popover closes, as a question it asks goes
+ * first: `take()` answers whether it took the key. A part that answers
+ * false, or one outside any popover, leaves Escape to the popover.
+ */
+export function escapeFirst(take) {
+  const firsts = getContext(ESCAPE);
+  if (!firsts) return;
+  firsts.push(take);
+  onDestroy(() => firsts.splice(firsts.indexOf(take), 1));
 }
 
 /** For a tooltip: a function that says whether an open layer it is not inside hides it now. */

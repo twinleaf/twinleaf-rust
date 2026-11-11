@@ -2,13 +2,20 @@
 // - a lower limit that drops nothing the hub holds is set at once;
 // - one that drops some asks in place, saying how much of the live history
 //   and, while plots are paused, of what they hold; Keep leaves the limit
-//   and sends the hub nothing, Drop sends the lower limit once;
+//   and sends the hub nothing, Drop sends the lower limit once; focus goes
+//   to Keep as it asks;
 // - a higher limit never asks;
-// - Escape, which closes the popover, keeps the limit.
+// - Escape while it asks keeps the limit and leaves the popover open, and
+//   a second Escape closes it.
 // The hub here says what it holds by `memory` messages, and the page's
 // /api/history requests are counted.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { page as browser } from 'vitest/browser';
 import { clickOn, mountPage, pressKey, settle, until } from './harness/page.js';
+
+/** Where VITE_TL_SHOTS names a folder, relative to this file, the screenshots go there. */
+const SHOTS = import.meta.env.VITE_TL_SHOTS;
+const shot = async (name) => SHOTS && (await browser.screenshot({ path: `${SHOTS}/${name}.png` }));
 
 /** A hub holding an hour of a 1600 bytes a second stream, its History an hour within 1 GB. */
 const FULL = { type: 'memory', bytes: 3600 * 1600, budget: 1e9, seconds: 3600, max_age: 3600, rate: 1600, oldest: { 0: 0 } };
@@ -110,16 +117,44 @@ describe('a lower History limit', () => {
     expect(sent).toEqual([{ seconds: 86400, bytes: 2.5e8 }]);
   });
 
-  it('is kept by Escape, which closes the popover', async () => {
+  it('is kept by Escape, which leaves the popover open; a second Escape closes it', async () => {
     await open(FULL);
     await pickTime('30 min');
     expect(question()).not.toBe(null);
     await pressKey('Escape');
-    expect(await until(() => !popover()), 'the popover closes').toBe(true);
-    await clickOn(document.querySelector('.status-bar .history'));
-    expect(await until(popover)).toBe(true);
-    expect(question()).toBe(null);
+    expect(await until(() => !popover(), 500), 'the popover stays').toBe(false);
+    expect(question(), 'the question goes').toBe(null);
+    expect(popover().querySelector('[aria-label="Time limit"]').textContent.trim(), 'the limit kept').toBe('60 min');
     expect(sent).toEqual([]);
+    await pressKey('Escape');
+    expect(await until(() => !popover()), 'the popover closes').toBe(true);
+    expect(sent).toEqual([]);
+    // A lower memory limit's question goes the same way.
+    await open({ ...FULL, bytes: 5e8, budget: 5e8, max_age: 86400, rate: 5e8 / 3600 });
+    await clickOn(popover().querySelector('[aria-label="Less memory"]'));
+    await settle();
+    expect(question()?.buttons).toEqual(['Keep 500.0 MB', 'Drop 30 min']);
+    await pressKey('Escape');
+    expect(await until(() => !popover(), 500)).toBe(false);
+    expect(question()).toBe(null);
+    expect(popover().querySelector('[aria-label="Memory limit"] span').textContent).toBe('500.0 MB');
+    expect(sent).toEqual([]);
+  });
+
+  it('moves focus to Keep as it asks, whichever control asked', async () => {
+    await open(FULL);
+    await pickTime('30 min');
+    expect(await until(() => document.activeElement === button('Keep 60 min')), 'Keep has focus after a pick from the list').toBe(true);
+    await shot('history-1-asks');
+    await pressKey('Escape');
+    await settle();
+    await shot('history-2-kept');
+    expect(document.activeElement, 'kept, focus goes back to the list').toBe(popover().querySelector('[aria-label="Time limit"]'));
+    await pressKey('Escape');
+    expect(await until(() => !popover())).toBe(true);
+    await open({ ...FULL, bytes: 5e8, budget: 5e8, max_age: 86400, rate: 5e8 / 3600 });
+    await clickOn(popover().querySelector('[aria-label="Less memory"]'));
+    expect(await until(() => document.activeElement === button('Keep 500.0 MB')), 'Keep has focus after the stepper').toBe(true);
   });
 });
 

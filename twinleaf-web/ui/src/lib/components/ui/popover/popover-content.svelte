@@ -11,9 +11,11 @@
 		portalProps,
 		onInteractOutside,
 		onCloseAutoFocus,
+		onEscapeKeydown,
 		...restProps
 	} = $props();
-	// A press outside, or another layer opening, leaves focus where it put it (overlay.svelte.js).
+	// A press outside, or another layer opening, leaves focus where it put it,
+	// and a part inside that takes Escape first keeps it open (overlay.svelte.js).
 	const layer = overlayContent();
 </script>
 
@@ -30,5 +32,6 @@
 		{...restProps}
 		onInteractOutside={(e) => (layer.outside(), onInteractOutside?.(e))}
 		onCloseAutoFocus={(e) => (layer.closing(e), onCloseAutoFocus?.(e))}
+		onEscapeKeydown={(e) => (layer.escape(e), e.defaultPrevented || onEscapeKeydown?.(e))}
 	/>
 </PopoverPortal>

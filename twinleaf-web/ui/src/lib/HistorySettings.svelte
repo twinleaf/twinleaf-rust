@@ -11,9 +11,11 @@
   // A lower limit that drops history the hub holds asks first, in place of
   // the waterline: what it drops of the live history and of what paused
   // plots hold (session.svelte.js `dropping`), with a button that drops it
-  // and one that keeps the limit set. Closing the popover keeps it too, as
-  // the question goes with the component. A higher limit, or a lower one
-  // that drops nothing, is set at once.
+  // and one that keeps the limit set, which has focus as it asks. Escape
+  // while it asks keeps the limit and leaves the popover open; closing the
+  // popover keeps it too, as the question goes with the component. Kept,
+  // focus goes back to the control that asked. A higher limit, or a lower
+  // one that drops nothing, is set at once.
   import * as Select from '$lib/components/ui/select/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import RiInfo from '@lucide/svelte/icons/info';
@@ -22,6 +24,7 @@
   import Tip from './Tip.svelte';
   import { api } from './protocol.js';
   import { dropping } from './session.svelte.js';
+  import { escapeFirst } from './overlay.svelte.js';
   import { HISTORY_BUDGETS, HISTORY_SPANS } from './constants.js';
   import { bytesEstimate, bytesText, spanText } from './units.js';
   import * as words from './words.js';
@@ -78,6 +81,19 @@
     api.setHistory(maxAge, budget);
   }
 
+  // The controls that ask, and the question's Keep, which has focus while it asks.
+  let timeTrigger = $state(null), lessButton = $state(null), keepButton = $state(null);
+  $effect(() => keepButton?.focus());
+
+  /** Keeps the limit set, and gives focus back to the control that asked. */
+  function keep() {
+    const from = asking.limit === 'time' ? timeTrigger : lessButton;
+    asking = null;
+    from?.focus();
+  }
+  // Escape while it asks keeps the limit, and leaves the popover open.
+  escapeFirst(() => !!asking && (keep(), true));
+
   const setBudget = (i) => set(memory.maxAge, HISTORY_BUDGETS[i], 'memory');
 </script>
 
@@ -86,14 +102,14 @@
     <span>Time limit</span>
     <!-- The list shows the limit set, not one a question keeps from being set. -->
     <Select.Root type="single" bind:value={() => String(memory.maxAge), (v) => set(+v, memory.budget, 'time')}>
-      <Select.Trigger size="sm" class="w-full text-xs {binding === 'time' ? 'text-foreground' : 'text-muted-foreground'}" aria-label="Time limit">{spanText(memory.maxAge)}</Select.Trigger>
+      <Select.Trigger bind:ref={timeTrigger} size="sm" class="w-full text-xs {binding === 'time' ? 'text-foreground' : 'text-muted-foreground'}" aria-label="Time limit">{spanText(memory.maxAge)}</Select.Trigger>
       <Select.Content>
         {#each HISTORY_SPANS as s}<Select.Item value={String(s)} label={spanText(s)} />{/each}
       </Select.Content>
     </Select.Root>
     <span>Memory limit</span>
     <div class="stepper" role="group" aria-label="Memory limit">
-      <button aria-label="Less memory" disabled={step === 0} onclick={() => setBudget(step - 1)}><RiMinus /></button>
+      <button bind:this={lessButton} aria-label="Less memory" disabled={step === 0} onclick={() => setBudget(step - 1)}><RiMinus /></button>
       <span class:muted={binding !== 'memory'}>{bytesText(memory.budget)}</span>
       <button aria-label="More memory" disabled={step === HISTORY_BUDGETS.length - 1} onclick={() => setBudget(step + 1)}><RiPlus /></button>
     </div>
@@ -104,7 +120,7 @@
         {#each ask.lines as line}<p>{line}</p>{/each}
       </div>
       <div class="lower-buttons">
-        <Button size="xs" variant="outline" onclick={() => (asking = null)}>{ask.keep}</Button>
+        <Button bind:ref={keepButton} size="xs" variant="outline" onclick={keep}>{ask.keep}</Button>
         <Button size="xs" variant="destructive" onclick={drop}>{ask.drop}</Button>
       </div>
     </div>
