@@ -354,7 +354,7 @@ describe('a dock header', () => {
 const ZONES = {
   tab: { items: () => [...document.querySelectorAll('[role=tablist] [data-tab]')], click: (el) => el.querySelector('span'), reach: (el) => el },
   chip: { items: () => [...document.querySelectorAll('.tiles .trace-zone .trace-chip')], click: (el) => el.querySelector('.name') ?? el, reach: (el) => el.closest('.trace-zone') },
-  signal: { items: () => [...document.querySelectorAll('.palette [data-key]')], click: (el) => el.querySelector('.sig-key') ?? el, reach: (el) => el.closest('.palette'), own: { Enter: 'list' } },
+  signal: { items: () => [...document.querySelectorAll('.palette [data-key]')], click: (el) => el.querySelector('.sig-key') ?? el, reach: (el) => el.closest('.palette'), own: { Enter: 'list', Space: 'list' } },
   'dock header': { items: () => [...document.querySelectorAll('.dock-head')], click: (el) => el.querySelector('.dock-title') ?? el, reach: (el) => el },
 };
 

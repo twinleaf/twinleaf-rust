@@ -8,13 +8,22 @@
 // Signals are picked as rows are, with the plots selected and never with
 // property rows (round 2, late notes); a click adds nothing, and Enter, a
 // double-click, the menu and a drag put the signals picked on the plots
-// selected, Delete taking them off (plan, "Signals selected like rows").
+// selected, Delete taking them off (plan, "Signals selected like rows"). A
+// double-click on one of several picked puts them all on; the arrows move
+// the list's cursor and pick nothing but with Shift, Space and Enter pick
+// the signal under it; the menu's Colour and Copy name act on the signals
+// picked; and an undo puts back the plots selected, not the signals picked.
 import { describe, expect, it } from 'vitest';
-import { commands } from 'vitest/browser';
+import { commands, page as browser } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, clickOn, drag, dropped, focusPage, frames, leafOf, mountPage, pickItem, plotMenu, pressKey, settle, until, wait, withExamples } from './harness/page.js';
+import { centre, clickOn, closeAll, drag, dropped, focusPage, frames, leafOf, mountPage, pickItem, plotMenu, pressKey, settle, until, wait, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
+import { DOUBLE_CLICK_MS } from '../src/lib/selection.svelte.js';
+import { colors } from '../src/lib/colors.svelte.js';
+
+/** Where VITE_TL_SHOTS names a folder, relative to this file, the screenshots go there. */
+const SHOTS = import.meta.env.VITE_TL_SHOTS;
 
 const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine']];
 
@@ -205,7 +214,7 @@ describe('signals in the Signals list', () => {
   const ORIGINS = ['Enter', 'Shift+Enter', 'Delete', 'Backspace', 'double-click', 'menu', 'drag'];
 
   it('are picked by a click, Ctrl-click and Shift-click as rows are, which adds nothing; Enter, a double-click, the menu and a drag put the picked signals on the selected plots, Shift+Enter in a new one, and Delete takes them off, each as one step', async () => {
-    const seen = Object.fromEntries([...ORIGINS, 'several', 'withPlots', 'menuRemove', 'menuAdd', 'dragSeveral', 'rowAlone'].map((k) => [k, 0]));
+    const seen = Object.fromEntries([...ORIGINS, 'several', 'withPlots', 'menuRemove', 'menuAdd', 'dragSeveral', 'rowAlone', 'narrowed', 'doubleSeveral', 'keyPicks', 'undoKeeps', 'bothCounted'].map((k) => [k, 0]));
     await fc.assert(
       fc.asyncProperty(fc.subarray([0, 1, 2]), fc.array(pickStep, { minLength: 1, maxLength: 4 }), fc.constantFrom(...ORIGINS), fc.nat(), fc.nat(2), async (plotPicks, picksMade, origin, onAt, toAt) => {
         // Each plot shows one of the list's signals; two of the list's are on no plot.
@@ -222,9 +231,16 @@ describe('signals in the Signals list', () => {
           let picks = [], anchor = null, at = null;
           for (const p of picksMade) {
             const key = order[p.at % order.length];
+            const narrows = p.how === 'click' && picks.length > 1 && picks.includes(key);
             await clickOn(chip(key), { ctrl: p.how === 'ctrl', shift: p.how === 'shift' });
             flushSync();
             at = key;
+            if (narrows) {
+              // A click on one of several signals picked narrows the pick to it once the double-click time has passed.
+              expect([...page.ws.selection.signals], `${key} clicked among ${picks}`).toEqual(picks);
+              await wait(DOUBLE_CLICK_MS + 10);
+              seen.narrowed++;
+            }
             if (p.how === 'shift' && anchor) {
               const [i, j] = [order.indexOf(anchor), order.indexOf(key)].sort((x, y) => x - y);
               picks = order.slice(i, j + 1);
@@ -247,9 +263,12 @@ describe('signals in the Signals list', () => {
           // What it acts on: made on a row, the signals picked when the row is one of them, or else that signal alone.
           let made = on, acts = selected, takes = false;
           if (origin === 'double-click') {
-            // Its clicks pick the signal alone.
+            // On one of several signals picked, it keeps them picked and puts them all on the plots; on another, its clicks pick it alone.
             await commands.mouse([['dblclick', ...centre(chip(on).querySelector('.sig-key'))]]);
-            picks = [on];
+            if (!picks.includes(on)) picks = [on];
+            else if (picks.length > 1) seen.doubleSeveral++;
+            await wait(DOUBLE_CLICK_MS + 10);
+            expect([...page.ws.selection.signals], 'a double-click leaves the signals picked').toEqual(picks);
           } else if (origin === 'menu') {
             await clickOn(chip(on), { right: true });
             expect(await until(() => menuRow('Colour'), 2000), 'the menu opens').toBe(true);
@@ -264,9 +283,10 @@ describe('signals in the Signals list', () => {
               expect(valueOf(add)).toBe('No plot selected');
               expect(add.hasAttribute('data-disabled')).toBe(true);
             } else {
-              // The row counts the signals it acts on and the plots it changes, each when more than one.
+              // The row counts the signals it acts on and the plots it changes, each when more than one: "2 signals to 2 plots", "2 signals from 2 plots".
               const changed = takes ? selected : lacking;
-              expect(valueOf(takes ? remove : add)).toBe([counted(picks.length, 'signal'), counted(changed.length, 'plot')].filter(Boolean).join(', ') || null);
+              expect(valueOf(takes ? remove : add)).toBe([counted(picks.length, 'signal'), counted(changed.length, 'plot')].filter(Boolean).join(takes ? ' from ' : ' to ') || null);
+              if (!takes && picks.length > 1 && changed.length > 1) seen.bothCounted++;
               // Remove from plot shows the key that does it.
               if (takes) expect([...remove.querySelectorAll('kbd')].map((k) => k.textContent)).toEqual(['Delete']);
               seen[takes ? 'menuRemove' : 'menuAdd']++;
@@ -280,13 +300,18 @@ describe('signals in the Signals list', () => {
             acts = [to];
             if (picks.includes(on) && picks.length > 1) seen.dragSeveral++;
           } else {
-            // The list's keys are made on the signal clicked last.
+            // The list's keys are made on the signal clicked last, which they pick first unless it is picked.
             made = at;
             await pressKey(origin);
             takes = origin === 'Delete' || origin === 'Backspace';
+            if (!picks.includes(made)) {
+              picks = [made];
+              seen.keyPicks++;
+            }
+            expect([...page.ws.selection.signals], `${origin} picks the signal it is made on`).toEqual(picks);
           }
           await settle();
-          const signals = origin === 'double-click' ? [on] : picks.includes(made) ? picks : [made];
+          const signals = origin === 'double-click' ? picks : picks.includes(made) ? picks : [made];
           if (!picks.includes(made)) seen.rowAlone++;
           const after = shows(page, [...ids, ...plotIds(page.ws.layout).filter((id) => !ids.includes(id))]);
           const said = `${origin} on ${made} with ${picks} picked and plots ${plotPicks} selected`;
@@ -308,10 +333,19 @@ describe('signals in the Signals list', () => {
           const changed = Object.keys(after).some((id) => JSON.stringify(after[id]) !== JSON.stringify(before[id] ?? null));
           expect(page.history.undos.length - steps, `${said}: one step where it changed a plot, none where not`).toBe(changed ? 1 : 0);
           if (changed) {
+            // A signal picked after the step, which the undo leaves picked: it puts back the plots only.
+            const other = chips().find((c) => !signals.includes(c.dataset.key));
+            if (other) {
+              await clickOn(other);
+              await wait(DOUBLE_CLICK_MS + 10);
+              seen.undoKeeps++;
+            }
+            const pickedNow = [...page.ws.selection.signals];
             page.history.undo();
             flushSync();
             expect(shows(page, ids), `${said}, undone`).toEqual(before);
             expect(plotIds(page.ws.layout)).toEqual(ids);
+            expect([...page.ws.selection.signals], `${said}: the undo leaves the signals picked`).toEqual(pickedNow);
           }
           seen[origin]++;
         } finally {
@@ -328,6 +362,157 @@ describe('signals in the Signals list', () => {
         [[1], [{ how: 'click', at: 3 }, { how: 'ctrl', at: 4 }], 'menu', 0, 0],
         [[1], [{ how: 'click', at: 3 }, { how: 'ctrl', at: 4 }], 'drag', 0, 1],
         [[1], [{ how: 'click', at: 3 }, { how: 'ctrl', at: 3 }], 'Enter', 0, 1],
+        // A click on one of two signals picked narrows to it, then a double-click on another.
+        [[0, 1], [{ how: 'click', at: 3 }, { how: 'ctrl', at: 4 }, { how: 'click', at: 4 }], 'double-click', 2, 0],
+      ]),
+    );
+    for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
+  }, 900_000);
+
+  /** A key pressed in the list: the arrows, Home and End, with Shift or not, Space, with Shift or not, and Enter. */
+  const listKey = fc.constantFrom('ArrowDown', 'ArrowDown', 'ArrowUp', 'Home', 'End', 'Shift+ArrowDown', 'Shift+ArrowUp', ' ', 'Shift+ ', 'Enter');
+
+  it('move the list’s cursor by the arrows, which pick nothing but with Shift the run to it; Space picks the signal under the cursor, and Enter picks it unless it is picked and puts the signals picked on the plot selected', async () => {
+    const seen = { moved: 0, apart: 0, run: 0, runFromCursor: 0, space: 0, enterPicks: 0, enterKeeps: 0 };
+    await fc.assert(
+      fc.asyncProperty(fc.array(listKey, { minLength: 1, maxLength: 10 }), async (keys) => {
+        const page = await mountPage(KEYS, 'columns', 0, [...KEYS.flat(), 'vector.x', 'vector.y']);
+        try {
+          const ids = plotIds(page.ws.layout);
+          await focusPage();
+          page.ws.selection.only([ids[0]]);
+          await settle();
+          const order = chips().map((c) => c.dataset.key), list = document.querySelector('.palette');
+          await pressKey('Shift');
+          list.focus();
+          // The model: the cursor's row, the signals picked in the order picked, and the signal a Shift pick runs from.
+          let at = 0, picks = [], anchor = null;
+          const run = (to) => {
+            const [i, j] = [order.indexOf(anchor), to].sort((x, y) => x - y);
+            picks = order.slice(i, j + 1);
+          };
+          for (const k of keys) {
+            await pressKey(k);
+            await settle();
+            const shift = k.startsWith('Shift+'), base = shift ? k.slice('Shift+'.length) : k;
+            const to = { ArrowDown: Math.min(order.length - 1, at + 1), ArrowUp: Math.max(0, at - 1), Home: 0, End: order.length - 1 }[base];
+            if (to !== undefined) {
+              if (shift) {
+                if (!picks.length) ((picks = [order[at]]), (anchor = order[at]), seen.runFromCursor++);
+                run(to);
+                seen.run++;
+              } else {
+                seen.moved++;
+                if (picks.length && !picks.includes(order[to])) seen.apart++;
+              }
+              at = to;
+            } else if (base === ' ') {
+              if (shift && anchor) run(at);
+              else (picks = [order[at]]), (anchor = order[at]);
+              seen.space++;
+            } else {
+              if (!picks.includes(order[at])) ((picks = [order[at]]), (anchor = order[at]), seen.enterPicks++);
+              else seen.enterKeeps++;
+              const shown = page.ws.plots[ids[0]].items.map((i) => i.key);
+              expect(picks.filter((p) => !shown.includes(p)), `Enter puts ${picks} on the plot selected`).toEqual([]);
+            }
+            const said = `${k} in ${JSON.stringify(keys)}`;
+            expect([...page.ws.selection.signals], `the signals picked after ${said}`).toEqual(picks);
+            expect(marked().sort(), `the page marks the signals picked after ${said}`).toEqual([...picks].sort());
+            expect(document.getElementById(list.getAttribute('aria-activedescendant'))?.dataset.key, `the cursor after ${said}`).toBe(order[at]);
+          }
+        } finally {
+          page.dispose();
+        }
+      }),
+      withExamples([
+        // The arrows move off the signal picked and pick nothing; Space picks the one they are on; Shift+Down runs from it.
+        [[' ', 'ArrowDown', 'ArrowDown', ' ', 'Shift+ArrowDown', 'Shift+ArrowUp']],
+        // With none picked, Shift+Down runs from the cursor's row; Enter on a signal picked keeps the run, and on another picks it.
+        [['ArrowDown', 'Shift+ArrowDown', 'Enter', 'End', 'Enter', 'Home', 'Shift+ ']],
+      ]),
+    );
+    for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
+  }, 900_000);
+
+  it('show the cursor apart from the signals picked: the focus ring around the cursor’s row, the picked look on those picked', async () => {
+    const page = await mountPage(KEYS, 'columns', 0, [...KEYS.flat(), 'vector.x', 'vector.y']);
+    try {
+      await focusPage();
+      await settle();
+      const order = chips().map((c) => c.dataset.key);
+      await clickOn(chip(order[0]));
+      await clickOn(chip(order[1]), { ctrl: true });
+      // From the signal clicked last, two rows down.
+      for (let i = 0; i < 2; i++) await pressKey('ArrowDown');
+      expect(await until(() => document.querySelector('.focus-ring')), 'a ring').toBe(true);
+      await settle(6);
+      const cursor = chip(order[3]), ring = [...document.querySelectorAll('.focus-ring')].map((r) => r.getBoundingClientRect());
+      expect(marked().sort(), 'the arrows pick nothing').toEqual([order[0], order[1]].sort());
+      expect(cursor.classList.contains('picked'), 'the cursor’s row has no picked look').toBe(false);
+      const box = cursor.getBoundingClientRect();
+      expect(ring.length, 'one ring').toBe(1);
+      expect(Math.abs(ring[0].top - box.top) < 6 && Math.abs(ring[0].bottom - box.bottom) < 6, 'the ring is around the cursor’s row').toBe(true);
+      // The picked look differs from a row with neither.
+      const look = (el) => [getComputedStyle(el).backgroundColor, getComputedStyle(el).borderTopColor].join(' ');
+      expect(look(chip(order[0])), 'the picked look').not.toBe(look(chip(order[4])));
+      if (SHOTS) await browser.screenshot({ path: `${SHOTS}/signals-cursor.png` });
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('the menu’s Colour and Copy name act on the signals picked when the menu’s signal is one of them, else on it alone, the names one a line', async () => {
+    const seen = { several: 0, alone: 0, colour: 0, copy: 0 };
+    const keys = [...KEYS.flat(), 'vector.x', 'vector.y'];
+    await fc.assert(
+      fc.asyncProperty(fc.array(fc.record({ ctrl: fc.boolean(), at: fc.nat() }), { minLength: 1, maxLength: 4 }), fc.nat(), fc.constantFrom('Colour', 'Copy name'), fc.nat(7), async (clicks, onAt, row, colour) => {
+        const page = await mountPage(KEYS, 'columns', 0, keys);
+        const copied = [];
+        const write = navigator.clipboard.writeText;
+        navigator.clipboard.writeText = (text) => (copied.push(text), Promise.resolve());
+        try {
+          await focusPage();
+          await settle();
+          const order = chips().map((c) => c.dataset.key);
+          for (const c of clicks) {
+            await clickOn(chip(order[c.at % order.length]), { ctrl: c.ctrl });
+            await wait(DOUBLE_CLICK_MS + 10);
+          }
+          const picks = [...page.ws.selection.signals], on = order[onAt % order.length];
+          const targets = picks.includes(on) ? picks : [on];
+          seen[targets.length > 1 ? 'several' : 'alone']++;
+          const was = Object.fromEntries(order.map((k) => [k, colors.of(k)]));
+          await clickOn(chip(on), { right: true });
+          expect(await until(() => menuRow(row), 2000), 'the menu opens').toBe(true);
+          const said = `${row} on ${on} with ${picks} picked`;
+          if (row === 'Colour') {
+            await clickOn(menuRow('Colour'));
+            const swatch = () => [...document.querySelectorAll('.swatch-choice')][colour];
+            expect(await until(swatch, 2000), 'the colours show').toBe(true);
+            await clickOn(swatch());
+            await settle();
+            for (const k of order) expect(colors.of(k), `${said}: ${k}`).toBe(targets.includes(k) ? colour : was[k]);
+            seen.colour++;
+          } else {
+            await clickOn(menuRow('Copy name'));
+            await settle();
+            expect(copied, said).toEqual([targets.join('\n')]);
+            seen.copy++;
+          }
+        } finally {
+          navigator.clipboard.writeText = write;
+          for (const k of keys) colors.pick(k, null);
+          await closeAll();
+          page.dispose();
+        }
+      }),
+      withExamples([
+        // Two signals picked, the menu on one of them, then on one not picked.
+        [[{ ctrl: false, at: 0 }, { ctrl: true, at: 2 }], 2, 'Colour', 3],
+        [[{ ctrl: false, at: 0 }, { ctrl: true, at: 2 }, { ctrl: true, at: 4 }], 0, 'Copy name', 0],
+        [[{ ctrl: false, at: 0 }, { ctrl: true, at: 2 }], 1, 'Colour', 5],
+        [[{ ctrl: false, at: 0 }, { ctrl: true, at: 2 }], 1, 'Copy name', 0],
       ]),
     );
     for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);

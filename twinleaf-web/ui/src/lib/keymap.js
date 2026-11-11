@@ -63,6 +63,8 @@ export const KEYMAP = [
     title: 'Lists',
     entries: [
       { ...MOVE, keys: ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'] },
+      { show: ['Shift', '↑', '↓'], on: 'signals', what: 'Extend the pick' },
+      { show: ['Space'], on: 'signals', keys: [' '], action: 'pick', what: 'Pick the signal the arrows are on; with Shift, the run to it' },
       { show: ['Click'], on: 'signal', what: 'Pick it; with Ctrl or Shift, as rows are picked' },
       { show: ['Double-click'], on: 'signal', what: 'Add to the selected plots' },
       { show: ['Ctrl', 'A'], on: 'signals', keys: ['a'], ctrl: true, action: 'pickAll', what: 'Pick every signal shown' },

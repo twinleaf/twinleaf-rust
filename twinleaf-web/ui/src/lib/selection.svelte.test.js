@@ -41,7 +41,8 @@ const act = fc.oneof(
   fc.record({ t: fc.constant('only'), ids: fc.subarray(IDS) }),
   fc.record({ t: fc.constant('rows'), keys: fc.subarray(PROPERTIES) }),
   fc.record({ t: fc.constant('rows'), keys: fc.subarray(SIGNALS, { minLength: 1 }) }),
-  { weight: 4, arbitrary: fc.record({ t: fc.constant('pick'), key: fc.constantFrom(...ROWS), how: fc.constantFrom('click', 'click', 'ctrl', 'shift', 'right') }) },
+  { weight: 4, arbitrary: fc.record({ t: fc.constant('pick'), key: fc.constantFrom(...ROWS), how: fc.constantFrom('click', 'click', 'ctrl', 'shift', 'right'), clicks: fc.constantFrom(0, 1, 2) }) },
+  fc.record({ t: fc.constant('move'), key: fc.constantFrom(...ROWS) }),
   fc.record({ t: fc.constant('unrow'), key: fc.constantFrom(...ROWS) }),
   fc.record({ t: fc.constant('snapshot') }),
   fc.record({ t: fc.constant('restore') }),
@@ -52,7 +53,7 @@ const act = fc.oneof(
 
 describe('the Selection, against a model of it', () => {
   it('chooses what the rules say after every act, names no plot that is gone, and leaves nothing for later but a narrowing click', () => {
-    const seen = { withPlots: 0, runOver: 0, kindChange: 0, dropped: 0 };
+    const seen = { withPlots: 0, runOver: 0, kindChange: 0, dropped: 0, signalClick: 0, rowNarrowed: 0 };
     fc.assert(
       fc.property(fc.array(act, { minLength: 1, maxLength: 30 }), (acts) => {
         time = clock.virtual();
@@ -67,7 +68,9 @@ describe('the Selection, against a model of it', () => {
         let narrowing = null; // the plot a click will narrow to, if nothing comes first
         // The model of the rows: every row picked, shown or not, in the order picked, and the row a Shift pick runs from.
         let picks = [], anchor = null;
+        let rowNarrowing = null; // the signal a click on one of several picked will narrow the pick to, if nothing comes first
         const setRows = (keys) => {
+          rowNarrowing = null;
           if (!keys.length) anchor = null;
           picks = [...new Set(keys)];
         };
@@ -123,11 +126,18 @@ describe('the Selection, against a model of it', () => {
             // A click on a row the page shows, with Ctrl, with Shift, or the right button.
             const like = (k) => isSignal(k) === isSignal(a.key), ord = order().filter(like), before = shownPicks();
             if (before.length && !before.some(like)) seen.kindChange++;
+            rowNarrowing = null;
             if (a.how === 'right') {
               s.rowMenu(a.key);
               if (!before.includes(a.key)) (setRows([a.key]), (anchor = a.key));
+            } else if (a.how === 'click' && a.clicks && isSignal(a.key) && before.length > 1 && before.includes(a.key)) {
+              // A click on one of several signals picked leaves them picked; a first click narrows to it later.
+              s.pickRow(a.key, {}, a.clicks);
+              anchor = a.key;
+              if (a.clicks === 1) rowNarrowing = a.key;
+              seen.signalClick++;
             } else {
-              s.pickRow(a.key, { shiftKey: a.how === 'shift', ctrlKey: a.how === 'ctrl' });
+              s.pickRow(a.key, { shiftKey: a.how === 'shift', ctrlKey: a.how === 'ctrl' }, a.clicks);
               if (a.how === 'shift' && ord.includes(anchor)) {
                 const [i, j] = [ord.indexOf(anchor), ord.indexOf(a.key)].sort((x, y) => x - y);
                 setRows(ord.slice(i, j + 1));
@@ -152,8 +162,14 @@ describe('the Selection, against a model of it', () => {
             s.restore(saved);
             const back = saved.selected.filter((i) => plots.has(i));
             expect([...s.plots].sort()).toEqual(back.sort());
-            // With a plot back, the signals picked come back and no property row; with none, every row picked.
-            setRows(saved.rows.filter((k) => !back.length || isSignal(k)));
+            // With a plot back, no property row; with none, the property rows picked then. The signals picked stay, but where property rows come back.
+            const rowsBack = back.length ? [] : saved.rows.filter((k) => !isSignal(k));
+            if (rowsBack.length) setRows(rowsBack);
+            else drop();
+          } else if (a.t === 'move') {
+            // The arrows move the row they are on, and pick nothing.
+            s.moveTo(a.key);
+            expect(s.rowAt).toBe(rows.has(a.key) ? a.key : null);
           } else if (a.t === 'unrow') {
             // The page shows its rows anew.
             rows.delete(a.key);
@@ -176,10 +192,12 @@ describe('the Selection, against a model of it', () => {
           } else if (a.t === 'wait') {
             const before = state();
             time.advance(a.ms);
-            if (narrowing && a.ms > DOUBLE_CLICK_MS) {
-              expect([...s.plots]).toEqual([narrowing]);
+            if (a.ms > DOUBLE_CLICK_MS) {
+              // A click waiting to narrow the plots or the signals picked has; nothing else changes.
+              expect([...s.plots].sort()).toEqual(narrowing ? [narrowing] : [...was].sort());
+              if (rowNarrowing) (setRows([rowNarrowing]), seen.rowNarrowed++);
               narrowing = null;
-            } else if (a.ms > DOUBLE_CLICK_MS || !narrowing) expect(state()).toBe(before);
+            } else if (!narrowing && !rowNarrowing) expect(state()).toBe(before);
           }
           // The rows picked are those of the picks the page shows, in the order picked: property rows, or signals by key.
           expect([...s.rows], JSON.stringify(a)).toEqual(shownPicks().filter((k) => !isSignal(k)));
@@ -202,6 +220,16 @@ describe('the Selection, against a model of it', () => {
           [[{ t: 'only', ids: ['a', 'b'] }, { t: 'pick', key: `${SIGNAL}x`, how: 'click' }, { t: 'pick', key: `${SIGNAL}z`, how: 'shift' }, { t: 'pick', key: `${SIGNAL}y`, how: 'ctrl' }, { t: 'targets', at: 0, scope: 'plot', key: `${SIGNAL}y` }, { t: 'pick', key: 's:gain', how: 'click' }]],
           // The one signal picked, dropped by Ctrl, leaves the plots selected.
           [[{ t: 'only', ids: ['a'] }, { t: 'pick', key: `${SIGNAL}y`, how: 'click' }, { t: 'pick', key: `${SIGNAL}y`, how: 'ctrl' }]],
+          // A click on one of two signals picked narrows to it once the double-click time has passed; a double-click leaves both.
+          [[{ t: 'rows', keys: [`${SIGNAL}x`, `${SIGNAL}y`] }, { t: 'pick', key: `${SIGNAL}x`, how: 'click', clicks: 1 }, { t: 'wait', ms: 100 }, { t: 'wait', ms: DOUBLE_CLICK_MS + 10 }]],
+          [[{ t: 'rows', keys: [`${SIGNAL}x`, `${SIGNAL}y`] }, { t: 'pick', key: `${SIGNAL}x`, how: 'click', clicks: 1 }, { t: 'pick', key: `${SIGNAL}x`, how: 'click', clicks: 2 }, { t: 'wait', ms: DOUBLE_CLICK_MS + 10 }]],
+          // An undo puts back the plots, and leaves the signals picked since.
+          [[{ t: 'only', ids: ['a'] }, { t: 'rows', keys: [`${SIGNAL}x`] }, { t: 'snapshot' }, { t: 'pick', key: `${SIGNAL}z`, how: 'click', clicks: 1 }, { t: 'only', ids: ['b'] }, { t: 'restore' }]],
+          [[{ t: 'rows', keys: [`${SIGNAL}x`] }, { t: 'snapshot' }, { t: 'pick', key: `${SIGNAL}z`, how: 'click', clicks: 1 }, { t: 'restore' }]],
+          // With no plot back, the property rows picked come back.
+          [[{ t: 'rows', keys: ['s:gain'] }, { t: 'snapshot' }, { t: 'pick', key: `${SIGNAL}z`, how: 'click', clicks: 1 }, { t: 'restore' }]],
+          // The arrows move off the signals picked and pick nothing.
+          [[{ t: 'rows', keys: [`${SIGNAL}x`] }, { t: 'move', key: `${SIGNAL}y` }, { t: 'move', key: 'r:temp' }]],
           // A run of property rows from one panel to the other passes over the Signals list between them.
           [[{ t: 'pick', key: 's:offset', how: 'click' }, { t: 'pick', key: 'r:temp', how: 'shift' }, { t: 'pick', key: `${SIGNAL}y`, how: 'right' }, { t: 'press', where: 'rows', shift: false }]],
         ],

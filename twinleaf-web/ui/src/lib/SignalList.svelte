@@ -12,13 +12,17 @@
   //
   // The search matches every word typed against the signal's key and units.
   // Signals are picked as the rows of every list are (selection.svelte.js):
-  // a click picks one, Ctrl adds or drops one, Shift picks a run, and the
-  // arrows pick the signal they move to, in the list or from its search,
-  // extending with Shift. What puts signals on plots is a command
-  // (commands.js), made on a signal from its menu, the list's keys or a
-  // double-click, so it acts on the signals picked when that signal is one
-  // of them. Dragging a signal out copies it, and the signals picked with
-  // it, and nothing drops back in.
+  // a click picks one, Ctrl adds or drops one, Shift picks a run. The
+  // arrows move the list's cursor, in the list or from its search, and pick
+  // nothing but with Shift, which picks the run to where they move; Space
+  // picks the signal under the cursor as a click does, with Shift the run
+  // to it. What puts signals on plots is a command (commands.js),
+  // made on a signal from its menu, the list's keys or a double-click, so
+  // it acts on the signals picked when that signal is one of them; made
+  // from the keys, it picks the signal under the cursor first, unless that
+  // is picked. The menu's Colour and Copy name act on those signals too.
+  // Dragging a signal out copies it, and the signals picked with it, and
+  // nothing drops back in.
   import { getContext, onDestroy, tick } from 'svelte';
   import { flip } from 'svelte/animate';
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
@@ -34,6 +38,7 @@
   import RiCopy from '@lucide/svelte/icons/clipboard-copy';
   import { COMMANDS } from './commands.js';
   import { stepIn } from './keymap.js';
+  import { counted } from './menus.js';
   import { claim } from './keyrouter.js';
   import { SIGNAL } from './selection.svelte.js';
   import { uid } from './tabs.js';
@@ -89,7 +94,9 @@
   let menuOpen = $state(false);
   let menuKey = $state(null); // the signal a right-click opened the menu for
   const picked = $derived(selection.signals);
-  /** The row the arrows are on: the signal picked or moved to last, or the first while that is none the list shows. */
+  /** The signals the menu's Colour and Copy name act on: those picked, when the menu's signal is one of them, or it alone. */
+  const menuKeys = $derived(menuKey ? selection.signalTargets(menuKey) : []);
+  /** The list's cursor, the row the arrows are on: the signal picked or moved to last, or the first while that is none the list shows. */
   const active = $derived(Math.max(0, palette.findIndex((i) => SIGNAL + i.key === selection.rowAt)));
   let focused = $state(false);
   /** Whether the search has focus, where Enter adds the signal the arrows are on. */
@@ -101,14 +108,15 @@
     focused = true;
     tick().then(() => document.getElementById(`pal-${palette[active]?.id}`)?.scrollIntoView({ block: 'nearest' }));
   }
-  /** Picks row `i` as a click with `mods`' keys does (`Selection.pickRow`). */
-  function pick(i, mods) {
-    if (palette[i]) selection.pickRow(SIGNAL + palette[i].key, mods);
+  /** Picks row `i` as a click with `mods`' keys, `clicks` times, does (`Selection.pickRow`). */
+  function pick(i, mods, clicks = 0) {
+    if (palette[i]) selection.pickRow(SIGNAL + palette[i].key, mods, clicks);
   }
-  /** Runs command `id` on the signal the arrows are on, from the keys: the key is the list's whenever there is one. */
+  /** Runs command `id` on the signal under the cursor, from the keys, which picks it first unless it is picked: the key is the list's whenever there is one. */
   function made(id) {
     const key = palette[active]?.key;
     if (!key) return false;
+    selection.rowMenu(SIGNAL + key);
     commands.run(id, { signal: key, from: 'key' });
     show();
   }
@@ -119,10 +127,17 @@
       when: (e, at) => list?.contains(at) || (at === search && FROM_SEARCH.includes(e.key)),
       on: {
         move(e) {
-          // The arrows pick the signal they move to; with Shift they pick the run to it.
-          pick(stepIn(e, active, palette.length), { shiftKey: e.shiftKey });
+          // The arrows move the cursor; with Shift they pick the run to where it goes, from the row it leaves when none is picked.
+          const to = palette[stepIn(e, active, palette.length)];
+          if (!to) return;
+          if (!e.shiftKey) selection.moveTo(SIGNAL + to.key);
+          else {
+            if (!picked.size) pick(active, {});
+            selection.pickRow(SIGNAL + to.key, { shiftKey: true });
+          }
           show();
         },
+        pick: (e) => (pick(active, e), show()),
         pickAll: () => palette.length > 0 && void selection.pickRows(palette.map((i) => SIGNAL + i.key)),
         ...Object.fromEntries(ON_SIGNAL.map((c) => [c.id, () => made(c.id)])),
       },
@@ -166,7 +181,7 @@
     aria-multiselectable="true"
     tabindex="0"
     data-focus-own
-    aria-label="Signals: Enter adds to the selected plots, Shift+Enter makes a new one"
+    aria-label="Signals: arrows move, Space picks, Enter adds to the selected plots, Shift+Enter makes a new one"
     aria-activedescendant={focused && palette[active] ? `pal-${palette[active].id}` : undefined}
     use:dndzone={{ items: palette, type: 'trace', flipDurationMs: FLIP_MS, dropFromOthersDisabled: true, dropTargetStyle: {}, delayTouchStart: true, zoneTabIndex: 0, zoneItemTabIndex: -1, autoAriaDisabled: true, transformDraggedElement: lifted }}
     onconsider={consider}
@@ -191,7 +206,7 @@
         tabindex="-1"
         style="--c: {t ? colorOf(t) : 'var(--muted-foreground)'}"
         animate:flip={{ duration: FLIP_MS }}
-        onclick={(e) => (pick(i, e), list?.focus())}
+        onclick={(e) => (pick(i, e, e.detail), list?.focus())}
         ondblclick={() => commands.run('addToPlots', { signal: item.key, from: 'row' })}
       >
         <Swatch key={item.key} /><span class="sig-key">{item.key}</span>{#if t?.meta.units}<span class="sig-units">{t.meta.units}</span>{/if}<small>{t?.meta.rate} Hz</small>
@@ -206,11 +221,12 @@
   {#if menuKey}
     {#each ON_SIGNAL as c (c.id)}<CommandItem id={c.id} signal={menuKey} />{/each}
     <ContextMenu.Sub>
-      <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorOf({ key: menuKey })}"></i>{#if colors.picked[menuKey] === undefined}Auto{/if}</span></ContextMenu.SubTrigger>
-      <ContextMenu.SubContent class="p-1.5"><ColorPicker key={menuKey} ondone={() => (menuOpen = false)} /></ContextMenu.SubContent>
+      <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value">{#if menuKeys.length > 1}{counted(menuKeys.length, 'signal')}{:else}<i style="--c: {colorOf({ key: menuKey })}"></i>{#if colors.picked[menuKey] === undefined}Auto{/if}{/if}</span></ContextMenu.SubTrigger>
+      <ContextMenu.SubContent class="p-1.5"><ColorPicker key={menuKey} keys={menuKeys} ondone={() => (menuOpen = false)} /></ContextMenu.SubContent>
     </ContextMenu.Sub>
     <ContextMenu.Separator />
-    <ContextMenu.Item onSelect={() => navigator.clipboard.writeText(menuKey)}><RiCopy class="menu-icon" />Copy name</ContextMenu.Item>
+    <!-- The names, one a line, in the order picked. -->
+    <ContextMenu.Item onSelect={() => navigator.clipboard.writeText(menuKeys.join('\n'))}><RiCopy class="menu-icon" />Copy name{#if menuKeys.length > 1}<span class="menu-value">{counted(menuKeys.length, 'signal')}</span>{/if}</ContextMenu.Item>
   {/if}
 </ContextMenu.Content>
 </ContextMenu.Root>

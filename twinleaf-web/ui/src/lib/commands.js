@@ -235,8 +235,8 @@ function burst(ctx, kind, fn) {
 const shows = (plot, key) => plot.items.some((i) => i.key === key);
 /** The plots of `ctx` that lack any of its signals. */
 const lacking = (ctx) => ctx.plots.filter((t) => ctx.signals.some((key) => !shows(t.plot, key)));
-/** How many signals `ctx` acts on and how many of `plots`, as a row's value: each when more than one. */
-const signalsValue = (ctx, plots) => [ctx.signals.length > 1 && counted(ctx.signals.length, 'signal'), plots.length > 1 && counted(plots.length, 'plot')].filter(Boolean).join(', ') || null;
+/** How many signals `ctx` acts on and how many of `plots`, as a row's value, each when more than one, `word` between them: "4 signals to 2 plots". */
+const signalsValue = (ctx, plots, word) => [ctx.signals.length > 1 && counted(ctx.signals.length, 'signal'), plots.length > 1 && counted(plots.length, 'plot')].filter(Boolean).join(` ${word} `) || null;
 /** The signals of `ctx` as an edit names them: the one signal, or how many. */
 const signalsNamed = (ctx) => (ctx.signals.length > 1 ? counted(ctx.signals.length, 'signal') : ctx.signals[0]);
 
@@ -392,7 +392,7 @@ export const COMMANDS = [
     id: 'addToPlots', scope: 'plot', needs: ['signals'], place: 'list', show: ['Enter'], keys: ['Enter'], shift: false, what: 'Add to the selected plots',
     icon: RiAdd, label: 'Add to plot',
     when: (ctx) => !ctx.plots.length || lacking(ctx).length > 0,
-    value: (ctx) => (ctx.plots.length ? signalsValue(ctx, lacking(ctx)) : 'No plot selected'),
+    value: (ctx) => (ctx.plots.length ? signalsValue(ctx, lacking(ctx), 'to') : 'No plot selected'),
     disabled: (ctx) => !ctx.plots.length,
     run: (ctx) => ctx.svc.edit(lacking(ctx).map((t) => t.id), `Add ${signalsNamed(ctx)}`, (plot) => ({ items: [...plot.items, ...ctx.signals.filter((key) => !shows(plot, key)).map(chip)] })),
   },
@@ -401,7 +401,7 @@ export const COMMANDS = [
     id: 'removeFromPlots', scope: 'plot', needs: ['signals'], place: 'list', show: ['Delete'], keys: ['Delete', 'Backspace'], what: 'Remove from the selected plots',
     icon: RiTrash, label: 'Remove from plot', destructive: true,
     when: (ctx) => ctx.plots.length > 0 && !lacking(ctx).length,
-    value: (ctx) => signalsValue(ctx, ctx.plots),
+    value: (ctx) => signalsValue(ctx, ctx.plots, 'from'),
     run: (ctx) => {
       const having = ctx.plots.filter((t) => ctx.signals.some((key) => shows(t.plot, key)));
       ctx.svc.edit(having.map((t) => t.id), `Remove ${signalsNamed(ctx)}`, (plot) => ({ items: plot.items.filter((i) => !ctx.signals.includes(i.key)) }));

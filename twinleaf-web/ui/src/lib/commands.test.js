@@ -61,7 +61,7 @@ describe('the command table', () => {
 });
 
 /** A plot of `kind` as a command takes it, its view and PlotView recording what is asked of them into `log`. */
-function plotOf(id, kind, log, live = true) {
+function plotOf(id, kind, log, live = true, items = ['s']) {
   const recorder = (name) => new Proxy({}, {
     get: (_, key) => {
       if (key === 'plotId') return id;
@@ -75,17 +75,17 @@ function plotOf(id, kind, log, live = true) {
       return (...args) => (log.push(`${name}.${String(key)}`), key === 'axisUnits' ? 'V' : key === 'axisIn' ? 'shared' : args[0]);
     },
   });
-  return { id, plot: { id, kind, legend: false, items: [{ key: 's' }] }, view: recorder(`${id}.view`), pv: recorder(`${id}.pv`) };
+  return { id, plot: { id, kind, legend: false, items: items.map((key) => ({ key })) }, view: recorder(`${id}.view`), pv: recorder(`${id}.pv`) };
 }
 
 /**
- * Commands over plots of `kinds` (one per id), each showing signal 's',
+ * Commands over plots of `kinds` (one per id), each showing signals `items`, 's' unless given,
  * with `picked` selected, `last` clicked last and `signals` picked in the
  * Signals list: every service records what it is asked into `log`,
  * and the workspace holds only which plots are maximized, which a command
  * changes by `maximize` and `restoreLayout` alone.
  */
-function page(kinds, picked, last, log, maximized = null, signals = ['s']) {
+function page(kinds, picked, last, log, maximized = null, signals = ['s'], items = ['s']) {
   const shown = IDS.slice(0, kinds.length);
   const selection = new Selection((id) => shown.includes(id), () => shown);
   selection.only(picked, last);
@@ -104,7 +104,7 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s']) {
     targets: (on) => selection.targets(on),
     pageTargets: (scope) => selection.pageTargets(scope),
     signalTargets: (key) => selection.signalTargets(key),
-    plotOf: (id) => plotOf(id, kinds[IDS.indexOf(id)], log),
+    plotOf: (id) => plotOf(id, kinds[IDS.indexOf(id)], log, true, items),
     last: () => selection.last,
     ws,
     selection,
@@ -240,8 +240,10 @@ describe('a command', () => {
     expect(row('removeFromPlots', ['a', 'b'], ['s'])).toMatchObject({ offered: true, value: '2 plots', destructive: true, show: ['Delete'] });
     expect(row('addToPlots', ['a', 'b'], ['s']).offered).toBe(false);
     expect(row('removeFromPlots', ['a'], ['s'])).toMatchObject({ offered: true, value: null });
-    expect(row('addToPlots', ['a', 'b'], ['s', 't'])).toMatchObject({ offered: true, value: '2 signals, 2 plots', disabled: false, show: ['Enter'] });
+    expect(row('addToPlots', ['a', 'b'], ['s', 't'])).toMatchObject({ offered: true, value: '2 signals to 2 plots', disabled: false, show: ['Enter'] });
     expect(row('removeFromPlots', ['a', 'b'], ['s', 't']).offered).toBe(false);
+    // Plots that show both signals.
+    expect(page(['time', 'time', 'time'], ['a', 'b'], null, log, null, ['s', 't'], ['s', 't']).cmds.row('removeFromPlots')).toMatchObject({ offered: true, value: '2 signals from 2 plots' });
     expect(row('addToPlots', ['a'], ['t', 'u', 'v'])).toMatchObject({ offered: true, value: '3 signals' });
     expect(row('addToPlots', [], ['t'])).toMatchObject({ offered: true, value: 'No plot selected', disabled: true });
     expect(row('removeFromPlots', [], ['s']).offered).toBe(false);

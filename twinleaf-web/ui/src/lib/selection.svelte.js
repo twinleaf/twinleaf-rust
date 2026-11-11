@@ -15,7 +15,11 @@
 // selected. The rows picked are those of the picks the page shows: a pick
 // whose panel folds, whose dock hides, that leaves Favorites or that the
 // Signals list's search leaves out stops being picked while it is not
-// shown, and the next pick starts from those that are.
+// shown, and the next pick starts from those that are. A click on one of
+// several signals picked narrows the pick to it once the double-click time
+// has passed, so a double-click acts on them all, as a click on one of
+// several selected plots does. The arrows move the row they are on without
+// picking it.
 //
 // A press anywhere clears them, but in what works on the plots: the plots
 // themselves, a menu or popover, and what is marked data-keeps-selection
@@ -27,7 +31,9 @@
 // unless it is in the selection already, so what it starts acts on what is
 // selected. The keyboard moving to a plot (Tab, 1 to 9, F6) selects it
 // alone, as a click on it does; focus that arrives otherwise, as when a
-// menu gives it back, only makes the plot the one clicked last.
+// menu gives it back, only makes the plot the one clicked last. An undo
+// puts back the plots selected and the property rows picked, never the
+// signals picked.
 
 import { SvelteSet } from 'svelte/reactivity';
 import * as clock from './clock.js';
@@ -79,6 +85,8 @@ export class Selection {
     return this.#shown && !this.#shown.has(this.#at) ? null : this.#at;
   }
   #narrowing;
+  /** The narrowing of the signals picked that a click on one of several of them waits to make. */
+  #rowNarrowing;
   /** Runs whenever the plots selected change: the page's, to show them. */
   changed = () => {};
 
@@ -160,14 +168,18 @@ export class Selection {
   }
 
   /**
-   * A click on row `key` with `mods`' keys, or an arrow moving to it: it
-   * picks the row alone; with Shift, the run to it from the row a pick
-   * started at, in page order (`rowOrder`), or the row alone when that row
-   * is not shown; with Ctrl or ⌘, it adds the row or drops it. The rows of
-   * the other kind, property rows or signals, are no part of it: a run
-   * passes over them, and none of them stays picked.
+   * A click on row `key` with `mods`' keys, or a key picking it: it picks
+   * the row alone; with Shift, the run to it from the row a pick started
+   * at, in page order (`rowOrder`), or the row alone when that row is not
+   * shown; with Ctrl or ⌘, it adds the row or drops it. The rows of the
+   * other kind, property rows or signals, are no part of it: a run passes
+   * over them, and none of them stays picked. `clicks` is a click's count
+   * on a signal: a click on one of several signals picked narrows the pick
+   * to it once the double-click time has passed, and a second click stops
+   * that.
    */
-  pickRow(key, { shiftKey = false, ctrlKey = false, metaKey = false } = {}) {
+  pickRow(key, { shiftKey = false, ctrlKey = false, metaKey = false } = {}, clicks = 0) {
+    clock.cancel(this.#rowNarrowing);
     const like = (k) => isSignal(k) === isSignal(key);
     const order = (this.rowOrder?.() ?? []).filter(like);
     // A signal's click leaves the plots selected, the last signal dropped too.
@@ -180,15 +192,23 @@ export class Selection {
         const next = new Set(this.#picked.filter(like));
         if (!next.delete(key)) next.add(key);
         this.#setRows([...next]);
+      } else if (clicks && !shiftKey && isSignal(key) && this.#picked.length > 1 && this.#picked.includes(key)) {
+        if (clicks === 1) this.#rowNarrowing = clock.after(DOUBLE_CLICK_MS, () => this.#setRows([key]));
       } else this.#setRows([key]);
       this.#anchor = key;
     }
     this.#at = key;
   }
 
-  /** A right-click on row `key`: it picks the row alone, unless it is picked already. */
+  /** A right-click on row `key`, or a key making a command on it: it picks the row alone, unless it is picked already. */
   rowMenu(key) {
+    clock.cancel(this.#rowNarrowing);
     if (!this.#picked.includes(key)) this.pickRow(key);
+  }
+
+  /** The arrows moved to row `key`: it is the row they are on, the rows picked as they were. */
+  moveTo(key) {
+    this.#at = key;
   }
 
   /**
@@ -215,21 +235,25 @@ export class Selection {
     return scope === 'view' ? this.all() : [];
   }
 
-  /** What an undo step keeps of the selection: the plots, the plot clicked last and the rows picked. */
+  /** What an undo step keeps of the selection: the plots, the plot clicked last and the property rows picked; never the signals. */
   snapshot() {
-    return { selected: [...this.plots], focusedId: this.last, rows: this.#picks, rowAt: this.#at };
+    const rows = this.#picks.filter((k) => !isSignal(k));
+    return { selected: [...this.plots], focusedId: this.last, rows, rowAt: rows.length ? this.#at : null };
   }
 
   /**
    * Puts back what `snapshot` gave, less the plots that do not show: its
-   * plots, and its row picks, of which those the page shows are the rows
-   * picked; but with a plot back, no property row.
+   * plots, and with none of them, its property rows, of which those the
+   * page shows are the rows picked. The signals picked stay as they are,
+   * but where property rows come back.
    */
   restore(s) {
     const ids = s.selected.filter((id) => this.exists(id));
-    const rows = (s.rows ?? []).filter((k) => !ids.length || isSignal(k));
-    this.#setRows(rows);
-    if (rows.length) this.#at = s.rowAt ?? null;
+    const rows = ids.length ? [] : (s.rows ?? []);
+    if (rows.length) {
+      this.#setRows(rows);
+      this.#at = s.rowAt;
+    } else this.#dropRows();
     this.#setPlots(ids, this.exists(s.focusedId) ? s.focusedId : null);
   }
 
@@ -251,6 +275,7 @@ export class Selection {
     if (!same) this.changed();
   }
   #setRows(keys) {
+    clock.cancel(this.#rowNarrowing);
     if (!keys.length) this.#anchor = null;
     if (keys.length || this.#picks.length) this.#picks = [...new Set(keys)];
   }

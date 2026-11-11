@@ -1,7 +1,7 @@
 <script>
-  // A signal's colour, as Office's colour menu lays it out: Automatic first,
-  // a checkbox, ticked while the signal keeps the colour it was given; the
-  // theme's eight colours in an even grid; then Custom…, which swaps the
+  // A signal's colour, or several signals', as Office's colour menu lays it
+  // out: Automatic first, a checkbox, ticked while the signal keeps the
+  // colour it was given; the theme's eight colours in an even grid; then Custom…, which swaps the
   // grid for a picker of any colour (saturation and value, hue, hex, and the
   // screen's eyedropper where the browser has one) with Back to return. A
   // colour from the grid is a choice made, so it calls `ondone`; Automatic
@@ -12,8 +12,10 @@
   import { colors, NAMES, hexToHsv, hsvToHex } from './colors.svelte.js';
   import { colorOf } from './plot.js';
 
-  /** `key` is the signal whose colour this picks; `ondone` hears a colour chosen from the grid. */
-  let { key, ondone } = $props();
+  /** `key` is the signal whose colour this shows, and `keys` those whose colour it picks, `key` alone unless given; `ondone` hears a colour chosen from the grid. */
+  let { key, keys = null, ondone } = $props();
+  /** Picks colour `color` for each of `keys`, or with a function, the colour it gives for each. */
+  const pickAll = (color) => (keys ?? [key]).forEach((k) => colors.pick(k, typeof color === 'function' ? color(k) : color));
   let editing = $state(false);
   let hsv = $state({ h: 0, s: 0, v: 0 });
   let hexText = $state('');
@@ -22,12 +24,12 @@
   const automatic = $derived(colors.picked[key] === undefined);
   const canSample = typeof window !== 'undefined' && 'EyeDropper' in window;
 
-  /** Ticked, the signal takes its given colour again; unticked, the colour last picked for it, or the one it shows. */
+  /** Ticked, each signal takes its given colour again; unticked, the colour last picked for it, or the one it shows. */
   function setAutomatic(on) {
-    colors.pick(key, on ? null : (colors.last[key] ?? colors.of(key)));
+    pickAll((k) => (on ? null : (colors.last[k] ?? colors.of(k))));
   }
   function choose(index) {
-    colors.pick(key, index);
+    pickAll(index);
     ondone?.();
   }
   /** Opens the custom picker on the signal's colour now. */
@@ -40,7 +42,7 @@
   function apply() {
     const hex = hsvToHex(hsv);
     hexText = hex;
-    colors.pick(key, hex);
+    pickAll(hex);
   }
   /** Follows a drag on `e.currentTarget`, calling `at(x, y)` with the pointer's place across it, 0 to 1 each. */
   function drag(e, at) {
@@ -58,7 +60,7 @@
     const hex = hexText.trim().replace(/^#?/, '#').toLowerCase();
     if (!/^#[0-9a-f]{6}$/.test(hex)) return;
     hsv = hexToHsv(hex);
-    colors.pick(key, hex);
+    pickAll(hex);
   }
   async function sample() {
     try {
