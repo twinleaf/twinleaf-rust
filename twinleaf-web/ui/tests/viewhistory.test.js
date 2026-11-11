@@ -130,6 +130,16 @@ const timeXs = (p) => plotIds(p.ws.layout).map((id) => xOf(p.ws.plots[id].cursor
 const liveWithX = (p) => p.ws.tabs.flatMap((t) => Object.entries(t.plots)).filter(([id, plot]) => p.views.get(id)?.live && hasTimeX(plot.cursors)).map(([id]) => id);
 /** Waits for menus to close, as they give the page its keys back, then presses `k`. */
 const keysOn = async (k) => (await until(() => !document.querySelector('[role=menu]')), await pressKey(k), flushSync(), await frames());
+/** Goes live, or pauses where that button or key toggles, on plot `id` of page `p` or the page, by route `how` of LIVE. */
+async function followBy(p, id, how) {
+  if (how === 'dblclick') await commands.mouse([['dblclick', ...centre(bodyOf(id))]]);
+  else if (how === 'End') (leaf(id).querySelector('.plot-card').focus(), await keysOn('End'));
+  else if (how === 'Space') (document.activeElement?.blur(), await keysOn('Space'));
+  else if (how === 'play') await press(id, p.views.get(id).live ? 'Pause' : 'Follow live');
+  else toolbar([...document.querySelectorAll('.top-bar button')].some((b) => b.textContent.trim() === 'Live') ? 'Live' : 'Follow live');
+  flushSync();
+  await frames();
+}
 
 describe('a plot’s header', () => {
   it('has Back and Forward where the split buttons were, which its menu still has', async () => {
@@ -227,14 +237,7 @@ describe('view history on the page', () => {
               if (moved('wheel', xs) && g.turns.length > 1) count.bursts++;
             } else if (g.t === 'follow' || g.t === 'pause') {
               await until(() => !document.querySelector('[role=menu]'));
-              if (g.t === 'pause') await press(id, p.views.get(id).live ? 'Pause' : 'Follow live');
-              else if (g.how === 'dblclick') await commands.mouse([['dblclick', ...centre(bodyOf(id))]]);
-              else if (g.how === 'End') (leaf(id).querySelector('.plot-card').focus(), await keysOn('End'));
-              else if (g.how === 'Space') (document.activeElement?.blur(), await keysOn('Space'));
-              else if (g.how === 'play') await press(id, p.views.get(id).live ? 'Pause' : 'Follow live');
-              else toolbar([...document.querySelectorAll('.top-bar button')].some((b) => b.textContent.trim() === 'Live') ? 'Live' : 'Follow live');
-              flushSync();
-              await frames();
+              await followBy(p, id, g.t === 'pause' ? 'play' : g.how);
               if (g.t === 'follow') count[g.how]++;
               moved(g.how ?? 'pause', xs);
             } else if (g.t === 'addX' || g.t === 'addXFollow') {
@@ -409,6 +412,30 @@ describe('view history on the page, each kind of gesture', () => {
       expect(ids.every((id) => !p.views.get(id).live)).toBe(true);
       await press(ids[1], 'Back');
       expect(shown(p)).toBe(start);
+    } finally {
+      p.dispose();
+    }
+  });
+
+  it('goes live at the span shown by Space and a plot’s play button, and back at the window by End, a double-click and the toolbar’s Live', async () => {
+    // One plot, so Space, which pauses while any plot it acts on is live, acts on it alone.
+    const p = await mountPage([KEYS[0]], 'rows', 0, KEYS[0]);
+    p.hub.session.offset = 1000;
+    p.hub.session.fetchWindow = () => {};
+    try {
+      const id = plotIds(p.ws.layout)[0], v = p.views.get(id);
+      const KEEPS = { Space: true, play: true, End: false, dblclick: false, toolbar: false };
+      expect(Object.keys(KEEPS).sort(), 'every route').toEqual([...LIVE].sort());
+      for (const how of LIVE) {
+        // Zoomed in, which pauses the plot at a span narrower than its window.
+        await wait(IDLE_MS + 100);
+        await wheel(p, id, [-120, -120]);
+        const span = v.span;
+        expect([v.live, span < v.window], `${how}: zoomed in, paused`).toEqual([false, true]);
+        await until(() => !document.querySelector('[role=menu]'));
+        await followBy(p, id, how);
+        expect([v.live, v.span], how).toEqual([true, KEEPS[how] ? span : v.window]);
+      }
     } finally {
       p.dispose();
     }

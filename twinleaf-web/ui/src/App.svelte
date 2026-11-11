@@ -712,13 +712,13 @@
   }
   /**
    * The toolbar's Live button: pauses every time plot of the tab while all
-   * follow live, as one view step, or has them all follow live (ViewHistory
-   * `follow`). Space does the same for the selected plots alone.
+   * follow live, as one view step, or has them all follow live back at
+   * their windows, as End does (ViewHistory `follow`).
    */
   function toggleLive() {
     const ids = ws.timeIds(), perf = clock.now();
     if (live) viewHistory.step(() => ids.forEach((id) => views.of(id).pause(perf)));
-    else viewHistory.follow(ids, false);
+    else viewHistory.follow(ids, true);
     refreshToolbar();
   }
   function setDelay(ms) {
