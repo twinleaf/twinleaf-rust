@@ -15,10 +15,11 @@
 //   none: with none, every plot shows.
 // - A maximized plot that is closed or moved to another tab leaves them, by
 //   an edit, an undo or a redo alike, and the rest stay maximized; once the
-//   last has gone, every plot shows. An undo or a redo otherwise keeps the
-//   view as it is, so a plot it brings back stays hidden behind it.
+//   last has gone, every plot shows.
 // - Opening a tab, adding a plot, arranging the tab and resetting it show
-//   every plot.
+//   every plot; so does an undo or a redo that brings a plot into the open
+//   tab, so what it brings shows. An undo or a redo that brings none keeps
+//   the view as it is.
 // - The plots selected and the plot clicked last are plots that show: one
 //   the view hides is let go of, whether maximizing hid it or an undo or a
 //   redo would select it.
@@ -125,10 +126,16 @@ export class Workspace {
     this.#set(this.#tabs.map((t) => (t.id === id ? fn(t) : t)));
   }
 
-  /** Puts back `tabs`, as undo and redo do: not an edit. */
+  /**
+   * Puts back `tabs`, as undo and redo do: not an edit. One that brings a
+   * plot into the open tab shows every plot, as the edit it takes back or
+   * makes again does, so the plot shows.
+   */
   restore(tabs) {
+    const had = this.plots ?? {};
     this.#tabs = frozen(tabs);
-    this.#prune();
+    if (Object.keys(this.plots ?? {}).some((id) => !had[id])) this.#fill(null);
+    else this.#prune();
   }
 
   /** Every plot id of every tab. */

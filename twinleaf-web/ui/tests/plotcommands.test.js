@@ -9,8 +9,8 @@
 // the key, the palette, a plot's menu, its button and a double-click on its
 // header. Through those, Escape, splits, tabs opened, closes, moves to
 // another tab, undos and redos, what shows is the maximized plots still in
-// the tab, or every plot once none is left (#6), and what is selected
-// shows (workspace.svelte.js). A paused plot's
+// the tab, or every plot once none is left (#6) or an undo or a redo brings
+// a plot into the tab, and what is selected shows (workspace.svelte.js). A paused plot's
 // page, taken down, asks the hub for no more windows. A plot menu's copy
 // count is the count of the window shown now, whichever count the hub
 // answers last (class 7).
@@ -235,7 +235,7 @@ const MAXIMIZE = {
 const ON_A_PLOT = ['menu', 'button', 'header'];
 
 describe('maximized plots', () => {
-  it('are what the last Maximize from any origin left of the tab’s plots, show alone with the selection among them, and go with Restore, Escape, a split or a tab opened, through any run of those, closes, moves to another tab, undos and redos', async () => {
+  it('are what the last Maximize from any origin left of the tab’s plots, show alone with the selection among them, and go with Restore, Escape, a split, an undo or a redo that brings a plot back, or a tab opened, through any run of those, closes, moves to another tab, undos and redos', async () => {
     const plotStep = fc.oneof(
       { weight: 4, arbitrary: fc.record({ t: fc.constant('max'), by: fc.constantFrom(...Object.keys(MAXIMIZE)), k: fc.nat() }) },
       { weight: 2, arbitrary: fc.record({ t: fc.constant('select'), ks: fc.subarray([0, 1, 2, 3]) }) },
@@ -264,6 +264,7 @@ describe('maximized plots', () => {
           for (const s of steps) {
             await clearNotices();
             const shown = page.ws.shownIds(), picked = [...page.ws.selected], was = page.ws.maximized, tab = page.ws.activeId, at = JSON.stringify(s);
+            const had = new Set(Object.keys(page.ws.plots));
             const on = shown.length ? shown[(s.k ?? 0) % shown.length] : null;
             // The plots the step leaves maximized, were none to go, and the selection it leaves where the rules say which.
             let left = was, selected;
@@ -305,6 +306,8 @@ describe('maximized plots', () => {
             await until(() => !document.querySelector(OPEN), 2000);
             flushSync();
             await frames();
+            // An undo or a redo that brings a plot into the tab leaves the view, so the plot shows.
+            if ((s.t === 'undo' || s.t === 'redo') && Object.keys(page.ws.plots).some((id) => !had.has(id))) left = null;
             // A tab opened shows every plot; a plot that has left the tab is maximized no more, and with none left every plot shows.
             const kept = page.ws.activeId === tab ? (left ?? []).filter((id) => page.ws.plots[id]) : [];
             const all = plotIds(page.ws.layout), now = page.ws.maximized;
@@ -326,9 +329,9 @@ describe('maximized plots', () => {
         // Each origin restores, then maximizes.
         [[0, 1], [{ t: 'max', by: 'key', k: 0 }, { t: 'max', by: 'key', k: 0 }, { t: 'max', by: 'palette', k: 0 }, { t: 'max', by: 'palette', k: 0 }, { t: 'max', by: 'menu', k: 1 }, { t: 'max', by: 'menu', k: 1 }]],
         [[2], [{ t: 'max', by: 'button', k: 0 }, { t: 'max', by: 'button', k: 3 }, { t: 'max', by: 'header', k: 0 }, { t: 'max', by: 'header', k: 1 }, { t: 'select', ks: [] }, { t: 'max', by: 'palette', k: 0 }]],
-        // A plot closed before the view was entered comes back behind it, not selected.
+        // A plot closed before the view was entered comes back, and the view is left so it shows.
         [[0], [{ t: 'escape' }, { t: 'close', k: 1 }, { t: 'select', ks: [0] }, { t: 'max', by: 'key', k: 0 }, { t: 'undo' }]],
-        // A split leaves the view; taken back, the view entered again, and made again, its plot stays behind it.
+        // A split leaves the view; taken back, the view entered again, and made again, the view is left again and every plot shows.
         [[0], [{ t: 'split', k: 0 }, { t: 'undo' }, { t: 'select', ks: [0] }, { t: 'max', by: 'button', k: 0 }, { t: 'redo' }, { t: 'tab' }, { t: 'tab' }]],
       ]),
     );

@@ -67,7 +67,7 @@ function run(s, { ws, history }) {
   const ids = plotIds(ws.layout), shown = ws.shownIds();
   const id = pick(shown, s.at ?? 0);
   const others = ws.tabs.filter((t) => t.id !== ws.activeId);
-  const before = stateOf(ws), was = { max: ws.maximized, tab: ws.activeId };
+  const before = stateOf(ws), was = { max: ws.maximized, tab: ws.activeId, plots: new Set(Object.keys(ws.plots ?? {})) };
   /** The plots maximized once the step is made, were none to go. */
   let max = was.max;
   if (s.t === 'split' && id) {
@@ -110,6 +110,8 @@ function run(s, { ws, history }) {
   } else if (s.t === 'undo') history.undo();
   else if (s.t === 'redo') history.redo();
   flushSync();
+  // An undo or a redo that brings a plot into the open tab shows every plot, as the edit it makes again or takes back does.
+  if ((s.t === 'undo' || s.t === 'redo') && Object.keys(ws.plots).some((i) => !was.plots.has(i))) max = null;
   if (stateOf(ws) !== before) changed[s.t] = (changed[s.t] ?? 0) + 1;
   // A tab opened shows every plot; a plot that has left the tab is maximized no more, and with none left every plot shows.
   const kept = ws.activeId === was.tab ? (max ?? []).filter((i) => ws.plots[i]) : [];
@@ -129,10 +131,10 @@ const always = (ok, ...runs) =>
     { examples: runs.map((r) => [r]) },
   );
 
-/** A plot closed, another maximized, and the close taken back: the plot it brings back is hidden. */
-const HIDDEN_BY_UNDO = [{ t: 'click', at: 1 }, { t: 'close', at: 1 }, { t: 'click', at: 0 }, { t: 'maximize' }, { t: 'undo' }];
-/** A split taken back, a plot maximized, and the split made again: the plot it adds is hidden. */
-const HIDDEN_BY_REDO = [{ t: 'split', at: 0, dir: 'row' }, { t: 'undo' }, { t: 'click', at: 0 }, { t: 'maximize' }, { t: 'redo' }];
+/** A plot closed, another maximized, and the close taken back: the plot it brings back shows, the maximized view left. */
+const BACK_BY_UNDO = [{ t: 'click', at: 1 }, { t: 'close', at: 1 }, { t: 'click', at: 0 }, { t: 'maximize' }, { t: 'undo' }];
+/** A split taken back, a plot maximized, and the split made again: the plot it adds shows, the maximized view left. */
+const BACK_BY_REDO = [{ t: 'split', at: 0, dir: 'row' }, { t: 'undo' }, { t: 'click', at: 0 }, { t: 'maximize' }, { t: 'redo' }];
 
 describe('after any run of edits, undos and redos', () => {
   // The runs tried first each take the plot away, or hide it, a different way.
@@ -143,8 +145,8 @@ describe('after any run of edits, undos and redos', () => {
         return [...ws.selected].every((i) => shown.includes(i));
       },
       [{ t: 'select', at: 0 }, { t: 'reset' }],
-      HIDDEN_BY_UNDO,
-      HIDDEN_BY_REDO,
+      BACK_BY_UNDO,
+      BACK_BY_REDO,
       [{ t: 'click', at: 0 }, { t: 'select', at: 1 }, { t: 'maximizeOn', at: 2 }],
     ),
   );
@@ -154,9 +156,13 @@ describe('after any run of edits, undos and redos', () => {
       [{ t: 'split', at: 0, dir: 'row' }, { t: 'maximize' }, { t: 'undo' }],
     ),
   );
-  it('the maximized plots are those last maximized that the tab still has, and none once a tab is opened, a plot added, the tab arranged or reset, or the view left', () =>
+  it('the maximized plots are those last maximized that the tab still has, and none once a tab is opened, a plot added by an edit, an undo or a redo, the tab arranged or reset, or the view left', () =>
     always(
       (ws, ids, want) => JSON.stringify(ws.maximized) === JSON.stringify(want),
+      BACK_BY_UNDO,
+      BACK_BY_REDO,
+      // A plot maximized and split, the split taken back, the plot maximized again and the split made again: every plot shows.
+      [{ t: 'click', at: 0 }, { t: 'maximize' }, { t: 'split', at: 0, dir: 'row' }, { t: 'undo' }, { t: 'click', at: 0 }, { t: 'maximize' }, { t: 'redo' }],
       [{ t: 'click', at: 0 }, { t: 'select', at: 1 }, { t: 'maximize' }, { t: 'close', at: 0 }, { t: 'undo' }, { t: 'redo' }, { t: 'toTab', at: 0, tab: 0 }, { t: 'undo' }],
       [{ t: 'click', at: 0 }, { t: 'maximize' }, { t: 'split', at: 0, dir: 'col' }, { t: 'maximizeOn', at: 1 }, { t: 'arrange', name: 'rows' }],
       [{ t: 'click', at: 2 }, { t: 'maximize' }, { t: 'tab', at: 1 }, { t: 'tab', at: 0 }],
@@ -170,7 +176,7 @@ describe('after any run of edits, undos and redos', () => {
       [{ t: 'split', at: 0, dir: 'row' }, { t: 'close', at: 1 }],
       [{ t: 'click', at: 0 }, { t: 'toTab', at: 0, tab: 0 }],
       [{ t: 'click', at: 0 }, { t: 'reset' }],
-      HIDDEN_BY_UNDO,
+      BACK_BY_UNDO,
     ),
   );
   it('runs every kind of step to some effect', () => {
