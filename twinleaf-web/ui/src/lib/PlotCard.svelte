@@ -3,7 +3,7 @@
   // layer draws behind, and its menus. The drawing is plot.js's PlotView;
   // this is the plot's controls. It is a plot of a PlotHost (plothost.js),
   // a tab's or a copy's, and reaches its surroundings through that alone.
-  import { onDestroy, onMount, setContext, tick } from 'svelte';
+  import { onDestroy, onMount, setContext, tick, untrack } from 'svelte';
   import { dndzone, TRIGGERS, SHADOW_ITEM_MARKER_PROPERTY_NAME as SHADOW } from 'svelte-dnd-action';
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
@@ -24,7 +24,8 @@
   import IconButton from './IconButton.svelte';
   import CommandItem from './CommandItem.svelte';
   import { AXIS_SETTINGS, commandOf, cursorPeers } from './commands.js';
-  import { DIGITS, axisFormat } from './units.js';
+  import { DIGITS, axisFormat, fromUnit, inUnit, unitChoices } from './units.js';
+  import * as Select from '$lib/components/ui/select/index.js';
   import KindPicker from './KindPicker.svelte';
   import { claim } from './keyrouter.js';
   import Tip from './Tip.svelte';
@@ -89,9 +90,10 @@
   /** Each axis setting's buttons, as [value, what the button reads]; its tip names the value in full (commands.js AXIS_SETTINGS). */
   const CHOICES = {
     label: [['off', 'Off'], ['units', 'Units'], ['name', 'Name']],
-    digits: [[null, 'Auto'], ...DIGITS.map((d) => [d, String(d)])],
     notation: [['auto', 'Auto'], ['plain', 'Plain'], ['exp', 'Exp']],
   };
+  /** The digits a sample line's − and + step through, fewest first. */
+  const STEPS = [null, ...DIGITS];
 
   const session = $derived(hub.session);
   /** The signal `key`'s colour, units and rate, once the hub has its trace. */
@@ -176,14 +178,36 @@
       const xd = plot.kind === 'spectrum' ? pv?.xd : null;
       fBounds = xd ? { lo: shown(xd[0]), hi: shown(xd[1]) } : { lo: '', hi: '' };
       fBoundsShown = { ...fBounds };
+      sampleAt = xd ? middle(xd) : null;
       return void (xAxisOpen = true);
     }
     boundsError = '';
-    const b = region.keys.length ? pv.yBounds(region.keys[0]) : null;
-    bounds = b ? { lo: shown(b[0]), hi: shown(b[1]) } : { lo: '', hi: '' };
-    boundsShown = { ...bounds };
+    readBounds();
     axisOpen = true;
   }
+  /**
+   * The value of range `r`, [lo, hi], a sample line writes as a value of
+   * the axis: its middle, or, of a range across zero, whose middle is no
+   * size of its values, its end further from zero.
+   */
+  const middle = (r) => (r[0] < 0 && r[1] > 0 ? (-r[0] > r[1] ? r[0] : r[1]) : (r[0] + r[1]) / 2);
+  /** The value the open axis popover's sample line writes, read as it opens and as its range is set. */
+  let sampleAt = $state(null);
+  /** The unit the y axis right-clicked writes its numbers in, where it fixes one (PlotView `yFixed`), which its range fields read and take. */
+  const fixedHere = () => (region.kind === 'y' && region.keys.length ? pv?.yFixed(region.keys[0]) : undefined);
+  /** Shows the range of the y axis right-clicked in its fields, in the unit it writes, and samples its middle. */
+  function readBounds() {
+    const b = region.keys.length ? pv.yBounds(region.keys[0]) : null, fixed = fixedHere();
+    bounds = b ? { lo: shown(inUnit(b[0], fixed)), hi: shown(inUnit(b[1], fixed)) } : { lo: '', hi: '' };
+    boundsShown = { ...bounds };
+    sampleAt = b ? middle(b) : null;
+  }
+  // The unit the axis fixes, which the heading names; the fields follow it as it changes with the popover open.
+  const fixedText = $derived(axisOpen ? (plot.yFormat, fixedHere()?.text) : null);
+  $effect(() => {
+    fixedText;
+    if (axisOpen && region.kind === 'y') untrack(readBounds);
+  });
   /**
    * What the popovers' fields showed as they opened, or last set: bounds
    * left as shown set nothing, so a field that loses focus as its popover
@@ -194,7 +218,7 @@
   /** Sets the bounds typed in, and says why it cannot when they do not make a range. Returns whether they hold. */
   function applyBounds() {
     if (!edited(bounds, boundsShown)) return true;
-    const lo = Number(bounds.lo), hi = Number(bounds.hi);
+    const fixed = fixedHere(), lo = fromUnit(Number(bounds.lo), fixed), hi = fromUnit(Number(bounds.hi), fixed);
     if (!isFinite(lo) || !isFinite(hi) || bounds.lo.trim() === '' || bounds.hi.trim() === '') boundsError = 'Enter a number in each';
     else if (lo >= hi) boundsError = 'Max must be above min';
     else if (plot.kind === 'spectrum' && plot.yScale !== 'linear' && lo <= 0) boundsError = 'A log axis starts above zero';
@@ -202,6 +226,7 @@
       boundsError = '';
       runHere('yRange', { key: region.keys[0], lo, hi });
       boundsShown = { ...bounds };
+      sampleAt = middle([lo, hi]);
       return true;
     }
     return false;
@@ -220,6 +245,7 @@
       fBoundsError = '';
       runHere('fRange', { range: [lo, hi] });
       fBoundsShown = { ...fBounds };
+      sampleAt = middle([lo, hi]);
       return true;
     }
     return false;
@@ -675,13 +701,27 @@
      with `how`: a button for each value, pressed at `current`, this plot's. -->
 {#snippet axisSetting(id, field, how, current)}
   {@const row = commands.row(id, { on: plot.id, how })}
-  <div class="axis-row" role="group" aria-label={row.label}>
+  <div class="axis-row fill" role="group" aria-label={row.label}>
     <span>{row.label}</span>
     <div class="seg">
       {#each CHOICES[field] as [to, text]}
         <button class:on={current === to} aria-pressed={current === to} aria-label={AXIS_SETTINGS[field].names.get(to)} data-command={id} onclick={() => runHere(id, { ...how, to })}>{text}</button>
       {/each}
     </div>
+  </div>
+{/snippet}
+<!-- An axis's sample line: `text`, a value of the axis as it writes its
+     values, and − and + that step digits command `id`, made with `how`,
+     from this plot's `current` through STEPS, stopping at either end. -->
+{#snippet sampleLine(id, how, current, text)}
+  {@const at = STEPS.indexOf(current)}
+  <div class="axis-sample" role="group" aria-label="Digits">
+    <output aria-label="Sample value">{text}</output>
+    <span class="axis-step">
+      <button aria-label="Fewer digits" data-command={id} disabled={at <= 0} onclick={() => runHere(id, { ...how, to: STEPS[at - 1] })}>−</button>
+      <span>{current === null ? 'auto' : `${current} fig`}</span>
+      <button aria-label="More digits" data-command={id} disabled={at >= STEPS.length - 1} onclick={() => runHere(id, { ...how, to: STEPS[at + 1] })}>+</button>
+    </span>
   </div>
 {/snippet}
 <!-- A scale's two buttons in an axis popover, which run command `id` with
@@ -945,9 +985,6 @@
           <span>Scale</span>
           {@render scale('xScale', {}, plot.xScale !== 'linear')}
         </div>
-        {@const set = axisFormat(plot.xFormat)}
-        {@render axisSetting('xDigits', 'digits', {}, set.digits)}
-        {@render axisSetting('xNotation', 'notation', {}, set.notation)}
       {/if}
       <div class="axis-row" role="group" aria-label="X cursors">
         <span>Cursors</span>
@@ -967,6 +1004,13 @@
           {/each}
         </div>
       {/if}
+      {#if plot.kind === 'spectrum'}
+        <!-- How the frequencies are written: a sample of them, and their notation. -->
+        {@const set = axisFormat(plot.xFormat)}
+        <div class="axis-sep"></div>
+        {@render sampleLine('xDigits', {}, set.digits, (plot.xFormat, sampleAt === null ? '—' : pv?.fText()(sampleAt)))}
+        {@render axisSetting('xNotation', 'notation', {}, set.notation)}
+      {/if}
     </Popover.Content>
   </Popover.Root>
 
@@ -975,7 +1019,7 @@
   <Popover.Root bind:open={axisOpen}>
     <Popover.Content customAnchor={axisAnchor} side="right" align="start" class="axis-pop w-auto gap-0 p-1.5">
       <div class="axis-head">
-        {#if axisKey}<i style="--c: {colorFor(axisKey)}"></i>{axisKey}{#if unitsOf(axisKey)}<span class="units">{unitsOf(axisKey)}</span>{/if}{:else}Y axis{/if}
+        {#if axisKey}<i style="--c: {colorFor(axisKey)}"></i>{axisKey}{#if unitsOf(axisKey)}<span class="units">{fixedText ?? unitsOf(axisKey)}</span>{/if}{:else}Y axis{/if}
         {#if axisKey && plot.mode === 'independent'}
           {@const other = region.side === 'left' ? 'right' : 'left'}
           <span class="axis-tools">
@@ -997,11 +1041,6 @@
           {@render scale('yScale', { key: region.keys[0] }, plot.yScale !== 'linear')}
         </div>
       {/if}
-      <!-- How the axis is labelled and writes its numbers, its ticks, tags and readout alike. -->
-      {@const set = axisFormat(plot.yFormat?.[region.keys?.[0]])}
-      {@render axisSetting('yLabel', 'label', { key: region.keys?.[0] }, set.label)}
-      {@render axisSetting('yDigits', 'digits', { key: region.keys?.[0] }, set.digits)}
-      {@render axisSetting('yNotation', 'notation', { key: region.keys?.[0] }, set.notation)}
       <!-- This axis's Y cursors, which a pull up off the x axis also draws out. -->
       <div class="axis-row" role="group" aria-label="Y cursors">
         <span>Cursors</span>
@@ -1009,6 +1048,27 @@
         {@render tool('clearYCursors', { key: region.keys[0] }, RiEraser, "Clear this axis's cursors")}
       </div>
       {#if boundsError}<div class="axis-error">{boundsError}</div>{/if}
+      <!-- How the axis writes its numbers, its ticks, tags and readout alike, and is labelled. -->
+      {@const key = region.keys?.[0]}
+      {@const set = axisFormat(plot.yFormat?.[key])}
+      {@const units = axisOpen && key !== undefined ? (pv?.axisUnits(key) ?? '') : ''}
+      <div class="axis-sep"></div>
+      {@render sampleLine('yDigits', { key }, set.digits, (plot.yFormat, sampleAt === null || key === undefined ? '—' : pv?.yValueText(key)(sampleAt)))}
+      {@render axisSetting('yNotation', 'notation', { key }, set.notation)}
+      {#if unitChoices(units).length}
+        {@const row = commands.row('yUnit', { on: plot.id, how: { key } })}
+        <div class="axis-row fill" role="group" aria-label={row.label}>
+          <span>{row.label}</span>
+          <Select.Root type="single" value={pv?.yFixed(key) ? String(set.unit) : 'auto'} onValueChange={(v) => runHere('yUnit', { key, to: v === 'auto' ? null : Number(v) })}>
+            <Select.Trigger size="sm" class="axis-unit" data-command="yUnit" aria-label="Unit: {row.value}">{row.value}</Select.Trigger>
+            <Select.Content>
+              <Select.Item value="auto" label="Auto" />
+              {#each unitChoices(units) as c}<Select.Item value={String(c.e)} label={c.text} />{/each}
+            </Select.Content>
+          </Select.Root>
+        </div>
+      {/if}
+      {@render axisSetting('yLabel', 'label', { key }, set.label)}
       {#if axisKey}
         <div class="axis-sep"></div>
         <ColorPicker key={axisKey} ondone={() => (axisOpen = false)} />

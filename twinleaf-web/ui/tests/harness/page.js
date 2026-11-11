@@ -260,19 +260,20 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
 }
 
 /**
- * Gives each of `hub`'s traces `seconds` of samples at 100 Hz up to now, and
- * a spectrum of 50 bins from 1 Hz to 50 Hz, so each plot draws its axes, its
- * legend's values and its cursors' readout.
+ * Gives each of `hub`'s traces `seconds` of samples at 100 Hz up to now, a
+ * sine of `amplitude`, and a spectrum of 50 bins from 1 Hz to 50 Hz, as
+ * large, so each plot draws its axes, its legend's values and its cursors'
+ * readout.
  */
-export function feed(hub, seconds = 20) {
+export function feed(hub, seconds = 20, amplitude = 1) {
   const session = hub.session, perf = clock.now(), traces = [...session.traces.values()];
   for (const t of traces) {
     const xs = Float64Array.from({ length: seconds * 100 }, (_, i) => i / 100);
-    const ys = Float32Array.from(xs, (x) => Math.sin(x + t.meta.id));
+    const ys = Float32Array.from(xs, (x) => amplitude * Math.sin(x + t.meta.id));
     session.apply({ kind: 'points', chunks: [{ id: t.meta.id, level: 0, brk: false, xs, ys }] }, perf);
   }
   const f = Float32Array.from({ length: 50 }, (_, i) => i + 1);
-  session.apply({ kind: 'spectra', spectra: traces.map((t) => ({ id: t.meta.id, f, a: f.map((v) => 1 / v), floor: 0.02 })) }, perf);
+  session.apply({ kind: 'spectra', spectra: traces.map((t) => ({ id: t.meta.id, f, a: f.map((v) => amplitude / v), floor: 0.02 * amplitude })) }, perf);
   session.tick(perf);
 }
 

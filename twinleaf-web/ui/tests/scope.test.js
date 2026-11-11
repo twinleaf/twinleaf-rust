@@ -96,6 +96,17 @@ async function setting(group, name) {
   await commands.mouse([['move', ...centre(el)], ['down'], ['up']]);
   await settle();
 }
+/** Opens the dropdown `trigger` of the open popover and picks its option whose name `name` matches, as /^p/ the unit in pico of the axis's own. */
+async function option(trigger, name) {
+  const el = document.querySelector(`[data-slot=popover-content] ${trigger}`);
+  expect(el, `the dropdown ${trigger}`).toBeTruthy();
+  await commands.mouse([['move', ...centre(el)], ['down'], ['up']]);
+  await settle();
+  const item = [...document.querySelectorAll('[data-slot=select-content] [role=option]')].find((o) => name.test(o.textContent.trim()));
+  expect(item, `the option ${name}`).toBeTruthy();
+  await commands.mouse([['move', ...centre(item)], ['down'], ['up']]);
+  await settle();
+}
 /** Double-clicks at `at`, on whatever is there. */
 async function dblclick(at) {
   document.elementFromPoint(...at).dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, clientX: at[0], clientY: at[1] }));
@@ -140,8 +151,8 @@ const COMMANDS = {
   'the x popover’s Digits': {
     edit: true,
     prepare: (page) => setEvery(page, { kind: 'spectrum' }),
-    act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await setting('Digits', '3')),
-    acted: (page, id) => page.ws.plots[id].xFormat?.digits === 3,
+    act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await button('More digits')),
+    acted: (page, id) => page.ws.plots[id].xFormat?.digits === 2,
   },
   'typed y bounds': {
     act: async (page, id) => (await rightClick(spots(page, id)['a y axis']), await bounds(Y_FIELDS, '-3', '4')),
@@ -482,12 +493,16 @@ const ON_AXIS = {
     acted: (pv, key) => pv.config().yFormat?.[key]?.label === 'units',
   },
   'the popover’s Digits': {
-    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await setting('Digits', '2')),
+    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await button('More digits')),
     acted: (pv, key) => pv.config().yFormat?.[key]?.digits === 2,
   },
   'the popover’s Notation': {
     act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await setting('Notation', 'Plain')),
     acted: (pv, key) => pv.config().yFormat?.[key]?.notation === 'plain',
+  },
+  'the popover’s Unit': {
+    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await option('[data-command=yUnit]', /^p/)),
+    acted: (pv, key) => pv.config().yFormat?.[key]?.unit === -12,
   },
   'Add Y cursors, then the cursor clear': {
     act: async (page, id, key, all) => {

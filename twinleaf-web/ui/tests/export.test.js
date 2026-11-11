@@ -300,6 +300,48 @@ describe('the export dialog', { timeout: 120_000 }, () => {
     }
   });
 
+  it('fixes the unit of an axis in a known unit, in the figure, the saved image and its range fields, and nothing on the page', async () => {
+    const [id] = await exportPage([[SIGNALS[0]]], { units: { [SIGNALS[0]]: 'nT' } });
+    const made = watchCopies(), saved = catchSaves(), was = pageState();
+    await openExport([id]);
+    await press('Image');
+    await press('Plot 1');
+    const copy = made.at(-1);
+    await drawn(copy);
+    const [before] = await saveAll(saved);
+    await openExport([id]);
+    await press('Image');
+    await press('Plot 1');
+    await drawn(made.at(-1));
+    const shownBefore = preview(), c = made.at(-1), pv = () => c.pv(c.id);
+    expect([...control('Axis unit').options].map((o) => o.textContent), 'the units offered').toEqual(['Auto', 'fT', 'pT', 'nT', 'µT', 'mT', 'T']);
+    await choose('Axis unit', '-12');
+    await drawn(c);
+    expect(c.plot(c.id).yFormat, 'the copy’s axis in pT').toEqual({ shared: { unit: -12 } });
+    expect(pv().legend.cursors ?? null, 'no cursors here').toBe(null);
+    const ticks = pv().tickLabels.filter((l) => l.axis === 'shared').map((l) => Number(l.text.replace('−', '-')));
+    expect(Math.max(...ticks.map(Math.abs)), 'its ticks in pT').toBeGreaterThan(100);
+    expect(meanDiff(shownBefore, preview()), 'the figure changed').toBeGreaterThan(0.02);
+    // A range typed in pT is that range in nT, and reads back in pT.
+    await choose('Range', 'typed');
+    await fill('From', -500);
+    await fill('To', 500);
+    await drawn(c);
+    expect(pv().yBounds('shared'), 'the range typed in pT').toEqual([-0.5, 0.5]);
+    expect([control('From').value, control('To').value], 'read back in pT').toEqual(['-500', '500']);
+    const [after] = await saveAll(saved);
+    const [a, b] = [await decoded(before.blob), await decoded(after.blob)];
+    expect(meanDiff(scaledTo(a, a.width, a.height), scaledTo(b, a.width, a.height)), 'the saved image changed').toBeGreaterThan(0.02);
+    expect(pageState(), 'the page as it was').toEqual(was);
+    // An axis in a unit the page does not know has no unit to fix.
+    page.dispose();
+    const [other] = await exportPage([[SIGNALS[0]]], { units: { [SIGNALS[0]]: 'psi' } });
+    await openExport([other]);
+    await press('Image');
+    await press('Plot 1');
+    expect(control('Axis unit'), 'no Unit for psi').toBe(null);
+  });
+
   it('reorders a stacked plot’s legend and lanes as its signals are dragged', async () => {
     const [id] = await exportPage([SIGNALS]);
     const made = watchCopies();

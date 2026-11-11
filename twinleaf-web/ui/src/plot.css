@@ -539,6 +539,20 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .axis-row .seg button:hover { color: var(--foreground); }
 .axis-row .seg button.on { background: var(--secondary); color: var(--foreground); }
 .axis-sep { height: 1px; margin: 4px 0; background: var(--border); }
+/* A row whose choice fills it: its label in a column of its own, then the
+   strip's buttons, each as wide as the others, or the dropdown. */
+.axis-row.fill > span:first-child { flex: 0 0 56px; }
+.axis-row.fill .seg { flex: 1; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; }
+.axis-row.fill .axis-unit { flex: 1; height: 24px; padding: 0 6px 0 8px; font: 11px var(--font-data); }
+/* An axis's sample line: a value as the axis writes it, then − and +
+   stepping its digits around how many it writes. */
+.axis-sample { display: flex; align-items: center; gap: 8px; margin: 0 4px 4px; padding: 4px 6px 4px 8px; border-radius: var(--radius); background: color-mix(in oklch, var(--primary) 10%, transparent); color: var(--foreground); }
+.axis-sample output { font: 600 13px var(--font-data); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.axis-step { display: flex; align-items: center; gap: 4px; margin-left: auto; color: var(--muted-foreground); font: 11px var(--font-data); }
+.axis-step span { min-width: 34px; text-align: center; }
+.axis-step button { width: 22px; height: 20px; padding: 0; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--foreground); font: 12px var(--font-data); cursor: pointer; }
+.axis-step button:hover:not(:disabled) { background: var(--secondary); }
+.axis-step button:disabled { opacity: 0.4; cursor: default; }
 /* An independent plot's chips: the one whose scale the axis shows has a solid
    line, the rest hollow, as a scope outlines the channels it is not set to. */
 .trace-chip.unscaled .swatch i { background: transparent; box-shadow: inset 0 0 0 1px var(--c); height: 5px; }

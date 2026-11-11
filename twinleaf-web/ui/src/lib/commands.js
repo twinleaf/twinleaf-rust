@@ -78,7 +78,7 @@ import { chip } from './tabs.js';
 import { ARRANGEMENTS, KINDS, MODES, kindLabel } from './constants.js';
 import { writeTables } from './copy.js';
 import { plotIds } from './layout.js';
-import { DIGITS, axisFormat } from './units.js';
+import { DIGITS, axisFormat, unitChoices } from './units.js';
 import * as clock from './clock.js';
 import RiAdd from '@lucide/svelte/icons/plus';
 import RiTrash from '@lucide/svelte/icons/trash-2';
@@ -105,6 +105,7 @@ import RiPeakLeft from '@lucide/svelte/icons/chevron-left';
 import RiLabel from '@lucide/svelte/icons/type';
 import RiDigits from '@lucide/svelte/icons/hash';
 import RiNotation from '@lucide/svelte/icons/superscript';
+import RiUnit from '@lucide/svelte/icons/ruler';
 import RiZoomTo from '@lucide/svelte/icons/zoom-in';
 import RiAxis from '@lucide/svelte/icons/arrow-right-left';
 import RiKind from '@lucide/svelte/icons/chart-line';
@@ -158,13 +159,19 @@ export function cursorPeers(on, targets, key) {
 
 /**
  * What an axis's settings hold (units.js `axisFormat`), by field: the name
- * of the edit that sets each, and how it names each value.
+ * of the edit that sets each, and how it names each value. A unit's values
+ * are those the axis's units offer (units.js `unitChoices`), so `names` of
+ * a unit takes the units and names Auto alone for a unit the page does not
+ * know.
  */
 export const AXIS_SETTINGS = {
   label: { what: 'Label', names: new Map([['off', 'Off'], ['units', 'Units'], ['name', 'Name and units']]) },
   digits: { what: 'Digits', names: new Map([[null, 'Auto'], ...DIGITS.map((d) => [d, String(d)])]) },
   notation: { what: 'Notation', names: new Map([['auto', 'Auto'], ['plain', 'Plain'], ['exp', 'Exponent']]) },
+  unit: { what: 'Unit', names: (units) => new Map([[null, 'Auto'], ...unitChoices(units).map((c) => [c.e, c.text])]) },
 };
+/** How setting `field` names its values on an axis in `units`. */
+const namesOf = (field, units) => (typeof AXIS_SETTINGS[field].names === 'function' ? AXIS_SETTINGS[field].names(units ?? '') : AXIS_SETTINGS[field].names);
 
 /** An axis's settings at Auto. */
 const AUTO = axisFormat(undefined);
@@ -182,7 +189,7 @@ function withSetting(s, field, to) {
  */
 function setYAxis(ctx, field, { key, to }) {
   const axes = new Map(axesLike(ctx.on?.pv, pvs(ctx), key).map(([p, axis]) => [p.plotId, axis]));
-  const { what, names } = AXIS_SETTINGS[field];
+  const { what } = AXIS_SETTINGS[field], names = namesOf(field, ctx.on?.pv?.axisUnits(key));
   if (!axes.size || !names.has(to)) return false;
   ctx.svc.edit([...axes.keys()], `${what} ${names.get(to)}`, (plot) => {
     const all = { ...plot.yFormat, [axes.get(plot.id)]: withSetting(plot.yFormat?.[axes.get(plot.id)], field, to) };
@@ -199,9 +206,12 @@ function setXAxis(ctx, field, { to }) {
 }
 
 /** How `field` is set on the axes a y axis command of `ctx` made on y axis `key` acts on, as a row's value: the name of the value they share, or Mixed. */
-const yAxisValue = (ctx, field, key) => common(axesLike(ctx.on?.pv, pvs(ctx), key).map(([p, axis]) => AXIS_SETTINGS[field].names.get(axisFormat(ctx.plots.find((t) => t.pv === p)?.plot.yFormat?.[axis])[field])));
+const yAxisValue = (ctx, field, key) => {
+  const names = namesOf(field, ctx.on?.pv?.axisUnits(key));
+  return common(axesLike(ctx.on?.pv, pvs(ctx), key).map(([p, axis]) => names.get(axisFormat(ctx.plots.find((t) => t.pv === p)?.plot.yFormat?.[axis])[field]) ?? names.get(null)));
+};
 /** How `field` is set on the x axes of the spectra of `ctx`, as a row's value. */
-const xAxisValue = (ctx, field) => common(ctx.plots.map((t) => AXIS_SETTINGS[field].names.get(axisFormat(t.plot.xFormat)[field])));
+const xAxisValue = (ctx, field) => common(ctx.plots.map((t) => namesOf(field).get(axisFormat(t.plot.xFormat)[field])));
 
 /** The distance between X1 and X2 on the PlotViews `targets` that have the pair, or null while none has. */
 export function xSpan(targets) {
@@ -541,7 +551,7 @@ export const COMMANDS = [
     },
     run: (ctx, key) => editCursors(ctx, 'Add Y cursors', axesLike(ctx.on?.pv, pvs(ctx), key), (p, axis) => p.yCursorsAdded(axis)),
   },
-  // An axis's label, digits and notation (units.js `axisFormat`): made on y
+  // An axis's label, digits, notation and unit (units.js `axisFormat`): made on y
   // axis `how.key`, on the axis of each plot in its units (`axesLike`); made
   // on a spectrum's x axis, on each spectrum. `how.to` is the value each sets.
   {
@@ -561,6 +571,13 @@ export const COMMANDS = [
     icon: RiNotation, label: 'Notation',
     value: (ctx, how) => yAxisValue(ctx, 'notation', how?.key),
     run: (ctx, how) => setYAxis(ctx, 'notation', how ?? {}),
+  },
+  {
+    // `how.to` the power of ten of the prefix, or null for Auto; on an axis in a unit the page does not know it sets nothing.
+    id: 'yUnit', scope: 'plot', needs: ['axis'],
+    icon: RiUnit, label: 'Unit',
+    value: (ctx, how) => yAxisValue(ctx, 'unit', how?.key),
+    run: (ctx, how) => setYAxis(ctx, 'unit', how ?? {}),
   },
   {
     id: 'xDigits', scope: 'plot', kinds: ['spectrum'], needs: ['axis'],

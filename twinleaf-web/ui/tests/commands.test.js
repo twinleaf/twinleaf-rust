@@ -222,7 +222,8 @@ describe('a plot command', () => {
           for (const name of offers.get(id)) {
             await check(name, ON_PLOT[name] ? fromPlot : fromPage, async () => {
               const el = await ORIGINS[name](page, on, id);
-              const control = naming(el, id)[0];
+              // A control that is disabled takes no gesture, as the sample line's − at Auto: the first that is not.
+              const control = naming(el, id).find((c) => !c.disabled);
               // A control the plot shows only for some plots, as a time axis's pause, is not this plot's; nor is a signal's row the menu has only for some selections.
               if (!control) return false;
               await make(control, () => calls.length > 0);

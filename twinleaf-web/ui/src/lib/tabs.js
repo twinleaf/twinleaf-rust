@@ -12,7 +12,7 @@
 // {x, f, y} as cursors.js lays them out, and is absent while none is
 // placed; `readout` is false while the cursors' readout is hidden, and
 // `readoutAt` where it was dragged, a share as `legendAt` is, top left when
-// absent. `yFormat` holds each y axis's label, digits and notation, by its
+// absent. `yFormat` holds each y axis's label, digits, notation and unit, by its
 // range key ('shared', or the signal key of an axis of its own), and
 // `xFormat` a spectrum's frequency axis's digits and notation, each as
 // units.js `axisFormat` reads them, a setting absent at Auto. `layout` is

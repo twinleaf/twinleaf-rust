@@ -14,7 +14,7 @@
 // - Nothing changes its own outline, shadow or border for focus.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync } from 'svelte';
-import { MENUS, closeAll, menuPage } from './harness/menus.js';
+import { MENUS, axisPopover, closeAll, menuPage } from './harness/menus.js';
 import { clickOn, focusPage, frames, pressKey, quietApi, settle, until } from './harness/page.js';
 
 beforeEach(() => quietApi());
@@ -148,6 +148,22 @@ describe('the focus ring', () => {
         seen.popovers.bare += got.bare;
         await closeAll();
       }
+      // A y axis's popover, which a right-click opens: each of its number settings is a stop of the keys, with the ring.
+      await focusPage();
+      const axis = await axisPopover(page, page.ids[0], 'y');
+      const numbers = ['.axis-step button:not(:disabled)', '[data-command=yNotation]', '[data-command=yUnit]', '[data-command=yLabel]'];
+      // Tab from the range's first field reaches each.
+      const stops = new Set();
+      axis.querySelector('input').focus();
+      for (let i = 0; i < 40 && axis.contains(document.activeElement); i++) {
+        stops.add(document.activeElement);
+        await pressKey('Tab');
+      }
+      for (const sel of numbers) expect([...stops].some((el) => el.matches(sel)), `the y axis popover's ${sel}, a stop of Tab`).toBe(true);
+      const got = await walk(axis, 'the y axis popover', colour);
+      seen.popovers.ringed += got.ringed;
+      seen.popovers.bare += got.bare;
+      await closeAll();
       // The dialogs the keys open.
       seen.dialogs = { ringed: 0, bare: 0 };
       for (const key of ['Control+k', '?']) {

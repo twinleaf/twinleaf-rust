@@ -18,7 +18,7 @@
   import { colorOf } from './plot.js';
   import { MODES } from './constants.js';
   import { AXIS_SETTINGS } from './commands.js';
-  import { axisFormat } from './units.js';
+  import { axisFormat, fromUnit, inUnit, unitChoices } from './units.js';
 
   /** `entry` is the plot exported: {copy, cid, title, yRanges}, its copy's host and plot id, its image's title, and each y axis's range as picked here. */
   let { entry = $bindable() } = $props();
@@ -41,9 +41,16 @@
   const set = $derived(axisFormat(plot.yFormat?.[axis]));
   /** Each value of axis setting `field` as a <select> holds it, and back. */
   const optionOf = (v) => (v === null ? 'auto' : String(v));
-  const valueOf = (field, s) => (field === 'digits' ? (s === 'auto' ? null : Number(s)) : s);
+  const valueOf = (field, s) => (field === 'digits' || field === 'unit' ? (s === 'auto' ? null : Number(s)) : s);
   /** Sets axis setting `field` to `to` on the copy: the axis popover's command. */
-  const setAxis = (field, to) => copy.commands.run({ label: 'yLabel', digits: 'yDigits', notation: 'yNotation' }[field], { on: cid, how: { key: axis, to } });
+  const setAxis = (field, to) => copy.commands.run({ label: 'yLabel', digits: 'yDigits', notation: 'yNotation', unit: 'yUnit' }[field], { on: cid, how: { key: axis, to } });
+
+  /** The units the axis shows (PlotView `axisUnits`), the units it may fix its numbers in, and the one it fixes, which its range fields read and take (PlotView `yFixed`). */
+  const units = $derived((plot.items, plot.mode, plot.kind, (axis && copy.pv(cid)?.axisUnits(axis)) ?? ''));
+  const choices = $derived(unitChoices(units));
+  const fixed = $derived((plot.yFormat, axis ? copy.pv(cid)?.yFixed(axis) : undefined));
+  /** The value of each axis setting `field` as its <select> shows it: a unit the axis's units do not offer at Auto. */
+  const current = (field) => (field === 'unit' && !fixed ? null : set[field]);
 
   /** The range picked for the axis: 'plot', as the plot had it, 'fit' or 'typed', with its [lo, hi]. */
   const range = $derived(entry.yRanges[axis] ?? { how: 'plot' });
@@ -200,16 +207,16 @@
       <div class="r">
         <span>From, to</span>
         <span class="pairin">
-          <input type="number" step="any" aria-label="From" value={shown(range.lo)} onchange={(e) => setRange('typed', Number(e.currentTarget.value), range.hi)} />
-          <input type="number" step="any" aria-label="To" value={shown(range.hi)} onchange={(e) => setRange('typed', range.lo, Number(e.currentTarget.value))} />
+          <input type="number" step="any" aria-label="From" value={shown(inUnit(range.lo, fixed))} onchange={(e) => setRange('typed', fromUnit(Number(e.currentTarget.value), fixed), range.hi)} />
+          <input type="number" step="any" aria-label="To" value={shown(inUnit(range.hi, fixed))} onchange={(e) => setRange('typed', range.lo, fromUnit(Number(e.currentTarget.value), fixed))} />
         </span>
       </div>
     {/if}
-    {#each ['label', 'digits', 'notation'] as field (field)}
+    {#each choices.length ? ['label', 'digits', 'notation', 'unit'] : ['label', 'digits', 'notation'] as field (field)}
       <div class="r">
         <span>{AXIS_SETTINGS[field].what}</span>
-        <select aria-label="Axis {field}" value={optionOf(set[field])} onchange={(e) => setAxis(field, valueOf(field, e.currentTarget.value))}>
-          {#each AXIS_SETTINGS[field].names as [v, name] (v)}<option value={optionOf(v)}>{name}</option>{/each}
+        <select aria-label="Axis {field}" value={optionOf(current(field))} onchange={(e) => setAxis(field, valueOf(field, e.currentTarget.value))}>
+          {#each field === 'unit' ? [[null, 'Auto'], ...choices.map((c) => [c.e, c.text])] : AXIS_SETTINGS[field].names as [v, name] (v)}<option value={optionOf(v)}>{name}</option>{/each}
         </select>
       </div>
     {/each}
