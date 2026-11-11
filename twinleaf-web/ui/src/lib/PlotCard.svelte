@@ -125,11 +125,13 @@
   // What a copy of the plot would hold, asked of the hub at each right-click
   // that opens or moves the menu, since the window may have changed while it
   // was shut or open. The right-click sets the placeholder itself, so the
-  // menu's first frame already has its line.
-  let copyCheck = $state(null);
+  // menu's first frame already has its line. A count asked again while the
+  // menu stays open keeps the answer shown until its own comes: the row
+  // never reads as an answer the page does not have.
+  /** What Copy data says before the hub's first count since the right-click: a wait, which cannot be chosen. */
+  const COUNTING = { state: 'counting', rows: null };
+  let copyCheck = $state(COUNTING);
   let copyAsk = $state(0);
-  /** What Copy data says while the hub counts the rows. */
-  const COUNTING = { state: 'ok', rows: null };
   function recountCopy() {
     if (plot.items.length) copyCheck = COUNTING;
     copyAsk++;
@@ -146,8 +148,8 @@
       const n = ++asked;
       commands.check('copyData', { on: plot.id }).then((check) => current && n === asked && (copyCheck = check), () => current && n === asked && (copyCheck = null));
     };
-    copyCheck = COUNTING;
-    ask();
+    // Asked when the menu opens, the plots it copies change, or a right-click asks again; never for what the count itself reads, as the hub's notes of what it holds.
+    untrack(ask);
     // A wheel over a plot zooms it with the menu still open: the count
     // follows once the views of every plot a copy would hold rest, keeping
     // the last one shown meanwhile.

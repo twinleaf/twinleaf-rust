@@ -200,12 +200,13 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
  * a page loaded again reads them. What the page asks of /api is refused, as a hub that
  * has gone away refuses it, until the page is disposed of; but with
  * `rowsPerSecond`, /api/rows counts that many rows a second of each
- * signal's window. Its clock is virtual, stepped by `frames`, `settle`,
+ * signal's window, each count answered `rowsLatency` ms of the page's
+ * time after it is asked, as a hub's reply takes. Its clock is virtual, stepped by `frames`, `settle`,
  * `wait` and `until`, until it is disposed of; with `realClock`, the
  * browser's own, as the smoke tests of real time mount it. It returns the
  * page's state, each plot's view and PlotView among it.
  */
-export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null, fromSaved = false, realClock = false } = {}) {
+export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null, rowsLatency = 0, fromSaved = false, realClock = false } = {}) {
   virtual?.end();
   virtual = realClock ? null : clock.virtual();
   const mine = virtual;
@@ -226,7 +227,8 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
     if (!at.pathname.startsWith('/api/')) return fetched(url, init);
     if (at.pathname === '/api/rows' && rowsPerSecond !== null) {
       const span = Number(at.searchParams.get('t1')) - Number(at.searchParams.get('t0'));
-      return reply({ count: Math.round(span * rowsPerSecond), oldest: 0, x: [], y: [] });
+      const counted = () => reply({ count: Math.round(span * rowsPerSecond), oldest: 0, x: [], y: [] });
+      return rowsLatency ? new Promise((done) => clock.after(rowsLatency, done)).then(counted) : counted();
     }
     return reply({ error: 'no hub in a test' }, 503);
   };
@@ -275,6 +277,33 @@ export function feed(hub, seconds = 20, amplitude = 1) {
   const f = Float32Array.from({ length: 50 }, (_, i) => i + 1);
   session.apply({ kind: 'spectra', spectra: traces.map((t) => ({ id: t.meta.id, f, a: f.map((v) => amplitude / v), floor: 0.02 * amplitude })) }, perf);
   session.tick(perf);
+}
+
+/** How often the server sends each trace's spectrum, and what it holds, in ms (twinleaf-web/src/hub.rs SPECTRUM_EVERY, MEMORY_EVERY). */
+export const SPECTRUM_EVERY_MS = 100;
+export const MEMORY_EVERY_MS = 1000;
+
+/**
+ * Lets `ms` of the page's time pass a frame at a time while `hub`, fed by
+ * `feed`, streams as the server does: every frame each trace's new samples
+ * at 100 Hz, every SPECTRUM_EVERY_MS the spectrum `feed` gave, and every
+ * MEMORY_EVERY_MS what the hub holds, every sample from the first, each
+ * arriving before the frame it is due in. After each frame it calls
+ * `each(frame)`, the frames counted from 0: what that frame drew.
+ */
+export async function stream(hub, ms, each = () => {}) {
+  const session = hub.session, traces = [...session.traces.values()], f = Float32Array.from({ length: 50 }, (_, i) => i + 1);
+  const due = (every, from, to) => Math.floor(to / every) > Math.floor(from / every);
+  for (let frame = 0; frame * clock.FRAME_MS < ms; frame++) {
+    const perf = clock.now(), next = perf + clock.FRAME_MS;
+    const first = Math.floor(session.latest * 100) + 1, last = Math.floor((session.latest + clock.FRAME_MS / 1000) * 100);
+    const xs = Float64Array.from({ length: Math.max(0, last - first + 1) }, (_, i) => (first + i) / 100);
+    if (xs.length) session.apply({ kind: 'points', chunks: traces.map((t) => ({ id: t.meta.id, level: 0, brk: false, xs, ys: Float32Array.from(xs, (x) => Math.sin(x + t.meta.id)) })) }, perf);
+    if (due(SPECTRUM_EVERY_MS, perf, next)) session.apply({ kind: 'spectra', spectra: traces.map((t) => ({ id: t.meta.id, f, a: f.map((v) => 1 / v), floor: 0.02 })) }, perf);
+    if (due(MEMORY_EVERY_MS, perf, next)) hub.text({ type: 'memory', bytes: 0, budget: 0, seconds: session.latest, max_age: 600, rate: 0, oldest: Object.fromEntries(traces.map((t) => [t.meta.id, 0])) });
+    await frames(1);
+    each(frame);
+  }
 }
 
 /**

@@ -8,11 +8,17 @@
 // view of every plot it would copy. A signal's menu in the Signals list
 // offers Remove from plot where every selected plot shows the signal and
 // Add to plot otherwise, and the row's count is the plots its click
-// changes, for every signal of the list and any plots selected.
+// changes, for every signal of the list and any plots selected. Left open
+// on live plots while the hub streams, every row of every menu and popover
+// keeps what it shows: it changes only as what it reports does, never back
+// and forth within a moment, and Copy data over the limit never reads as
+// a copy it could make.
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { MENUS, click, closeAll, openMenu, rightClick, settle } from './harness/menus.js';
-import { centre, editCursors, feed, mountPage, wait, withExamples, withYPair } from './harness/page.js';
+import { MENUS, OPEN, axisPopover, click, closeAll, menuPage, openMenu, rightClick, settle } from './harness/menus.js';
+import { MEMORY_EVERY_MS, centre, editCursors, feed, mountPage, stream, wait, withExamples, withYPair } from './harness/page.js';
+import { FRAME_MS } from '../src/lib/clock.js';
+import { MAX_COPY_ROWS } from '../src/lib/copy.js';
 import { plotIds } from '../src/lib/layout.js';
 import { prefs } from '../src/lib/prefs.svelte.js';
 
@@ -219,4 +225,100 @@ describe('a menu row’s value', () => {
     // Several plots that all show it, some that do and some that do not, and none that do.
     for (const [which, n] of Object.entries(seen)) expect(n, which).toBeGreaterThan(0);
   }, 120_000);
+});
+
+/** How a command's row reads: its text, whether it can be chosen, and whether its value warns. */
+const looks = (r) => `${r.textContent.trim()} · ${r.hasAttribute('data-disabled') ? 'disabled' : 'enabled'}${r.querySelector('.menu-value.warn') ? ' · warns' : ''}`;
+/** Whether a row reads as waiting on the hub's answer. */
+const waiting = (look) => look.includes('Counting…');
+/** The frames a row must show what it changed to before it may go back: a shorter stay is a flicker. */
+const FLICKER_FRAMES = 30;
+/** Each command's row in the menus and popovers open, by the menu it is in and its place there, as it reads. */
+function openRows() {
+  const rows = new Map();
+  [...document.querySelectorAll(OPEN)].forEach((menu, m) => [...menu.querySelectorAll('[data-command]')].forEach((r, i) => rows.set(`${m}.${i} ${r.dataset.command}`, looks(r))));
+  return rows;
+}
+/**
+ * Leaves what is open as it is while `ms` of the page's time pass and the
+ * hub streams, noting each row's look at every frame: by row, the looks in
+ * order, with the frames each showed for.
+ */
+async function leftOpen(page, ms) {
+  const runs = new Map();
+  await stream(page.hub, ms, () => {
+    for (const [row, look] of openRows()) {
+      const seen = runs.get(row) ?? runs.set(row, []).get(row), last = seen.at(-1);
+      if (last?.look === look) last.frames++;
+      else seen.push({ look, frames: 1 });
+    }
+  });
+  return runs;
+}
+/** The plot menus and popovers, opened on plot `id`: every menu MENUS opens, and each axis's popover. */
+const ON_A_PLOT = { ...MENUS, 'the x axis': (page, id) => axisPopover(page, id, 'x'), 'the y axis': (page, id) => axisPopover(page, id, 'y') };
+/** The hub's reply to a count, in ms: two frames, as a hub nearby answers. */
+const ROWS_LATENCY = 30;
+
+describe('a menu row left open on live plots', () => {
+  it('of Copy data over the limit reads so at every frame while the hub notes what it holds each second', async () => {
+    // 2 signals × 10 s × 10,000 rows a second on the first plot.
+    const page = await menuPage({ rowsPerSecond: 10_000, rowsLatency: ROWS_LATENCY });
+    try {
+      prefs.setHints(false);
+      page.ws.selection.only([]);
+      await MENUS['the plot menu'](page, page.ids[0]);
+      // Three of the hub's notes of what it holds, a second apart, while the menu stays open.
+      const runs = await leftOpen(page, 3 * MEMORY_EVERY_MS + 100);
+      const [copy] = [...runs].filter(([row]) => row.endsWith(' copyData')).map(([, seen]) => seen.map((s) => s.look));
+      expect(copy, 'what Copy data showed, in order').toEqual([expect.stringMatching(/^Copy data200,000 rows.* · disabled · warns$/)]);
+    } finally {
+      prefs.setHints(true);
+      page.dispose();
+    }
+  }, 60_000);
+
+  it('shows what it reports, changing only once the hub has answered, never back and forth, and over a limit never under it', async () => {
+    const page = await menuPage({ rowsPerSecond: 10_000, rowsLatency: ROWS_LATENCY });
+    const seen = { rows: 0, over: 0 };
+    try {
+      prefs.setHints(false);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom(...Object.keys(ON_A_PLOT)),
+          fc.constantFrom(...page.ids),
+          // When in the hub's second the menu opens, and how long it is left open.
+          fc.integer({ min: 0, max: MEMORY_EVERY_MS - 1 }),
+          fc.integer({ min: MEMORY_EVERY_MS, max: 1.2 * MEMORY_EVERY_MS }),
+          async (name, id, phase, ms) => {
+            await closeAll();
+            page.ws.selection.only([]);
+            await wait(phase);
+            await ON_A_PLOT[name](page, id);
+            const runs = await leftOpen(page, ms);
+            for (const [row, looks] of runs) {
+              const said = `${name} on ${id}, ${row}: ${looks.map((l) => `${l.look} ×${l.frames}`).join(' → ')}`;
+              // Nothing it reports changes as the plots stream: a wait for the hub's answer, then the answer, and no more.
+              const answers = looks.filter((l) => !waiting(l.look));
+              expect(answers.length, said).toBeLessThanOrEqual(1);
+              expect(looks.findIndex((l) => !waiting(l.look)), said).toBeGreaterThanOrEqual(looks.length - 1);
+              // No look comes back after a stay of fewer than FLICKER_FRAMES frames.
+              looks.forEach((l, i) => i > 0 && i < looks.length - 1 && looks[i + 1].look === looks[i - 1].look && expect(l.frames, said).toBeGreaterThanOrEqual(FLICKER_FRAMES));
+              // Over the limit, it never reads under it.
+              const over = looks.findIndex((l) => l.look.includes('warns'));
+              if (over >= 0) expect(looks.slice(over).every((l) => l.look.includes('warns')), said).toBe(true);
+              seen.rows++;
+              if (row.endsWith(' copyData') && over >= 0) seen.over++;
+            }
+          },
+        ),
+        withExamples([['the plot menu', page.ids[0], 0, 2 * MEMORY_EVERY_MS], ['the plot menu', page.ids[1], MEMORY_EVERY_MS - 2 * FRAME_MS, MEMORY_EVERY_MS]]),
+      );
+    } finally {
+      prefs.setHints(true);
+      page.dispose();
+    }
+    expect(seen.rows, 'rows of commands').toBeGreaterThan(0);
+    expect(seen.over, `Copy data over ${MAX_COPY_ROWS.toLocaleString()} rows`).toBeGreaterThan(0);
+  }, 180_000);
 });

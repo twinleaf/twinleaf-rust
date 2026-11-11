@@ -228,6 +228,9 @@ describe('a command', () => {
     expect(p.cmds.row('exportData', { on: 'c' }).value).toBe(null);
     expect(p.cmds.row('maximize', { on: 'a' }).label).toBe('Maximize');
     expect(p.cmds.row('copyData', { on: 'a', how: { state: 'too-many', rows: 200000, reason: 'More' } })).toMatchObject({ disabled: true, value: { text: '200,000 rows', warn: true } });
+    // Before the hub has counted, it waits: no count, no warning, and it cannot be chosen.
+    expect(p.cmds.row('copyData', { on: 'a', how: { state: 'counting', rows: null } })).toMatchObject({ disabled: true, value: { text: 'Counting…', warn: false } });
+    expect(p.cmds.row('copyData', { on: 'a', how: { state: 'ok', rows: 4000 } })).toMatchObject({ disabled: false, value: { text: '4,000 rows', warn: false } });
     // The palette offers the commands the table lists there, so none that needs an axis, and none with no plots to act on.
     const offered = p.cmds.offered().map((c) => c.id);
     expect(offered).not.toContain('addYCursors');

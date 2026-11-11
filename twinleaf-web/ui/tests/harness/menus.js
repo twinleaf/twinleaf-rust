@@ -16,13 +16,15 @@ export const row = (label) => [...document.querySelectorAll('[role^=menuitem], [
 /**
  * The page: three plots in rows, the first two showing both signals and the
  * third one of them; the first independent, with the legend, its X and Y
- * cursors placed; another tab; and two properties of a device.
+ * cursors placed; another tab; and two properties of a device. `rows` is
+ * what /api/rows counts, as mountPage's `rowsPerSecond` and `rowsLatency`
+ * take it.
  */
-export async function menuPage() {
+export async function menuPage(rows = {}) {
   const page = await mountPage([SIGNALS, SIGNALS, [SIGNALS[0]]], 'rows', 1, SIGNALS, [
     { name: 'gain', channel: 'setting', value: 3 },
     { name: 'offset', channel: 'setting', value: 0.5 },
-  ]);
+  ], rows);
   feed(page.hub);
   const ids = plotIds(page.ws.layout);
   page.history.group('Prepare', () => page.ws.setPlot(ids[0], { mode: 'independent', legend: true }));
