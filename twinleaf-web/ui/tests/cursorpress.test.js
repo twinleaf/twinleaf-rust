@@ -53,6 +53,11 @@ const EXAMPLES = [
   ...['time', 'spectrum'].flatMap((kind) => Object.keys(LAYOUTS).map((layout, i) => [{ kind, layout, ...PLACED.ends, readoutAt: CORNERS[(i + (kind === 'time')) % 4] }])),
   ...Object.keys(LAYOUTS).flatMap((layout, i) => ['corner', 'none', 'out', 'mid'].map((how, k) => [{ kind: (i + k) % 3 ? 'time' : 'spectrum', layout, ...PLACED[how], readoutAt: CORNERS[(i + k) % 4] }])),
 ];
+/** A Y cursor at the foot of its axis beside an X cursor's tag along the plot's foot, which the pointer's value, wider than a cursor's name, reaches before it reaches the Y cursor's tags. */
+const BESIDE_X_TAG = [
+  [{ kind: 'time', layout: 'overlay', x: { a: null, b: -0.3 }, y: [{ a: null, b: 0 }, { a: null, b: null }, { a: null, b: null }], readoutAt: { x: 0, y: 0 } }],
+  [{ kind: 'time', layout: 'one left, two right', x: { a: null, b: 1.3 }, y: [{ a: null, b: null }, { a: null, b: 0 }, { a: null, b: null }], readoutAt: { x: 0, y: 0 } }],
+];
 
 const inside = (p, [x, y]) => x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h;
 const centreOf = (p) => [p.x + p.w / 2, p.y + p.h / 2];
@@ -172,6 +177,13 @@ function hover(pv, canvas, at) {
   pv.draw(clock.now());
 }
 
+/** How wide plot view `pv`, of `kind`, draws the pointer's value on y axis `key` with the pointer at client y `y`: its text, in the canvas's font, and 4 px each side. */
+function pointerTagWidth(pv, canvas, key, y, kind) {
+  const v = pv.yValueAt(key, y), ctx = document.createElement('canvas').getContext('2d');
+  ctx.font = canvas.getContext('2d').font;
+  return ctx.measureText(kind === 'spectrum' ? v.toExponential(2) : v.toPrecision(4)).width + 8;
+}
+
 describe('what follows the pointer over a plot', () => {
   it('the hover’s tip, beside the pointer, covers no cursor’s tag or tab, wherever the pointer is about one', async () => {
     const m = await mounted(), { page, id, canvas } = m;
@@ -235,13 +247,15 @@ describe('what follows the pointer over a plot', () => {
                 if (own) {
                   for (const tag of tags) expect(overlap(own, tag), `${where} covers ${nameOf(tag)}`).toBe(false);
                   expect(own.y, `${where} is at the pointer's height`).toBe(y + 0.5 - 8);
+                  expect(own.w, `${where} is as wide as its text`).toBeCloseTo(pointerTagWidth(pv, canvas, axis.key, y, c.kind), 3);
                   // Against its side of the lane, never moved in past a cursor's tag.
                   if (first) expect(axis.side === 'left' ? own.x : own.x + own.w, `${where} is against the lane's ${axis.side} side`).toBe(axis.side === 'left' ? lane.x + 1 : lane.x + lane.w - 1);
                   count.drawn++;
                 } else {
                   // Left out only where a cursor's tag is in its place.
-                  const place = { x: axis.side === 'left' ? lane.x + 1 : lane.x + lane.w - 21, y: y + 0.5 - 8, w: 20, h: 16 };
-                  if (first) expect(tags.some((tag) => overlap(place, tag)), `${where} is not drawn, with no cursor's tag in its place`).toBe(true);
+                  const w = pointerTagWidth(pv, canvas, axis.key, y, c.kind);
+                  const place = { x: axis.side === 'left' ? lane.x + 1 : lane.x + lane.w - 1 - w, y: y + 0.5 - 8, w, h: 16 };
+                  if (first) expect(tags.some((tag) => overlap(place, tag)), `${where} is not drawn, with no cursor's tag in its place ${JSON.stringify(place)}`).toBe(true);
                   count.hidden++;
                 }
                 if (axis.key === line.axis.key) states.push(own ? 'drawn' : 'hidden');
@@ -253,7 +267,7 @@ describe('what follows the pointer over a plot', () => {
           }
           canvas.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
         }),
-        { examples: EXAMPLES, numRuns: EXAMPLES.length + Math.ceil(fc.readConfigureGlobal().numRuns / 4) },
+        { examples: [...EXAMPLES, ...BESIDE_X_TAG], numRuns: EXAMPLES.length + BESIDE_X_TAG.length + Math.ceil(fc.readConfigureGlobal().numRuns / 4) },
       );
       for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(20);
     } finally {
