@@ -28,6 +28,42 @@ const CLOCK_SNAP = 0.5;
 const SAME_SPAN = 1 + 1e-9;
 
 /**
+ * The seconds of history a History setting of `maxAge` seconds and
+ * `budget` bytes drops of what the hub holds, by its `memory` (Session
+ * `memory`), as {live, paused}: the oldest seconds of the live history, and
+ * of the history paused plots hold. Raising a limit drops nothing.
+ *
+ * The live history keeps the least of what it holds, the new time limit,
+ * and the share of what it holds the new budget leaves, the oldest bytes
+ * going first. The paused copy runs from `held.seconds` before the pause
+ * to the pause, and holds `held.bytes` of rows the live history no longer
+ * does, its oldest; the bytes of a second are the live history's. It
+ * keeps the new time limit before the pause, and of the rows the live
+ * history then no longer holds what fits in the budget the live history
+ * leaves, its oldest going first. So both parts are what the hub's own
+ * rules (twinleaf-web/src/hub.rs `set_history`) drop, to within a second
+ * of what the streams' rates and the hub's chunks round to, as of the
+ * hub's last `memory` message, which it sends once a second while what it
+ * holds changes.
+ */
+export function dropping(memory, maxAge, budget) {
+  const { seconds: live, bytes } = memory;
+  const perSecond = live > 0 ? bytes / live : 0;
+  const kept = Math.min(live, maxAge, budget < bytes ? live * (budget / bytes) : live);
+  const held = memory.held;
+  if (!held || !(held.seconds > 0)) return { live: Math.max(0, live - kept), paused: 0 };
+  // Seconds back from the newest live row: the live history begins at
+  // `live`, the paused copy's newest row is where it meets it.
+  const beyond = perSecond > 0 ? held.bytes / perSecond : 0;
+  const pause = live - Math.max(0, held.seconds - beyond);
+  const from = pause + Math.min(held.seconds, maxAge);
+  const alone = Math.max(0, from - Math.max(pause, kept));
+  const room = perSecond > 0 ? Math.max(0, budget - kept * perSecond) / perSecond : Infinity;
+  const heldKept = Math.min(held.seconds, maxAge) - Math.max(0, alone - room);
+  return { live: Math.max(0, live - kept), paused: Math.max(0, held.seconds - heldKept) };
+}
+
+/**
  * One line of points, in device seconds, kept for `keep` seconds before the
  * newest. Points have absolute indices that never change, so a GPU ring
  * buffer can find the ones it has not uploaded.
@@ -253,7 +289,13 @@ export class Session {
   pps = $state(0);
   /** The seconds each level of the decimation keeps, finest first. */
   levels = $state.raw([]);
-  /** The hub's raw history, {bytes, budget, seconds, maxAge, rate}, or null before it says. */
+  /**
+   * The hub's raw history, {bytes, budget, seconds, maxAge, rate, held,
+   * oldest}, or null before it says. `held` is the history paused plots
+   * hold, {bytes, seconds}: the bytes it holds beyond the live history and
+   * the seconds of each stream it holds up to the pause, or null while no
+   * plot is paused.
+   */
   memory = $state.raw(null);
   /** The oldest time the hub held of each trace when the session first heard, by trace id: an oldest later than it since is a drop. */
   firstHeld = {};

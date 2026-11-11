@@ -6,8 +6,12 @@
 // bar's labels. A notice is one function of what came back, each device's
 // outcome (writes.svelte.js): {level, text, detail}, `detail` the lines
 // under the text.
+//
+// And the question lowering a History limit asks before it drops history
+// the hub holds.
 
 import { switchOf } from './properties.js';
+import { spanText } from './units.js';
 
 /** `items` joined as a sentence lists them: "a", "a and b", "a, b and c", the rest past `most` counted. */
 export function list(items, most = 3) {
@@ -153,3 +157,16 @@ export const OFF = 'Off';
 export const writeTo = (n) => `Write to ${count(n, 'device', 'devices')}`;
 export const runOn = (n) => `Run on ${count(n, 'device', 'devices')}`;
 export const runSeveral = (n) => `Run ${n}…`;
+
+/**
+ * The question lowering a History limit asks first, of what it drops
+ * (session.svelte.js `dropping`): `live` and `paused` the oldest seconds of
+ * the live history and of what paused plots hold, `keep` the limit now
+ * set, as the setting shows it. Its lines, and its two buttons.
+ */
+export function lowerAsk({ live, paused }, keep) {
+  const lines = [];
+  if (live > 0) lines.push(`This drops the oldest ${spanText(live)} now held`);
+  if (paused > 0) lines.push(`Paused plots lose the oldest ${spanText(paused)} they show`);
+  return { lines, drop: `Drop ${spanText(Math.max(live, paused))}`, keep: `Keep ${keep}` };
+}

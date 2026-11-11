@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { Session, Trace } from './session.svelte.js';
+import fc from 'fast-check';
+import { dropping, Session, Trace } from './session.svelte.js';
 import { Hub } from './hub.svelte.js';
 import { decodeFrame, holdMessage, signalKey, spectraMessage } from './protocol.js';
 
@@ -295,5 +296,77 @@ describe('the history a hub holds', () => {
     expect(s.held(traces).history).toBeNull();
     s.text(memory({ 0: 0 }, 86400));
     expect(s.held(traces).history).toBe(86400);
+  });
+});
+
+describe('what a lower History setting drops', () => {
+  /**
+   * The hub's `memory` as a hub keeps it, within its History setting and
+   * its budget at 1600 bytes a second, the paused copy holding no more
+   * than the setting and, beyond the live history, the room the live
+   * history leaves; and a new setting.
+   */
+  const hubAndSetting = fc
+    .record({
+      maxAge: fc.double({ min: 60, max: 86400, noNaN: true }),
+      budget: fc.double({ min: 1e6, max: 32e9, noNaN: true }),
+      fill: fc.double({ min: 0, max: 1, noNaN: true }),
+      held: fc.option(fc.record({ seconds: fc.double({ min: 0, max: 1, noNaN: true }), bytes: fc.double({ min: 0, max: 1, noNaN: true }) }), { nil: null }),
+      newAge: fc.double({ min: 60, max: 86400, noNaN: true }),
+      newBudget: fc.double({ min: 1e6, max: 32e9, noNaN: true }),
+    })
+    .map(({ maxAge, budget, fill, held, newAge, newBudget }) => {
+      const seconds = Math.min(maxAge, budget / 1600) * fill, bytes = seconds * 1600;
+      const memory = { bytes, budget, seconds, maxAge, rate: 1600, oldest: {}, held: held && { seconds: maxAge * held.seconds, bytes: (budget - bytes) * held.bytes } };
+      return { memory, maxAge: newAge, budget: newBudget };
+    });
+  const close = (a, b) => Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(b));
+
+  it('is never negative, and nothing when the hub holds no more than the new limits', () => {
+    fc.assert(
+      fc.property(hubAndSetting, ({ memory, maxAge, budget }) => {
+        const { live, paused } = dropping(memory, maxAge, budget);
+        expect(live).toBeGreaterThanOrEqual(0);
+        expect(paused).toBeGreaterThanOrEqual(0);
+        const beyond = memory.held?.bytes ?? 0, heldSeconds = memory.held?.seconds ?? 0;
+        if (memory.seconds <= maxAge && memory.bytes <= budget) expect(live).toBe(0);
+        if (Math.max(memory.seconds, heldSeconds) <= maxAge && memory.bytes + beyond <= budget) expect(close(paused, 0)).toBe(true);
+      }),
+    );
+  });
+
+  it('is what the hub holds beyond a lower time limit, the paused copy counted apart', () => {
+    fc.assert(
+      fc.property(hubAndSetting, ({ memory, maxAge }) => {
+        // The budget the hub has, which holds all of it.
+        const { live, paused } = dropping(memory, maxAge, memory.budget);
+        expect(close(live, Math.max(0, memory.seconds - maxAge))).toBe(true);
+        expect(close(paused, Math.max(0, (memory.held?.seconds ?? 0) - maxAge))).toBe(true);
+        expect(dropping({ ...memory, held: null }, maxAge, memory.budget)).toEqual({ live, paused: 0 });
+      }),
+    );
+  });
+
+  it('is the share of the live history beyond a lower budget, its oldest', () => {
+    fc.assert(
+      fc.property(hubAndSetting, ({ memory, budget }) => {
+        const { live } = dropping(memory, memory.maxAge, budget);
+        const share = memory.bytes > budget ? (memory.bytes - budget) / memory.bytes : 0;
+        expect(close(live, memory.seconds * share)).toBe(true);
+      }),
+    );
+  });
+
+  it('is nothing for a higher setting, and no less for a lower one than for one between it and the setting', () => {
+    fc.assert(
+      fc.property(hubAndSetting, fc.double({ min: 0, max: 1, noNaN: true }), ({ memory, maxAge, budget }, between) => {
+        expect(dropping(memory, Math.max(maxAge, memory.maxAge), Math.max(budget, memory.budget))).toEqual({ live: 0, paused: 0 });
+        if (maxAge > memory.maxAge) return;
+        const lower = dropping(memory, maxAge, budget);
+        const higher = dropping(memory, maxAge + (memory.maxAge - maxAge) * between, budget);
+        expect(lower.live).toBeGreaterThanOrEqual(higher.live - 1e-6);
+        expect(lower.paused).toBeGreaterThanOrEqual(higher.paused - 1e-6);
+      }),
+    );
   });
 });

@@ -248,6 +248,11 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .water-caption .info:hover { color: var(--foreground); }
 .water-caption .info svg { width: 12px; height: 12px; }
 .water-caption .short { color: var(--cursor-a); }
+/* The question a lower limit asks, in the waterline's place: its lines,
+   then its two buttons at the right, Keep before Drop. */
+.lower-ask { display: flex; flex-direction: column; gap: var(--space-2); }
+.lower-lines { display: flex; flex-direction: column; gap: var(--space-1); color: var(--foreground); }
+.lower-buttons { display: flex; justify-content: flex-end; gap: var(--space-2); }
 .status-bar kbd { font: 10px var(--font-data); padding: 0 3px; border: 1px solid var(--border); border-radius: 3px; }
 .action-grid { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px; }
 /* An action button picked as a row, and its number among several picked to run. */
