@@ -524,12 +524,15 @@ export class PlotView {
    * page's ViewHistory: each drag, burst of wheel turns and command here
    * that moves the views is a step of it. `cursors` is the page's
    * CursorEdits, which holds the cursors the plot draws and writes those a
-   * drag here moves, on the plots `targetIds` returns: the ids of the plots
-   * of `targets`. `onFollow()` has the page follow live on those, back at
-   * the windows they had before they paused.
+   * drag here moves, on what `cursorTargets(key)` returns: the PlotViews,
+   * each as [pv, axis], that a drag of an X cursor, with no `key`, or of a Y
+   * cursor on y axis `key` moves (commands.js `cursorPeers`), this one among
+   * them. `onFollow()` has the page follow live on the plots of `targets`,
+   * back at the windows they had before they paused.
    */
-  constructor({ body, overlay, config, hub, view, targets, targetIds, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors }) {
-    Object.assign(this, { body, overlay, config, hub, view, targets, targetIds, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors });
+  constructor({ body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors }) {
+    cursorTargets ??= (key) => [[this, key]];
+    Object.assign(this, { body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors });
     this.zoomBand = null; // [x0, x1] in client px while a Ctrl+drag marks a range to zoom to
     this.ctx = overlay.getContext('2d');
     this.specHover = null;
@@ -1785,19 +1788,16 @@ export class PlotView {
     else this.hoverTime.t = value;
   }
 
-  /**
-   * Shows X cursor `name` at `value`, or removed with null, while a drag
-   * moves it: a time cursor on every plot the drag acts on, a spectrum's on
-   * this plot.
-   */
+  /** Shows X cursor `name` at `value`, or removed with null, while a drag moves it, on every plot the drag moves it on (`cursorTargets`). */
   draftX(name, value) {
     const kind = this.config().kind;
-    for (const id of kind === 'time' ? this.targetIds() : [this.plotId]) this.cursors.draft(id, withX(this.cursors.get(id), kind, name, value));
+    for (const [p] of this.cursorTargets()) this.cursors.draft(p.plotId, withX(this.cursors.get(p.plotId), kind, name, value));
   }
 
-  /** Shows Y cursor `name` of y axis `key` at `value`, or removed with null, while a drag moves it. */
+  /** Shows Y cursor `name` of y axis `key` at `value`, or removed with null, while a drag moves it, on the axis in its units of every plot the drag moves it on. */
   draftY(key, name, value) {
-    this.cursors.draft(this.plotId, withY(this.placed, this.config().kind, key, name, value));
+    const kind = this.config().kind;
+    for (const [p, axis] of this.cursorTargets(key)) this.cursors.draft(p.plotId, withY(this.cursors.get(p.plotId), kind, axis, name, value));
   }
 
   /** The data x under clientX, and back. */
@@ -1986,8 +1986,8 @@ export class PlotView {
       const grab = cursor?.at === undefined ? 0 : (cursor.kind === 'x' ? e.clientX : e.clientY) - cursor.at;
       drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: 0, mode, targets, band, cursor: cursor?.name, key: cursor?.key, grab };
       // A time cursor holds a moment the live view would scroll away, so
-      // dragging one out pauses the view.
-      if (mode === 'xcursor' && cursor.at === undefined && isTime()) for (const v of this.targets()) v.pause(clock.now());
+      // dragging one pauses every plot it moves on.
+      if (mode === 'xcursor' && isTime()) for (const [p] of this.cursorTargets()) p.view.pause(clock.now());
     });
     // Turns an axis drag that has moved off the press into what its
     // direction says, and says whether it is still to decide.
@@ -2009,7 +2009,7 @@ export class PlotView {
         // live view would scroll away, so it pauses the view.
         drag.mode = 'xcursor';
         drag.cursor = pick(this.markers(), (v) => Math.abs(this.pxOf(v) - e.clientX));
-        if (isTime()) for (const v of this.targets()) v.pause(clock.now());
+        if (isTime()) for (const [p] of this.cursorTargets()) p.view.pause(clock.now());
       } else if (drag.mode === 'axis') {
         if (isTime()) (drag.mode = 'seek'), (this.seeking = true);
         else drag.mode = 'none';

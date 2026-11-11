@@ -9,13 +9,16 @@
 // step, which one Back takes back (round 2, View history #6). A command on
 // the cursors, from a menu, a popover, the readout or a double-click that
 // follows live, is an edit: exactly one undo step on however many plots,
-// which undo takes back and redo makes again.
+// which undo takes back and redo makes again. A cursor dragged by its line,
+// tag or tab moves on the selected plots of the plot's kind, a Y cursor on
+// those with an axis in its units, and on no other, as one undo step.
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, closeAll, editCursors, feed, leafOf, mountPage, pressKey, rightClick, settle, wait, withExamples, withYPair } from './harness/page.js';
+import { centre, closeAll, editCursors, feed, leafOf, mountPage, pressKey, rightClick, settle, until, wait, withExamples, withYPair } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
+import { withX, withY, xOf, yOf } from '../src/lib/cursors.js';
 import { plotIds } from '../src/lib/layout.js';
 import { SAVE_KEY } from '../src/lib/tabs.js';
 
@@ -586,4 +589,95 @@ describe('cursors placed on a plot', () => {
       again.dispose();
     }
   });
+});
+
+describe('a cursor dragged on a plot', () => {
+  // Three time plots and three spectra, each of a signal in volts but the last of each, in amperes.
+  const DRAG_KEYS = [['sine.sine'], ['sine.sine'], ['aux.triangle'], ['sine.sine'], ['sine.sine'], ['aux.triangle']];
+  const KIND = ['time', 'time', 'time', 'spectrum', 'spectrum', 'spectrum'];
+  const UNITS = ['V', 'V', 'A', 'V', 'V', 'A'];
+  const ALL = [0, 1, 2, 3, 4, 5];
+  /** Cursor `name` of plot `id`'s `axis`, 'x' or 'y' on its shared axis, as the tab keeps it. */
+  const cursorOf = (page, id, axis, name) => {
+    const c = page.ws.plots[id].cursors, kind = page.ws.plots[id].kind;
+    return (axis === 'x' ? xOf(c, kind) : yOf(c, kind, 'shared'))[name];
+  };
+  /** `cursors` of a plot of `kind` with cursor `name` of `axis` at `v`. */
+  const withCursor = (cursors, kind, axis, name, v) => (axis === 'x' ? withX(cursors, kind, name, v) : withY(cursors, kind, 'shared', name, v));
+  /** Where on PlotView `pv` a press takes cursor `name` of `axis` by its `by` ('line', 'tag' or 'tab'), as the page draws it now; or null where none does. */
+  function pressOn(pv, axis, name, by) {
+    const parts = pv.pressable.filter((p) => p.part === by && p.kind === axis && p.name === name && !p.edge);
+    const points = parts.flatMap((p) => (by === 'line' ? [0.3, 0.5, 0.7].map((t) => (axis === 'x' ? [p.x + p.w / 2, p.y + t * p.h] : [p.x + t * p.w, p.y + p.h / 2])) : [[p.x + p.w / 2, p.y + p.h / 2]]));
+    return points.find((at) => document.elementFromPoint(...at) === pv.overlay && pv.pressAt(...at)?.kind === axis && pv.pressAt(...at)?.name === name) ?? null;
+  }
+
+  it('moves it on the selected plots of its kind alone, a Y cursor on those with an axis in its units, each to the same place, as one undo step', async () => {
+    const reached = new Set();
+    let leftAlone = 0;
+    await fc.assert(
+      fc.asyncProperty(fc.subarray(ALL), fc.nat(5), fc.constantFrom('x', 'y'), fc.constantFrom('line', 'tag', 'tab'), fc.constantFrom('a', 'b'), fc.double({ min: 0.2, max: 0.8, noNaN: true }), async (picks, k, axis, by, name, f) => {
+        const page = await mountPage(DRAG_KEYS, 'grid', 0, ['sine.sine', 'aux.triangle'], [], { units: { 'aux.triangle': 'A' } });
+        try {
+          feed(page.hub);
+          const ids = plotIds(page.ws.layout), id = ids[k], pv = page.pv(id);
+          page.history.group('Prepare', () => ids.forEach((i, n) => page.ws.setPlot(i, { kind: KIND[n] })));
+          await settle();
+          // The time plots paused at one moment, as plots with X cursors are; but live for a time X cursor pulled out of its tab, which the drag pauses.
+          const live = axis === 'x' && by === 'tab' && KIND[k] === 'time';
+          if (!live) for (const i of ids.slice(0, 3)) page.views.get(i).pause(clock.now());
+          await settle();
+          // The same cursors on every plot of one kind and units, each placed but the one a tab is pulled for.
+          ids.forEach((i, n) => {
+            const p = page.pv(i), [x0, x1] = p.xd, [lo, hi] = p.yBounds('shared');
+            const x = KIND[n] === 'spectrum' ? { a: 10, b: 20 } : live ? { a: null, b: null } : { a: x0 + 0.4 * (x1 - x0), b: x0 + 0.6 * (x1 - x0) };
+            const y = { a: lo + 0.4 * (hi - lo), b: lo + 0.6 * (hi - lo) };
+            if (by === 'tab') (axis === 'x' ? x : y)[name] = null;
+            editCursors(page, i, () => withYPair(withX(withX(undefined, KIND[n], 'a', x.a), KIND[n], 'b', x.b), KIND[n], 'shared', y.a, y.b));
+          });
+          page.ws.selection.only(picks.map((n) => ids[n]));
+          flushSync();
+          await commands.mouse([['move', ...centre(leafOf(id))]]);
+          await settle(10);
+          const first = pressOn(pv, axis, name, by);
+          if (!first) return;
+          // Over the press, once what shows there has settled, as the readout and the header come and go with the pointer.
+          await commands.mouse([['move', ...first]]);
+          await settle(10);
+          const from = pressOn(pv, axis, name, by);
+          if (!from) return;
+          const P = pv.geo.plot, lane = pv.yAxes.find((a) => a.key === 'shared').lane;
+          const to = axis === 'x' ? [P.x + f * P.w, P.y + P.h / 2] : [lane.x + lane.w / 2, lane.y + f * lane.h];
+          // What the rule names: the selection when the plot is in it, else the plot; of those, its kind, and for a Y cursor, its units.
+          const named = (picks.includes(k) ? picks : [k]).filter((n) => KIND[n] === KIND[k] && (axis === 'x' || UNITS[n] === UNITS[k]));
+          const before = ids.map((i) => page.ws.plots[i].cursors), lives = ids.map((i) => page.views.get(i).live), steps = page.history.undos.length;
+          await commands.mouse([['move', ...from], ['down'], ['move', (from[0] + to[0]) / 2, (from[1] + to[1]) / 2], ['move', ...to], ['up']]);
+          await settle();
+          const got = cursorOf(page, id, axis, name), what = `${axis} ${by} on ${k} with ${picks} selected`;
+          expect(got, `${what}: moved`).not.toBe((axis === 'x' ? xOf(before[k], KIND[k]) : yOf(before[k], KIND[k], 'shared'))[name]);
+          // Exactly the plots the rule names change, each to where the dragged one went: from where they all were, by the same amount.
+          ids.forEach((i, n) => expect(page.ws.plots[i].cursors, `${what}: plot ${n}`).toEqual(named.includes(n) ? withCursor(before[n], KIND[n], axis, name, got) : before[n]));
+          // A time X cursor pauses the plots it is placed on, and those alone.
+          ids.forEach((i, n) => expect(page.views.get(i).live, `${what}: plot ${n} live`).toBe(lives[n] && !(axis === 'x' && KIND[n] === 'time' && named.includes(n))));
+          expect(page.history.undos.length - steps, `${what}: undo steps`).toBe(1);
+          await until(() => !document.querySelector('[role=menu]'));
+          await pressKey('Control+z');
+          flushSync();
+          expect(ids.map((i) => page.ws.plots[i].cursors), `${what}: undone`).toEqual(before);
+          reached.add(`${axis} ${by}`);
+          if (picks.includes(k) && picks.some((n) => !named.includes(n))) leftAlone++;
+        } finally {
+          page.dispose();
+        }
+      }),
+      // Each cursor by each of its parts, every plot selected; then random runs.
+      withExamples([
+        [ALL, 0, 'x', 'line', 'a', 0.3], [ALL, 3, 'x', 'tag', 'b', 0.7], [ALL, 0, 'x', 'tab', 'a', 0.5], [ALL, 4, 'x', 'tab', 'b', 0.4],
+        [ALL, 1, 'y', 'line', 'a', 0.3], [ALL, 4, 'y', 'tag', 'b', 0.25], [ALL, 2, 'y', 'tab', 'b', 0.5], [ALL, 3, 'y', 'line', 'b', 0.7],
+      ]),
+    );
+    // A replay of one failure runs that case alone.
+    if (fc.readConfigureGlobal().path !== undefined) return;
+    expect([...reached].sort()).toEqual(['x line', 'x tab', 'x tag', 'y line', 'y tab', 'y tag']);
+    expect(leftAlone).toBeGreaterThan(0);
+  }, 600_000);
 });

@@ -28,7 +28,7 @@
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import IconButton from './IconButton.svelte';
   import CommandItem from './CommandItem.svelte';
-  import { axesLike, commandOf, xSpan } from './commands.js';
+  import { axesLike, commandOf, cursorPeers, xSpan } from './commands.js';
   import KindPicker from './KindPicker.svelte';
   import { plotPickers } from './keys.js';
   import { claim } from './keyrouter.js';
@@ -450,7 +450,7 @@
       hub,
       view,
       targets,
-      targetIds,
+      cursorTargets: (key) => cursorPeers(pv, targetPvs(), key),
       cursors,
       onFollow: () => runHere('follow'),
       hoverTime: hover,

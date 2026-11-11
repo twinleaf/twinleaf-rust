@@ -92,6 +92,18 @@ export function axesLike(on, targets, key) {
   return targets.map((p) => [p, p.axisIn(units, key)]).filter(([, axis]) => axis !== null);
 }
 
+/**
+ * What a cursor dragged on PlotView `on` moves, of the PlotViews `targets`
+ * a gesture on it acts on, as [pv, axis]: an X cursor's, with no `key`, on
+ * those of `on`'s kind; a Y cursor's, on its y axis `key`, on the axis in
+ * its units of each of those that has one (`axesLike`). A plot of another
+ * kind is left as it was.
+ */
+export function cursorPeers(on, targets, key) {
+  const same = targets.filter((p) => p.config().kind === on.config().kind);
+  return key === undefined ? same.map((p) => [p, undefined]) : axesLike(on, same, key);
+}
+
 /** The distance between X1 and X2 on the PlotViews `targets` that have the pair, or null while none has. */
 export function xSpan(targets) {
   return common(targets.flatMap((p) => {
