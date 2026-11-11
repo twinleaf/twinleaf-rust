@@ -85,10 +85,7 @@ const menuItems = () => [...document.querySelectorAll('[role=menu] [role=menuite
 
 describe('a property row', () => {
   it('is picked by a click, Ctrl-click, Shift-click or right-click as a sheet picks, across panels and docks in page order, past folded panels, and only while it shows', async () => {
-    const page = await mount();
     const folds = ['settings', 'reports', 'other', 'diagnostics', 'favorites'];
-    const initial = Object.fromEntries(folds.map((id) => [id, isOpen(id)]));
-    const favorites = page.history.favorites;
     const seen = { across: 0, docks: 0, pastFolded: 0, dropped: 0, rightUnpicked: 0, rightPicked: 0, rightButton: 0, buttons: 0, hidden: 0, starredAway: 0, anchorHidden: 0, copy: 0, bar: 0 };
     const hidden = () => !!document.querySelector('.dock-side.right.rail');
     /** Clicks the dock's button `el` with Shift held, which keeps the selection, and waits for the dock to slide as the button said it would. */
@@ -98,27 +95,27 @@ describe('a property row', () => {
       expect(await until(() => hidden() === hides), hides ? 'the dock hidden' : 'the dock shown').toBe(true);
       await frames(2);
     }
-    try {
-      await fc.assert(
-        fc.asyncProperty(
-          fc.array(
-            fc.oneof(
-              { weight: 6, arbitrary: fc.record({ t: fc.constantFrom('click', 'ctrl', 'ctrl', 'shift', 'shift', 'right'), at: fc.nat() }) },
-              fc.record({ t: fc.constantFrom('fold', 'keyfold'), panel: fc.constantFrom(...folds) }),
-              fc.record({ t: fc.constantFrom('hide', 'show') }),
-              fc.record({ t: fc.constant('star'), at: fc.nat() }),
-            ),
-            { minLength: 1, maxLength: 10 },
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(
+          fc.oneof(
+            { weight: 6, arbitrary: fc.record({ t: fc.constantFrom('click', 'ctrl', 'ctrl', 'shift', 'shift', 'right'), at: fc.nat() }) },
+            fc.record({ t: fc.constantFrom('fold', 'keyfold'), panel: fc.constantFrom(...folds) }),
+            fc.record({ t: fc.constantFrom('hide', 'show') }),
+            fc.record({ t: fc.constant('star'), at: fc.nat() }),
           ),
-          async (acts) => {
-            if (hidden()) await shiftPress(document.querySelector('button[aria-label="Show the right dock"]'));
-            for (const id of folds) if (isOpen(id) !== initial[id]) await click(panelHead(id));
+          { minLength: 1, maxLength: 10 },
+        ),
+        async (acts) => {
+          // A page of its own for each case: the page keeps the row picked last while it does not show,
+          // which nothing on it tells, so a case that began on the page another left would not replay alone.
+          const page = await mount(), favorites = page.history.favorites;
+          try {
             page.history.group('Seed', () => favorites.set(['gain', 'temp']));
-            page.ws.selection.clear();
             flushSync();
             await frames();
             // The model: the rows picked, in the order picked, whether they show or not; the row a Shift pick runs from; the row picked last.
-            let picks = [], anchor = null, at = page.ws.selection.rowAt;
+            let picks = [], anchor = null, at = null;
             const shownPicks = () => picks.filter((k) => shown().includes(k));
             for (const a of acts) {
               if ((a.t === 'fold' || a.t === 'keyfold') && !panelHead(a.panel)) continue;
@@ -205,6 +202,8 @@ describe('a property row', () => {
               // The signals on the page are no part of a pick of property rows, a run past them too.
               expect(document.querySelectorAll('.palette .chip').length).toBe(SIGNALS.length);
               expect([page.ws.selection.signals.size, document.querySelectorAll('.palette .chip[aria-selected=true]').length]).toEqual([0, 0]);
+              // The page keeps the row picked last, and says it while it shows.
+              expect(page.ws.selection.rowAt, 'the row picked last, while it shows').toBe(shown().includes(at) ? at : null);
               // The edit bar shows only under the row picked last, while it shows, and counts the rows it edits.
               const bars = [...document.querySelectorAll('.write-bar')];
               if (!shown().includes(at)) expect(bars.length, 'no bar for a row that does not show').toBe(0);
@@ -219,19 +218,24 @@ describe('a property row', () => {
                 }
               }
             }
-          },
-        ),
-          // Each case counted below, whatever the seed: the rows run settings (0 to 3), favorites (4, 5), reports (6, 7), the action buttons (8, 9) and other (10, 11).
-          withExamples([
-            [[{ t: 'click', at: 0 }, { t: 'shift', at: 11 }, { t: 'ctrl', at: 3 }, { t: 'ctrl', at: 3 }, { t: 'right', at: 5 }, { t: 'click', at: 6 }, { t: 'shift', at: 10 }, { t: 'right', at: 0 }, { t: 'ctrl', at: 8 }, { t: 'right', at: 9 }]],
-            [[{ t: 'ctrl', at: 4 }, { t: 'ctrl', at: 2 }, { t: 'ctrl', at: 3 }, { t: 'hide' }, { t: 'right', at: 2 }, { t: 'show' }, { t: 'right', at: 2 }]],
-            [[{ t: 'click', at: 4 }, { t: 'star', at: 4 }, { t: 'click', at: 6 }, { t: 'keyfold', panel: 'reports' }, { t: 'shift', at: 8 }]],
-          ]),
-      );
-      for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
-    } finally {
-      page.dispose();
-    }
+          } finally {
+            page.dispose();
+          }
+        },
+      ),
+        // Each case counted below, whatever the seed: the rows run settings (0 to 3), favorites (4, 5), reports (6, 7), the action buttons (8, 9) and other (10, 11).
+        withExamples([
+          [[{ t: 'click', at: 0 }, { t: 'shift', at: 11 }, { t: 'ctrl', at: 3 }, { t: 'ctrl', at: 3 }, { t: 'right', at: 5 }, { t: 'click', at: 6 }, { t: 'shift', at: 10 }, { t: 'right', at: 0 }, { t: 'ctrl', at: 8 }, { t: 'right', at: 9 }]],
+          [[{ t: 'ctrl', at: 4 }, { t: 'ctrl', at: 2 }, { t: 'ctrl', at: 3 }, { t: 'hide' }, { t: 'right', at: 2 }, { t: 'show' }, { t: 'right', at: 2 }]],
+          [[{ t: 'click', at: 4 }, { t: 'star', at: 4 }, { t: 'click', at: 6 }, { t: 'keyfold', panel: 'reports' }, { t: 'shift', at: 8 }]],
+          // The row picked last, in Favorites, starred away and its pick let go by a press on a header, then starred
+          // again from Settings: it shows again as the row picked last, the edit bar under it, until its dock hides.
+          [[{ t: 'click', at: 4 }, { t: 'star', at: 4 }, { t: 'fold', panel: 'other' }, { t: 'star', at: 0 }, { t: 'hide' }]],
+        ]),
+    );
+    // A replay of one failure runs that case alone.
+    if (fc.readConfigureGlobal().path !== undefined) return;
+    for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
   }, 600_000);
 
   it('menu offers Add to and Remove from Favorites for the picked rows it changes, the star on a picked row sets every picked row, and either is one step undo takes back', async () => {
