@@ -193,6 +193,28 @@ tio proxy udp://localhost
 
 It listens on every interface. `--listen loopback` keeps it to this machine.
 
+It serves three captures for `tio capture`:
+
+| RPC             | Name            | What it holds                                              |
+| --------------- | --------------- | ---------------------------------------------------------- |
+| `test.capture`  | Test Signal     | 800 to 1200 `f32` samples of the sine, 0.5 s after trigger |
+| `fid.capture`   | FID             | one shot of a free induction decay, 1500 `i16` ADC counts  |
+| `phase.capture` | Unwrapped phase | the unwrapped phase of such a shot, 1500 `f32` in rad      |
+
+An FID shot is what a 2 MS/s ADC reads in the 750 µs it measures of each
+1 ms repetition: `amplitude × exp(−t/T2) × sin(2πft)` plus noise, in counts
+of a 16 bit converter that the capture's calibration takes to volts. It is
+ready one repetition after its trigger. `fid.frequency` (Hz), `fid.t2` (s),
+`fid.amplitude` (V) and `fid.noise` (V in each sample) set it, as
+`--fid-frequency`, `--fid-t2`, `--fid-amplitude` and `--fid-noise` do at the
+start. The frequency of each shot wanders a part in a thousand about
+`fid.frequency` over about a second, so repeated captures differ.
+
+```sh
+tio capture fid.capture
+tio rpc fid.t2 500e-6
+```
+
 ## Shell completions
 
 `tio` can generate completion scripts for bash, zsh, fish, and PowerShell. Add

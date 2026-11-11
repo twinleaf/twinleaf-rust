@@ -1,6 +1,7 @@
 //! tio simulate
 //!
-//! Simulates a small Twinleaf device that publishes a noisy sine wave on stream 1.
+//! Simulates a small Twinleaf device that publishes a noisy sine wave on stream 1,
+//! and serves captures of it, of a free induction decay and of that decay's phase.
 //! With `--layout`, it simulates one such device at each route given, all
 //! behind the one UDP port, as a hub and the devices on its ports are.
 //!
@@ -268,6 +269,20 @@ impl Simulator {
             device::CAPTURE_SAMPLES_MIN,
             device::CAPTURE_SAMPLES_MAX,
             device::CAPTURE_DELAY_NS as f64 / 1e9
+        );
+        terminal_println!(
+            "  capture fid.capture: one FID shot, {} i16 samples at {} MS/s, frequency={} Hz T2={} s amplitude={} V noise={} V, ready {} ms after its trigger",
+            device::FID_SAMPLES,
+            device::FID_SAMPLE_RATE / 1e6,
+            board.fid_frequency(),
+            board.fid_t2(),
+            board.fid_amplitude(),
+            board.fid_noise(),
+            device::FID_DELAY_NS as f64 / 1e6
+        );
+        terminal_println!(
+            "  capture phase.capture: the unwrapped phase of such a shot, {} f32 samples in rad",
+            device::FID_SAMPLES
         );
         match cli.upload {
             crate::UploadKind::Image => {
