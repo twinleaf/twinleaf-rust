@@ -15,7 +15,7 @@ import { scaleLinear, scaleLog, scaleTime } from 'd3-scale';
 import { DRAG_START } from './constants.js';
 import { colors } from './colors.svelte.js';
 import { prefs } from './prefs.svelte.js';
-import { spanText } from './units.js';
+import { axisFormat, formOf, numberText, rangeText, si, spanText } from './units.js';
 import { WINDOW_LIMITS, windowText } from './window.js';
 import { placedIn, withX, withY, withoutX, withoutY, xOf, yOf } from './cursors.js';
 import * as clock from './clock.js';
@@ -438,30 +438,44 @@ function spectrumAt(s, f) {
   return { x: s.f[lo], y: s.a[lo] };
 }
 
-const PREFIXES = { '-15': 'f', '-12': 'p', '-9': 'n', '-6': 'µ', '-3': 'm', 0: '', 3: 'k', 6: 'M', 9: 'G' };
-
-/**
- * `v` with four significant digits and an SI prefix on `unit`, as 197.8 mV.
- * A value without a physical unit, or in arbitrary units, has no prefix.
- */
 /** A tick on a linear frequency axis, as few digits as it needs: 500 Hz, 1.5 kHz. */
 const hzLabel = (f) => (Math.abs(f) >= 1000 ? `${+(f / 1000).toPrecision(4)} kHz` : `${+f.toPrecision(4)} Hz`);
 
-export function si(v, unit) {
-  if (!isFinite(v)) return '—';
-  if (!unit || unit === 'arb') return v.toPrecision(4);
-  if (v === 0) return `0 ${unit}`;
-  const e = Math.max(-15, Math.min(9, Math.floor(Math.log10(Math.abs(v)) / 3) * 3));
-  return `${(v / 10 ** e).toPrecision(4)} ${PREFIXES[e]}${unit}`;
-}
+/**
+ * How each place a plot writes a value of a y axis writes it on Auto
+ * (units.js `formOf`), a time plot's and a spectrum's: `tag` the pointer's
+ * tag on the axis; `value` the cursors' tags and readout and the hover's
+ * tip, a time plot's in the signal's units with an SI prefix; `legend` the
+ * legend's value; `floor` a spectrum's noise floor. A spectrum's values
+ * keep their exponent and their units apart, being per √Hz.
+ */
+export const Y_AUTO = {
+  tag: { time: { digits: 4, notation: 'fig' }, spectrum: { digits: 3, notation: 'exp' } },
+  value: { time: { digits: 4, notation: 'si' }, spectrum: { digits: 4, notation: 'exp' } },
+  legend: { time: { digits: 5, notation: 'fig' }, spectrum: { digits: 4, notation: 'exp' } },
+  floor: { spectrum: { digits: 3, notation: 'exp' } },
+};
+/** How a spectrum's x axis writes a frequency on Auto: a cursor's place, and the distance between two. */
+export const F_AUTO = { at: { digits: 4, notation: 'fig' }, span: { digits: 4, notation: 'si' } };
 
-/** The range lo … hi in `unit`, both ends with the prefix of the larger. */
-export function siRange(lo, hi, unit) {
-  if (!isFinite(lo) || !isFinite(hi)) return '—';
-  const big = Math.max(Math.abs(lo), Math.abs(hi));
-  if (!unit || unit === 'arb' || big === 0) return `${lo.toPrecision(4)} … ${hi.toPrecision(4)}${unit && unit !== 'arb' ? ` ${unit}` : ''}`;
-  const e = Math.max(-15, Math.min(9, Math.floor(Math.log10(big) / 3) * 3));
-  return `${(lo / 10 ** e).toPrecision(4)} … ${(hi / 10 ** e).toPrecision(4)} ${PREFIXES[e]}${unit}`;
+/**
+ * The text of each of a y axis's numbered `ticks`, or of a spectrum's
+ * frequency axis's with `hz`, in axis format `f` (units.js `axisFormat`).
+ * On Auto they read as `auto(v)`: the scale's own tick format, a log
+ * axis's decades as 1e+3, or `hzLabel`. Else they read in f's notation, or
+ * with Auto in that of `auto`'s place, plain on a linear y axis, an
+ * exponent on a log one and an SI prefix on Hz, to f's digits, or with Auto
+ * the fewest; and with more where fewer would write two ticks alike. Plain
+ * numbers on a linear axis, `log` false, take the decimals of the largest.
+ */
+export function tickTexts(ticks, f, auto, { log = false, hz = false } = {}) {
+  if (f.digits === null && f.notation === 'auto') return ticks.map(auto);
+  const notation = f.notation !== 'auto' ? f.notation : hz ? 'si' : log ? 'exp' : 'plain';
+  const of = Math.max(0, ...ticks.map(Math.abs));
+  for (let digits = f.digits ?? 1; ; digits++) {
+    const texts = ticks.map((v) => numberText(v, { digits, notation }, hz ? 'Hz' : '', log ? v : of || v));
+    if (digits >= 17 || new Set(texts).size === texts.length) return texts;
+  }
 }
 
 /**
@@ -582,7 +596,8 @@ export class PlotView {
     this.drawnOn = null; // where the plot's body was as it last drew, {x, y, w, h} in client px
     this.tagsParted = {}; // the pairs of tags that are on their outer sides, by pair, see `parted`
     this.tagsPlaced = [];
-    this.tickLabels = []; // the box of each tick label, {x, y, w, h} in client px, as last drawn, and a y label's axis, its range key
+    this.tickLabels = []; // each tick label as last drawn, {text, x, y, w, h}, its box in client px, and a y label's axis, its range key
+    this.labelBoxes = []; // each y axis's label as last drawn, {axis, text, x, y, w, h}
     this.cursorStubs = []; // each cursor line's run past the plot's edge into the axis, {x0, y0, x1, y1}
     this.axisHover = null; // clientX over the x axis, where a drag seeks
     this.phosphor = new Map(); // signal key -> the shares its axis column shows, eased frame to frame
@@ -702,13 +717,50 @@ export class PlotView {
     const head = this.body.closest('.plot-card.monitor')?.querySelector('.plot-head')?.getBoundingClientRect().bottom ?? -Infinity;
     const tabs = ys.map((lane) => this.tabRoom(lane, head));
     const least = tabs.some((room) => room > 0) ? GUTTER.min : GUTTER.bare;
-    const counts = this.axisCounts(cfg);
-    const widths = Object.fromEntries(['left', 'right'].map((side) => [side, Array.from({ length: counts[side] }, (_, i) => Math.max(this.gutter[side][i] ?? GUTTER.min, least))]));
+    const counts = this.axisCounts(cfg), labels = this.axisLabels(cfg, ys, tabs, head);
+    const labelled = (side, i) => [...labels.values()].some((l) => l.side === side && l.slot === i);
+    const widths = Object.fromEntries(['left', 'right'].map((side) => [side, Array.from({ length: counts[side] }, (_, i) => Math.max(this.gutter[side][i] ?? GUTTER.min, least) + (labelled(side, i) ? AXIS_LABEL : 0))]));
     const width = (side) => Math.max(widths[side].reduce((a, b) => a + b, 0), GUTTER.bare);
     const left = width('left'), right = width('right');
     const plot = { x: body.x + left, y: top, w: body.w - left - right, h: height };
     const lanes = count === 1 ? [plot] : ys.map(({ y }) => ({ x: plot.x, y, w: plot.w, h }));
-    return { plot, lanes, head, tabs, widths };
+    return { plot, lanes, head, tabs, widths, labels };
+  }
+
+  /**
+   * The label each y axis draws along its outer edge, as its settings ask
+   * (units.js `axisFormat`), by range key, as {text, side, slot, y0, y1}:
+   * its units, or its signals' names with their units, as "sine.sine (V)",
+   * each of an axis of several units with its own. It runs up the axis in a
+   * column of the gutter AXIS_LABEL px wide, which widens the axis's band
+   * for it, centred between `y0` and `y1`: the room of its lane in `ys`
+   * below a floating header whose foot is at `head`, and above the tabs of
+   * Y cursors resting at the lane's foot, which `tabs` counts, CLEAR px
+   * from each. A label longer than that room is the units alone, and where
+   * those are longer too, or there are none, the axis has no label.
+   */
+  axisLabels(cfg, ys, tabs, head) {
+    const out = new Map(), traces = this.traces(), spectrum = cfg.kind === 'spectrum';
+    const unitsOf = (t) => (t.meta.units ? (spectrum ? `${t.meta.units}/√Hz` : t.meta.units) : '');
+    // Each axis as [key, its traces, its lane, side, slot].
+    let axes;
+    if (cfg.mode === 'overlay') axes = [['shared', traces, 0, 'left', 0]];
+    else if (cfg.mode === 'stacked') axes = traces.map((t, i) => [t.key, [t], i, 'left', 0]);
+    else {
+      const slots = axisSlots(cfg.keys, cfg.sides);
+      axes = ['left', 'right'].flatMap((side) => slots[side].map((key, slot) => [key, traces.filter((t) => t.key === key), 0, side, slot]));
+    }
+    this.ctx.font = `11px ${theme().dataFont}`;
+    for (const [key, ts, i, side, slot] of axes) {
+      const { label } = axisFormat(cfg.yFormat?.[key]), lane = ys[i];
+      if (label === 'off' || !ts.length || !lane) continue;
+      const units = [...new Set(ts.map(unitsOf).filter(Boolean))];
+      const named = units.length > 1 ? ts.map((t) => (unitsOf(t) ? `${t.key} (${unitsOf(t)})` : t.key)).join(', ') : `${ts.map((t) => t.key).join(', ')}${units.length ? ` (${units[0]})` : ''}`;
+      const y0 = Math.max(lane.y, head + CLEAR) + CLEAR, y1 = lane.y + lane.h - Math.min(2, tabs[i]) * (TAB.h + CLEAR) - CLEAR;
+      const text = [label === 'name' && named, units.join(', ')].find((s) => s && this.ctx.measureText(s).width <= y1 - y0);
+      if (text) out.set(key, { text, side, slot, y0, y1 });
+    }
+    return out;
   }
 
   /**
@@ -1045,7 +1097,7 @@ export class PlotView {
    * log or linear as the plot sets them; a time plot's are linear.
    */
   drawOverlay(cfg, geo, body, plans, ranges, xd, spectrum, allTraces) {
-    const logX = spectrum && cfg.xLog, logY = spectrum && cfg.yLog;
+    const logX = spectrum && cfg.xLog, logY = spectrum && cfg.yLog, kind = spectrum ? 'spectrum' : 'time';
     const ctx = this.ctx;
     const T = theme();
     ctx.setTransform(this.dpr, 0, 0, this.dpr, -body.x * this.dpr, -body.y * this.dpr);
@@ -1104,9 +1156,13 @@ export class PlotView {
     ctx.fillStyle = T.axisText;
     ctx.textAlign = 'center';
     this.tickLabels = [];
+    this.labelBoxes = [];
     // With no room beside the plot, the X cursors' tabs rest on the axis's left end.
     const xTabsBeside = P.x - body.x >= 2 * TAB.w + 6;
     let labelEnd = xTabsBeside ? -Infinity : P.x + 2 * TAB.w + 4;
+    // A spectrum's frequencies as its x axis's settings write them.
+    const xFormat = axisFormat(spectrum ? cfg.xFormat : null), fTicks = spectrum ? xticks.filter((f) => !logX || labelled(f)) : [];
+    const fTexts = new Map(tickTexts(fTicks, xFormat, hzLabel, { hz: true, log: logX }).map((text, i) => [fTicks[i], text]));
     for (const tv of xticks) {
       const px = Math.round(sx(tv)) + 0.5;
       if (px < P.x || px > P.x + P.w) continue;
@@ -1117,12 +1173,12 @@ export class PlotView {
         ctx.lineTo(px, lane.y + lane.h);
         ctx.stroke();
       }
-      const label = logX ? (labelled(tv) ? hzLabel(tv) : '') : spectrum ? hzLabel(tv) : time.label(tv);
+      const label = spectrum ? (fTexts.get(tv) ?? '') : time.label(tv);
       if (!label) continue;
       const half = ctx.measureText(label).width / 2;
       if (px - half < labelEnd + X_LABEL_GAP || px + half > body.x + body.w) continue;
       ctx.fillText(label, px, P.y + P.h + AXIS_BELOW + 15);
-      this.tickLabels.push({ x: px - half, y: P.y + P.h + AXIS_BELOW + 15 - LABEL.up, w: 2 * half, h: LABEL.up + LABEL.down });
+      this.tickLabels.push({ text: label, x: px - half, y: P.y + P.h + AXIS_BELOW + 15 - LABEL.up, w: 2 * half, h: LABEL.up + LABEL.down });
       labelEnd = px + half;
     }
 
@@ -1145,8 +1201,9 @@ export class PlotView {
       axes.push({ key: 'shared', lane: geo.lanes[0], range: ranges.get('shared'), side: 'left', color: T.axisText, plans });
     }
     // Each axis's band of the gutter, from the plot outward; the outermost
-    // reaches the plot's edge.
+    // reaches the plot's edge. Each writes its numbers as its settings say.
     for (const a of axes) {
+      a.format = axisFormat(cfg.yFormat?.[a.key]);
       a.slot ??= 0;
       let inner = 0;
       for (let i = 0; i < a.slot; i++) inner += geo.widths[a.side][i];
@@ -1207,7 +1264,7 @@ export class PlotView {
       const sy = yScale(ax.range, ax.lane);
       const { grid, labels, count } = laneTicks(sy, ax.lane, logY ? decade : undefined, reachOf(ax.lane));
       // Numbers take the precision of the ticks they label, so no two read the same.
-      const fmt = logY ? (v) => v.toExponential(0) : sy.tickFormat(count);
+      const texts = tickTexts(labels, ax.format, logY ? (v) => v.toExponential(0) : sy.tickFormat(count), { log: logY });
       // The ticks a Y cursor dragged with Shift snaps to: where the axis draws its grid, or else its numbers.
       ax.ticks = i === 0 || cfg.mode === 'stacked' ? grid : labels;
       if (i === 0 || cfg.mode === 'stacked')
@@ -1222,14 +1279,27 @@ export class PlotView {
       ctx.textAlign = ax.side === 'left' ? 'right' : 'left';
       ctx.fillStyle = ax.color;
       let widest = 0;
-      for (const tv of labels) {
-        const py = Math.round(sy(tv)) + 0.5, label = fmt(tv), w = ctx.measureText(label).width;
+      for (const [n, tv] of labels.entries()) {
+        const py = Math.round(sy(tv)) + 0.5, label = texts[n], w = ctx.measureText(label).width;
         widest = Math.max(widest, w);
         ctx.fillText(label, ax.side === 'left' ? ax.x1 - GUTTER.gap : ax.x0 + GUTTER.gap, py + 4);
-        this.tickLabels.push({ axis: ax.key, x: ax.side === 'left' ? ax.x1 - GUTTER.gap - w : ax.x0 + GUTTER.gap, y: py + 4 - LABEL.up, w, h: LABEL.up + LABEL.down });
+        this.tickLabels.push({ axis: ax.key, text: label, x: ax.side === 'left' ? ax.x1 - GUTTER.gap - w : ax.x0 + GUTTER.gap, y: py + 4 - LABEL.up, w, h: LABEL.up + LABEL.down });
       }
       const want = labels.length ? Math.max(GUTTER.min, Math.ceil(widest + GUTTER.gap + GUTTER.pad)) : GUTTER.bare;
       need[ax.side][ax.slot] = Math.max(need[ax.side][ax.slot] ?? 0, want);
+      // Its label, which the frame's geometry made room for, running up the column at the band's outer edge.
+      const named = geo.labels.get(ax.key);
+      if (named) {
+        const w = geo.widths[ax.side][ax.slot], tw = ctx.measureText(named.text).width, cy = (named.y0 + named.y1) / 2;
+        const x = ax.side === 'left' ? ax.x1 - w + CLEAR + LABEL.up : ax.x0 + w - CLEAR - LABEL.down;
+        ctx.save();
+        ctx.translate(x, cy);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textAlign = 'center';
+        ctx.fillText(named.text, 0, 0);
+        ctx.restore();
+        this.labelBoxes.push({ axis: ax.key, text: named.text, x: x - LABEL.up, y: cy - tw / 2, w: LABEL.up + LABEL.down, h: tw });
+      }
     });
     for (const side of ['left', 'right'])
       this.gutter[side] = need[side].map((want, slot) => {
@@ -1378,7 +1448,7 @@ export class PlotView {
       for (const a of axes) {
         if (a.lane !== hoverLane) continue;
         const v = yScale(a.range, a.lane).invert(hy);
-        const text = spectrum ? v.toExponential(2) : v.toPrecision(4);
+        const text = numberText(v, formOf(Y_AUTO.tag[kind], a.format));
         const w = ctx.measureText(text).width + 8;
         const box = { x: this.tagSlot(a.lane, a.side, py, w, 16), y: py - 8, w, h: 16 };
         if (cursorTags.some((p) => overlaps(p, box))) continue;
@@ -1412,9 +1482,15 @@ export class PlotView {
 
     // Readouts, which the page shows in the plot's header: each trace's value
     // at the hover, or its newest value while live, and its values at A and
-    // B with B - A.
-    const fx = spectrum ? (f) => `${f.toPrecision(4)} Hz` : time.readout;
-    const fy = spectrum ? (v) => v.toExponential(3) : (v) => v.toPrecision(5);
+    // B with B - A. Each is written as its y axis's settings say, and a
+    // spectrum's frequencies as its x axis's.
+    const fx = spectrum ? (f) => numberText(f, formOf(F_AUTO.at, xFormat), 'Hz') : time.readout;
+    /** The form a value of y axis `key` takes at `place` of Y_AUTO, and how it reads there in `units`, which a spectrum keeps apart. */
+    const yForm = (key, place) => formOf(Y_AUTO[place][kind], axisFormat(cfg.yFormat?.[key]));
+    const yText = (key, place, units = '') => {
+      const form = yForm(key, place);
+      return (v) => numberText(v, form, spectrum ? '' : units);
+    };
     const rows = {};
     // Where a pixel's column holds several points, the hover reads all of
     // them, lowest to highest, as one point there would be any of them.
@@ -1450,23 +1526,22 @@ export class PlotView {
         ctx.arc(sx(pt.x), sy(pt.y), 3, 0, Math.PI * 2);
         ctx.fill();
       }
+      const key = this.rangeKey(cfg, p.t), fy = yText(key, 'legend');
       let value = '';
       if (pts.hover && read?.v !== undefined) value = fy(read.v);
       else if (!spectrum && this.view.live && p.t.length) value = fy(p.t.yAt(p.t.absEnd - 1));
       // Where the points come from: raw samples, or how many raw rows per point.
       let info = `${p.t.meta.rate} Hz`;
       if (!spectrum) info += p.fromWindow ? (p.src.ratio === 1 ? ' · raw' : ` · 1:${p.src.ratio}`) : p.level ? ` · live, level ${p.level}` : ' · live';
-      // A spectrum's values keep their exponent, its units being per √Hz.
-      const fv = spectrum ? fy : (v) => si(v, p.t.meta.units);
+      const fv = yText(key, 'value', p.t.meta.units);
       const cell = (pt) => (pt ? fv(pt.y) : '—');
       // A spectrum's floor, which its chip shows in place of a value, or a dash while there is none.
-      const floor = spectrum ? (p.s.floor ? p.s.floor.toExponential(2) : '—') : null;
+      const floor = spectrum ? (p.s.floor ? yText(key, 'floor')(p.s.floor) : '—') : null;
       rows[p.t.key] = { value, floor, info, a: cell(pts.a), b: cell(pts.b), d: pts.a && pts.b ? fv(pts.b.y - pts.a.y) : '—' };
     });
     // The cursors' readout: where X1 and X2 are, with each signal's value
     // there, and each y axis's Y1 and Y2, a spectrum's also as a ratio in dB.
     const delta = marks.a !== null && marks.b !== null;
-    const xUnit = spectrum ? 'Hz' : 's';
     const xs =
       marks.a === null && marks.b === null
         ? null
@@ -1474,15 +1549,14 @@ export class PlotView {
             v: spectrum ? 'f' : 't',
             a: marks.a === null ? '—' : fx(marks.a),
             b: marks.b === null ? '—' : fx(marks.b),
-            d: delta ? si(marks.b - marks.a, xUnit) : '—',
+            d: delta ? (spectrum ? numberText(marks.b - marks.a, formOf(F_AUTO.span, xFormat), 'Hz') : si(marks.b - marks.a, 's')) : '—',
             rate: delta && !spectrum && marks.b !== marks.a ? si(1 / Math.abs(marks.b - marks.a), 'Hz') : '',
           };
     const ys = [];
     for (const a of axes) {
       const yc = this.yPair(a.key);
       if (!yc || (yc.a === null && yc.b === null)) continue;
-      const units = a.plans[0]?.t.meta.units ?? '';
-      const fv = spectrum ? fy : (v) => si(v, units);
+      const fv = yText(a.key, 'value', a.plans[0]?.t.meta.units ?? '');
       const both = yc.a !== null && yc.b !== null;
       ys.push({
         key: a.key,
@@ -1498,9 +1572,9 @@ export class PlotView {
     this.legend = { rows, cursors };
     if (!hold) this.hoverRead = this.hover ? { x: this.hover.x, y: this.hover.y, at: now, reads } : null;
     if (near) {
-      const u = near.t.meta.units;
+      const u = near.t.meta.units, key = this.rangeKey(cfg, near.t);
       const { v, span } = near.read ?? {};
-      const value = v === undefined ? '' : spectrum ? fy(v) : span ? siRange(span.lo, span.hi, u) : si(v, u);
+      const value = v === undefined ? '' : span ? rangeText(span.lo, span.hi, yForm(key, 'value'), u) : yText(key, 'value', u)(v);
       this.drawTip(ctx, T, hoverLane, near, value, sx(marks.hover), hy);
     }
     if (!spectrum) this.drawWindow(ctx, T, P, open, frameAt);
@@ -1569,7 +1643,7 @@ export class PlotView {
     const color = { a: T.cursorA, b: T.cursorB };
     const xName = { a: 'X1', b: 'X2' }, yName = { a: 'Y1', b: 'Y2' };
     const inView = (v) => v !== null && v >= xd[0] && v <= xd[1];
-    const fx = this.spectrum ? (f) => `${f.toPrecision(4)} Hz` : time.readout;
+    const fx = this.spectrum ? (f) => numberText(f, formOf(F_AUTO.at, axisFormat(this.config().xFormat)), 'Hz') : time.readout;
     // The box and text of a tag centred on (cx, cy), or, with `align`, beside cx on that side.
     const tag = (cx, cy, text, align = 'center') => {
       const w = Math.max(TAB.w, ctx.measureText(text).width + 6);
@@ -1655,8 +1729,9 @@ export class PlotView {
       const sy = this.axisScale(a);
       // The lane's edge on the axis's side, which its tags sit just inside and its lines run on past.
       const left = a.side === 'left', edge = left ? a.lane.x : a.lane.x + a.lane.w;
-      const units = a.plans[0]?.t.meta.units ?? '';
-      const fv = this.spectrum ? (v) => v.toExponential(3) : (v) => si(v, units);
+      const form = formOf(Y_AUTO.value[this.spectrum ? 'spectrum' : 'time'], a.format);
+      const units = this.spectrum ? '' : (a.plans[0]?.t.meta.units ?? '');
+      const fv = (v) => numberText(v, form, units);
       for (const name of ['a', 'b']) {
         const v = yc[name];
         const py = v === null ? NaN : sy(v);
@@ -2379,6 +2454,13 @@ export class PlotView {
  * labels that change width as the plot moves do not shift it.
  */
 const GUTTER = { gap: 6, pad: 6, min: 24, bare: 12, slack: 10 };
+/**
+ * The width, in px, of the column at a y axis's outer edge its label runs
+ * up in (`axisLabels`), outside the room its numbers take: the axes' 11 px
+ * type on its side, as far as a tick label's digits reach above and below
+ * their line (LABEL), and CLEAR px either side.
+ */
+const AXIS_LABEL = 11 + 2 * CLEAR;
 /**
  * A paused plot's history scrollbar: its height, and its thumb's least
  * width, in px. The thumb is as wide as the window is a share of the history,

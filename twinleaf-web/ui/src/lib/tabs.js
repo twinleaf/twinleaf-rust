@@ -10,8 +10,11 @@
 // places an independent plot's axes, signal key to 'left', 'right' or
 // 'none' (plot.js axisSlots). `cursors` holds the plot's X and Y cursors,
 // {x, f, y} as cursors.js lays them out, and is absent while none is
-// placed. `layout` is the split tree of layout.js over the plot ids, or
-// null for an empty tab.
+// placed. `yFormat` holds each y axis's label, digits and notation, by its
+// range key ('shared', or the signal key of an axis of its own), and
+// `xFormat` a spectrum's frequency axis's digits and notation, each as
+// units.js `axisFormat` reads them, a setting absent at Auto. `layout` is
+// the split tree of layout.js over the plot ids, or null for an empty tab.
 //
 // The tabs are kept in localStorage under SAVE_KEY as {tabs, activeId}.
 // Outside tools read that key and shape, so `tabFromJson` is the one place

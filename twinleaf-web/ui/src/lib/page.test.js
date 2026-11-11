@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { controlOf, mergeRows, writersOf } from './properties.js';
 import { KEYMAP, actionFor, sheet } from './keymap.js';
-import { lanesOf, siRange } from './plot.js';
+import { lanesOf } from './plot.js';
 import { Views } from './views.js';
-import { bytesEstimate, bytesText, spanText } from './units.js';
+import fc from 'fast-check';
+import { DIGITS, axisFormat, formOf, numberText, rangeText, siRange, bytesEstimate, bytesText, spanText } from './units.js';
 
 const rpc = (name, type, access, channel = 'setting') => ({ name, type, access, channel, readable: access.includes('read'), persistent: false });
 
@@ -88,6 +89,97 @@ describe('a range of values', () => {
     expect(siRange(-2.438, 0.4413, 'V')).toBe('-2.438 … 0.4413 V');
     expect(siRange(-0.0012, 0.0031, 'V')).toBe('-1.200 … 3.100 mV');
     expect(siRange(-1, 2, 'arb')).toBe('-1.000 … 2.000');
+  });
+});
+
+describe('a measured value', () => {
+  const PREFIX = { f: -15, p: -12, n: -9, µ: -6, m: -3, k: 3, M: 6, G: 9 };
+  const UNITS = ['V', 'nT', 'Hz', 'V/√Hz', 'arb', ''];
+  /** The value text `s` writes, read back: its prefix and unit taken off; and its significant figures, the trailing zeros of a whole number among them. */
+  function read(s, unit) {
+    let t = s;
+    if (unit && unit !== 'arb') {
+      expect(t.endsWith(` ${unit}`) || t.endsWith(unit), `${s} ends in ${unit}`).toBe(true);
+      t = t.slice(0, t.lastIndexOf(unit)).trimEnd();
+    }
+    let scale = 0;
+    const last = t.at(-1);
+    if (last in PREFIX) (scale = PREFIX[last]), (t = t.slice(0, -1).trimEnd());
+    expect(t, s).toMatch(/^-?\d+(\.\d+)?(e[+-]\d+)?$/);
+    const mantissa = t.replace(/^-/, '').replace(/e.*$/, '');
+    const digits = mantissa.replace('.', '').replace(/^0+/, '');
+    return { v: Number(t) * 10 ** scale, figures: digits.length, nonzero: digits.replace(/0+$/, '').length };
+  }
+  // Values of every size, both signs and zero, as an axis meets them: none so small that plain numbers would need over 100 decimals.
+  const value = fc
+    .oneof(fc.double({ min: -1e12, max: 1e12, noNaN: true, noDefaultInfinity: true }), fc.double({ min: -1e-3, max: 1e-3, noNaN: true }), fc.constantFrom(0, 1, -1, 999.96, 0.0995, 1e-9, 567.8, 1e5))
+    .map((v) => (Math.abs(v) < 1e-30 ? 0 : v));
+  const unit = fc.constantFrom(...UNITS);
+
+  it('on Auto writes as the page writes it with no settings: an SI prefix to four figures, or as toPrecision or toExponential', () => {
+    // The page's own formats, written out here as they were before an axis had settings.
+    const PREFIXES = { '-15': 'f', '-12': 'p', '-9': 'n', '-6': 'µ', '-3': 'm', 0: '', 3: 'k', 6: 'M', 9: 'G' };
+    const si = (v, unit) => {
+      if (!isFinite(v)) return '—';
+      if (!unit || unit === 'arb') return v.toPrecision(4);
+      if (v === 0) return `0 ${unit}`;
+      const e = Math.max(-15, Math.min(9, Math.floor(Math.log10(Math.abs(v)) / 3) * 3));
+      return `${(v / 10 ** e).toPrecision(4)} ${PREFIXES[e]}${unit}`;
+    };
+    const range = (lo, hi, unit) => {
+      const big = Math.max(Math.abs(lo), Math.abs(hi));
+      if (!unit || unit === 'arb' || big === 0) return `${lo.toPrecision(4)} … ${hi.toPrecision(4)}${unit && unit !== 'arb' ? ` ${unit}` : ''}`;
+      const e = Math.max(-15, Math.min(9, Math.floor(Math.log10(big) / 3) * 3));
+      return `${(lo / 10 ** e).toPrecision(4)} … ${(hi / 10 ** e).toPrecision(4)} ${PREFIXES[e]}${unit}`;
+    };
+    const auto = axisFormat(undefined);
+    fc.assert(
+      fc.property(value, value, unit, fc.constantFrom(3, 4, 5), (v, w, u, d) => {
+        expect(formOf({ digits: d, notation: 'si' }, auto)).toEqual({ digits: d, notation: 'si' });
+        expect(numberText(v, formOf({ digits: 4, notation: 'si' }, auto), u)).toBe(si(v, u));
+        expect(numberText(v, { digits: d, notation: 'fig' })).toBe(v.toPrecision(d));
+        expect(numberText(v, { digits: d, notation: 'fig' }, 'Hz')).toBe(`${v.toPrecision(d)} Hz`);
+        expect(numberText(v, { digits: d, notation: 'exp' })).toBe(v.toExponential(d - 1));
+        expect(rangeText(Math.min(v, w), Math.max(v, w), { digits: 4, notation: 'si' }, u)).toBe(range(Math.min(v, w), Math.max(v, w), u));
+      }),
+    );
+  });
+
+  it('to fixed digits reads back as the value within its last figure, in as many figures, in each notation', () => {
+    const seen = new Set();
+    fc.assert(
+      fc.property(value, unit, fc.constantFrom(...DIGITS), fc.constantFrom('si', 'fig', 'plain', 'exp'), (v, u, d, notation) => {
+        const text = numberText(v, { digits: d, notation }, u), { v: back, figures, nonzero } = read(text, u);
+        // Half the last figure's place, as the figures round it, and a hair for the float of reading it back.
+        const place = v === 0 ? 0 : Math.floor(Math.log10(Number(Math.abs(v).toPrecision(d))));
+        expect(Math.abs(back - v), `${v} as ${text}`).toBeLessThanOrEqual(0.5 * 10 ** (place - d + 1) * (1 + 1e-9) + Math.abs(v) * 1e-12);
+        // A whole number may end in zeros past its figures, as 570; else it has exactly as many.
+        const whole = !/[.e]/.test(text.replace(/\s.*$/, ''));
+        if (whole && back !== 0) expect(nonzero <= d && figures >= d, `${v} as ${text}: ${d} figures`).toBe(true);
+        else if (back !== 0) expect(figures, `${v} as ${text}`).toBe(d);
+        // An exponent only where asked, or where toPrecision writes one, or for an SI value past the prefixes.
+        if (notation === 'plain' || (notation === 'si' && u && u !== 'arb' && Math.abs(v) < 1e12 && Math.abs(v) >= 1e-15)) expect(text, `${v} in ${notation}`).not.toMatch(/e/);
+        if (notation === 'exp') expect(text).toMatch(/e[+-]\d+/);
+        seen.add(`${notation}:${whole}`);
+      }),
+      { examples: [[567.8, 'V', 2, 'si'], [123456, '', 2, 'plain'], [0.0995, 'V', 2, 'plain'], [999.96, 'V', 3, 'si'], [0, 'V', 3, 'exp']] },
+    );
+    for (const k of ['si:true', 'plain:true', 'plain:false', 'exp:false', 'fig:false']) expect(seen.has(k), k).toBe(true);
+  });
+
+  it('in plain numbers shares the decimals of the axis’s largest', () => {
+    expect([0, 0.5, 1].map((v) => numberText(v, { digits: 2, notation: 'plain' }, '', 1))).toEqual(['0.0', '0.5', '1.0']);
+    expect([-200, 0, 200, 400].map((v) => numberText(v, { digits: 3, notation: 'plain' }, '', 400))).toEqual(['-200', '0', '200', '400']);
+    expect(numberText(0.0001978, { digits: 4, notation: 'plain' }, 'V')).toBe('0.0001978 V');
+    expect(numberText(0.5678, { digits: 2, notation: 'si' }, 'V')).toBe('570 mV');
+  });
+
+  it('takes an axis’s settings as they are kept, any it does not know at Auto', () => {
+    expect(axisFormat(undefined)).toEqual({ label: 'off', digits: null, notation: 'auto' });
+    expect(axisFormat({ label: 'units', digits: 3, notation: 'exp' })).toEqual({ label: 'units', digits: 3, notation: 'exp' });
+    expect(axisFormat({ label: 'big', digits: 9, notation: 'si' })).toEqual({ label: 'off', digits: null, notation: 'auto' });
+    expect(formOf({ digits: 4, notation: 'si' }, { digits: 2, notation: 'auto' })).toEqual({ digits: 2, notation: 'si' });
+    expect(formOf({ digits: 4, notation: 'si' }, { digits: null, notation: 'plain' })).toEqual({ digits: 4, notation: 'plain' });
   });
 });
 

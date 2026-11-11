@@ -28,7 +28,8 @@
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import IconButton from './IconButton.svelte';
   import CommandItem from './CommandItem.svelte';
-  import { axesLike, commandOf, cursorPeers, xSpan } from './commands.js';
+  import { AXIS_SETTINGS, axesLike, commandOf, cursorPeers, xSpan } from './commands.js';
+  import { DIGITS, axisFormat } from './units.js';
   import KindPicker from './KindPicker.svelte';
   import { plotPickers } from './keys.js';
   import { claim } from './keyrouter.js';
@@ -104,6 +105,12 @@
     eachAxis(key, (p) => ids.add(p.plotId));
     onEach(scale === 'log' ? 'Log density scale' : 'Linear density scale', (p) => (ids.has(p.id) ? { yScale: scale } : null));
   }
+  /** Each axis setting's buttons, as [value, what the button reads]; its tip names the value in full (commands.js AXIS_SETTINGS). */
+  const CHOICES = {
+    label: [['off', 'Off'], ['units', 'Units'], ['name', 'Name']],
+    digits: [[null, 'Auto'], ...DIGITS.map((d) => [d, String(d)])],
+    notation: [['auto', 'Auto'], ['plain', 'Plain'], ['exp', 'Exp']],
+  };
   // What the menus' rows say of the plots their commands act on (menus.js):
   // a count over them, a setting they share, or how many they are where a
   // row names plots. Each is read as its menu opens.
@@ -467,7 +474,7 @@
       onFrequencies: (lo, hi) => onView({ fRange: [lo, hi] }),
       onFitY: (key) => asStep(() => eachAxis(key, (p, axis) => p.fit([axis]))),
       viewHistory,
-      config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
+      config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null, yFormat: plot.yFormat ?? null, xFormat: plot.xFormat ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
     });
     registry.add(pv);
     plotPickers.set(plot.id, openPicker);
@@ -737,6 +744,19 @@
 {#snippet value(text)}{#if text}<span class="menu-value">{text}</span>{/if}{/snippet}
 <!-- The distance between X1 and X2, after a ruler, when a pair is placed. -->
 {#snippet span()}{@const d = xSpan(targetPvs())}{#if d}<span class="menu-value"><RiSpan />{d}</span>{/if}{/snippet}
+<!-- An axis setting's row of an axis popover, as command `id` reads, made
+     with `how`: a button for each value, pressed at `current`, this plot's. -->
+{#snippet axisSetting(id, field, how, current)}
+  {@const row = commands.row(id, { on: plot.id, how })}
+  <div class="axis-row" role="group" aria-label={row.label}>
+    <span>{row.label}</span>
+    <div class="seg">
+      {#each CHOICES[field] as [to, text]}
+        <button class:on={current === to} aria-pressed={current === to} aria-label={AXIS_SETTINGS[field].names.get(to)} data-command={id} onclick={() => runHere(id, { ...how, to })}>{text}</button>
+      {/each}
+    </div>
+  </div>
+{/snippet}
 <!-- The peak commands' rows, on a plot that shows a signal: each says where its X cursor would go. -->
 {#snippet peakItems()}{#if plot.items.length}{#each PEAKS as id}<CommandItem {id} on={plot.id} />{/each}{/if}{/snippet}
 <!-- A signal's own menu, on its chip and on its row of the legend: what
@@ -994,6 +1014,9 @@
             <button class:on={plot.xScale === 'linear'} aria-pressed={plot.xScale === 'linear'} onclick={() => setEach('Linear frequency scale', 'xScale', 'linear')}>Linear</button>
           </div>
         </div>
+        {@const set = axisFormat(plot.xFormat)}
+        {@render axisSetting('xDigits', 'digits', {}, set.digits)}
+        {@render axisSetting('xNotation', 'notation', {}, set.notation)}
       {/if}
       <div class="axis-row" role="group" aria-label="X cursors">
         <span>Cursors</span>
@@ -1058,6 +1081,11 @@
           </div>
         </div>
       {/if}
+      <!-- How the axis is labelled and writes its numbers, its ticks, tags and readout alike. -->
+      {@const set = axisFormat(plot.yFormat?.[region.keys?.[0]])}
+      {@render axisSetting('yLabel', 'label', { key: region.keys?.[0] }, set.label)}
+      {@render axisSetting('yDigits', 'digits', { key: region.keys?.[0] }, set.digits)}
+      {@render axisSetting('yNotation', 'notation', { key: region.keys?.[0] }, set.notation)}
       <!-- This axis's Y cursors, which a pull up off the x axis also draws out. -->
       <div class="axis-row" role="group" aria-label="Y cursors">
         <span>Cursors</span>

@@ -95,7 +95,7 @@ export const KEYMAP = [
       { show: ['Drag'], on: 'y axis', what: 'Offset y' },
       { show: ['Wheel'], on: 'y axis', what: 'Zoom y' },
       { show: ['Double-click'], on: 'y axis', what: 'Fit y' },
-      { show: ['Right-click'], on: 'axis', what: 'Range, scale, cursors' },
+      { show: ['Right-click'], on: 'axis', what: 'Range, scale, numbers, cursors' },
       { show: ['Click'], what: 'Select plot' },
       { show: ['Shift', 'Click'], what: 'Add to selection, or remove' },
       { show: ['Drag'], on: 'header', what: 'Move plot, or the selection' },

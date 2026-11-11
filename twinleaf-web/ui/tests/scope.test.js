@@ -89,6 +89,13 @@ async function button(label) {
   await commands.mouse([['move', ...centre(el)], ['down'], ['up']]);
   await settle();
 }
+/** Clicks the button of value `name` in the row of axis setting `group` of the open popover. */
+async function setting(group, name) {
+  const el = document.querySelector(`[data-slot=popover-content] [role=group][aria-label="${group}"] button[aria-label="${name}"]`);
+  expect(el, `the ${group} ${name}`).toBeTruthy();
+  await commands.mouse([['move', ...centre(el)], ['down'], ['up']]);
+  await settle();
+}
 /** Double-clicks at `at`, on whatever is there. */
 async function dblclick(at) {
   document.elementFromPoint(...at).dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, clientX: at[0], clientY: at[1] }));
@@ -121,9 +128,21 @@ function yCursors(page) {
  * Each command, made on plot `id` from where it is offered: `prepare(page)`
  * sets every plot up for it, `act(page, id)` makes it as a person would and
  * returns what `acted` needs, and `acted(page, id, got)` says whether it
- * changed plot `id`. One with `cursors` is a command on the cursors.
+ * changed plot `id`. One with `cursors` is a command on the cursors, and
+ * one with `edit` another edit of the plots.
  */
 const COMMANDS = {
+  'the y popover’s Notation': {
+    edit: true,
+    act: async (page, id) => (await rightClick(spots(page, id)['a y axis']), await setting('Notation', 'Exponent')),
+    acted: (page, id) => page.ws.plots[id].yFormat?.shared?.notation === 'exp',
+  },
+  'the x popover’s Digits': {
+    edit: true,
+    prepare: (page) => setEvery(page, { kind: 'spectrum' }),
+    act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await setting('Digits', '3')),
+    acted: (page, id) => page.ws.plots[id].xFormat?.digits === 3,
+  },
   'typed y bounds': {
     act: async (page, id) => (await rightClick(spots(page, id)['a y axis']), await bounds(Y_FIELDS, '-3', '4')),
     acted: (page, id) => same(page.pv(id).yBounds('shared'), [-3, 4]),
@@ -259,7 +278,7 @@ describe('a command made on a plot', () => {
         try {
           feed(page.hub);
           await settle();
-          const { prepare, act, acted, cursors } = COMMANDS[name];
+          const { prepare, act, acted, cursors, edit } = COMMANDS[name];
           await prepare?.(page);
           // The readout and the legend show what a frame drew a few times a second.
           await wait(150);
@@ -274,8 +293,8 @@ describe('a command made on a plot', () => {
           await settle();
           const want = picked.includes(id) ? picked : [id];
           for (const p of ids) expect(acted(page, p, got), `${name} on ${ids.indexOf(p)}, made on ${k} with ${picks} selected`).toBe(want.includes(p));
-          if (cursors) {
-            // One edit, on however many plots: undo puts every plot's cursors back, and redo makes it again.
+          if (cursors || edit) {
+            // One edit, on however many plots: undo puts every plot's cursors, or what it set, back, and redo makes it again.
             expect(page.history.undos.length - steps, `${name}: undo steps`).toBe(1);
             const after = page.ws.tabs;
             page.history.undo();
@@ -457,6 +476,18 @@ const ON_AXIS = {
     prepare: (pv, key, page) => editCursors(page, pv.plotId, (c) => withYPair(c, pv.config().kind, key, 0.1, 0.2)),
     act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await button('Clear this axis')),
     acted: (pv, key) => !pv.hasYCursors(key),
+  },
+  'the popover’s Label': {
+    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await setting('Label', 'Units')),
+    acted: (pv, key) => pv.config().yFormat?.[key]?.label === 'units',
+  },
+  'the popover’s Digits': {
+    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await setting('Digits', '2')),
+    acted: (pv, key) => pv.config().yFormat?.[key]?.digits === 2,
+  },
+  'the popover’s Notation': {
+    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await setting('Notation', 'Plain')),
+    acted: (pv, key) => pv.config().yFormat?.[key]?.notation === 'plain',
   },
   'Add Y cursors, then the cursor clear': {
     act: async (page, id, key, all) => {

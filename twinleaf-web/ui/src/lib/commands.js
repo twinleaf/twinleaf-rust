@@ -15,7 +15,8 @@
 // - `kinds` lists the kinds of plot it acts on, or null for every kind; the
 //   plots of other kinds are dropped from what it acts on.
 // - `needs` lists what it needs beyond plots: 'workspace', a plot placed in
-//   a tab's layout; 'axis', a y axis it is made on, which its `how` names;
+//   a tab's layout; 'axis', an axis it is made on, a y axis by the key its
+//   `how` names;
 //   'signals', the signals of the Signals list it puts on the plots or
 //   takes off them. Made on a signal's row, from its menu, its keys or a
 //   double-click, a command acts on the signals picked when the row is one
@@ -54,6 +55,7 @@ import { withX } from './cursors.js';
 import { nearestPeak, peaks, stepPeak } from './snap.js';
 import { chip } from './tabs.js';
 import { kindLabel } from './constants.js';
+import { DIGITS, axisFormat } from './units.js';
 import * as clock from './clock.js';
 import RiAdd from '@lucide/svelte/icons/plus';
 import RiTrash from '@lucide/svelte/icons/trash-2';
@@ -75,6 +77,9 @@ import RiFit from '@lucide/svelte/icons/unfold-vertical';
 import RiPeak from '@lucide/svelte/icons/mountain';
 import RiPeakRight from '@lucide/svelte/icons/chevron-right';
 import RiPeakLeft from '@lucide/svelte/icons/chevron-left';
+import RiLabel from '@lucide/svelte/icons/type';
+import RiDigits from '@lucide/svelte/icons/hash';
+import RiNotation from '@lucide/svelte/icons/superscript';
 
 /** How far an arrow pans, as a share of the span, and zooms, as a factor. */
 const PAN = 0.1, ZOOM = 1.25;
@@ -108,6 +113,53 @@ export function cursorPeers(on, targets, key) {
   const same = targets.filter((p) => p.config().kind === on.config().kind);
   return key === undefined ? same.map((p) => [p, undefined]) : axesLike(on, same, key);
 }
+
+/**
+ * What an axis's settings hold (units.js `axisFormat`), by field: the name
+ * of the edit that sets each, and how it names each value.
+ */
+export const AXIS_SETTINGS = {
+  label: { what: 'Label', names: new Map([['off', 'Off'], ['units', 'Units'], ['name', 'Name and units']]) },
+  digits: { what: 'Digits', names: new Map([[null, 'Auto'], ...DIGITS.map((d) => [d, String(d)])]) },
+  notation: { what: 'Notation', names: new Map([['auto', 'Auto'], ['plain', 'Plain'], ['exp', 'Exponent']]) },
+};
+
+/** An axis's settings at Auto. */
+const AUTO = axisFormat(undefined);
+/** Settings `s` of one axis with `field` set to `to`: those at Auto left out, and undefined when all are. */
+function withSetting(s, field, to) {
+  const out = { ...s, [field]: to };
+  for (const [f, v] of Object.entries(out)) if (v === undefined || v === AUTO[f]) delete out[f];
+  return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * Sets `field` of the settings of the y axis of each plot of `ctx` in the
+ * units of y axis `key` of the plot it is made on (`axesLike`) to `to`, as
+ * one edit.
+ */
+function setYAxis(ctx, field, { key, to }) {
+  const axes = new Map(axesLike(ctx.on?.pv, pvs(ctx), key).map(([p, axis]) => [p.plotId, axis]));
+  const { what, names } = AXIS_SETTINGS[field];
+  if (!axes.size || !names.has(to)) return false;
+  ctx.svc.edit([...axes.keys()], `${what} ${names.get(to)}`, (plot) => {
+    const all = { ...plot.yFormat, [axes.get(plot.id)]: withSetting(plot.yFormat?.[axes.get(plot.id)], field, to) };
+    for (const [k, v] of Object.entries(all)) if (!v) delete all[k];
+    return { yFormat: Object.keys(all).length ? all : undefined };
+  });
+}
+
+/** Sets `field` of the x axis settings of each spectrum of `ctx` to `to`, as one edit. */
+function setXAxis(ctx, field, { to }) {
+  const { what, names } = AXIS_SETTINGS[field];
+  if (!names.has(to)) return false;
+  ctx.svc.edit(ids(ctx), `Frequency ${what.toLowerCase()} ${names.get(to)}`, (plot) => ({ xFormat: withSetting(plot.xFormat, field, to) }));
+}
+
+/** How `field` is set on the axes a y axis command of `ctx` made on y axis `key` acts on, as a row's value: the name of the value they share, or Mixed. */
+const yAxisValue = (ctx, field, key) => common(axesLike(ctx.on?.pv, pvs(ctx), key).map(([p, axis]) => AXIS_SETTINGS[field].names.get(axisFormat(ctx.plots.find((t) => t.pv === p)?.plot.yFormat?.[axis])[field])));
+/** How `field` is set on the x axes of the spectra of `ctx`, as a row's value. */
+const xAxisValue = (ctx, field) => common(ctx.plots.map((t) => AXIS_SETTINGS[field].names.get(axisFormat(t.plot.xFormat)[field])));
 
 /** The distance between X1 and X2 on the PlotViews `targets` that have the pair, or null while none has. */
 export function xSpan(targets) {
@@ -377,6 +429,39 @@ export const COMMANDS = [
       return names.some(Boolean) ? common(names) : null;
     },
     run: (ctx, key) => editCursors(ctx, 'Add Y cursors', axesLike(ctx.on?.pv, pvs(ctx), key), (p, axis) => p.yCursorsAdded(axis)),
+  },
+  // An axis's label, digits and notation (units.js `axisFormat`): made on y
+  // axis `how.key`, on the axis of each plot in its units (`axesLike`); made
+  // on a spectrum's x axis, on each spectrum. `how.to` is the value each sets.
+  {
+    id: 'yLabel', scope: 'plot', needs: ['axis'],
+    icon: RiLabel, label: 'Label',
+    value: (ctx, how) => yAxisValue(ctx, 'label', how?.key),
+    run: (ctx, how) => setYAxis(ctx, 'label', how ?? {}),
+  },
+  {
+    id: 'yDigits', scope: 'plot', needs: ['axis'],
+    icon: RiDigits, label: 'Digits',
+    value: (ctx, how) => yAxisValue(ctx, 'digits', how?.key),
+    run: (ctx, how) => setYAxis(ctx, 'digits', how ?? {}),
+  },
+  {
+    id: 'yNotation', scope: 'plot', needs: ['axis'],
+    icon: RiNotation, label: 'Notation',
+    value: (ctx, how) => yAxisValue(ctx, 'notation', how?.key),
+    run: (ctx, how) => setYAxis(ctx, 'notation', how ?? {}),
+  },
+  {
+    id: 'xDigits', scope: 'plot', kinds: ['spectrum'], needs: ['axis'],
+    icon: RiDigits, label: 'Digits',
+    value: (ctx) => xAxisValue(ctx, 'digits'),
+    run: (ctx, how) => setXAxis(ctx, 'digits', how ?? {}),
+  },
+  {
+    id: 'xNotation', scope: 'plot', kinds: ['spectrum'], needs: ['axis'],
+    icon: RiNotation, label: 'Notation',
+    value: (ctx) => xAxisValue(ctx, 'notation'),
+    run: (ctx, how) => setXAxis(ctx, 'notation', how ?? {}),
   },
   {
     id: 'clearCursors', scope: 'view',

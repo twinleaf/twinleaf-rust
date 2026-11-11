@@ -177,12 +177,18 @@ describe('the y numbers of a stacked plot’s lanes', () => {
   /** Where VITE_TL_SHOTS names a folder, relative to this file, the screenshots go there. */
   const SHOTS = import.meta.env.VITE_TL_SHOTS;
 
-  /** A page with one plot of `lanes` signals in `mode`, paused, the y ranges of its axes [lo, lo + span] each, and `at(h)`, which makes the plot's tile `h` px high, draws it, and gives what it drew. */
-  async function stacked(lanes, ranges = [], mode = 'stacked') {
+  /**
+   * A page with one plot of `lanes` signals in `mode`, paused, the y ranges
+   * of its axes [lo, lo + span] each, every axis with settings `axes`
+   * (units.js axisFormat), and `at(h)`, which makes the plot's tile `h` px
+   * high, draws it, and gives what it drew.
+   */
+  async function stacked(lanes, ranges = [], mode = 'stacked', axes = null) {
     const page = await mountPage([MANY.slice(0, lanes)], 'grid', 0, MANY);
     feed(page.hub);
     const id = plotIds(page.ws.layout)[0];
-    page.history.group('Prepare', () => page.ws.setPlot(id, { mode }));
+    const yFormat = axes && Object.fromEntries(['shared', ...MANY].map((k) => [k, axes]));
+    page.history.group('Prepare', () => page.ws.setPlot(id, { mode, ...(yFormat && { yFormat }) }));
     page.views.get(id).pause(clock.now());
     await wait(300);
     await settle();
@@ -203,8 +209,8 @@ describe('the y numbers of a stacked plot’s lanes', () => {
         const above = Math.min(top ? EDGE.above : REACH, a.lane.y - head - CLEAR), below = foot ? EDGE.below : REACH;
         return { key: a.key, axis: a, lane: a.lane, top, foot, above, below, labels: labels.filter((l) => l.axis === a.key) };
       });
-      const xTabs = pv.pressable.filter((p) => p.part === 'tab' && p.kind === 'x');
-      return { body, P, labels, lanes: lanesDrawn, head, left: P.x - body.left, right: body.right - P.x - P.w, xLabels: pv.tickLabels.filter((l) => l.axis === undefined), xTabs };
+      const xTabs = pv.pressable.filter((p) => p.part === 'tab' && p.kind === 'x'), yTabs = pv.pressable.filter((p) => p.part === 'tab' && p.kind === 'y');
+      return { body, P, labels, lanes: lanesDrawn, head, left: P.x - body.left, right: body.right - P.x - P.w, xLabels: pv.tickLabels.filter((l) => l.axis === undefined), xTabs, yTabs, named: pv.labelBoxes };
     };
     // As `at`, once the tile has become a monitor or stopped being one, its header slid in or out.
     const shown = async (h) => {
@@ -216,9 +222,21 @@ describe('the y numbers of a stacked plot’s lanes', () => {
     return { page, pv, id, leaf, at, shown };
   }
 
-  /** Checks what a plot drew: its numbers clear of each other, of the time axis and within their lanes, none alone in a lane, and its gutter as wide as they need. */
+  /**
+   * Checks what a plot drew: its numbers clear of each other, of the time
+   * axis and within their lanes, none alone in a lane and no two of a lane
+   * alike, and its gutter as wide as they need, and as each axis's label,
+   * which lies within its lane and clear of every number and tab.
+   */
   function check(drawn, where) {
-    const { labels, lanes, left, right, body, P, xLabels, xTabs, head } = drawn;
+    const { labels, lanes, left, right, body, P, xLabels, xTabs, yTabs, named, head } = drawn;
+    for (const { key, labels: mine } of lanes) expect(new Set(mine.map((l) => l.text)).size, `${where}: ${key}'s numbers ${mine.map((l) => l.text)} read apart`).toBe(mine.length);
+    for (const n of named) {
+      const { lane } = lanes.find((l) => l.key === n.axis);
+      expect(n.y >= Math.max(lane.y, head) && n.y + n.h <= lane.y + lane.h, `${where}: ${n.axis}'s label ${n.text}, ${n.y} + ${n.h}, within its lane ${lane.y} + ${lane.h}`).toBe(true);
+      expect(n.x >= body.left, `${where}: ${n.text} in the body`).toBe(true);
+      for (const b of [...labels, ...xLabels, ...xTabs, ...yTabs]) expect(n.x + n.w <= b.x || b.x + b.w <= n.x || n.y + n.h <= b.y || b.y + b.h <= n.y, `${where}: ${n.axis}'s label ${n.text} at ${[n.x, n.y, n.w, n.h]} clear of ${b.text} at ${[b.x, b.y, b.w, b.h]}`).toBe(true);
+    }
     labels.forEach((a, i) =>
       labels.slice(i + 1).forEach((b) => {
         const apart = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h + CLEAR <= b.y || b.y + b.h + CLEAR <= a.y;
@@ -238,30 +256,39 @@ describe('the y numbers of a stacked plot’s lanes', () => {
     // else a tab's room while a lane has room below the header for a resting tab, 14 px with 2 about it; else bare. It
     // narrows only once it is 10 px wider than that.
     const widest = Math.max(0, ...labels.map((l) => l.w)), tab = lanes.some(({ lane }) => lane.y + lane.h - Math.max(lane.y, head) >= 18);
-    const want = labels.length ? Math.max(24, Math.ceil(widest + 12)) : tab ? 24 : 12;
-    expect(left >= want && left <= want + 10, `${where}: the gutter, ${left} px, for ${labels.length ? `numbers ${widest} px wide` : tab ? 'a tab and no numbers' : 'nothing'}`).toBe(true);
-    if (!labels.length && !tab) expect(left, `${where}: the bare gutter`).toBe(12);
+    // A label widens it by its column, the axes' 11 px type with 2 px either side.
+    const want = (labels.length ? Math.max(24, Math.ceil(widest + 12)) : tab ? 24 : 12) + (named.length ? 15 : 0);
+    expect(left >= want && left <= want + 10, `${where}: the gutter, ${left} px, for ${labels.length ? `numbers ${widest} px wide` : tab ? 'a tab and no numbers' : 'nothing'}${named.length ? ' and a label' : ''}`).toBe(true);
+    if (!labels.length && !tab && !named.length) expect(left, `${where}: the bare gutter`).toBe(12);
     // The plot area takes the rest of the body's width.
     expect(Math.abs(P.w - (body.width - left - right)), `${where}: the plot area's width`).toBeLessThan(0.01);
   }
 
-  it('keep their numbers clear of each other and of the next lane’s, show several or none by the lane’s height, never one alone, reach the plot’s top and foot, and narrow the gutter to what is drawn', async () => {
-    const count = { several: 0, none: 0, bare: 0 };
+  it('keep their numbers clear of each other and of the next lane’s, show several or none by the lane’s height, never one alone, reach the plot’s top and foot, and narrow the gutter to what is drawn, with any digits and label', async () => {
+    const count = { several: 0, none: 0, bare: 0, labelled: 0, unlabelled: 0 };
+    const DIGITS = [null, 2, 3, 4, 5];
+    for (const d of DIGITS) count[`several at ${d} digits`] = 0;
     const range = fc.tuple(fc.double({ min: -1e4, max: 1e4, noNaN: true }), fc.double({ min: 1e-3, max: 1e4, noNaN: true }));
+    const axes = fc.record({ digits: fc.constantFrom(...DIGITS), label: fc.constantFrom('off', 'name'), notation: fc.constantFrom('auto', 'plain', 'exp') });
     await fc.assert(
-      fc.asyncProperty(fc.integer({ min: 1, max: 12 }), fc.integer({ min: 100, max: 900 }), fc.array(range, { maxLength: 12 }), async (lanes, h, ranges) => {
-        const { page, at } = await stacked(lanes, ranges);
+      fc.asyncProperty(fc.integer({ min: 1, max: 12 }), fc.integer({ min: 100, max: 900 }), fc.array(range, { maxLength: 12 }), axes, async (lanes, h, ranges, set) => {
+        const { page, at } = await stacked(lanes, ranges, 'stacked', set);
         try {
           const drawn = at(h);
-          check(drawn, `${lanes} lanes in a tile ${h} px high`);
+          check(drawn, `${lanes} lanes in a tile ${h} px high, ${JSON.stringify(set)}`);
           for (const l of drawn.lanes) count[kindOf(l.labels.length) ? 'several' : 'none']++;
+          if (drawn.lanes.some((l) => l.labels.length)) count[`several at ${set.digits} digits`]++;
           if (!drawn.labels.length && drawn.left === 12) count.bare++;
+          if (set.label !== 'off') count[drawn.named.length === drawn.lanes.length ? 'labelled' : 'unlabelled']++;
         } finally {
           page.dispose();
         }
       }),
-      // Two, six and twelve lanes at a usual height, and twelve in a short plot.
-      withExamples([[2, 600, []], [6, 600, []], [12, 600, []], [12, 160, []], [12, 100, []]]),
+      // Two, six and twelve lanes at a usual height, and twelve in a short plot; and two lanes and twelve short ones, labelled, at each digits.
+      withExamples([
+        ...[[2, 600, []], [6, 600, []], [12, 600, []], [12, 160, []], [12, 100, []]].map((c) => [...c, { digits: null, label: 'off', notation: 'auto' }]),
+        ...DIGITS.flatMap((digits) => [[2, 600, [[-1.16, 2.32], [1234.5, 0.07]], { digits, label: 'name', notation: 'auto' }], [12, 160, [], { digits, label: 'name', notation: digits ? 'plain' : 'exp' }]]),
+      ]),
     );
     for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(0);
   }, 600_000);

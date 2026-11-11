@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import fc from 'fast-check';
 import { Detail, Points, Trace } from './session.svelte.js';
 import { scaleLinear, scaleLog } from 'd3-scale';
-import { axisSlots, blurred, laneTicks, onPixelGrid, pickLevel, pickSource, PlotView, rowCounts, timeAxis, View } from './plot.js';
+import { axisSlots, blurred, F_AUTO, laneTicks, onPixelGrid, pickLevel, pickSource, PlotView, rowCounts, tickTexts, timeAxis, View, Y_AUTO } from './plot.js';
+import { axisFormat, formOf, numberText, si } from './units.js';
 
 const meta = { id: 0, route: '/', stream: 'sine', column: 'sine', units: 'V', rate: 1000 };
 
@@ -242,6 +243,65 @@ describe('laneTicks', () => {
     const { labels } = laneTicks(sy, lane, decade);
     expect(labels.length).toBeGreaterThanOrEqual(2);
     for (const v of labels) expect(decade(v), `${v}`).toBe(true);
+  });
+});
+
+describe('an axis’s numbers', () => {
+  const finite = fc.double({ min: -1e9, max: 1e9, noNaN: true }).map((v) => (Math.abs(v) < 1e-30 ? 0 : v));
+
+  it('on Auto read at each place as the page writes them with no settings', () => {
+    // The page's own formats, written out here as they were before an axis had settings; `si`, which the
+    // tests of a measured value hold to its own, written out there.
+    const PAGE = {
+      'tag.time': (v) => v.toPrecision(4),
+      'tag.spectrum': (v) => v.toExponential(2),
+      'value.time': (v, u) => si(v, u),
+      'value.spectrum': (v) => v.toExponential(3),
+      'legend.time': (v) => v.toPrecision(5),
+      'legend.spectrum': (v) => v.toExponential(3),
+      'floor.spectrum': (v) => v.toExponential(2),
+    };
+    const auto = axisFormat(undefined);
+    fc.assert(
+      fc.property(finite, fc.constantFrom('V', 'nT', 'arb', ''), (v, u) => {
+        for (const [place, kinds] of Object.entries(Y_AUTO))
+          for (const [kind, form] of Object.entries(kinds)) expect(numberText(v, formOf(form, auto), kind === 'time' && place === 'value' ? u : ''), `${place} on a ${kind} plot`).toBe(PAGE[`${place}.${kind}`](v, u));
+        expect(numberText(v, formOf(F_AUTO.at, auto), 'Hz')).toBe(`${v.toPrecision(4)} Hz`);
+        expect(numberText(v, formOf(F_AUTO.span, auto), 'Hz')).toBe(si(v, 'Hz'));
+      }),
+    );
+    expect(Object.keys(PAGE).length).toBe(Object.values(Y_AUTO).reduce((n, kinds) => n + Object.keys(kinds).length, 0));
+  });
+
+  it('number their ticks as the scale does on Auto, else in the notation and digits set, no two alike, plain ones to the decimals of the largest', () => {
+    const domain = fc.tuple(fc.double({ min: -1e6, max: 1e6, noNaN: true }), fc.double({ min: 1e-6, max: 1e6, noNaN: true }));
+    const set = fc.record({ digits: fc.constantFrom(null, 2, 3, 4, 5), notation: fc.constantFrom('auto', 'plain', 'exp') });
+    const seen = new Set();
+    fc.assert(
+      fc.property(domain, fc.integer({ min: 40, max: 800 }), set, fc.boolean(), ([lo, span], h, f, log) => {
+        if (log) [lo, span] = [10 ** (Math.abs(lo) % 6 - 3), 10 ** (Math.abs(lo) % 6 - 3) * (1 + (span % 1e4))];
+        const lane = { y: 0, h }, sy = (log ? scaleLog() : scaleLinear()).domain([lo, lo + span]).range([h, 0]);
+        const decade = (v) => Number.isInteger(Math.round(Math.log10(v) * 1e6) / 1e6);
+        const { labels, count } = laneTicks(sy, lane, log ? decade : undefined);
+        const auto = log ? (v) => v.toExponential(0) : sy.tickFormat(count);
+        const texts = tickTexts(labels, { label: 'off', ...f }, auto, { log });
+        if (f.digits === null && f.notation === 'auto') return void expect(texts).toEqual(labels.map(auto));
+        expect(new Set(texts).size, `${texts}`).toBe(texts.length);
+        const notation = f.notation === 'auto' ? (log ? 'exp' : 'plain') : f.notation;
+        for (const t of texts) expect(/e[+-]\d+$/.test(t), `${t} in ${notation}`).toBe(notation === 'exp');
+        if (notation === 'plain' && !log) expect(new Set(texts.map((t) => t.split('.')[1]?.length ?? 0)).size, `${texts}`).toBeLessThanOrEqual(1);
+        // Exponents have as many figures as set, or more to tell two ticks apart.
+        if (notation === 'exp' && f.digits) for (const t of texts) expect(t.split('e')[0].replace(/[-.]/g, '').length, t).toBeGreaterThanOrEqual(f.digits);
+        seen.add(`${notation}:${log}`);
+      }),
+      { examples: [[[-1, 2], 300, { digits: 2, notation: 'auto' }, false], [[100, 0.05], 300, { digits: 2, notation: 'exp' }, false], [[1, 999], 300, { digits: null, notation: 'plain' }, true], [[1, 999], 300, { digits: 3, notation: 'auto' }, true]] },
+    );
+    for (const k of ['plain:false', 'exp:false', 'plain:true', 'exp:true']) expect(seen.has(k), k).toBe(true);
+    // Ticks 0.01 apart about 100, which two figures would write alike, take as many as tell them apart.
+    expect(tickTexts([100, 100.01, 100.02], { digits: 2, notation: 'plain' }, String)).toEqual(['100.00', '100.01', '100.02']);
+    expect(tickTexts([0, 0.5, 1], { digits: 3, notation: 'auto' }, String)).toEqual(['0.00', '0.50', '1.00']);
+    expect(tickTexts([500, 1000, 1500], { digits: 2, notation: 'auto' }, String, { hz: true })).toEqual(['500 Hz', '1.0 kHz', '1.5 kHz']);
+    expect(tickTexts([500, 1000, 1500], { digits: null, notation: 'plain' }, String, { hz: true })).toEqual(['500 Hz', '1000 Hz', '1500 Hz']);
   });
 });
 
