@@ -3,6 +3,7 @@
 //! window of raw rows and exports them to a file. What each says is in
 //! `protocol`.
 
+use crate::captures::Want;
 use crate::hub::{Ended, Live};
 use crate::protocol::{
     CallRequest, DiscoverRequest, Done, ExportRequest, Frame, HistoryRequest, MountArg,
@@ -94,7 +95,9 @@ async fn ws(upgrade: WebSocketUpgrade, State(hubs): State<Hubs>) -> Response {
 /// Sends a page the hub's snapshot, then every change the hub sends, until
 /// the page goes or the hub retires. A page that falls so far behind that the
 /// channel drops changes it has not read gets a snapshot again, which
-/// replaces all it holds. What the page sends names the spectra it shows.
+/// replaces all it holds. What the page sends names the spectra it shows
+/// and the captures it wants, and the captures it asked for go to it as
+/// the hub reads them.
 async fn client(mut socket: WebSocket, live: Arc<Live>) {
     let page = live.page();
     let mut retired = live.retired();
@@ -121,12 +124,22 @@ async fn client(mut socket: WebSocket, live: Arc<Live>) {
                 Err(broadcast::error::RecvError::Closed) => return,
             },
             _ = retired.changed() => return,
+            captured = page.captures() => {
+                for frame in captured {
+                    if send(&mut socket, &frame).await.is_err() { return }
+                }
+            }
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<PageMessage>(&text) {
                     Ok(PageMessage::Spectra { traces }) => {
                         page.show_spectra(traces.into_iter().collect());
                     }
                     Ok(PageMessage::Hold { on }) => page.hold(on),
+                    Ok(PageMessage::Capture { route, rpc }) => page.capture(&route, &rpc, Want::Once),
+                    Ok(PageMessage::Repeat { route, rpc, delay }) => {
+                        page.capture(&route, &rpc, Want::Repeat(delay));
+                    }
+                    Ok(PageMessage::Stop { route, rpc }) => page.capture(&route, &rpc, Want::Stop),
                     Err(error) => log::debug!("A page sent what this server does not read: {error}"),
                 },
                 Some(Ok(_)) => {}
@@ -308,7 +321,7 @@ async fn export(
     let ids: Vec<u16> = args
         .ids
         .split(',')
-        .map(|id| id.trim().parse())
+        .map(|id| id.trim().parse::<u16>())
         .collect::<Result<_, _>>()
         .map_err(|_| Refusal::new(StatusCode::BAD_REQUEST, "ids are trace numbers"))?;
     let (t0, t1) = (args.t0, args.t1);

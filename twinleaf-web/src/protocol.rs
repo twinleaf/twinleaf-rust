@@ -11,9 +11,9 @@
 //!   which names the hub and the number of the last change the snapshot
 //!   holds. Then come a [`Message::Trace`] for every trace, one points frame
 //!   of every point the hub has sent, a [`Message::Config`], and the newest
-//!   [`Message::Routes`], [`Message::Device`], [`Message::Table`] and
-//!   [`Message::Settings`] of every device. The page replaces all it holds of
-//!   any hub with it.
+//!   [`Message::Routes`], [`Message::Device`], [`Message::Table`],
+//!   [`Message::Settings`], [`Message::Captures`] and [`Message::Capture`]
+//!   of every device. The page replaces all it holds of any hub with it.
 //! - A change comes after it, numbered one more than the change before. It
 //!   is a points frame as each flush has new points, a spectrum frame per
 //!   trace as each is estimated, a [`Message::Trace`] as a new column
@@ -39,6 +39,33 @@
 //! value, as the proxy keeps them, so the hub keeps the newest of each and a
 //! snapshot holds it. Only points and spectra are a stream, and the snapshot
 //! holds the decimated history of the points.
+//!
+//! # Captures
+//!
+//! A capture is a device's one-shot readout of a buffer, such as an ADC's
+//! samples of one shot. A device has a capture RPC for each kind it takes,
+//! and [`Message::Captures`] lists them. A capture has no time of its own,
+//! and none is sent.
+//!
+//! The page asks for captures on the socket. [`PageMessage::Capture`] asks
+//! for one capture of an RPC now, [`PageMessage::Repeat`] for captures of
+//! it again and again, and [`PageMessage::Stop`] takes back what the page
+//! asked of it. What a page asked goes when its socket does. The hub takes
+//! the captures, one RPC's at a time, while some page wants them.
+//!
+//! Where each capture RPC stands is its [`Message::Capture`], a change
+//! every page hears and a snapshot holds the newest of. A capture that
+//! cannot be taken is a state of it too, [`CaptureState::Busy`],
+//! [`CaptureState::Timeout`] or [`CaptureState::Error`], and no refusal.
+//!
+//! A capture the hub read goes to the pages that asked for it and to no
+//! other, as one capture frame, which `wire` lays out. It holds the
+//! device's elements as the device sent them, with their calibration and
+//! what they are of. It is no numbered change, so its frame carries 0, and
+//! no snapshot holds it. The hub numbers the captures it reads of each RPC
+//! from 1, and the frame and the RPC's state carry the number. A page that
+//! reads slowly is kept only the newest capture of each RPC, so the
+//! numbers it is sent may skip.
 //!
 //! # The requests
 //!
@@ -121,6 +148,25 @@ pub(crate) enum Message {
         route: String,
         values: BTreeMap<String, Value>,
     },
+    /// The capture RPCs of one device, in the order of their names. It
+    /// follows the device's table, and lists none for a device with none.
+    /// It goes out again when a capture read of one says another label.
+    Captures {
+        route: String,
+        captures: Vec<CaptureInfo>,
+    },
+    /// Where one capture RPC of one device stands. `number` is that of the
+    /// last capture the hub read of it, 0 for none. `repeat` is the seconds
+    /// the hub waits after each capture while pages ask for them again and
+    /// again, the shortest any page asked, or `null` while none does.
+    Capture {
+        route: String,
+        rpc: String,
+        #[serde(flatten)]
+        state: CaptureState,
+        number: u64,
+        repeat: Option<f64>,
+    },
 }
 
 impl Message {
@@ -154,6 +200,50 @@ pub(crate) struct Held {
     pub(crate) seconds: f64,
 }
 
+/// One capture RPC as the page lists it.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub(crate) struct CaptureInfo {
+    pub(crate) rpc: String,
+    /// What its metadata says a capture of it is of, as the newest capture
+    /// the hub read of it says, or as the device says before one is taken.
+    /// `None` for a device that does not say before one is.
+    pub(crate) label: Option<CaptureLabel>,
+}
+
+/// What a capture is of, as its metadata names it. `name` is what the
+/// device calls the capture, `units` those of a calibrated element, and
+/// `x_name` and `x_units` what its x measures.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub(crate) struct CaptureLabel {
+    pub(crate) name: String,
+    pub(crate) units: String,
+    pub(crate) x_name: String,
+    pub(crate) x_units: String,
+}
+
+/// Where a capture RPC stands.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub(crate) enum CaptureState {
+    /// The hub is taking no capture of it and waits to take none, and the
+    /// last it took did not fail.
+    Idle,
+    /// The hub triggered a capture, which the device has not finished.
+    Capturing,
+    /// The hub is reading a capture, `read` of its `size` bytes so far.
+    /// Only a read longer than a tenth of a second says so.
+    Reading { read: u32, size: u32 },
+    /// The hub read a capture and waits to take the next.
+    Waiting,
+    /// The device refused the trigger, as a capture is in progress on it
+    /// already, one another host started or one the hub gave up.
+    Busy,
+    /// The device did not finish the capture, or did not answer, in time.
+    Timeout,
+    /// The capture failed, as `error` says.
+    Error { error: String },
+}
+
 /// A text frame the page sends on the socket.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -164,6 +254,20 @@ pub(crate) enum PageMessage {
     /// Whether the page holds a plot paused, so the hub keeps the history as
     /// it was at the pause, as a scope's Stop does.
     Hold { on: bool },
+    /// Asks for one capture of the capture RPC `rpc` of the device at
+    /// `route`, taken now. A capture the hub is already taking of it
+    /// answers the ask.
+    Capture { route: String, rpc: String },
+    /// Asks for captures of `rpc` again and again, each triggered `delay`
+    /// seconds after the last was read, from 0.05 to 10. Asked again, it
+    /// changes the page's delay.
+    Repeat {
+        route: String,
+        rpc: String,
+        delay: f64,
+    },
+    /// Takes back what the page asked of `rpc`.
+    Stop { route: String, rpc: String },
 }
 
 /// A trace as the page names it.
@@ -510,6 +614,111 @@ mod tests {
         let message: PageMessage =
             serde_json::from_str(r#"{"type": "spectra", "traces": [1, 4]}"#).unwrap();
         assert_eq!(message, PageMessage::Spectra { traces: vec![1, 4] });
+    }
+
+    #[test]
+    fn a_page_asks_for_captures_and_takes_the_ask_back() {
+        let asks = [
+            r#"{"type": "capture", "route": "/", "rpc": "fid.capture"}"#,
+            r#"{"type": "repeat", "route": "/0", "rpc": "fid.capture", "delay": 0.05}"#,
+            r#"{"type": "stop", "route": "/", "rpc": "fid.capture"}"#,
+        ]
+        .map(|text| serde_json::from_str::<PageMessage>(text).unwrap());
+        let (route, rpc) = ("/".to_string(), "fid.capture".to_string());
+        assert_eq!(
+            asks,
+            [
+                PageMessage::Capture {
+                    route: route.clone(),
+                    rpc: rpc.clone()
+                },
+                PageMessage::Repeat {
+                    route: "/0".into(),
+                    rpc: rpc.clone(),
+                    delay: 0.05
+                },
+                PageMessage::Stop { route, rpc },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_capture_says_how_it_stands_beside_its_number_and_delay() {
+        let of = |state: CaptureState, number: u64, repeat: Option<f64>| {
+            json_of(&Message::Capture {
+                route: "/".into(),
+                rpc: "fid.capture".into(),
+                state,
+                number,
+                repeat,
+            })
+        };
+        assert_eq!(
+            of(CaptureState::Waiting, 7, Some(0.05)),
+            json!({"type": "capture", "route": "/", "rpc": "fid.capture",
+                "state": "waiting", "number": 7, "repeat": 0.05})
+        );
+        assert_eq!(
+            of(
+                CaptureState::Reading {
+                    read: 512,
+                    size: 3000
+                },
+                0,
+                None
+            ),
+            json!({"type": "capture", "route": "/", "rpc": "fid.capture",
+                "state": "reading", "read": 512, "size": 3000, "number": 0, "repeat": null})
+        );
+        assert_eq!(
+            of(
+                CaptureState::Error {
+                    error: "the device is gone".into()
+                },
+                2,
+                None
+            ),
+            json!({"type": "capture", "route": "/", "rpc": "fid.capture",
+                "state": "error", "error": "the device is gone", "number": 2, "repeat": null})
+        );
+        for (state, name) in [
+            (CaptureState::Idle, "idle"),
+            (CaptureState::Capturing, "capturing"),
+            (CaptureState::Busy, "busy"),
+            (CaptureState::Timeout, "timeout"),
+        ] {
+            assert_eq!(of(state, 0, None)["state"], name);
+        }
+    }
+
+    #[test]
+    fn a_device_lists_its_captures_with_or_without_a_label() {
+        let listed = Message::Captures {
+            route: "/".into(),
+            captures: vec![
+                CaptureInfo {
+                    rpc: "fid.capture".into(),
+                    label: Some(CaptureLabel {
+                        name: "FID".into(),
+                        units: "V".into(),
+                        x_name: "Time".into(),
+                        x_units: "s".into(),
+                    }),
+                },
+                CaptureInfo {
+                    rpc: "old.capture".into(),
+                    label: None,
+                },
+            ],
+        };
+        assert_eq!(
+            json_of(&listed),
+            json!({"type": "captures", "route": "/", "captures": [
+                {"rpc": "fid.capture",
+                    "label": {"name": "FID", "units": "V", "x_name": "Time", "x_units": "s"}},
+                {"rpc": "old.capture", "label": null},
+            ]})
+        );
     }
 
     #[test]

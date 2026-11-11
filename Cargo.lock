@@ -4195,6 +4195,7 @@ dependencies = [
  "tokio",
  "tower",
  "twinleaf",
+ "twinleaf-tools",
 ]
 
 [[package]]

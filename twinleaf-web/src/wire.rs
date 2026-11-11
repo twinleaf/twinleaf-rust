@@ -26,9 +26,32 @@
 //!   f64 noise floor (NaN when there is none),
 //!   n × f32 frequency (Hz), n × f32 density (units per √Hz)
 //! ```
+//!
+//! A capture, kind 3, goes to the pages that asked for it. It is no change
+//! of what every page holds, so its `seq` is 0.
+//!
+//! ```text
+//! u64 number (the hub's count of this RPC's captures, from 1),
+//! u32 n, u8 element type, u8 element bytes, u16 pad,
+//! f32 y calibration, f32 x offset, f32 x stride, u32 pad,
+//! 6 × u16 bytes of route, rpc, name, units, x name, x units, u32 pad,
+//! the six strings, UTF-8, then zeros up to a multiple of 8 bytes,
+//! n × element, as the device sent them
+//! ```
+//!
+//! Element `i` is `element × y calibration` in `units`, at
+//! `x offset + i × x stride` in the x units. The element type is the
+//! protocol's code, 0x10 for u8, 0x11 i8, 0x20 u16, 0x21 i16, 0x40 u32,
+//! 0x41 i32, 0x42 f32, 0x80 u64, 0x81 i64 and 0x82 f64. Its high half is
+//! the bytes of one element. The elements start at a multiple of 8 bytes,
+//! so a page reads them in place as an array of their type.
+
+use twinleaf::device::capture::CaptureReadout;
 
 /// The bytes before a frame's body.
 const HEADER: usize = 16;
+/// The bytes of a capture frame before its strings.
+const CAPTURE_HEAD: usize = HEADER + 48;
 
 /// One trace's points in time order.
 #[derive(Clone, Debug, PartialEq)]
@@ -94,6 +117,105 @@ pub(crate) fn encode_spectra(spectra: &[Spectrum], seq: u64) -> Vec<u8> {
         }
     }
     buf
+}
+
+/// Encodes the capture `readout` holds as one frame, capture `number` of
+/// `rpc` on the device at `route`. Its data is its elements and no more.
+pub(crate) fn encode_capture(
+    route: &str,
+    rpc: &str,
+    number: u64,
+    readout: &CaptureReadout,
+) -> Vec<u8> {
+    let meta = &readout.metadata;
+    let strings = [
+        route,
+        rpc,
+        &meta.name,
+        &meta.units,
+        &meta.x_name,
+        &meta.x_units,
+    ];
+    let text: usize = strings.iter().map(|string| string.len()).sum();
+    let padded = text.next_multiple_of(8);
+    let mut buf = header(3, 0, 48 + padded + readout.data.len());
+    buf.extend_from_slice(&number.to_le_bytes());
+    buf.extend_from_slice(&meta.length.to_le_bytes());
+    buf.push(meta.data_type.value());
+    buf.push(meta.data_type.size() as u8);
+    buf.extend_from_slice(&[0; 2]);
+    buf.extend_from_slice(&meta.y_calibration.to_le_bytes());
+    buf.extend_from_slice(&meta.x_offset.to_le_bytes());
+    buf.extend_from_slice(&meta.x_stride.to_le_bytes());
+    buf.extend_from_slice(&[0; 4]);
+    for string in strings {
+        buf.extend_from_slice(&(string.len() as u16).to_le_bytes());
+    }
+    buf.extend_from_slice(&[0; 4]);
+    for string in strings {
+        buf.extend_from_slice(string.as_bytes());
+    }
+    buf.resize(CAPTURE_HEAD + padded, 0);
+    buf.extend_from_slice(&readout.data);
+    buf
+}
+
+/// A capture frame as a page reads it.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Captured {
+    pub(crate) route: String,
+    pub(crate) rpc: String,
+    pub(crate) number: u64,
+    pub(crate) data_type: u8,
+    pub(crate) y_calibration: f32,
+    pub(crate) x_offset: f32,
+    pub(crate) x_stride: f32,
+    pub(crate) name: String,
+    pub(crate) units: String,
+    pub(crate) x_name: String,
+    pub(crate) x_units: String,
+    /// The elements, as many bytes as the frame says they take.
+    pub(crate) data: Vec<u8>,
+}
+
+/// Decodes a capture frame, as the page does.
+#[cfg(test)]
+pub(crate) fn decode_capture(frame: &[u8]) -> Captured {
+    let u16_at = |at: usize| usize::from(u16::from_le_bytes([frame[at], frame[at + 1]]));
+    let u32_at = |at: usize| u32::from_le_bytes(frame[at..at + 4].try_into().unwrap());
+    let f32_at = |at: usize| f32::from_bits(u32_at(at));
+    assert_eq!(frame[0], 3, "a capture frame");
+    assert_eq!(frame[8..HEADER], [0; 8], "a capture is no numbered change");
+    let (n, element) = (u32_at(24) as usize, usize::from(frame[29]));
+    assert_eq!(element, usize::from(frame[28] >> 4));
+    let mut at = CAPTURE_HEAD;
+    let strings: Vec<String> = (0..6)
+        .map(|index| {
+            let len = u16_at(48 + 2 * index);
+            let string = String::from_utf8(frame[at..at + len].to_vec()).unwrap();
+            at += len;
+            string
+        })
+        .collect();
+    let data = at.next_multiple_of(8);
+    assert!(frame[at..data].iter().all(|&pad| pad == 0));
+    assert_eq!(frame.len(), data + n * element, "its elements and no more");
+    let [route, rpc, name, units, x_name, x_units] = strings.try_into().unwrap();
+    Captured {
+        route,
+        rpc,
+        number: u64::from_le_bytes(frame[16..24].try_into().unwrap()),
+        data_type: frame[28],
+        y_calibration: f32_at(32),
+        x_offset: f32_at(36),
+        x_stride: f32_at(40),
+        name,
+        units,
+        x_name,
+        x_units,
+        data: frame[data..].to_vec(),
+    }
 }
 
 /// Splits time-ordered points of level `level` into chunks at the gap times
@@ -227,6 +349,67 @@ mod tests {
         expected.extend_from_slice(&1.5f64.to_le_bytes());
         expected.extend_from_slice(&2.0f32.to_le_bytes());
         assert_eq!(frame, expected);
+    }
+
+    fn capture() -> CaptureReadout {
+        use twinleaf::device::capture::CaptureMetadata;
+        CaptureReadout {
+            metadata: CaptureMetadata {
+                size: 6,
+                blocksize: 256,
+                data_type: twinleaf::proto::data::DataType::I16,
+                length: 3,
+                y_calibration: 0.5,
+                x_offset: 1.0,
+                x_stride: 0.25,
+                name: "FID".into(),
+                units: "V".into(),
+                x_name: "Time".into(),
+                x_units: "s".into(),
+            },
+            data: vec![1, 0, 0xfe, 0xff, 3, 0],
+        }
+    }
+
+    #[test]
+    fn a_capture_frame_holds_what_the_capture_is_of_then_its_elements() {
+        let frame = encode_capture("/0", "fid.capture", 258, &capture());
+        let mut expected = vec![3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        expected.extend_from_slice(&[2, 1, 0, 0, 0, 0, 0, 0]);
+        expected.extend_from_slice(&[3, 0, 0, 0, 0x21, 2, 0, 0]);
+        for value in [0.5f32, 1.0, 0.25] {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        expected.extend_from_slice(&[0; 4]);
+        expected.extend_from_slice(&[2, 0, 11, 0, 3, 0, 1, 0, 4, 0, 1, 0, 0, 0, 0, 0]);
+        expected.extend_from_slice(b"/0fid.captureFIDVTimes");
+        expected.extend_from_slice(&[0; 2]);
+        expected.extend_from_slice(&[1, 0, 0xfe, 0xff, 3, 0]);
+        assert_eq!(frame, expected);
+        assert_eq!((frame.len() - 6) % 8, 0, "the elements start on 8 bytes");
+    }
+
+    #[test]
+    fn a_capture_frame_decodes_to_its_capture() {
+        let readout = capture();
+        let decoded = decode_capture(&encode_capture("/", "fid.capture", 1, &readout));
+        assert_eq!(
+            decoded,
+            Captured {
+                route: "/".into(),
+                rpc: "fid.capture".into(),
+                number: 1,
+                data_type: 0x21,
+                y_calibration: 0.5,
+                x_offset: 1.0,
+                x_stride: 0.25,
+                name: "FID".into(),
+                units: "V".into(),
+                x_name: "Time".into(),
+                x_units: "s".into(),
+                data: readout.data,
+            }
+        );
     }
 
     #[test]

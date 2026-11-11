@@ -31,6 +31,8 @@ futures-util = { version = "0.3", default-features = false }
 hdf5 = ["twinleaf/hdf5"]
 
 [dev-dependencies]
+# The simulated device the hub's capture tests read.
+twinleaf-tools = { path = "../twinleaf-tools", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.47", features = ["rt", "macros"] }
 proptest = "1"

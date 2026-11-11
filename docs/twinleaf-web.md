@@ -48,10 +48,11 @@ The server sends no CORS headers, and hyper's `header_read_timeout` is set.
 | Module | What it holds |
 |---|---|
 | `protocol` | every message and request type, and the contract below |
-| `wire` | the binary frames: points and spectra |
+| `wire` | the binary frames: points, spectra and captures |
 | `feed` | the channel of changes, which numbers each one |
 | `hub` | `Live` (one connection to the proxy, its `Hub` of traces, its devices) and how it ends |
-| `devices` | each device's newest identity, RPC table and settings; calls and reads |
+| `devices` | each device's newest identity, RPC table, settings and captures; calls and reads |
+| `captures` | the captures pages ask for: the task that takes each capture RPC's, and each page's outbox |
 | `routes` | the routes, which hub is current, mount order |
 | `discover` | the device picker's scan |
 | `guard`, `assets` | the checks above, and the built page |
@@ -70,7 +71,8 @@ snapshot:
 1. **Snapshot**, as a socket opens and whenever a page fell more than 1024
    changes behind (`Lagged`): `hub {id, seq}`, a `trace` per trace, one
    points frame of all history sent so far, `config`, `memory`, `routes`, then each
-   listed device's newest `device`, `table` and `settings`. The page drops
+   listed device's newest `device`, `table`, `settings`, `captures` and a
+   `capture` per capture RPC the hub has taken. The page drops
    everything of any hub and builds a new `Session` from it.
 2. **Changes**, each numbered `seq` one more than the last (`feed.rs`):
    points frames (every 16 ms), one spectra frame per round (every 100 ms),
@@ -88,10 +90,115 @@ sends nothing), and sends a device's messages only while `routes` lists it
 (a device listed again sends its newest again). Only points and spectra
 stream.
 
-The page sends one message, `spectra {traces}`, naming the trace ids its
+The page sends `spectra {traces}`, naming the trace ids its
 open tab shows as spectra, after each snapshot and when that set changes.
 The hub estimates and sends only the spectra some page names; a page's
-names go when its socket does.
+names go when its socket does. It sends `hold {on}` while it holds a plot
+paused, and the three capture messages below.
+
+### Captures
+
+A capture is a device's one-shot readout of a buffer, such as the ADC
+samples of one FID shot. A device has one capture RPC per kind of capture
+(flagged CAPTURE, or named `*.capture` on a device that does not flag
+it). A capture has no absolute time, and the hub sends none. The page
+draws nothing of this yet: `ui/` neither asks for captures nor reads them.
+
+**Listing.** As a device's table loads, the hub lists its capture RPCs and
+reads each one's metadata once, without triggering, for what the device
+says before a capture is taken:
+
+```json
+{"type": "captures", "seq": 41, "route": "/", "captures": [
+  {"rpc": "fid.capture",
+   "label": {"name": "FID", "units": "V", "x_name": "Time", "x_units": "s"}},
+  {"rpc": "old.capture", "label": null}]}
+```
+
+`label` is `null` for a device that does not answer its metadata before a
+capture. The first capture the hub reads of that RPC fills it in, and the
+message goes out again whenever a capture's metadata names it otherwise.
+`name` is the capture's identity for a person. A device with no
+capture RPC lists `[]`.
+
+**Asking.** Three messages from the page, each naming one capture RPC of
+one device. Only an RPC that device's `captures` lists is taken; any other
+ask is dropped and logged.
+
+```json
+{"type": "capture", "route": "/", "rpc": "fid.capture"}
+{"type": "repeat", "route": "/", "rpc": "fid.capture", "delay": 0.05}
+{"type": "stop", "route": "/", "rpc": "fid.capture"}
+```
+
+- `capture` asks for one capture now. If the hub is already taking one of
+  that RPC, that one answers the ask.
+- `repeat` asks for captures again and again: trigger, read, wait `delay`
+  seconds (0.05 to 10, clamped), repeat. Several pages may ask; the hub
+  runs one loop per RPC at the shortest delay asked. Sent again, it changes
+  the page's delay.
+- `stop` takes back both. A page's asks also go when its socket closes.
+  The loop ends when no page wants it, or when the device is lost; a
+  capture in flight that no page wants any more is given up between two
+  calls.
+
+**State.** Every page hears where each capture RPC stands, as a numbered
+change, and a snapshot holds the newest:
+
+```json
+{"type": "capture", "seq": 57, "route": "/", "rpc": "fid.capture",
+ "state": "waiting", "number": 12, "repeat": 0.05}
+```
+
+| `state` | Means |
+|---|---|
+| `idle` | nothing in flight or awaited, and the last capture taken did not fail |
+| `capturing` | triggered; the device has not finished |
+| `reading` | the blocks are being read, with `read` and `size` in bytes; only sent for a read longer than 0.1 s, then every 0.1 s |
+| `waiting` | a repeating capture was read and waits its delay |
+| `busy` | the device refused the trigger: a capture is already in progress on it (another host's, or one the hub gave up) |
+| `timeout` | the device did not finish within 10 s of the trigger, or a call got no reply in 3 s |
+| `error` | anything else, with `error` as text: the device's error status, a refused call, metadata this build cannot read, an element type the frame does not carry, or `the device is gone` |
+
+`number` is the number of the last capture the hub read of that RPC (0
+for none). `repeat` is the delay in effect, or `null` when no page asks
+for it to repeat. A failure is a state, not a refused request: one
+capture asked for ends in `busy`, `timeout` or `error`; a repeating one
+shows the failure, waits its delay but at least 1 s, and tries again. It
+stops only for `the device is gone`, which also clears every page's ask.
+
+**The capture.** Each capture the hub reads goes, as one binary frame of
+kind 3 (`wire.rs`), to the pages that asked for that RPC and to no other:
+
+```text
+u8 kind = 3, 7 × u8 pad, u64 seq = 0
+u64 number
+u32 n, u8 element type, u8 element bytes, u16 pad
+f32 y calibration, f32 x offset, f32 x stride, u32 pad
+6 × u16 byte lengths of route, rpc, name, units, x name, x units, u32 pad
+the six strings (UTF-8), zero padded to a multiple of 8 bytes
+n × element, little endian, exactly as the device sent them
+```
+
+The elements are in the device's own type and width (`0x10` u8, `0x11`
+i8, `0x20` u16, `0x21` i16, `0x40` u32, `0x41` i32, `0x42` f32, `0x80`
+u64, `0x81` i64, `0x82` f64; a capture of any other type is an `error`).
+Element `i` is `element × y calibration` in `units` at `x offset + i × x
+stride` in the x units. They start on a multiple of 8 bytes, so the page
+can view them in place as a typed array. The frame is not a numbered
+change (`seq` 0) and is in no snapshot: a page is sent the captures read
+after it asked.
+
+`number` counts the captures the hub read of that RPC, from 1, in a hub's
+lifetime, and is the same number the `capture` state carries, so a page
+can tell a new capture from one it has. A page that reads slowly is not
+queued for: each page has one slot per capture RPC, a newer capture
+replaces an unsent older one, and the numbers that page sees skip.
+
+The hub takes a capture one call at a time (trigger, status until done,
+at once and then after waits that double from 2 ms to 100 ms, metadata,
+then each block in turn), so the stream and other RPCs share the link with
+at most one capture call in flight per capture RPC.
 
 Every `/api` route takes the request type `protocol.rs` declares and
 answers its reply type. A request the server cannot serve answers a non-2xx

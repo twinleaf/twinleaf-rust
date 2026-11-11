@@ -416,7 +416,6 @@ impl Simulator {
 
 /// Returns the arguments `args` give a simulator that a test starts, on a
 /// free port of loopback.
-#[cfg(test)]
 fn test_cli(args: &[&str]) -> SimulateCli {
     use clap::Parser;
     let on_loopback = ["tio-simulate", "--port", "0", "--listen", "loopback"];
@@ -424,9 +423,15 @@ fn test_cli(args: &[&str]) -> SimulateCli {
 }
 
 /// Serves the simulator `args` start on a free port of loopback from a
-/// thread until `stop` is set, and returns the URL a proxy opens it at.
-#[cfg(test)]
-pub(crate) fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
+/// thread until `stop` is set, and returns the URL a proxy opens it at. A
+/// test of what needs a device serves one so, with no terminal and no
+/// keys.
+///
+/// # Panics
+///
+/// Panics if `args` are not arguments of `tio simulate`, or the simulator
+/// cannot start. Its thread panics if serving fails.
+pub fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
     let cli = test_cli(args);
     let (bound, port) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

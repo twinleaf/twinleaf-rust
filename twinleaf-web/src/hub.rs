@@ -32,6 +32,7 @@
 //! it). Its pages' sockets then close, and the next request starts the hub
 //! that takes its place.
 
+use crate::captures::{Captures, Outbox, Want};
 use crate::devices::Devices;
 use crate::export::ExportTrace;
 use crate::feed::Feed;
@@ -187,6 +188,8 @@ pub(crate) struct Live {
     pub(crate) devices: Arc<Devices>,
     /// The tree the connection sees, which the page's calls go through.
     pub(crate) tree: DeviceTree,
+    /// The captures the pages ask for.
+    captures: Arc<Captures>,
     /// The number the next page to connect is known by.
     next_page: AtomicU64,
     end: End,
@@ -235,6 +238,16 @@ impl Live {
             Some(layout) => Connection::open_layout(layout)?,
             None => Connection::connect()?,
         };
+        Live::over(connection, layout, runtime)
+    }
+
+    /// Starts a hub over `connection`, which opened `layout`, or the
+    /// proxy's default for `None`.
+    pub(crate) fn over(
+        connection: Connection,
+        layout: Option<&Layout>,
+        runtime: &tokio::runtime::Handle,
+    ) -> std::io::Result<Live> {
         let tree = connection.tree(DeviceRoute::root());
         let (mailbox, mail) = mpsc::channel();
         let mut hub = Hub::new();
@@ -252,6 +265,7 @@ impl Live {
                 .collect()
         });
         crate::devices::watch(&connection, mounts, devices.clone(), runtime);
+        let captures = Captures::new(devices.clone(), &tree, runtime);
         let end = End {
             connection: connection.clone(),
             retired: Arc::new(watch::channel(false).0),
@@ -272,6 +286,7 @@ impl Live {
             mailbox,
             devices,
             tree,
+            captures,
             next_page: AtomicU64::new(0),
             end,
         })
@@ -300,11 +315,13 @@ impl Live {
         answer.await.map_err(|_| Ended)
     }
 
-    /// A page that connected to this hub, whose spectra go once it does.
+    /// A page that connected to this hub, whose spectra and captures go
+    /// once it does.
     pub(crate) fn page(self: &Arc<Live>) -> Page {
         Page {
             id: self.next_page.fetch_add(1, Ordering::Relaxed),
             live: self.clone(),
+            outbox: Arc::default(),
         }
     }
 
@@ -403,6 +420,8 @@ impl Live {
 pub(crate) struct Page {
     id: u64,
     live: Arc<Live>,
+    /// The captures the page asked for and has not been sent.
+    outbox: Arc<Outbox>,
 }
 
 impl Page {
@@ -419,12 +438,26 @@ impl Page {
         let id = self.id;
         self.live.tell("hold", move |hub| hub.hold(id, on));
     }
+
+    /// Asks `want` of the capture `rpc` of the device at `route`.
+    pub(crate) fn capture(&self, route: &str, rpc: &str, want: Want) {
+        self.live
+            .captures
+            .ask(self.id, &self.outbox, route, rpc, want);
+    }
+
+    /// Waits for captures the page asked for, and takes the frames to send
+    /// it, the newest of each RPC.
+    pub(crate) async fn captures(&self) -> Vec<Arc<Frame>> {
+        self.outbox.take().await
+    }
 }
 
 impl Drop for Page {
     fn drop(&mut self) {
         self.show_spectra(BTreeSet::new());
         self.hold(false);
+        self.live.captures.forget(self.id);
     }
 }
 
