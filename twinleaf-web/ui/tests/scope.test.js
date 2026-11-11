@@ -16,7 +16,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, closeAll, editCursors, feed, leafOf, mountPage, pressKey, rightClick, settle, until, wait, withExamples, withYPair } from './harness/page.js';
+import { centre, clearNotices, closeAll, editCursors, feed, leafOf, mountPage, pressKey, rightClick, settle, until, wait, withExamples, withYPair } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { withX, withY, xOf, yOf } from '../src/lib/cursors.js';
 import { plotIds } from '../src/lib/layout.js';
@@ -610,10 +610,37 @@ describe('a cursor dragged on a plot', () => {
     const points = parts.flatMap((p) => (by === 'line' ? [0.3, 0.5, 0.7].map((t) => (axis === 'x' ? [p.x + p.w / 2, p.y + t * p.h] : [p.x + t * p.w, p.y + p.h / 2])) : [[p.x + p.w / 2, p.y + p.h / 2]]));
     return points.find((at) => document.elementFromPoint(...at) === pv.overlay && pv.pressAt(...at)?.kind === axis && pv.pressAt(...at)?.name === name) ?? null;
   }
+  /** The corners of its plot the cursors' readout can be dragged to. */
+  const CORNERS = [{ x: 0, y: 0 }, { x: 1, y: 1 }, { x: 1, y: 0 }, { x: 0, y: 1 }];
+  /**
+   * Where on plot `id` of `page` a press takes cursor `name` of `axis` by its
+   * `by`, with the notices closed and the plot's readout moved to the first
+   * corner that leaves the part uncovered, the pointer resting over it; null
+   * when no corner does.
+   */
+  async function uncover(page, id, axis, name, by) {
+    const pv = page.pv(id);
+    await clearNotices();
+    for (const readoutAt of CORNERS) {
+      page.history.group('Prepare', () => page.ws.setPlot(id, { readoutAt }));
+      if (!(await until(() => pressOn(pv, axis, name, by), 500))) continue;
+      // Over the press, once what shows there has settled, as the readout and the header come and go with the pointer.
+      await commands.mouse([['move', ...pressOn(pv, axis, name, by)]]);
+      await settle(10);
+      const at = pressOn(pv, axis, name, by);
+      if (at) return at;
+    }
+    return null;
+  }
+  // Each cursor by each of its parts, every plot selected.
+  const EXAMPLES = [
+    [ALL, 0, 'x', 'line', 'a', 0.3], [ALL, 3, 'x', 'tag', 'b', 0.7], [ALL, 0, 'x', 'tab', 'a', 0.5], [ALL, 4, 'x', 'tab', 'b', 0.4],
+    [ALL, 1, 'y', 'line', 'a', 0.3], [ALL, 4, 'y', 'tag', 'b', 0.25], [ALL, 2, 'y', 'tab', 'b', 0.5], [ALL, 3, 'y', 'line', 'b', 0.7],
+  ];
 
   it('moves it on the selected plots of its kind alone, a Y cursor on those with an axis in its units, each to the same place, as one undo step', async () => {
     const reached = new Set();
-    let leftAlone = 0;
+    let leftAlone = 0, skipped = 0;
     await fc.assert(
       fc.asyncProperty(fc.subarray(ALL), fc.nat(5), fc.constantFrom('x', 'y'), fc.constantFrom('line', 'tag', 'tab'), fc.constantFrom('a', 'b'), fc.double({ min: 0.2, max: 0.8, noNaN: true }), async (picks, k, axis, by, name, f) => {
         const page = await mountPage(DRAG_KEYS, 'grid', 0, ['sine.sine', 'aux.triangle'], [], { units: { 'aux.triangle': 'A' } });
@@ -638,13 +665,9 @@ describe('a cursor dragged on a plot', () => {
           flushSync();
           await commands.mouse([['move', ...centre(leafOf(id))]]);
           await settle(10);
-          const first = pressOn(pv, axis, name, by);
-          if (!first) return;
-          // Over the press, once what shows there has settled, as the readout and the header come and go with the pointer.
-          await commands.mouse([['move', ...first]]);
-          await settle(10);
-          const from = pressOn(pv, axis, name, by);
-          if (!from) return;
+          const from = await uncover(page, id, axis, name, by);
+          if (EXAMPLES.some((e) => same(e, [picks, k, axis, by, name, f]))) expect(from, `${axis} ${name} by its ${by} on plot ${k}: a place a press takes it`).not.toBeNull();
+          if (!from) return void skipped++;
           const P = pv.geo.plot, lane = pv.yAxes.find((a) => a.key === 'shared').lane;
           const to = axis === 'x' ? [P.x + f * P.w, P.y + P.h / 2] : [lane.x + lane.w / 2, lane.y + f * lane.h];
           // What the rule names: the selection when the plot is in it, else the plot; of those, its kind, and for a Y cursor, its units.
@@ -669,15 +692,12 @@ describe('a cursor dragged on a plot', () => {
           page.dispose();
         }
       }),
-      // Each cursor by each of its parts, every plot selected; then random runs.
-      withExamples([
-        [ALL, 0, 'x', 'line', 'a', 0.3], [ALL, 3, 'x', 'tag', 'b', 0.7], [ALL, 0, 'x', 'tab', 'a', 0.5], [ALL, 4, 'x', 'tab', 'b', 0.4],
-        [ALL, 1, 'y', 'line', 'a', 0.3], [ALL, 4, 'y', 'tag', 'b', 0.25], [ALL, 2, 'y', 'tab', 'b', 0.5], [ALL, 3, 'y', 'line', 'b', 0.7],
-      ]),
+      // The examples, then random runs, which may find no part to press.
+      withExamples(EXAMPLES),
     );
     // A replay of one failure runs that case alone.
     if (fc.readConfigureGlobal().path !== undefined) return;
-    expect([...reached].sort()).toEqual(['x line', 'x tab', 'x tag', 'y line', 'y tab', 'y tag']);
+    expect([...reached].sort(), `with ${skipped} random cases that found no part to press`).toEqual(['x line', 'x tab', 'x tag', 'y line', 'y tab', 'y tag']);
     expect(leftAlone).toBeGreaterThan(0);
   }, 600_000);
 });

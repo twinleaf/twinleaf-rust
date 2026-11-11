@@ -18,8 +18,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { toast as notices } from 'svelte-sonner';
-import { OPEN, centre, feed, focusPage, frames, headerSpot, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, settle, showing, until, wait, withExamples } from './harness/page.js';
+import { OPEN, centre, clearNotices, feed, focusPage, frames, headerSpot, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, settle, showing, until, wait, withExamples } from './harness/page.js';
 import { GUTTER, plotIds, rects, restrict } from '../src/lib/layout.js';
 import { api } from '../src/lib/protocol.js';
 import { COMMANDS } from '../src/lib/commands.js';
@@ -183,18 +182,6 @@ describe('a key', () => {
     expect(seen.size).toBe(10);
   }, 600_000);
 });
-
-/**
- * Closes every notice on the page and waits until they have gone. The
- * notices stack up over the middle of the plots, an undo's and a redo's
- * among them, stay while the pointer rests on them, and take every press
- * on them: a press meant for a plot comes after this.
- */
-async function clearNotices() {
-  if (!document.querySelector('[data-sonner-toast]')) return;
-  notices.dismiss();
-  expect(await until(() => !document.querySelector('[data-sonner-toast]'), 3000), 'the notices gone').toBe(true);
-}
 
 /**
  * The origins of Maximize, which is Restore while plots are maximized: each

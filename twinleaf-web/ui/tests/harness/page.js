@@ -16,6 +16,7 @@ import { flushSync, mount, unmount } from 'svelte';
 import fc from 'fast-check';
 import { expect, vi } from 'vitest';
 import { commands, userEvent } from 'vitest/browser';
+import { toast as notices } from 'svelte-sonner';
 import App from '../../src/App.svelte';
 import { Hub } from '../../src/lib/hub.svelte.js';
 import { Workspace } from '../../src/lib/workspace.svelte.js';
@@ -379,6 +380,18 @@ export async function until(ready, ms = 5000) {
     if (left <= 0) return false;
     await frames(1);
   }
+}
+
+/**
+ * Closes every notice on the page and waits until they have gone. The
+ * notices stack up over the plots, an undo's and a redo's among them, stay
+ * while the pointer rests on them, and take every press on them: a press
+ * meant for a plot comes after this.
+ */
+export async function clearNotices() {
+  if (!document.querySelector('[data-sonner-toast]')) return;
+  notices.dismiss();
+  expect(await until(() => !document.querySelector('[data-sonner-toast]'), 3000), 'the notices gone').toBe(true);
 }
 
 /** Waits until no drag of the drag library is under way, as one lets go and its drop lands. */
