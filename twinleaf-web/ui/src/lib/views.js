@@ -43,6 +43,32 @@ export class Views {
     return this.map.get(id);
   }
 
+  /** The plots loaded paused whose hub has not yet said what it holds, by id. */
+  #loaded = new Set();
+
+  /**
+   * Shows each plot of `saved`, a Map of plot id to the paused View state
+   * the tabs were kept with (tabs.js `loadTabs`), paused as it was, at page
+   * time `perf`, until `settle`.
+   */
+  load(saved, perf) {
+    for (const [id, s] of saved) {
+      this.of(id).restore(s, perf);
+      this.#loaded.add(id);
+    }
+  }
+
+  /**
+   * Once the hub has said what it holds: the plots `load` showed, each
+   * once, that no longer hold what they show at page time `perf` (View
+   * `holds`). Those that do stay as they were loaded.
+   */
+  settle(perf) {
+    const gone = [...this.#loaded].filter((id) => this.map.has(id) && !this.map.get(id).holds(perf));
+    this.#loaded.clear();
+    return gone;
+  }
+
   setDelay(seconds) {
     this.delay = seconds;
     for (const v of this.map.values()) v.delay = seconds;

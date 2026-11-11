@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { SAVE_KEY, defaultContent, exportText, importText, loadTabs, makeTab, remapIds, saveTabs, tabFromJson } from './tabs.js';
-import { plotIds } from './layout.js';
+import { SAVE_KEY, defaultContent, exportText, importText, loadTabs, makeTab, newPlot, remapIds, saveTabs, tabFromJson } from './tabs.js';
+import { plotIds, presets } from './layout.js';
 
 /** A localStorage of one Map. */
 function storage() {
@@ -53,6 +53,43 @@ describe('tabs', () => {
     expect(plotIds(back[0].layout).length).toBe(4);
     expect(() => importText('{"format": "other"}')).toThrow('not a Twinleaf layout file');
     expect(() => importText('{"format": "twinleaf-plot-layouts", "tabs": []}')).toThrow('no layouts');
+  });
+});
+
+describe('a plot’s view kept with the tabs', () => {
+  const X = { x: { a: 1001, b: 1002 }, y: { time: { shared: { a: 0.5, b: null } } } };
+  const PAUSED = { live: false, window: 10, span: 4, right: 1003, pausedAt: 1005, pausedHistory: 600, yRanges: { time: { shared: [-1, 1] } } };
+  /** Tabs of a time plot and a spectrum, both with time X cursors, saved with each view as `state(id)` gives it, then read back. */
+  function kept(state) {
+    const s = storage(), time = { ...newPlot('time', 'overlay', ['a.b']), cursors: X }, spectrum = { ...newPlot('spectrum', 'overlay', ['a.b']), cursors: X };
+    const t = makeTab('A', { plots: { [time.id]: time, [spectrum.id]: spectrum }, layout: presets.rows([time.id, spectrum.id]) });
+    saveTabs(s, [t], t.id, (id) => ({ state: () => ({ ...state(id), spectra: new Map() }) }));
+    return { s, time: time.id, spectrum: spectrum.id, back: loadTabs(s) };
+  }
+
+  it('keeps a paused time plot’s view and its time X cursors, and only those', () => {
+    const { time, spectrum, back } = kept(() => PAUSED);
+    expect([...back.views], 'the paused views').toEqual([[time, PAUSED]]);
+    expect(back.tabs[0].plots[time].cursors, 'the time plot’s cursors').toEqual(X);
+    expect(back.tabs[0].plots[time].view, 'no view in the tab').toBeUndefined();
+    expect(back.tabs[0].plots[spectrum].cursors, 'a spectrum keeps no time X cursors').toEqual({ y: X.y });
+  });
+
+  it('keeps nothing of a live view, and the plot loads with no time X cursors', () => {
+    const { time, back } = kept(() => ({ ...PAUSED, live: true }));
+    expect([...back.views]).toEqual([]);
+    expect(back.tabs[0].plots[time].cursors).toEqual({ y: X.y });
+  });
+
+  it('keeps nothing of a view that does not hold together, nor in a file of tabs', () => {
+    for (const bad of [{ ...PAUSED, span: 'x' }, { ...PAUSED, right: null }, { ...PAUSED, yRanges: 3 }]) {
+      const { time, back } = kept(() => bad);
+      expect([...back.views], JSON.stringify(bad)).toEqual([]);
+      expect(back.tabs[0].plots[time].cursors).toEqual({ y: X.y });
+    }
+    const { s } = kept(() => PAUSED);
+    const [t] = importText(exportText(JSON.parse(s.map.get(SAVE_KEY)).tabs));
+    expect(Object.values(t.plots).map((p) => p.cursors), 'imported').toEqual([{ y: X.y }, { y: X.y }]);
   });
 });
 

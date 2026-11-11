@@ -13,8 +13,9 @@
 // paused puts back those it had as it last went live from that view, by
 // any route, Back and Forward among them; an undo or a redo changes them as the
 // edit history has them, and one that brings them back to a live plot shows
-// the paused view it left; a page loaded again follows live with none;
-// nothing else changes them. The window field's arrows and wheel turns in a
+// the paused view it left; a page loaded again on a hub that holds what
+// it showed shows each plot paused as it was, with its cursors, and each
+// live one live; nothing else changes them. The window field's arrows and wheel turns in a
 // burst are one step too, and so is each window typed in it.
 // Then each kind of gesture once: arrow keys, the toolbar's Live, a plot's
 // Pause on a selection, Y cursors, a spectrum's pan and y zoom,
@@ -270,15 +271,20 @@ describe('view history on the page', () => {
               expect(cursorsOf(p), 'tab: the cursors').toBe(cursors);
               check('tab');
             } else if (g.t === 'reload') {
-              // The page loaded again from what it saved: it follows live, with no time X cursors, and no step to go to.
+              // The page loaded again from what it saved, on a hub that holds all it showed: a plot saved
+              // paused shows what it showed with its cursors, one saved live follows live; no step to go to.
               flushSync();
-              const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
+              const saved = JSON.parse(localStorage.getItem(SAVE_KEY)), now = p.hub.now(clock.now());
               p.dispose();
               p = await page('rows', 1, { saved: { [SAVE_KEY]: saved }, fromSaved: true });
+              p.hub.session.offset = now + 1 - clock.now() / 1000;
+              p.hub.text({ type: 'memory', bytes: 0, budget: 0, seconds: 0, max_age: 0, rate: 0, oldest: Object.fromEntries(KEYS.flat().map((_, i) => [i, 0])) });
+              flushSync();
               await frames();
               expect(plotIds(p.ws.layout), 'reload: the plots').toEqual(ids);
-              expect(ids.map((i) => p.views.get(i).live), 'reload: live').toEqual(ids.map(() => true));
-              expect(timeXs(p).filter((x) => hasTimeX({ x })), 'reload: time X cursors').toEqual([]);
+              expect(ids.map((i) => p.views.get(i).live), 'reload: live').toEqual(wasLive);
+              expect(ids.map((i, k) => (wasLive[k] ? null : one(p, i))), 'reload: the paused views').toEqual(views.map((s, k) => (wasLive[k] ? null : s)));
+              expect(timeXs(p), 'reload: time X cursors').toEqual(xs);
               line = [{ shows: shown(p), xs: null }];
               at = 0;
               left.clear();
@@ -631,6 +637,88 @@ describe('view history on the page, each kind of gesture', () => {
       expect(p.views.get(id).live).toBe(true);
       await press(id, 'Back');
       expect(one(p, id), 'Back past Follow live to the drag').toBe(dragged);
+    } finally {
+      p.dispose();
+    }
+  });
+});
+
+// A page loaded again shows a plot saved paused paused at its saved view
+// with its cursors until the hub first says what it holds; it stays so when
+// the hub holds that stretch, and else follows live at its window without
+// its time X cursors, by no step of either history. A plot saved live loads live.
+describe('a page loaded again', () => {
+  /** The hub's report of what it holds: each trace from `oldest`. */
+  const memory = (p, oldest) => (p.hub.text({ type: 'memory', bytes: 0, budget: 0, seconds: 0, max_age: 0, rate: 0, oldest: Object.fromEntries(KEYS.flat().map((_, i) => [i, oldest])) }), flushSync());
+
+  it('keeps a plot saved paused paused with its cursors while the hub holds what it showed, and else has it follow live without its time X cursors', async () => {
+    for (const held of [true, false]) {
+      let p = await page();
+      try {
+        const [id, other] = plotIds(p.ws.layout);
+        memory(p, 900);
+        await pickFromMenu(id, 'Add X cursors');
+        await pickFromMenu(id, 'Add Y cursors');
+        const v = p.views.get(id), view = one(p, id), cursors = p.ws.plots[id].cursors, start = v.right - v.span, now = p.hub.now(clock.now());
+        expect([v.live, hasTimeX(cursors), !!cursors.y], 'paused, with X and Y cursors').toEqual([false, true, true]);
+        flushSync();
+        const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
+        p.dispose();
+        p = await page('rows', 0, { saved: { [SAVE_KEY]: saved }, fromSaved: true });
+        // Five seconds later on the hub's clock.
+        p.hub.session.offset = now + 5 - clock.now() / 1000;
+        await frames();
+        const w = p.views.get(id);
+        // Before the hub says: as saved.
+        expect([one(p, id), p.ws.plots[id].cursors, p.views.get(other).live], `${held}: before the hub says`).toEqual([view, cursors, true]);
+        memory(p, held ? 900 : start + 1);
+        await frames();
+        if (held) expect([one(p, id), p.ws.plots[id].cursors], 'held: as saved').toEqual([view, cursors]);
+        else {
+          expect([w.live, w.span, p.ws.plots[id].cursors], 'gone: live at its window, the Y cursors kept').toEqual([true, w.window, { y: cursors.y }]);
+          expect(liveWithX(p)).toEqual([]);
+        }
+        expect([p.history.undos.length, button(id, 'Back').disabled], `${held}: no step`).toEqual([0, true]);
+        // The hub's later reports change nothing.
+        memory(p, now + 3);
+        await frames();
+        expect(w.live, `${held}: after a later report`).toBe(!held);
+      } finally {
+        p.dispose();
+      }
+    }
+  });
+});
+
+describe('a page loaded again, edited before the hub says', () => {
+  it('drops the time X cursors of a plot that then follows live from every step undo and redo keep, so neither brings them back', async () => {
+    let p = await page();
+    try {
+      const [id] = plotIds(p.ws.layout);
+      await pickFromMenu(id, 'Add X cursors');
+      const v = p.views.get(id), start = v.right - v.span, now = p.hub.now(clock.now());
+      flushSync();
+      const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
+      p.dispose();
+      p = await page('rows', 0, { saved: { [SAVE_KEY]: saved }, fromSaved: true });
+      p.hub.session.offset = now + 5 - clock.now() / 1000;
+      await frames();
+      // An edit while the plot is loaded paused with its cursors: the legend shown.
+      await keysOn('Escape');
+      p.ws.selection.only([id]);
+      leaf(id).querySelector('.plot-card').focus();
+      await keysOn('l');
+      expect([p.ws.plots[id].legend, hasTimeX(p.ws.plots[id].cursors)], 'the legend shown, the cursors still placed').toEqual([true, true]);
+      // The hub no longer holds what the plot showed.
+      p.hub.text({ type: 'memory', bytes: 0, budget: 0, seconds: 0, max_age: 0, rate: 0, oldest: Object.fromEntries(KEYS.flat().map((_, i) => [i, start + 1])) });
+      flushSync();
+      await frames();
+      expect([p.views.get(id).live, hasTimeX(p.ws.plots[id].cursors)], 'live, no time X cursors').toEqual([true, false]);
+      document.activeElement?.blur();
+      for (const k of ['Control+z', 'Control+y', 'Control+z']) {
+        await keysOn(k);
+        expect([p.ws.plots[id].legend, p.views.get(id).live, hasTimeX(p.ws.plots[id].cursors)], k).toEqual([k === 'Control+y', true, false]);
+      }
     } finally {
       p.dispose();
     }

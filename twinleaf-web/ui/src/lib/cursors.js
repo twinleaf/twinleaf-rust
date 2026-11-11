@@ -16,8 +16,10 @@
 // the plot; going live, by any route, takes them away, by an edit made with
 // it where a person went live; Back, or an undo, into the paused view brings
 // back the pause and the cursors it had (viewhistory.svelte.js keeps this);
-// and a tab read from storage or a file, whose views start live, has none
-// (tabs.js). Y cursors and a spectrum's `f` stay as they are.
+// and a tab read from storage or a file has none, but on a time plot kept
+// paused, which loads paused (tabs.js), and loses them once loaded if the
+// hub no longer holds what it shows (`unloaded`). Y cursors and a
+// spectrum's `f` stay as they are.
 //
 // The values are never changed in place: each change here gives a new one.
 // CursorEdits is the one writer of a plot's `cursors`: every change is an
@@ -156,5 +158,16 @@ export class CursorEdits {
   /** Plots `ids` follow live: their time X cursors, which would scroll away, are removed, as one step. */
   followed(ids) {
     return this.set('Follow live', new Map(ids.map((id) => [id, withoutX(this.ws.plots[id]?.cursors, 'time')])));
+  }
+
+  /**
+   * Plots `ids`, of any tab, loaded paused at a view the hub no longer
+   * holds, follow live: their time X cursors go as the tabs end loading,
+   * which is no edit, from the tabs and from every step undo and redo keep
+   * (History `amend`), so neither brings them back.
+   */
+  unloaded(ids) {
+    const gone = new Set(ids), off = (p) => (gone.has(p.id) && p.cursors ? { ...p, cursors: withoutX(p.cursors, 'time') } : p);
+    this.history.amend((tabs) => tabs.map((t) => (Object.keys(t.plots).some((id) => gone.has(id)) ? { ...t, plots: Object.fromEntries(Object.entries(t.plots).map(([id, p]) => [id, off(p)])) } : t)));
   }
 }

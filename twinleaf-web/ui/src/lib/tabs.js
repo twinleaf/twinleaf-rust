@@ -15,7 +15,10 @@
 //
 // The tabs are kept in localStorage under SAVE_KEY as {tabs, activeId}.
 // Outside tools read that key and shape, so `tabFromJson` is the one place
-// that reads it, and a change to it changes the key.
+// that reads it, and a change to it changes the key. A paused time plot is
+// kept with its `view` there too, as View `state` gives it without spectra,
+// so the page loads it paused where it was (ViewHistory `settle`); the
+// tabs the page edits hold no view.
 
 import { cursorsFromJson, withoutX } from './cursors.js';
 import { fromJson, plotIds, presets } from './layout.js';
@@ -66,43 +69,74 @@ export function remapIds(t) {
   return { id: uid('t'), name: t.name, plots, layout: walk(t.layout) };
 }
 
+/** The paused view JSON `v` describes, as View `state` gives one without spectra, or null when it is none or does not hold together. */
+function pausedFromJson(v) {
+  const number = (n) => typeof n === 'number' && isFinite(n);
+  const object = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
+  if (!object(v) || v.live !== false || !['window', 'span', 'right', 'pausedAt'].every((k) => number(v[k]))) return null;
+  if (!(v.pausedHistory === null || number(v.pausedHistory)) || !object(v.yRanges)) return null;
+  const yRanges = {};
+  for (const [kind, byKey] of Object.entries(v.yRanges))
+    for (const [key, r] of Object.entries(object(byKey) ? byKey : {})) if (Array.isArray(r) && r.length === 2 && r.every(number)) (yRanges[kind] ??= {})[key] = [...r];
+  const { window, span, right, pausedAt, pausedHistory } = v;
+  return { live: false, window, span, right, pausedAt, pausedHistory, yRanges };
+}
+
 /**
  * The tab saved or imported JSON describes, or null if it does not hold
  * together: a name, plots with items, and a layout over those plots. A
  * plot's cursors are read as far as they hold together, but for its time X
- * cursors: its view starts live, which has none (cursors.js). Its items get
+ * cursors, which only a time plot kept paused keeps: any other view starts
+ * live, which has none (cursors.js). Such a plot's view goes into `paused`,
+ * a Map by plot id, when given; without it none is kept. Its items get
  * fresh ids, as one shared with another plot or the signal list
  * confuses the drag library.
  */
-export function tabFromJson(t) {
+export function tabFromJson(t, paused = null) {
   if (!t || typeof t.name !== 'string' || typeof t.plots !== 'object' || !t.plots) return null;
-  const plots = {};
+  const plots = {}, views = new Map();
   for (const [id, p] of Object.entries(t.plots)) {
     if (!p || !Array.isArray(p.items)) return null;
-    const { cursors: _, ...rest } = p, cursors = withoutX(cursorsFromJson(p.cursors), 'time');
+    const view = paused && p.kind === 'time' ? pausedFromJson(p.view) : null;
+    if (view) views.set(id, view);
+    const { cursors: _, view: __, ...rest } = p, read = cursorsFromJson(p.cursors), cursors = view ? read : withoutX(read, 'time');
     plots[id] = { ...PLOT_DEFAULTS, ...rest, id, items: p.items.filter((i) => i && typeof i.key === 'string').map((i) => chip(i.key)), ...(cursors && { cursors }) };
   }
   const layout = t.layout ? fromJson(t.layout) : null;
   const ids = plotIds(layout);
   if ((t.layout && !layout) || !ids.every((id) => plots[id]) || new Set(ids).size !== ids.length) return null;
+  for (const [id, view] of views) paused.set(id, view);
   return { id: typeof t.id === 'string' ? t.id : uid('t'), name: t.name, plots, layout };
 }
 
-/** The tabs kept in `storage`, or one default tab, as {tabs, activeId}. */
+/** The tabs kept in `storage`, or one default tab, as {tabs, activeId, views}: `views` the paused views kept, by plot id. */
 export function loadTabs(storage) {
   try {
-    const saved = JSON.parse(storage.getItem(SAVE_KEY));
-    const tabs = (saved?.tabs ?? []).map(tabFromJson).filter(Boolean);
-    if (tabs.length) return { tabs, activeId: tabs.some((t) => t.id === saved.activeId) ? saved.activeId : tabs[0].id };
+    const saved = JSON.parse(storage.getItem(SAVE_KEY)), views = new Map();
+    const tabs = (saved?.tabs ?? []).map((t) => tabFromJson(t, views)).filter(Boolean);
+    if (tabs.length) return { tabs, activeId: tabs.some((t) => t.id === saved.activeId) ? saved.activeId : tabs[0].id, views };
   } catch {}
   const t = makeTab('Main');
-  return { tabs: [t], activeId: t.id };
+  return { tabs: [t], activeId: t.id, views: new Map() };
 }
 
-/** Keeps `tabs` and the open one in `storage`. A storage that refuses keeps nothing. */
-export function saveTabs(storage, tabs, activeId) {
+/**
+ * Keeps `tabs` and the open one in `storage`, each time plot whose View
+ * `viewOf(id)` gives is paused with that view. A storage that refuses
+ * keeps nothing.
+ */
+export function saveTabs(storage, tabs, activeId, viewOf = () => undefined) {
+  const kept = tabs.map((t) => {
+    const plots = Object.entries(t.plots).map(([id, p]) => {
+      const s = p.kind === 'time' ? viewOf(id)?.state() : null;
+      if (!s || s.live) return [id, p];
+      const { spectra: _, ...view } = s;
+      return [id, { ...p, view }];
+    });
+    return { ...t, plots: Object.fromEntries(plots) };
+  });
   try {
-    storage.setItem(SAVE_KEY, JSON.stringify({ tabs, activeId }));
+    storage.setItem(SAVE_KEY, JSON.stringify({ tabs: kept, activeId }));
   } catch {}
 }
 

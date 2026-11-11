@@ -559,7 +559,7 @@ describe('Add Y cursors on an axis, then its clear', () => {
 });
 
 describe('cursors placed on a plot', () => {
-  it('are saved with its tab, and are on the plot when the page is loaded again, but for its time X cursors, as the page loads live', async () => {
+  it('are saved with its tab, and are on the plot when the page is loaded again, but for its time X cursors once the hub no longer holds what the plot showed', async () => {
     const first = await mountPage([SIGNALS, SIGNALS], 'rows', 0, SIGNALS);
     let saved, placed;
     try {
@@ -578,15 +578,19 @@ describe('cursors placed on a plot', () => {
     } finally {
       first.dispose();
     }
-    const again = await mountPage([], 'rows', 0, SIGNALS, [], { saved: { [SAVE_KEY]: saved }, fromSaved: true });
-    try {
-      feed(again.hub);
-      await settle();
-      const [a, b] = plotIds(again.ws.layout);
-      expect(again.ws.plots[a].cursors).toEqual({ y: placed.y });
-      expect([again.pv(a).cursorsPlaced(), again.pv(b).cursorsPlaced()], 'drawn on the plot that had them').toEqual([2, 0]);
-    } finally {
-      again.dispose();
+    // The hub's report of what it holds: from `oldest` on, or from after the plot's view started.
+    for (const held of [true, false]) {
+      const again = await mountPage([], 'rows', 0, SIGNALS, [], { saved: { [SAVE_KEY]: saved }, fromSaved: true });
+      try {
+        feed(again.hub, 30);
+        const [a, b] = plotIds(again.ws.layout);
+        again.hub.text({ type: 'memory', bytes: 0, budget: 0, seconds: 0, max_age: 0, rate: 0, oldest: Object.fromEntries(SIGNALS.map((_, i) => [i, held ? 0 : 15])) });
+        await settle();
+        expect(again.ws.plots[a].cursors, `${held}: the cursors`).toEqual(held ? placed : { y: placed.y });
+        expect([again.pv(a).cursorsPlaced(), again.pv(b).cursorsPlaced()], `${held}: drawn on the plot that had them`).toEqual([held ? 4 : 2, 0]);
+      } finally {
+        again.dispose();
+      }
     }
   });
 });

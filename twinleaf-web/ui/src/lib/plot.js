@@ -2565,10 +2565,25 @@ export class View {
    */
   keepWithin() {
     const limits = this.live ? null : this.limits();
-    if (!limits) return;
-    const [lo, hi] = limits;
-    this.span = View.fit(this.span, limits);
-    this.right = Math.min(hi, Math.max(lo + this.span, this.right));
+    if (limits) [this.span, this.right] = this.#within(limits);
+  }
+
+  /** [span, right], the paused view's span and right edge kept within `limits`. */
+  #within(limits) {
+    const [lo, hi] = limits, span = View.fit(this.span, limits);
+    return [span, Math.min(hi, Math.max(lo + span, this.right))];
+  }
+
+  /**
+   * Whether the view is paused within what it can show at page time
+   * `perf`, as `keepWithin` leaves it, and ends no later than the newest
+   * samples: whether the hub still holds all of what it shows.
+   */
+  holds(perf) {
+    const limits = this.live ? null : this.limits(perf);
+    if (!limits || this.pausedAt > this.hub.now(perf) - this.delay) return false;
+    const [span, right] = this.#within(limits);
+    return span === this.span && right === this.right;
   }
 
   /**
@@ -2649,17 +2664,17 @@ export class View {
   /**
    * Shows `s`, a value `state` gave, again at page time `perf`: a live
    * one follows the newest samples, and a paused one ends no later than
-   * they do, with the History setting of the pause `s` was taken in, within
-   * its limits. One whose start the hub has dropped is left for `startHeld`
-   * to move, which says that it did. A y range it does not hold fits itself
-   * to the data again.
+   * they do, once any have arrived, with the History setting of the pause
+   * `s` was taken in, within its limits. One whose start the hub has
+   * dropped is left for `startHeld` to move, which says that it did. A y
+   * range it does not hold fits itself to the data again.
    */
   restore(s, perf) {
-    const newest = this.hub.now(perf) - this.delay;
+    const newest = this.hub.now(perf) - this.delay, end = (t) => (newest > -Infinity ? Math.min(t, newest) : t);
     if (s.live && !this.live) this.left = this.state();
     Object.assign(this, { live: s.live, window: s.window, span: s.span });
     if (s.live) this.pausedAt = this.pausedHistory = null;
-    else [this.right, this.pausedAt, this.pausedHistory] = [Math.min(s.right, newest), Math.min(s.pausedAt ?? s.right, newest), s.pausedHistory ?? null];
+    else [this.right, this.pausedAt, this.pausedHistory] = [end(s.right), end(s.pausedAt ?? s.right), s.pausedHistory ?? null];
     if (!this.held().dropped) this.keepWithin();
     this.yByKind = mapsOf(s.yRanges, (range) => ({ range: [...range], auto: false }));
     this.spectra = new Map(s.spectra ?? []);

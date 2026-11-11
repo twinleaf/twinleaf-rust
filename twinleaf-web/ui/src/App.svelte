@@ -130,7 +130,12 @@
   let renderer = $state();
   let glCanvas;
 
-  $effect(() => saveTabs(localStorage, ws.tabs, ws.activeId));
+  // The tabs are kept as they change, and so are the views of paused time plots as they move.
+  let viewMoves = $state(0);
+  $effect(() => {
+    viewMoves;
+    saveTabs(localStorage, ws.tabs, ws.activeId, (id) => views.get(id));
+  });
   // A plot keeps its view while an undo or a redo can bring it back, and a
   // tab its view history, each going once none can. A closed plot comes back
   // showing what it showed, by the rule Back shows a view by, as the hub may
@@ -215,6 +220,7 @@
   function viewChanged(id) {
     requestDetail(id);
     refreshToolbar();
+    viewMoves++;
   }
   /**
    * The browser's own right-click menu shows only where it has something to
@@ -334,6 +340,13 @@
   let span = $state(10);
   let delayMs = $state(150);
   let hud = $state({ fps: 0, frameMs: 0, segments: 0, drawCalls: 0, uploadKBs: 0, rxKBs: 0, gpu: '' });
+  // A time plot kept paused loads paused where it was, with its cursors,
+  // and stays so once the hub first says what it holds if it holds what
+  // the plot shows; else it follows live then (ViewHistory `settle`).
+  views.load(ws.loaded, clock.now());
+  $effect(() => {
+    if (hub.session.memory) untrack(() => viewHistory.settle(clock.now()));
+  });
   // The docks beside the tiles and the panels in them (docks.svelte.js).
   const docks = new Docks(localStorage);
   // The devices unchecked in the Devices panel, by route, one set per hub,

@@ -60,10 +60,14 @@ export class Workspace {
   /** Told of every edit before it is made: History's check that an undo step holds it. */
   guard = null;
 
-  /** `initial` is {tabs, activeId}, as tabs.js `loadTabs` returns it. */
+  /** The paused views the tabs were kept with, by plot id, as tabs.js `loadTabs` read them: what the page loads each plot's View with (Views `load`). */
+  loaded;
+
+  /** `initial` is {tabs, activeId, views?}, as tabs.js `loadTabs` returns it. */
   constructor(initial) {
     this.#tabs = frozen(initial.tabs);
     this.activeId = initial.activeId;
+    this.loaded = initial.views ?? new Map();
   }
 
   /** The plots selected in the open tab, by id: the Selection's, which alone changes them. */
@@ -127,7 +131,8 @@ export class Workspace {
   }
 
   /**
-   * Puts back `tabs`, as undo and redo do: not an edit. One that brings a
+   * Puts back `tabs`, as undo and redo do and as the page ends loading
+   * them (History `amend`): not an edit. One that brings a
    * plot into the open tab shows every plot, as the edit it takes back or
    * makes again does, so the plot shows.
    */

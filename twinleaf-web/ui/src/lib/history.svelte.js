@@ -97,6 +97,20 @@ export class History {
     return e.label;
   }
 
+  /**
+   * Gives the tabs, and the tabs every step undo and redo keep, as `fn(tabs)`
+   * makes them: a change no step holds, as the page ends loading the tabs,
+   * which is then so whatever is undone or redone. A step it leaves with
+   * nothing to change stays, and changes nothing.
+   */
+  amend(fn) {
+    for (const e of [...this.undos, ...this.redos]) {
+      e.before = { ...e.before, tabs: fn(e.before.tabs) };
+      e.after = { ...e.after, tabs: fn(e.after.tabs) };
+    }
+    this.ws.restore(fn(this.ws.tabs));
+  }
+
   /** The ids of every tab and every plot the tabs hold, or an undo or a redo would bring back: {tabs, plots}, each a Set. */
   held() {
     const tabs = new Set(), plots = new Set();

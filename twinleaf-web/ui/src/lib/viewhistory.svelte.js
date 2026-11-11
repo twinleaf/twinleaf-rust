@@ -43,10 +43,11 @@
 // The other thing the two hold together is a plot's time X cursors, which
 // a view that follows live never has (cursors.js): they mark moments, which
 // scroll away. A view goes live through here alone: by `follow`, which
-// every Follow live, Pause and Live of the page runs, and by Back and
-// Forward. Each takes the time X cursors of the plots it makes live, by an
-// edit (CursorEdits `followed`), Back's and Forward's the one their kind
-// change makes. A step holds the time X cursors each plot had (`x`), and
+// every Follow live, Pause and Live of the page runs, by Back and
+// Forward, and by `settle`, as a plot loaded paused finds the hub no
+// longer holds what it shows. Each takes the time X cursors of the plots
+// it makes live, by an edit (CursorEdits `followed`), Back's and Forward's
+// the one their kind change makes, `settle`'s as no edit, the load's end. A step holds the time X cursors each plot had (`x`), and
 // Back or Forward that shows a live plot paused again puts back those its
 // view had as it last went live from there: a step's paused side takes the
 // cursors a plot has as Back or Forward makes it live from that side. So
@@ -186,6 +187,20 @@ export class ViewHistory {
         this.cursors.followed(ids);
       }),
     );
+  }
+
+  /**
+   * Ends loading the plots kept paused, once the hub has said what it
+   * holds, at page time `perf` (Views `settle`): each that still holds
+   * what it shows stays paused with its cursors; each other follows live
+   * at its window without its time X cursors (CursorEdits `unloaded`),
+   * as part of the load, a step of neither history.
+   */
+  settle(perf) {
+    const gone = this.views.settle(perf);
+    if (!gone.length) return;
+    for (const id of gone) this.views.of(id).follow(true);
+    this.cursors.unloaded(gone);
   }
 
   /** Shows what the newest step that moves a plot shown in the open tab moved, as it was before; says whether there was one. */
