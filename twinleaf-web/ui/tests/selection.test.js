@@ -23,7 +23,9 @@ const LIST = [
   ['the Live button', () => [...document.querySelectorAll('button')].filter((b) => /^(Live|Paused|Pause)/.test(b.textContent.trim())), false],
   ['the Layout menu', () => [...document.querySelectorAll('button')].filter((b) => b.textContent.trim() === 'Layout'), false],
   ['display settings', () => [...document.querySelectorAll('button[aria-label="Display settings"]')], false],
-  ['the tab strip', () => [...document.querySelectorAll('[role=tablist] [data-tab]')], false],
+  ['the tab strip, but the open tab', () => [...document.querySelectorAll('[role=tablist] [data-tab]:not([aria-selected=true])')], false],
+  // Selecting the tab that is open is no change (tabs.test.js).
+  ['the open tab', () => [...document.querySelectorAll('[role=tablist] [data-tab][aria-selected=true]')], true],
   ['dock headers', () => [...document.querySelectorAll('.dock-head')], false],
   ['the status bar', () => [...document.querySelectorAll('.status-bar')], false],
   ['the gaps between plots', () => [...document.querySelectorAll('.tiles .separator')], false],
@@ -44,7 +46,7 @@ function press(el, init = {}) {
 
 describe('a press', () => {
   it('on each control the list names keeps the plots selected or clears them, as it says', async () => {
-    const page = await mountPage(KEYS, 'columns', 0, ['vector.x', 'vector.y']);
+    const page = await mountPage(KEYS, 'columns', 1, ['vector.x', 'vector.y']);
     try {
       for (const [name, find, keeps] of LIST) {
         const els = find();

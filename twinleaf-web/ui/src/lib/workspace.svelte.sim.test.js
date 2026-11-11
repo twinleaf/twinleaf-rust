@@ -98,9 +98,11 @@ function run(s, { ws, history }) {
   } else if (s.t === 'dock' && id) history.group('Move', () => ws.setLayout(dock(ws.layout, id, pick(ids, s.to), s.edge)));
   else if (s.t === 'toTab' && id && others.length) history.group('Move to tab', () => ws.movePlotToTab(id, pick(others, s.tab).id));
   else if (s.t === 'tab') {
-    // A tab opened shows every plot, the open tab too.
-    ws.selectTab(ws.tabs[s.at % ws.tabs.length].id);
-    max = null;
+    // Another tab opened shows every plot; the open tab selected again is no change.
+    const to = ws.tabs[s.at % ws.tabs.length].id;
+    ws.selectTab(to);
+    if (to !== was.tab) max = null;
+    else expect(stateOf(ws), 'the open tab selected again').toBe(before);
   } else if (s.t === 'addTab') history.group('New tab', () => ws.addTab());
   else if (s.t === 'duplicateTab') history.group('Duplicate tab', () => ws.duplicateTab(ws.tab));
   else if (s.t === 'closeTab') history.group('Close tab', () => ws.closeTab(ws.tabs[s.at % ws.tabs.length]));
@@ -166,6 +168,8 @@ describe('after any run of edits, undos and redos', () => {
       [{ t: 'click', at: 0 }, { t: 'select', at: 1 }, { t: 'maximize' }, { t: 'close', at: 0 }, { t: 'undo' }, { t: 'redo' }, { t: 'toTab', at: 0, tab: 0 }, { t: 'undo' }],
       [{ t: 'click', at: 0 }, { t: 'maximize' }, { t: 'split', at: 0, dir: 'col' }, { t: 'maximizeOn', at: 1 }, { t: 'arrange', name: 'rows' }],
       [{ t: 'click', at: 2 }, { t: 'maximize' }, { t: 'tab', at: 1 }, { t: 'tab', at: 0 }],
+      // The open tab selected again: the view, the selection and the plot clicked last stay.
+      [{ t: 'click', at: 0 }, { t: 'select', at: 1 }, { t: 'maximize' }, { t: 'tab', at: 0 }],
       [{ t: 'maximizeOn', at: 3 }, { t: 'escape' }, { t: 'maximize' }, { t: 'maximize' }],
       [{ t: 'maximizeOn', at: 0 }, { t: 'addTab' }, { t: 'undo' }],
     ),

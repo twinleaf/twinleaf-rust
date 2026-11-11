@@ -5,7 +5,9 @@
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, dropped, frames, mountPage, withExamples } from './harness/page.js';
+import { centre, clickOn, drag, dropped, feed, focusPage, frames, mountPage, pressKey, settle, turnWheel, wait, withExamples } from './harness/page.js';
+import { plotIds } from '../src/lib/layout.js';
+import { SAVE_KEY, newPlot } from '../src/lib/tabs.js';
 
 const stripOrder = () => [...document.querySelectorAll('[role=tablist] [data-tab]')].map((e) => e.dataset.tab);
 
@@ -58,4 +60,63 @@ describe('the tab strip', () => {
     );
     expect(moved).toBeGreaterThan(0);
   }, 600_000);
+});
+
+// Selecting the tab that is open is no change: a click on it, or Enter on
+// it, leaves the page as it was, whatever is maximized, selected or picked.
+describe('the open tab', () => {
+  const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine'], ['aux.sawtooth']];
+  const RPCS = [{ name: 'sine.freq', channel: 'setting', value: 1 }, { name: 'sine.amp', channel: 'setting', value: 2 }];
+  /** Everything a select of the open tab might change: the saved document, the selection, the maximized plots, and both histories' lengths, the view history's as its buttons offer it. */
+  const stateOf = (page) =>
+    JSON.stringify({
+      saved: localStorage.getItem(SAVE_KEY),
+      selection: page.ws.selection.snapshot(),
+      rows: [...page.ws.selection.rows],
+      maximized: page.ws.maximized,
+      undos: page.history.undos.length,
+      redos: page.history.redos.length,
+      views: [...document.querySelectorAll('.plot-head button.view-step')].map((b) => b.disabled),
+    });
+
+  it('clicked or given Enter, changes nothing: not the saved document, the selection, the maximized plots or a history', async () => {
+    const seen = new Set();
+    await fc.assert(
+      fc.asyncProperty(fc.boolean(), fc.subarray([0, 1, 2, 3]), fc.boolean(), fc.constantFrom('click', 'Enter'), async (max, picked, rows, how) => {
+        const page = await mountPage(KEYS, 'grid', 1, KEYS.flat(), RPCS);
+        try {
+          await focusPage();
+          const ids = plotIds(page.ws.layout);
+          // A step to undo and one to redo, so neither history is empty.
+          page.history.group('Split', () => page.ws.addPlot(newPlot('time', 'overlay', []), ids[0]));
+          page.history.group('Split', () => page.ws.addPlot(newPlot('time', 'overlay', []), ids[1]));
+          page.history.undo();
+          // A zoom, so the view history has a step back.
+          feed(page.hub);
+          await settle();
+          turnWheel(page, ids[0], -120);
+          await wait(1000);
+          if (max) page.ws.maximize([ids[0], ids[2]]);
+          if (rows) await clickOn(document.querySelector('.dock-panel tr[id^=prop-] td:last-child'));
+          if (picked.length) page.ws.selection.only(page.ws.shownIds().filter((_, i) => picked.includes(i)));
+          await settle();
+          const tab = document.querySelector(`[role=tab][data-tab="${page.ws.activeId}"]`);
+          const before = stateOf(page);
+          expect(JSON.parse(before).views, 'the view steps offered').toContain(false);
+          seen.add(`${!!page.ws.maximized} ${page.ws.selected.size > 0} ${page.ws.selection.rows.size > 0}`);
+          if (how === 'click') await clickOn(tab.querySelector('span'));
+          else {
+            tab.focus();
+            await pressKey('Enter');
+          }
+          await settle();
+          expect(stateOf(page), `${how} on the open tab`).toBe(before);
+        } finally {
+          page.dispose();
+        }
+      }),
+      withExamples([[true, [0, 1], false, 'click'], [false, [], true, 'Enter'], [true, [], true, 'click'], [false, [2], false, 'Enter']]),
+    );
+    expect([...seen].sort(), 'maximized, plots selected, rows picked').toEqual(expect.arrayContaining(['true true false', 'false false true', 'true false true']));
+  }, 300_000);
 });

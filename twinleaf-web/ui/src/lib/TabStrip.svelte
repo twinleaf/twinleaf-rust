@@ -104,6 +104,7 @@
                 role="tab"
                 tabindex={t.id === ws.activeId ? 0 : -1}
                 aria-selected={t.id === ws.activeId}
+                data-keeps-selection={t.id === ws.activeId ? '' : undefined}
                 onclick={() => ws.selectTab(t.id)}
                 ondblclick={() => startRename(t.id)}
               >

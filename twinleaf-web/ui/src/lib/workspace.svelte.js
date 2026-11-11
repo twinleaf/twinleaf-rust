@@ -16,7 +16,7 @@
 // - A maximized plot that is closed or moved to another tab leaves them, by
 //   an edit, an undo or a redo alike, and the rest stay maximized; once the
 //   last has gone, every plot shows.
-// - Opening a tab, adding a plot, arranging the tab and resetting it show
+// - Opening another tab, adding a plot, arranging the tab and resetting it show
 //   every plot; so does an undo or a redo that brings a plot into the open
 //   tab, so what it brings shows. An undo or a redo that brings none keeps
 //   the view as it is.
@@ -169,8 +169,9 @@ export class Workspace {
     return [...keys];
   }
 
-  /** Opens tab `id`, every plot of it showing and none selected. */
+  /** Opens tab `id`, every plot of it showing and none selected. Selecting the tab that is open is no change. */
   selectTab(id) {
+    if (id === this.activeId) return;
     if (this.focusedId) this.lastFocus.set(this.activeId, this.focusedId);
     this.activeId = id;
     this.#fill(null);
