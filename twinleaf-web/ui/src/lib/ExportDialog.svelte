@@ -42,6 +42,12 @@
   const PIXEL_BYTES = { png: 0.15, jpg: 0.09 };
   /** The tallest the figure shows, in CSS px. */
   const PREVIEW_HEIGHT = 340;
+  /**
+   * The most room a thumbnail takes, in CSS px. A thumbnail is its plot's
+   * picture drawn at the size it shows, of its plot's shape, not a larger
+   * one scaled down, which thins its lines away.
+   */
+  const THUMB = { w: 116, h: 96 };
 
   // What one opening exports: each plot, its copy, and what the page showed.
   let entries = $state([]);
@@ -88,7 +94,7 @@
       const { a, b } = xOf(plot.cursors, 'time');
       return [{
         id, copy, cid, traces, kind: plot.kind, on: true, title: '', yRanges: {},
-        thumb: pv ? thumbOf(plots.picture(id)) : '',
+        thumb: pv?.drawnOn ? thumbOf(id, pv.drawnOn) : null,
         screen: pv?.drawnOn ? { w: Math.round(pv.drawnOn.w), h: Math.round(pv.drawnOn.h) } : { w: 640, h: 300 },
         shows: plot.kind === 'time' ? copy.view(cid).range(openedAt) : null,
         captured: plot.kind === 'time' ? copy.view(cid).limits(perf) : null,
@@ -112,13 +118,10 @@
     entries = [];
   }
 
-  /** A small picture of `canvas`, for a thumbnail. */
-  function thumbOf(canvas) {
-    const c = document.createElement('canvas'), w = 260;
-    c.width = w;
-    c.height = Math.max(1, Math.round((canvas.height / canvas.width) * w));
-    c.getContext('2d').drawImage(canvas, 0, 0, c.width, c.height);
-    return c.toDataURL('image/png');
+  /** Page plot `id`'s thumbnail, its body `body` in CSS px: {src, w, h}, its picture at the size it shows, w by h CSS px within THUMB. */
+  function thumbOf(id, body) {
+    const k = Math.min(THUMB.w / body.w, THUMB.h / body.h);
+    return { src: plots.picture(id, { ratio: k * screenRatio }).toDataURL('image/png'), w: body.w * k, h: body.h * k };
   }
 
   /**
@@ -391,34 +394,40 @@
     return c;
   }
 
-  // The legend drags on the figure as on the plot: where it shows on the
-  // figure there is a handle, whose presses go on to the legend of the
-  // plot the figure is drawn from, at the place on that plot they land, so
-  // the plot's own drag moves it, snapping as it does there.
+  // The legend and the cursors' readout drag on the figure as on the plot:
+  // where each shows on the figure there is a handle, whose presses go on
+  // to that element of the plot the figure is drawn from, at the place on
+  // that plot they land, so the plot's own drag moves it, snapping as it
+  // does there.
   let fig = $state(null);
-  /** The legend's box on the figure, {left, top, width, height} in CSS px, or null while it shows none. */
-  let legendBox = $state(null);
+  /** What a handle stands over, by name: the plot's element it forwards to. */
+  const LAID_OVER = { legend: '.pinned-legend', readout: '.cursor-readout' };
+  /** Each handle's box on the figure, by name, {left, top, width, height} in CSS px, for those that show. */
+  let handles = $state({});
   $effect(() => {
-    if (tab !== 'image' || !fig) return void (legendBox = null);
+    if (tab !== 'image' || !fig) return void (handles = {});
     const handle = clock.every(50, () => {
-      const el = legendOf(), shown = fig.querySelector('.stage-shown');
-      if (!el || !shown) return void (legendBox = null);
-      const [r, s, f, at] = [el.getBoundingClientRect(), shown.getBoundingClientRect(), fig.getBoundingClientRect(), placeOf()];
-      const box = { left: s.left - f.left + (r.left - at.x) * scale, top: s.top - f.top + (r.top - at.y + at.top) * scale, width: r.width * scale, height: r.height * scale };
-      if (JSON.stringify(box) !== JSON.stringify(legendBox)) legendBox = box;
+      const shown = fig.querySelector('.stage-shown'), next = {};
+      for (const name of Object.keys(LAID_OVER)) {
+        const el = laidOver(name);
+        if (!el || !shown) continue;
+        const [r, s, f, at] = [el.getBoundingClientRect(), shown.getBoundingClientRect(), fig.getBoundingClientRect(), placeOf()];
+        next[name] = { left: s.left - f.left + (r.left - at.x) * scale, top: s.top - f.top + (r.top - at.y + at.top) * scale, width: r.width * scale, height: r.height * scale };
+      }
+      if (JSON.stringify(next) !== JSON.stringify(handles)) handles = next;
     });
     return () => clock.cancel(handle);
   });
-  /** The legend of the plot the figure is drawn from. */
-  const legendOf = () => fig?.querySelector('.stage-box .pinned-legend') ?? null;
+  /** The element `name` of LAID_OVER of the plot the figure is drawn from, or null. */
+  const laidOver = (name) => fig?.querySelector(`.stage-box ${LAID_OVER[name]}`) ?? null;
   /** Where the figure's plot lies: its body's top left in client px, and the room the figure's title takes above it, in CSS px. */
   const placeOf = () => {
     const body = fig.querySelector('.stage-box').getBoundingClientRect();
     return { x: body.left, y: body.top, top: figure ? bandsOf(figure, layout.width).top : 0 };
   };
-  /** Sends pointer event `e` on the handle on to the plot's legend, at the place on the plot it lands. */
-  function forward(e) {
-    const el = legendOf(), shown = fig.querySelector('.stage-shown');
+  /** Sends pointer event `e` on handle `name` on to that element of the plot, at the place on the plot it lands. */
+  function forward(name, e) {
+    const el = laidOver(name), shown = fig.querySelector('.stage-shown');
     if (!el || !shown) return;
     const s = shown.getBoundingClientRect(), at = placeOf();
     const clientX = at.x + (e.clientX - s.left) / scale, clientY = at.y + (e.clientY - s.top) / scale - at.top;
@@ -450,7 +459,7 @@
         {#each entries as e, i (e.cid)}
           <div class="thumb" class:off={!e.on} class:at={i === at}>
             <button class="pick" aria-pressed={i === at} aria-label="Show plot {i + 1}" onclick={() => (at = i)}>
-              {#if e.thumb}<img src={e.thumb} alt="" />{:else}<span class="blank"></span>{/if}
+              {#if e.thumb}<img src={e.thumb.src} alt="" style="width: {e.thumb.w}px; height: {e.thumb.h}px" />{:else}<span class="blank"></span>{/if}
               <small>{e.traces.map((t) => t.key).join(', ') || 'Empty plot'}</small>
             </button>
             <label><input type="checkbox" bind:checked={e.on} aria-label="Include plot {i + 1}" /> Plot {i + 1}</label>
@@ -462,9 +471,9 @@
         {#each current ? [{ e: current, tab }] : [] as shown (`${shown.e.cid}|${shown.tab}`)}
           <div class="fig" bind:this={fig}>
             <PlotStage host={shown.e.copy} id={shown.e.cid} width={layout.width} height={layout.height} pixelRatio={layout.ratio} {figure} {scale} {screenRatio} />
-            {#if legendBox}
-              <div class="legend-handle" role="presentation" style="left: {legendBox.left}px; top: {legendBox.top}px; width: {legendBox.width}px; height: {legendBox.height}px" onpointerdown={forward} onpointermove={forward} onpointerup={forward} onlostpointercapture={(e) => legendOf()?.dispatchEvent(new PointerEvent('lostpointercapture', { pointerId: e.pointerId }))}></div>
-            {/if}
+            {#each Object.entries(handles) as [name, box] (name)}
+              <div class="handle" data-handle={name} role="presentation" style="left: {box.left}px; top: {box.top}px; width: {box.width}px; height: {box.height}px" onpointerdown={(e) => forward(name, e)} onpointermove={(e) => forward(name, e)} onpointerup={(e) => forward(name, e)} onlostpointercapture={(e) => laidOver(name)?.dispatchEvent(new PointerEvent('lostpointercapture', { pointerId: e.pointerId }))}></div>
+            {/each}
           </div>
         {/each}
         <div class="will">
@@ -637,12 +646,19 @@
   .thumb.at { border-color: var(--primary); }
   .thumb.off { opacity: 0.45; }
   .thumb .pick { display: grid; gap: 4px; padding: 0; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; min-width: 0; outline: none; }
-  .thumb img, .thumb .blank { width: 100%; height: 44px; object-fit: contain; border-radius: 3px; display: block; background: var(--plot-bg); }
+  .thumb img { display: block; margin: 0 auto; border-radius: 3px; }
+  .thumb .blank { display: block; width: 100%; height: 44px; border-radius: 3px; background: var(--plot-bg); }
   .thumb label { font-size: 12px; display: flex; gap: 6px; align-items: center; }
   .thumb small { font: 11px var(--font-data); color: var(--muted-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .main { padding: 12px 14px 14px; display: grid; gap: 12px; min-width: 0; align-content: start; overflow-y: auto; }
   .fig { position: relative; margin: 0 auto; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; line-height: 0; max-width: 100%; }
-  .legend-handle { position: absolute; cursor: grab; touch-action: none; }
+  .handle { position: absolute; cursor: grab; touch-action: none; }
+  .insp :global(.sec.overlays) { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 10px; }
+  .insp :global(.overlay) { display: grid; gap: 6px; align-content: start; min-width: 0; }
+  .insp :global(.overlay .c) { display: flex; gap: 5px; align-items: center; flex-wrap: nowrap; }
+  .insp :global(.overlay .chips button) { padding: 2px 6px; }
+  .insp :global(.overlay .nine) { grid-template-columns: repeat(3, 12px); }
+  .insp :global(.overlay .nine button) { width: 12px; }
   .will { border: 1px solid var(--border); border-radius: 6px; overflow: auto; max-height: 172px; scrollbar-width: thin; }
   .will thead th { position: sticky; top: 0; background: var(--popover); }
   table { border-collapse: collapse; width: 100%; font-size: 12.5px; }

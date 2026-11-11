@@ -2,13 +2,17 @@
   // The export inspector's Plot tab: what belongs to the one plot picked, a
   // paused copy of it (PlotHost `copy`). Its rows are the plot's own
   // settings and commands, run on the copy, so the figure shows them as the
-  // plot would and the page's plot is left as it was: the layout, the
-  // legend and where it sits, and one list of the signals, each with its
+  // plot would and the page's plot is left as it was: the layout; the
+  // legend and, while the plot has cursors, their readout, each shown or
+  // not and where it sits, a place picked for one never putting it over the
+  // other; and one list of the signals, each with its
   // colour, its name in the legend and its unit, which shows its y axis
   // below the list: the axis's range, and its label, digits and notation,
   // the same settings as the axis's own popover. A stacked plot's signals
   // drag to reorder its lanes and its legend. The title is the image's.
-  import { setContext } from 'svelte';
+  import { flushSync, setContext } from 'svelte';
+  import { placedIn } from './cursors.js';
+  import * as clock from './clock.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
   import ColorPicker from './ColorPicker.svelte';
   import { colorOf } from './plot.js';
@@ -59,9 +63,47 @@
   }
   const shown = (v) => (v === undefined || v === null ? '' : String(+v.toPrecision(6)));
 
-  /** The legend's nine places, as [x, y, name]. */
+  /** The nine places the legend and the readout take, as [x, y, name]. */
   const PLACES = [0, 0.5, 1].flatMap((y) => [0, 0.5, 1].map((x) => [x, y, `${['Top', 'Middle', 'Bottom'][y * 2]} ${['left', 'centre', 'right'][x * 2]}`]));
-  const legendAt = $derived(plot.legendAt ?? { x: 1, y: 0 });
+  /**
+   * What the page lays over the plot that the pane places: the legend and
+   * the cursors' readout, each with its name here, the command that shows
+   * or hides it, whether it shows, its field and where it sits without one
+   * (PlotCard.svelte), the edit that moves it, and its element.
+   */
+  const OVERLAYS = {
+    legend: { name: 'Legend', command: 'legend', shown: (p) => !!p.legend, field: 'legendAt', fallback: { x: 1, y: 0 }, what: 'Move the legend', el: '.pinned-legend' },
+    readout: { name: 'Cursors', command: 'readout', shown: (p) => p.readout !== false, field: 'readoutAt', fallback: { x: 0, y: 0 }, what: 'Move the readout', el: '.cursor-readout' },
+  };
+  const atOf = (which) => plot[OVERLAYS[which].field] ?? OVERLAYS[which].fallback;
+  const hasCursors = $derived(placedIn(plot.cursors, plot.kind) > 0);
+  /** The box of overlay `which` on the copy's plot, in client px, or null while it shows none. */
+  const boxOf = (which) => copy.pv(cid)?.body.querySelector(OVERLAYS[which].el)?.getBoundingClientRect() ?? null;
+  const overlap = (a, b) => !!a && !!b && a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+  /** Lays the copy's plot out and draws it, as a frame does, so what it lays over itself is where the next frame shows it: the readout moves clear of the cursors' tags as it draws (plot.js `placeReadout`). */
+  const laidOut = () => (flushSync(), copy.renderer && copy.draw(clock.now(), { still: true }));
+  /**
+   * Puts overlay `which` at place `at`, as one edit. Where it then lies over
+   * the other one, the other moves to the place nearest its own where the
+   * two lie clear of each other, or with none, the place farthest from `at`.
+   */
+  function place(which, at) {
+    const me = OVERLAYS[which], other = which === 'legend' ? 'readout' : 'legend', o = OVERLAYS[other];
+    copy.history.group(me.what, () => {
+      copy.ws.setPlot(cid, { [me.field]: at });
+      laidOut();
+      if (!overlap(boxOf(which), boxOf(other))) return;
+      const from = atOf(other), far = (p) => Math.hypot(p[0] - at.x, p[1] - at.y);
+      const tries = PLACES.filter(([x, y]) => x !== at.x || y !== at.y).sort((a, b) => Math.hypot(a[0] - from.x, a[1] - from.y) - Math.hypot(b[0] - from.x, b[1] - from.y) || far(b) - far(a));
+      for (const [x, y] of tries) {
+        copy.ws.setPlot(cid, { [o.field]: { x, y } });
+        laidOut();
+        if (!overlap(boxOf(which), boxOf(other))) return;
+      }
+      const [x, y] = [...tries].sort((a, b) => far(b) - far(a))[0];
+      copy.ws.setPlot(cid, { [o.field]: { x, y } });
+    });
+  }
 
   /** Renames signal `key` in the legend: `name`, or its key with none. */
   function rename(key, name) {
@@ -91,20 +133,25 @@
     {/each}
   </span>
 </div>
-<div class="sec">
-  <h3>Legend</h3>
-  <div class="r">
-    <span class="chips"><button aria-pressed={!!plot.legend} data-command="legend" onclick={() => copy.commands.run('legend', { on: cid })}>Shown</button></span>
-    <span class="c">
-      {#if plot.legend}
-        <span class="nine" role="group" aria-label="Legend place">
-          {#each PLACES as [x, y, name] (name)}
-            <button aria-pressed={legendAt.x === x && legendAt.y === y} aria-label={name} onclick={() => copy.edit(cid, 'Move the legend', { legendAt: { x, y } })}></button>
-          {/each}
+<!-- The legend and, while the plot has cursors, their readout, side by side: each shown or not, and its place among nine. -->
+<div class="sec overlays">
+  {#each Object.entries(OVERLAYS) as [which, o] (which)}
+    {#if which === 'legend' || hasCursors}
+      <div class="overlay" data-overlay={which}>
+        <h3>{o.name}</h3>
+        <span class="c">
+          <span class="chips"><button aria-pressed={o.shown(plot)} aria-label="{o.name} shown" data-command={o.command} onclick={() => copy.commands.run(o.command, { on: cid })}>Shown</button></span>
+          {#if o.shown(plot)}
+            <span class="nine" role="group" aria-label="{o.name} place">
+              {#each PLACES as [x, y, name] (name)}
+                <button aria-pressed={atOf(which).x === x && atOf(which).y === y} aria-label={which === 'legend' ? name : `${o.name} ${name.toLowerCase()}`} onclick={() => place(which, { x, y })}></button>
+              {/each}
+            </span>
+          {/if}
         </span>
-      {/if}
-    </span>
-  </div>
+      </div>
+    {/if}
+  {/each}
 </div>
 <div class="sec">
   <h3>Title</h3>

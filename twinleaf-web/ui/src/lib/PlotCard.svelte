@@ -1051,8 +1051,9 @@
                signal there; then each y axis's Y1 and Y2. Column 1 is X1 or
                Y1, 2 is X2 or Y2. It floats in the plot where it was dragged
                to, as the legend does, taking none of the plot's height, and
-               its menu copies it or clears the cursors. -->
-          {#if legend.cursors}
+               its menu copies it or clears the cursors. It shows unless the
+               plot hides it, `readout` false. -->
+          {#if legend.cursors && plot.readout !== false}
             {@const c = legend.cursors}
             {@const extra = !!c.x?.rate || c.ys.some((y) => y.ratio)}
             {@const at = atOf('readoutAt', READOUT_AT)}
@@ -1151,6 +1152,7 @@
       {/if}
       <CommandItem id="addYCursors" on={plot.id} how={region.keys?.[0]} />
       <CommandItem id="clearCursors" on={plot.id} />
+      <CommandItem id="readout" on={plot.id} />
       <ContextMenu.Label>Show</ContextMenu.Label>
       <CommandItem id="setKind" on={plot.id} />
       <CommandItem id="setLayout" on={plot.id} />

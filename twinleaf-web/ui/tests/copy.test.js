@@ -388,9 +388,10 @@ describe('a picture of a paused copy', () => {
     [small.width, small.height] = [el.width, el.height];
     small.getContext('2d').drawImage(picture, 0, 0, el.width, el.height);
     const b = pixels(small);
+    // The canvas shown draws each line a device pixel wide at the least, where the picture scaled down to it thins them: they differ most there.
     let sum = 0;
     for (let i = 0; i < a.data.length; i++) sum += Math.abs(a.data[i] - b.data[i]);
-    expect(sum / a.data.length, 'the mean difference of a channel, of 255, between the canvas shown and the picture scaled to it').toBeLessThan(6);
+    expect(sum / a.data.length, 'the mean difference of a channel, of 255, between the canvas shown and the picture scaled to it').toBeLessThan(8);
   });
 
   it('holds the legend where it shows, and never the hover’s line, tip or values', async () => {

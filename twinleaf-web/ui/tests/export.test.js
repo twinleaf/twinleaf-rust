@@ -30,6 +30,7 @@ import { SAVE_KEY } from '../src/lib/tabs.js';
 import { colors } from '../src/lib/colors.svelte.js';
 import { prefs } from '../src/lib/prefs.svelte.js';
 import { exportUrl } from '../src/lib/exportfile.js';
+import { theme as themeOf } from '../src/lib/plot.js';
 
 /** Where VITE_TL_SHOTS names a folder, relative to this file, the screenshots go there. */
 const SHOTS = import.meta.env.VITE_TL_SHOTS;
@@ -38,6 +39,8 @@ const shot = async (name) => SHOTS && (await browser.screenshot({ path: `${SHOTS
 const SIGNALS = ['sine.sine', 'aux.triangle', 'aux.saw'];
 /** The mean difference of a channel, of 255, the figure shown and its file scaled to it may have. */
 const LIKENESS = 6;
+/** How far, of 255, a thumbnail's pixel may be from a trace's colour and be of it; and the least share of a thumbnail's pixels in its traces' colours. */
+const THUMB_TOLERANCE = 40, THUMB_SHARE = 0.02;
 
 let page, restore = [];
 afterEach(async () => {
@@ -59,6 +62,12 @@ async function exportPage(plots = [SIGNALS.slice(0, 2)], options = {}) {
   return plotIds(page.ws.layout);
 }
 
+/** Gives plot `id` of the page X cursors 2 s and 4 s into what it shows, as a step made before a case, so it has a readout. */
+function withCursors(id) {
+  const [t0] = page.plots.view(id).range(page.hub.now(0));
+  page.history.group('Prepare', () => page.ws.setPlot(id, { cursors: { x: { a: t0 + 2, b: t0 + 4 } } }));
+  flushSync();
+}
 const dialog = () => document.querySelector('.export-dialog[data-state=open]');
 /** The dialog's control that reads `text`, or is labelled it. */
 const control = (text) => [...dialog().querySelectorAll('button, input, select')].find((b) => b.getAttribute('aria-label') === text || b.textContent.trim() === text) ?? null;
@@ -243,7 +252,7 @@ describe('the export dialog', { timeout: 120_000 }, () => {
     const made = watchCopies(), saved = catchSaves();
     const key = SIGNALS[0];
     // Each row: what it needs first, and the change, each made through the dialog.
-    const legend = async () => (await press('Plot 1'), await press('Shown'));
+    const legend = async () => (await press('Plot 1'), await press('Legend shown'));
     const ROWS = [
       { row: 'Background', change: async () => press(control('Dark').getAttribute('aria-pressed') === 'true' ? 'White' : 'Dark') },
       { row: 'Grid', change: () => press('Grid') },
@@ -254,7 +263,7 @@ describe('the export dialog', { timeout: 120_000 }, () => {
       { row: 'Title', first: () => press('Plot 1'), change: () => fill('Title', 'A title') },
       { row: 'Layout Stacked', first: () => press('Plot 1'), change: () => press('Stacked') },
       { row: 'Layout Independent', first: () => press('Plot 1'), change: () => press('Independent') },
-      { row: 'Legend', first: () => press('Plot 1'), change: () => press('Shown') },
+      { row: 'Legend', first: () => press('Plot 1'), change: () => press('Legend shown') },
       { row: 'Legend place', first: legend, change: () => press('Bottom left') },
       { row: 'Name', first: legend, change: () => fill(`Name of ${key}`, 'Field') },
       { row: 'Colour', first: () => press('Plot 1'), change: async () => (await press(`Colour of ${key}`), await until(() => document.querySelector('.swatch-choice')), await clickOn(document.querySelectorAll('.swatch-choice')[5]), await until(() => !document.querySelector('[data-slot=popover-content]'))) },
@@ -299,7 +308,7 @@ describe('the export dialog', { timeout: 120_000 }, () => {
     await press('Image');
     await press('Plot 1');
     await press('Stacked');
-    await press('Shown');
+    await press('Legend shown');
     await drawn(copy);
     const rows = () => [...dialog().querySelectorAll('.r.sig')];
     expect(rows().every((r) => r.querySelector('.grip')), 'each signal has a grip').toBe(true);
@@ -333,10 +342,10 @@ describe('the export dialog', { timeout: 120_000 }, () => {
     const copy = made.at(-1);
     await press('Image');
     await press('Plot 1');
-    await press('Shown');
+    await press('Legend shown');
     await drawn(copy);
-    expect(await until(() => dialog().querySelector('.legend-handle')), 'a handle on the figure’s legend').toBe(true);
-    const handle = dialog().querySelector('.legend-handle'), shown = dialog().querySelector('.stage-shown').getBoundingClientRect();
+    expect(await until(() => dialog().querySelector('[data-handle=legend]')), 'a handle on the figure’s legend').toBe(true);
+    const handle = dialog().querySelector('[data-handle=legend]'), shown = dialog().querySelector('.stage-shown').getBoundingClientRect();
     const from = centre(handle), h = handle.getBoundingClientRect();
     // To the figure's bottom left, a little short of it: it snaps there.
     const to = [shown.left + h.width / 2 + 2, shown.bottom - h.height / 2 - 30];
@@ -347,6 +356,106 @@ describe('the export dialog', { timeout: 120_000 }, () => {
     expect(page.ws.plots[id].legendAt, 'the page’s plot’s legend').toBeUndefined();
     expect(control('Bottom left').getAttribute('aria-pressed'), 'the place picked among the nine').toBe('true');
     await shot('export-legend-dragged');
+  });
+
+  it('drags the cursors’ readout on the figure as on the plot, to the corner it is let go past', async () => {
+    const [id] = await exportPage();
+    withCursors(id);
+    const made = watchCopies();
+    await openExport([id]);
+    const copy = made.at(-1);
+    await press('Image');
+    await press('Plot 1');
+    await drawn(copy);
+    expect(await until(() => dialog().querySelector('[data-handle=readout]')), 'a handle on the figure’s readout').toBe(true);
+    const handle = dialog().querySelector('[data-handle=readout]'), shown = dialog().querySelector('.stage-shown').getBoundingClientRect();
+    const from = centre(handle), to = [shown.right + 20, shown.bottom + 20];
+    await commands.mouse([['move', ...from], ['down'], ...[1, 2, 3, 4, 5, 6].map((k) => ['move', from[0] + ((to[0] - from[0]) * k) / 6, from[1] + ((to[1] - from[1]) * k) / 6]), ['up']]);
+    await drawn(copy);
+    expect(copy.plot(copy.id).readoutAt, 'the copy’s readout at the bottom right').toEqual({ x: 1, y: 1 });
+    expect(copy.history.undos.at(-1)?.label, 'the plot’s own edit').toBe('Move the readout');
+    expect(page.ws.plots[id].readoutAt, 'the page’s plot’s readout').toBeUndefined();
+    expect(control('Cursors bottom right').getAttribute('aria-pressed'), 'the place picked among the nine').toBe('true');
+    await shot('export-readout-dragged');
+  });
+
+  it('shows the cursors’ readout or not, at each of its places, in the figure and the saved image, and nothing on the page', async () => {
+    const [id] = await exportPage();
+    withCursors(id);
+    const made = watchCopies(), saved = catchSaves();
+    const ROWS = [
+      { row: 'Cursors shown', change: () => press('Cursors shown') },
+      ...['top centre', 'top right', 'middle left', 'middle centre', 'middle right', 'bottom left', 'bottom centre', 'bottom right'].map((p) => ({ row: `Cursors ${p}`, change: () => press(`Cursors ${p}`) })),
+    ];
+    for (const { row, change } of ROWS) {
+      const was = pageState();
+      await openExport([id]);
+      await press('Image');
+      await press('Plot 1');
+      await drawn(made.at(-1));
+      const [before] = await saveAll(saved);
+      await openExport([id]);
+      await press('Image');
+      await press('Plot 1');
+      await drawn(made.at(-1));
+      const shownBefore = preview();
+      await change();
+      await drawn(made.at(-1));
+      const shownAfter = preview();
+      if (row === 'Cursors bottom centre') await shot('export-readout-place');
+      const [after] = await saveAll(saved);
+      expect(meanDiff(shownBefore, shownAfter), `${row}: the figure changed`).toBeGreaterThan(0.02);
+      const [a, b] = [await decoded(before.blob), await decoded(after.blob)];
+      expect(meanDiff(scaledTo(a, a.width, a.height), scaledTo(b, a.width, a.height)), `${row}: the saved image changed`).toBeGreaterThan(0.02);
+      expect(pageState(), `${row}: the page as it was`).toEqual(was);
+    }
+  });
+
+  it('never puts the legend and the readout over each other by their pickers', async () => {
+    const [id] = await exportPage();
+    withCursors(id);
+    const made = watchCopies();
+    await openExport([id]);
+    const copy = made.at(-1);
+    await press('Image');
+    await press('Plot 1');
+    await press('Legend shown');
+    await drawn(copy);
+    const NAMES = ['top left', 'top centre', 'top right', 'middle left', 'middle centre', 'middle right', 'bottom left', 'bottom centre', 'bottom right'];
+    const box = (sel) => dialog().querySelector(`.stage-box ${sel}`).getBoundingClientRect();
+    const place = fc.constantFrom(...NAMES);
+    // The same place for both, picked in either order, among the cases.
+    const examples = [['top left', 'top left', true], ['top right', 'top right', false], ['middle centre', 'middle centre', true]];
+    await fc.assert(
+      fc.asyncProperty(place, place, fc.boolean(), async (legend, readout, legendLast) => {
+        const picks = legendLast ? [`Cursors ${readout}`, legend[0].toUpperCase() + legend.slice(1)] : [legend[0].toUpperCase() + legend.slice(1), `Cursors ${readout}`];
+        for (const p of picks) await press(p);
+        await drawn(copy);
+        const [l, r] = [box('.pinned-legend'), box('.cursor-readout')];
+        const over = l.left < r.right && r.left < l.right && l.top < r.bottom && r.top < l.bottom;
+        expect(over, `legend ${legend}, readout ${readout}, ${legendLast ? 'the legend' : 'the readout'} picked last: one over the other`).toBe(false);
+        // The one picked last is where it was picked.
+        const last = legendLast ? copy.plot(copy.id).legendAt : copy.plot(copy.id).readoutAt, name = legendLast ? legend : readout;
+        const [y, x] = name.split(' ');
+        expect(last, `${name} picked last, where it was picked`).toEqual({ x: { left: 0, centre: 0.5, right: 1 }[x], y: { top: 0, middle: 0.5, bottom: 1 }[y] });
+      }),
+      { examples, numRuns: examples.length + fc.readConfigureGlobal().numRuns },
+    );
+    expect(page.ws.plots[id].legendAt ?? null, 'the page’s legend').toBe(null);
+    await shot('export-legend-and-readout');
+    // Side by side in one row at the inspector's narrowest, in a 900 by 600 window, each column within it.
+    await browser.viewport(900, 600);
+    await settle(8);
+    const insp = dialog().querySelector('.insp').getBoundingClientRect(), cols = [...dialog().querySelectorAll('.overlay')].map((c) => c.getBoundingClientRect());
+    expect(cols.length, 'the legend and the cursors').toBe(2);
+    expect(Math.abs(cols[0].top - cols[1].top), 'in one row').toBeLessThan(1);
+    for (const [i, c] of cols.entries()) expect(c.left >= insp.left && c.right <= insp.right, `column ${i + 1} within the inspector`).toBe(true);
+    for (const c of dialog().querySelectorAll('.overlay')) {
+      expect(c.scrollWidth, 'nothing cut in a column').toBeLessThanOrEqual(c.clientWidth);
+      const [chip, nine] = [c.querySelector('.chips').getBoundingClientRect(), c.querySelector('.nine').getBoundingClientRect()];
+      expect(nine.top < chip.bottom && chip.top < nine.bottom, 'Shown and the places on one line, so the row is no taller than the legend’s alone').toBe(true);
+    }
+    await shot('export-legend-and-readout-900x600');
   });
 
   it('saves an image of width × height × resolution pixels, the figure shown, finer', async () => {
@@ -532,6 +641,33 @@ describe('the export dialog', { timeout: 120_000 }, () => {
     expect(await until(() => written.length === 2), 'copied from the menu').toBe(true);
   });
 
+  it('shows each plot’s thumbnail with its traces plain to see, light and dark', async () => {
+    const ids = await exportPage([SIGNALS.slice(0, 2), [SIGNALS[2]]]);
+    const shares = [];
+    for (const theme of ['light', 'dark']) {
+      prefs.setTheme(theme);
+      restore.push(() => prefs.setTheme('system'));
+      await settle(6);
+      await openExport(ids);
+      const look = themeOf(theme === 'dark');
+      for (const [i, img] of [...dialog().querySelectorAll('.thumb img')].entries()) {
+        await until(() => img.complete && img.naturalWidth > 0);
+        const c = document.createElement('canvas');
+        [c.width, c.height] = [img.naturalWidth, img.naturalHeight];
+        c.getContext('2d').drawImage(img, 0, 0);
+        const p = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+        const keys = page.ws.plots[ids[i]].items.map((it) => it.key), traces = keys.map((k) => look.tracesRgba[colors.of(k)].map((v) => Math.round(v * 255)));
+        let hit = 0;
+        for (let j = 0; j < p.length; j += 4) if (traces.some(([r, g, b]) => Math.abs(p[j] - r) <= THUMB_TOLERANCE && Math.abs(p[j + 1] - g) <= THUMB_TOLERANCE && Math.abs(p[j + 2] - b) <= THUMB_TOLERANCE)) hit++;
+        shares.push(`${theme} ${i + 1}: ${((100 * hit) / (c.width * c.height)).toFixed(2)}%`);
+        expect.soft(hit / (c.width * c.height), `${theme}, plot ${i + 1}: the share of its pixels in its traces' colours`).toBeGreaterThan(THUMB_SHARE);
+      }
+      await shot(`export-thumbs-${theme}`);
+      await pressKey('Escape');
+      await until(() => !document.querySelector('.export-dialog'));
+    }
+  });
+
   it('looks like the agreed design, light and dark', async () => {
     const ids = await exportPage([SIGNALS, [SIGNALS[2]]]);
     for (const theme of ['light', 'dark']) {
@@ -548,7 +684,7 @@ describe('the export dialog', { timeout: 120_000 }, () => {
         await settle(8);
         await shot(`export-${theme}-image-${layout.toLowerCase()}`);
       }
-      await press('Shown');
+      await press('Legend shown');
       await press(`Axis of ${SIGNALS[1]}`);
       await settle(8);
       await shot(`export-${theme}-image-plot-axis`);

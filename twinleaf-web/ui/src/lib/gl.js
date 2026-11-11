@@ -302,7 +302,8 @@ export class Renderer {
     gl.uniform2f(this.u.uOrigin, x0 - base, y0);
     gl.uniform2f(this.u.uScale, 2 / (x1 - x0), 2 / (y1 - y0));
     gl.uniform2f(this.u.uViewport, g.w, g.h);
-    gl.uniform1f(this.u.uWidth, width * this.dpr);
+    // Never thinner than a device pixel, so a picture drawn small keeps its lines whole.
+    gl.uniform1f(this.u.uWidth, Math.max(1, width * this.dpr));
     gl.uniform4f(this.u.uColor, ...color);
     return true;
   }

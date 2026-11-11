@@ -72,7 +72,7 @@
 // signal. `svc` is the page's services, as `commands` takes them.
 import { common, counted } from './menus.js';
 import { axisSlots, cursorText } from './plot.js';
-import { withX } from './cursors.js';
+import { placedIn, withX } from './cursors.js';
 import { nearestPeak, peaks, stepPeak } from './snap.js';
 import { chip } from './tabs.js';
 import { ARRANGEMENTS, KINDS, MODES, kindLabel } from './constants.js';
@@ -92,6 +92,7 @@ import RiLegend from '@lucide/svelte/icons/list';
 import RiCopy from '@lucide/svelte/icons/clipboard-copy';
 import RiExport from '@lucide/svelte/icons/file-down';
 import RiImage from '@lucide/svelte/icons/image';
+import RiReadout from '@lucide/svelte/icons/table-2';
 import RiXCursors from '@lucide/svelte/icons/separator-vertical';
 import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
 import RiEraser from '@lucide/svelte/icons/eraser';
@@ -582,6 +583,16 @@ export const COMMANDS = [
       return n ? `${n} placed` : null;
     },
     run: (ctx) => void ctx.svc.cursors.clear(ids(ctx)),
+  },
+  {
+    // The cursors' readout shown or hidden on every plot it acts on, as the lead plot's turns; a menu has its row while the lead plot has cursors placed.
+    id: 'readout', scope: 'plot', palette: 'Plots',
+    icon: RiReadout, label: (ctx) => (ctx.lead?.plot.readout === false ? 'Show the readout' : 'Hide the readout'),
+    when: (ctx) => !!ctx.lead && placedIn(ctx.lead.plot.cursors, ctx.lead.plot.kind) > 0,
+    run: (ctx) => {
+      const on = ctx.lead.plot.readout === false;
+      ctx.svc.edit(ids(ctx), on ? 'Show the readout' : 'Hide the readout', () => ({ readout: on ? undefined : false }));
+    },
   },
   {
     // A menu has its row on a plot with an X cursor placed.

@@ -10,7 +10,9 @@
 // places an independent plot's axes, signal key to 'left', 'right' or
 // 'none' (plot.js axisSlots). `cursors` holds the plot's X and Y cursors,
 // {x, f, y} as cursors.js lays them out, and is absent while none is
-// placed. `yFormat` holds each y axis's label, digits and notation, by its
+// placed; `readout` is false while the cursors' readout is hidden, and
+// `readoutAt` where it was dragged, a share as `legendAt` is, top left when
+// absent. `yFormat` holds each y axis's label, digits and notation, by its
 // range key ('shared', or the signal key of an axis of its own), and
 // `xFormat` a spectrum's frequency axis's digits and notation, each as
 // units.js `axisFormat` reads them, a setting absent at Auto. `layout` is
