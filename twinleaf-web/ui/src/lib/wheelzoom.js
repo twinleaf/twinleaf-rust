@@ -52,16 +52,18 @@ export const STILL = Object.freeze({ at: [], acc: 0, dir: 0 });
 /**
  * A turn of `dy` px, positive out, at page time `now` ms, of `wheel`: the
  * wheel after it, the steps it makes along `ladder`, and whether it turned
- * the other way from the turn before. A turn the other way starts its
- * steps afresh, and so does one after the wheel was still for RATE_MS.
+ * the other way from the turn before. The px short of a step are kept for
+ * the turns after, however long the wheel is still; a turn the other way
+ * drops them and starts its steps afresh. A turn of no px keeps the way
+ * the wheel turned last.
  */
 export function turn(wheel, dy, now) {
   const at = [...wheel.at.filter((t) => now - t < RATE_MS), now];
   const dir = Math.sign(dy) || wheel.dir;
   const reversed = wheel.dir !== 0 && dir !== wheel.dir;
-  let acc = (reversed || at.length === 1 ? 0 : wheel.acc) + dy;
-  const steps = Math.trunc(acc / NOTCH_PX) + 0;
-  acc -= steps * NOTCH_PX;
+  let acc = (reversed ? 0 : wheel.acc) + dy, steps = 0;
+  // A notch's worth at a time.
+  for (; Math.abs(acc) >= NOTCH_PX; acc -= Math.sign(acc) * NOTCH_PX) steps += Math.sign(acc);
   return { wheel: { at, acc, dir }, steps, ladder: ladderOf(at.length), reversed };
 }
 

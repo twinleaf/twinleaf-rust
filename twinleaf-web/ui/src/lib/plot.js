@@ -634,11 +634,13 @@ export class PlotView {
     z.frame ??= clock.frame(step);
   }
 
-  /** Ends the wheel's ease of time where it has reached. */
+  /** Ends the wheel's ease of time where it has reached. The wheel keeps what it turned short of a step. */
   stopTime() {
-    if (!this.timeZoom) return;
-    clock.cancel(this.timeZoom.frame);
-    this.timeZoom = null;
+    const z = this.timeZoom;
+    if (!z) return;
+    clock.cancel(z.frame);
+    z.frame = null;
+    z.eases.clear();
   }
 
   /** The plot's GPU slot for trace `t`, which holds its window, or, by `variant`, its spectrum drawn in a pair of scales. */

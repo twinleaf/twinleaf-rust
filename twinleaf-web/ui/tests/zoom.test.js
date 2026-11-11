@@ -18,13 +18,15 @@
 // fine spans, a few in quick succession middling ones, and a spin clock
 // spans, each sequence ending on the span the rule says in the frames the
 // ease takes; a trackpad's stream of small turns and its momentum tail
-// step the same way and never past where they end; a turn the other way
+// step the same way and never past where they end; the px short of a step
+// stay for the next turn, however long the wheel is still and across a
+// press on the plot, until a turn the other way; a turn the other way
 // mid-ease turns the span round at the next frame; at the limit the ease
 // ends there; a burst is one step for Back; Shift's y zoom does not ease.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { easing, feed, frames, holdHistory, leafOf, mountPage, settle, turnWheel, turnWheelToRest, wait, wheelRest, withExamples } from './harness/page.js';
+import { clickOn, easing, feed, frames, holdHistory, leafOf, mountPage, settle, turnWheel, turnWheelToRest, wait, wheelRest, withExamples } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { GONE, IDLE_MS } from '../src/lib/viewhistory.svelte.js';
@@ -206,8 +208,10 @@ describe('the wheel over a time plot', () => {
   const restFrames = (from, to) => Math.max(1, Math.ceil((EASE_MS * Math.log(Math.max(1, Math.abs(Math.log(from / to)) / REST))) / clock.FRAME_MS));
   /** Whether `spans` never turn back against `dir`. */
   const onward = (spans, dir) => spans.every((s, i) => !i || (s - spans[i - 1]) * dir >= 0);
-  /** Plot `id` paused at `span` s on a hub holding an hour, drawn, its wheel still and its last view step over. */
+  /** Plot `id` paused at `span` s on a hub holding an hour, drawn, its wheel still with nothing turned short of a step, and its last view step over. */
   async function pausedAt(span) {
+    page.pv(id).stopTime();
+    page.pv(id).timeZoom = null;
     view.follow(true);
     view.setSpan(span);
     holdHistory(page, { history: 3600 });
@@ -289,6 +293,31 @@ describe('the wheel over a time plot', () => {
     expect(onward(spans, 1)).toBe(true);
     const last = steps.at(-1), before = spans[last - 1];
     expect(spans.indexOf(20) - last + 1, 'frames from the last step to rest').toBe(restFrames(before, 20));
+  }, 60_000);
+
+  it('keeps the px turned short of a step, across a still wheel and a press on the plot, until a turn the other way', async () => {
+    await pausedAt(10);
+    turnWheel(page, id, 60);
+    await wheelRest(page, id);
+    expect(view.span, 'short of a step').toBe(10);
+    await wait(RATE_MS + 100);
+    turnWheel(page, id, 60);
+    await wheelRest(page, id);
+    expect(view.span, 'with the 60 px before, a step, a fine one as the wheel was still').toBe(11);
+    // 20 px over the step, kept across a press on the plot.
+    await wait(RATE_MS + 100);
+    await clickOn(leafOf(id).querySelector('.plot-body canvas'));
+    await settle();
+    turnWheel(page, id, 80);
+    await wheelRest(page, id);
+    expect(view.span, 'with the 20 px over, a step').toBe(12);
+    // A turn the other way starts afresh.
+    turnWheel(page, id, 60);
+    await wheelRest(page, id);
+    await wait(RATE_MS + 100);
+    turnWheel(page, id, -110);
+    await wheelRest(page, id);
+    expect(view.span, '110 px in, the 60 out dropped: a step in').toBe(11);
   }, 60_000);
 
   it('turns round at the next frame for a turn the other way mid-ease, from the span it shows', async () => {

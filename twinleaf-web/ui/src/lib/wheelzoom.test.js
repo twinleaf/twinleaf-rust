@@ -146,19 +146,21 @@ describe('the wheel’s steps', () => {
     );
   });
 
-  it('add up a trackpad’s small turns, a step for each notch’s worth, and start afresh when it turns the other way', () => {
+  it('add up a trackpad’s small turns, a step for each notch’s worth however long the wheel is still between them, and start afresh when it turns the other way', () => {
     fc.assert(
-      fc.property(fc.array(fc.integer({ min: 1, max: 30 }), { minLength: 1, maxLength: 60 }), (dys) => {
-        let w = STILL, steps = 0;
-        dys.forEach((dy, i) => {
-          const r = turn(w, dy, i * 16);
+      fc.property(fc.array(fc.record({ dy: fc.integer({ min: 1, max: 30 }), gap: fc.constantFrom(16, RATE_MS - 1, RATE_MS, 5_000) }), { minLength: 1, maxLength: 60 }), (turns) => {
+        let w = STILL, steps = 0, t = 0;
+        for (const { dy, gap } of turns) {
+          const r = turn(w, dy, (t += gap));
           w = r.wheel;
           steps += r.steps;
-        });
-        const sum = dys.reduce((a, b) => a + b, 0);
+        }
+        const sum = turns.reduce((a, b) => a + b.dy, 0);
         expect(steps).toBe(Math.trunc(sum / NOTCH_PX));
-        expect(turn(w, -1, dys.length * 16)).toMatchObject({ reversed: true, steps: 0 });
+        expect(turn(w, -1, t + 16)).toMatchObject({ reversed: true, steps: 0 });
       }),
+      // Short of a step, a still wheel, and the rest of the step.
+      { examples: [[[{ dy: 30, gap: 16 }, { dy: 30, gap: 16 }, { dy: 30, gap: 16 }, { dy: 20, gap: 5_000 }]]] },
     );
   });
 
