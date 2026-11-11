@@ -1172,7 +1172,7 @@
 <Toasts />
 <KeysDialog bind:open={keysOpen} />
 <ExportDialog bind:what={exporting} />
-<CommandPalette bind:open={paletteOpen} session={hub.session} {ws} {act} />
+<CommandPalette bind:open={paletteOpen} session={hub.session} {ws} {act} devices={checked} />
 
 <AlertDialog.Root open={!!closing} onOpenChange={(o) => !o && (closing = null)}>
   <AlertDialog.Content>

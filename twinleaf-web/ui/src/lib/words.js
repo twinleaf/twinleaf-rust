@@ -4,7 +4,8 @@
 // right after a write; the notice of a
 // Revert, which says what it put back and what it left; the report of a
 // run; the question a run of several actions asks first; and the edit
-// bar's labels. A notice is one function of what came back, each device's
+// bar's and the command palette's labels, and why a value typed cannot be
+// written. A notice is one function of what came back, each device's
 // outcome (writes.svelte.js): {level, text, detail}, `detail` the lines
 // under the text.
 //
@@ -160,6 +161,30 @@ export const OFF = 'Off';
 export const writeTo = (n) => `Write to ${count(n, 'device', 'devices')}`;
 export const runOn = (n) => `Run on ${count(n, 'device', 'devices')}`;
 export const runSeveral = (n) => `Run ${n}…`;
+/** The command palette's read of a property, on `n` devices. */
+export const readFrom = (n) => `Read from ${count(n, 'device', 'devices')}`;
+/** How many devices a property's call reaches, as the edit bar says it. */
+export const reach = (n) => count(n, 'device', 'devices');
+
+// Why a value typed cannot be written (editbar.js `checkValue`).
+/** Text that is no whole number for integer type `type`, of range `lo` to `hi`. */
+export const notWhole = (type, lo, hi) => `Not a whole number: ${type} takes ${lo} to ${hi}`;
+/** Whole number `text` outside the range `lo` to `hi` of `type`. */
+export const outOfRange = (text, type, lo, hi) => `${text} is out of range: ${type} takes ${lo} to ${hi}`;
+/** Text that is no number for float type `type`. */
+export const notNumber = (type) => `Not a number: ${type} takes a number, as 1.5 or 2e-3`;
+/** Text that is no switch value. */
+export const NOT_BOOL = 'Not true or false: bool takes true or false';
+/** Text of `len` bytes, longer than the `max` that `type` holds. */
+export const tooLong = (type, max, len) => `Too long: ${type} takes at most ${max} bytes, not ${len}`;
+/** Text that is not hex digits in pairs, for bytes type `type`. */
+export const notHex = (type) => `Not hex: ${type} takes hex digits in pairs, as 0aff`;
+/** Hex of the wrong length for `type`, which takes `n` bytes. */
+export const wrongLength = (type, n) => `${type} takes ${n} bytes, as ${2 * n} hex digits`;
+/** Text typed for an action, which takes none. */
+export const NO_ARGUMENT = 'An action takes no value: Enter runs it';
+/** Text typed for property `name`, which only reads. */
+export const readOnly = (name) => `${name} is read-only: Enter reads it`;
 
 /**
  * The question lowering a History limit asks first, of what it drops

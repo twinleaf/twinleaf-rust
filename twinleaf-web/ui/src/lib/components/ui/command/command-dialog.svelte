@@ -10,6 +10,7 @@
 		description = "Search for a command to run...",
 		showCloseButton = false,
 		portalProps,
+		onEscapeKeydown,
 		children,
 		class: className,
 		...restProps
@@ -25,6 +26,7 @@
 		class={cn("rounded-xl! top-1/3 translate-y-0 overflow-hidden p-0", className)}
 		{showCloseButton}
 		{portalProps}
+		{onEscapeKeydown}
 	>
 		<Command {...restProps} bind:value bind:ref {children} />
 	</Dialog.Content>

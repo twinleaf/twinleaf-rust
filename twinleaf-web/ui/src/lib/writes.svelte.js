@@ -233,17 +233,29 @@ export class DeviceWrites {
 
   /** Reads `name` from each of `devices` that shows no value of it, as announcements keep only some entries. */
   readMissing(name, devices) {
-    for (const d of devices) {
-      if (this.valueOf(d, name) !== undefined) continue;
-      const c = this.#now();
-      this.hub
-        .read(d.route, [name])
-        .then((reply) => {
-          const got = reply.values[name];
-          if (got?.state === 'ok') c.reads.set(key(d.route, name), got.value);
-        })
-        .catch(() => {});
-    }
+    this.read(name, devices.filter((d) => this.valueOf(d, name) === undefined));
+  }
+
+  /**
+   * Reads `name` afresh from each of `devices`, keeping each value read for
+   * its cell, and gives each device's answer, {device, state, value,
+   * error}: `state` ok, error, or unknown when no answer came.
+   */
+  read(name, devices) {
+    if (!devices.length) return Promise.resolve([]);
+    const c = this.#now();
+    return Promise.all(
+      devices.map((d) =>
+        this.hub.read(d.route, [name]).then(
+          (reply) => {
+            const got = reply.values[name];
+            if (got?.state === 'ok') c.reads.set(key(d.route, name), got.value);
+            return { device: d, state: got?.state ?? 'unknown', value: got?.value, error: got?.error ?? 'no value came back' };
+          },
+          (error) => ({ device: d, state: 'unknown', error: error.message }),
+        ),
+      ),
+    );
   }
 
   /** Starts a write or Revert: the one before it loses its Revert and its claim on the notice. */

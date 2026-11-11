@@ -7,7 +7,7 @@
 // several actions keep their order; rows that only show have no bar.
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { editBar } from './editbar.js';
+import { checkValue, editBar, typeProblem } from './editbar.js';
 import { mergeRows } from './properties.js';
 
 const DECLS = {
@@ -93,5 +93,40 @@ describe('the edit bar', () => {
       },
     );
     for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
+  });
+});
+
+describe('a value typed for a type', () => {
+  const INTS = ['u8', 'u16', 'u32', 'u64', 'i8', 'i16', 'i32', 'i64'];
+  const range = (type) => {
+    const bits = BigInt(type.slice(1));
+    return type[0] === 'i' ? [-(1n << (bits - 1n)), (1n << (bits - 1n)) - 1n] : [0n, (1n << bits) - 1n];
+  };
+  it('takes a whole number in its type’s range and no other, saying why', () => {
+    fc.assert(
+      fc.property(fc.constantFrom(...INTS), fc.bigInt({ min: -(1n << 70n), max: 1n << 70n }), fc.constantFrom('', '+', '.5', 'x', ' '), (type, v, junk) => {
+        const [lo, hi] = range(type), text = String(v);
+        expect(typeProblem(type, text) === null, `${text} as ${type}`).toBe(v >= lo && v <= hi);
+        if (v < lo || v > hi) expect(typeProblem(type, text)).toContain('out of range');
+        if (junk && junk !== '+') expect(typeProblem(type, text + junk)).toContain('Not a whole number');
+      }),
+      { examples: [['u8', 255n, ''], ['u8', 256n, ''], ['u8', -1n, ''], ['i8', -128n, ''], ['i8', -129n, ''], ['u64', (1n << 64n) - 1n, 'x']] },
+    );
+  });
+  it('takes a number for a float, true or false for a bool, text within its length, and hex in pairs', () => {
+    for (const [type, text, ok] of [
+      ['f32', '1.5', true], ['f32', '-2e-3', true], ['f64', '.5', true], ['f64', 'inf', true], ['f32', 'NaN', true], ['f32', '1,5', false], ['f32', '', false], ['f64', '0x10', false],
+      ['bool', 'true', true], ['bool', 'false', true], ['bool', 'True', false], ['bool', '1', false],
+      ['string', 'anything at all', true], ['string<3>', 'abc', true], ['string<3>', 'abcd', false], ['string<3>', 'é', true], ['string<1>', 'é', false],
+      ['bytes', '0aFF', true], ['bytes', '0a1', false], ['bytes', 'zz', false], ['bytes<2>', '0aff', true], ['bytes<2>', '0a', false],
+      ['capture', 'whatever', true], [null, 'whatever', true],
+    ]) expect(typeProblem(type, text) === null, `${text} as ${type}`).toBe(ok);
+  });
+  it('checks each device’s entry by its own type, on the devices a write reaches', () => {
+    const devices = ['/0', '/1'].map((route) => ({ route, table: { rpcs: [{ name: 'gain', type: route === '/0' ? 'u16' : 'u8', access: ['read', 'write'], channel: 'setting' }] } }));
+    const rows = mergeRows(devices);
+    expect(checkValue(rows, devices, '300')).toContain('u8 takes 0 to 255');
+    expect(checkValue(rows, [devices[0]], '300')).toBe(null);
+    expect(checkValue(rows, devices, '200')).toBe(null);
   });
 });

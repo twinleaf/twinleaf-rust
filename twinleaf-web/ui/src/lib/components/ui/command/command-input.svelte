@@ -8,6 +8,7 @@
 		ref = $bindable(null),
 		class: className,
 		value = $bindable(""),
+		before,
 		...restProps
 	} = $props();
 </script>
@@ -29,6 +30,7 @@
 		</CommandPrimitive.Input>
 		<InputGroup.Addon>
 			<SearchIcon class="size-4 shrink-0 opacity-50" />
+			{@render before?.()}
 		</InputGroup.Addon>
 	</InputGroup.Root>
 </div>

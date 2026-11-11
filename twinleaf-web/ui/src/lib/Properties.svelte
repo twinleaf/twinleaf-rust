@@ -42,7 +42,7 @@
   import { Input } from '$lib/components/ui/input/index.js';
   import Tip from './Tip.svelte';
   import { controlOf, deviceLabel, isButtons, isFavorites, mergeRows, panelRows, sameShown, writersOf } from './properties.js';
-  import { editBar, kindOf } from './editbar.js';
+  import { checkValue, editBar, kindOf } from './editbar.js';
   import { counted } from './menus.js';
   import { writeTables } from './copy.js';
   import { toast } from './toast.svelte.js';
@@ -177,6 +177,8 @@
     lastEdit = names;
     draft = untrack(filled);
   });
+  /** Why what is typed cannot be written to the bar's rows (editbar.js `checkValue`), or null. */
+  const problem = $derived(bar && !switching && draft.trim() !== '' && bar.kind !== 'kinds' && bar.kind !== 'actions' && bar.control !== 'action' ? checkValue(bar.rows, devices, draft.trim()) : null);
   /** Writes `text` to every row of the bar, on the devices a write of each reaches. */
   const writeBar = (text) => writes.write(bar.rows.map((r) => ({ name: r.name, devices: writersOf(r, devices) })), text, switching);
   /** Runs actions `names` in order, each on every device that has it. */
@@ -271,7 +273,7 @@
   function editorKey(e) {
     if (e.key === 'Enter' && bar && draft.trim() !== '') {
       e.preventDefault();
-      writeBar(draft.trim());
+      if (!problem) writeBar(draft.trim());
     } else escapeTyped(e, draft, filled(), () => (draft = filled()));
   }
 </script>
@@ -418,7 +420,7 @@
 {#if bar && !(buttons && bar.rows.length < 2)}
   {@const n = bar.reach.length}
   <!-- The bar acts on the rows picked, so a press in it keeps them, as one among the rows does. -->
-  <div class="write-bar" class:several={bar.rows.length > 1} data-rows>
+  <div class="write-bar" class:several={bar.rows.length > 1} class:problem={!!problem} data-rows>
     <span class="wname" title={bar.detail ?? bar.label}>{bar.label}</span>
     {#if bar.kind === 'kinds'}
       <span class="reach">{bar.hint}</span>
@@ -436,9 +438,11 @@
         bind:value={draft}
         placeholder={differ ? words.MIXED : (bar.rows[0].rpc.type ?? '')}
         aria-label="New value of {bar.label}"
+        aria-invalid={problem ? 'true' : undefined}
         onkeydown={editorKey}
       />
-      <Button size="xs" variant="outline" disabled={!n || draft.trim() === ''} onclick={() => writeBar(draft.trim())}>{words.writeTo(n)}</Button>
+      <Button size="xs" variant="outline" disabled={!n || draft.trim() === '' || !!problem} onclick={() => writeBar(draft.trim())}>{words.writeTo(n)}</Button>
+      {#if problem}<span class="why" role="alert">{problem}</span>{/if}
     {/if}
   </div>
 {/if}

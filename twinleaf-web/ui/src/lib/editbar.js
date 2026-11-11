@@ -7,6 +7,13 @@
 // of one type, or actions. Rows of several kinds edit nothing, and say
 // so. Rows that only show a value have no bar. What the bar says is
 // words.js's.
+//
+// A value typed is checked against the type of each device's entry before
+// anything is written (`checkValue`), as the hub reads it
+// (twinleaf/src/session/rpc/value.rs `parse`): a whole number in its
+// type's range, a number, true or false, text within its length, or hex
+// digits in pairs. A type the table names no rule for is left to the hub,
+// which refuses what it cannot take.
 
 import { controlOf, sameShown, switchOf, writersOf } from './properties.js';
 import * as words from './words.js';
@@ -60,4 +67,48 @@ export function editBar(rows, devices, valueOf) {
   if (kind === 'action') return { kind: 'actions', label: words.actions(rows.length), rows, reach };
   const shared = values.length && values.every((v) => sameShown(v, values[0])) ? values[0] : undefined;
   return { kind: 'values', label: words.values(rows.length, kind.slice(6)), rows, reach, shared };
+}
+
+const INT = /^([ui])(8|16|32|64)$/;
+const FLOAT = /^f(32|64)$/;
+const FLOAT_TEXT = /^[+-]?(inf|infinity|nan|(\d+\.?\d*|\.\d+)(e[+-]?\d+)?)$/i;
+const SIZED = /^(string|bytes)(?:<(\d+)>)?$/;
+
+/** Why `text` is no value of type `type`, as words.js says it, or null when it is one, or when `type` has no rule here. */
+export function typeProblem(type, text) {
+  const int = INT.exec(type ?? '');
+  if (int) {
+    // A negative number for an unsigned type is out of its range.
+    const signed = int[1] === 'i', bits = BigInt(int[2]);
+    const lo = signed ? -(1n << (bits - 1n)) : 0n, hi = signed ? (1n << (bits - 1n)) - 1n : (1n << bits) - 1n;
+    if (!/^[+-]?\d+$/.test(text)) return words.notWhole(type, lo, hi);
+    const v = BigInt(text.replace(/^\+/, ''));
+    return v < lo || v > hi ? words.outOfRange(text, type, lo, hi) : null;
+  }
+  if (FLOAT.test(type ?? '')) return FLOAT_TEXT.test(text) ? null : words.notNumber(type);
+  if (type === 'bool') return text === 'true' || text === 'false' ? null : words.NOT_BOOL;
+  const sized = SIZED.exec(type ?? '');
+  if (!sized) return null;
+  const n = sized[2] === undefined ? null : Number(sized[2]);
+  if (sized[1] === 'string') {
+    const len = new TextEncoder().encode(text).length;
+    return n !== null && len > n ? words.tooLong(type, n, len) : null;
+  }
+  if (!/^([0-9a-f]{2})*$/i.test(text)) return words.notHex(type);
+  return n !== null && text.length !== 2 * n ? words.wrongLength(type, n) : null;
+}
+
+/**
+ * Why `text` cannot be written to `rows` on `devices`, or null when it
+ * can: the first problem of its type on a device a write of a row reaches,
+ * each device's entry checked by its own type.
+ */
+export function checkValue(rows, devices, text) {
+  for (const r of rows) {
+    for (const d of writersOf(r, devices)) {
+      const problem = typeProblem(r.entries.get(d.route).type, text);
+      if (problem) return problem;
+    }
+  }
+  return null;
 }

@@ -142,7 +142,7 @@ describe.each(OWNED)('$what', ({ owner, writes, once }) => {
 /** The one module that listens for keys. */
 const KEY_ROUTER = 'lib/keyrouter.js';
 /** What a text field is: what is typed into. */
-const FIELDS = ['input', 'Input', 'textarea'];
+const FIELDS = ['input', 'Input', 'textarea', 'Command.Input'];
 /** A key event's handler as an attribute, and a key event named to listen for. */
 const KEY_ATTRIBUTE = /^onkey(down|up|press)(capture)?$/, KEY_LISTENED = /['"`]key(down|up|press)['"`]/;
 

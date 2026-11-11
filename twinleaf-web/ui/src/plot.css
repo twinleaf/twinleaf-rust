@@ -648,6 +648,9 @@ label > [data-slot=checkbox]::after { content: none; }
 /* Several rows' label stays whole, what they are and their state, and the controls go under it when the panel is narrow. */
 .write-bar.several { flex-wrap: wrap; }
 .write-bar.several .wname { flex: 1 0 auto; }
+/* Why a value typed cannot be written, on a line of its own under the controls. */
+.write-bar.problem { flex-wrap: wrap; }
+.write-bar .why { flex: 1 0 100%; color: var(--destructive); }
 
 /* The device writes' notice, drawn as Sonner draws the page's other notices, and the lines under any notice's text. */
 [data-sonner-toast] [data-description] { white-space: pre-line; }
