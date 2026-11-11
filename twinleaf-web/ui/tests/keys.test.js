@@ -20,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { OPEN, centre, clickOn, editCursors, emptySpots, feed, focusPage, frames, headerSpot, leafOf, mountPage, plotMenu, pressKey, quietApi, settle, until, withExamples, withYPair } from './harness/page.js';
+import { OPEN, centre, clickOn, closeAll, editCursors, emptySpots, feed, focusPage, frames, headerSpot, leafOf, mountPage, plotMenu, pressKey, quietApi, settle, until, withExamples, withYPair } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { cursorOf, page as tree } from '../src/lib/focus.js';
 import { ORDER, lastKey } from '../src/lib/keyrouter.js';
@@ -343,4 +343,59 @@ describe('Space on a button', () => {
     expect(where.size).toBeGreaterThan(3);
     expect(seen.button).toBeGreaterThan(0);
   }, 600_000);
+
+  it('on a dropdown’s trigger, Space or Enter after a click is the page’s and opens nothing; after the keyboard moved focus to it, opens it and is not the page’s', async () => {
+    const page = await mountPage(KEYS, 'columns', 1, [...KEYS.flat(), ...SIGNALS], RPCS);
+    const triggers = () => places().filter((el) => el.matches('[aria-haspopup]'));
+    const tried = new Set();
+    try {
+      feed(page.hub);
+      await focusPage();
+      await settle();
+      const count = triggers().length;
+      // Each plot's kind and layout, and the page's own.
+      expect(count).toBeGreaterThanOrEqual(2 * KEYS.length);
+      const ids = plotIds(page.ws.layout);
+      const live = () => JSON.stringify(ids.map((id) => page.views.of(id).live));
+      for (let i = 0; i < count; i++) {
+        for (const how of ['press', 'keys']) {
+          for (const key of [' ', 'Enter']) {
+            await focusPage();
+            await settle();
+            const el = triggers()[i], said = `${key === ' ' ? 'Space' : key} on ${named(el)}, focused by ${how}`;
+            tried.add(el);
+            // A plot's trigger is in the plot selected, as a click on it selects it.
+            const plot = el.closest('.leaf')?.dataset.plot;
+            if (plot) page.ws.selection.only([plot]);
+            if (how === 'keys') await pressKey('Shift');
+            el.focus();
+            await settle();
+            const before = live(), steps = page.history.undos.length;
+            await pressKey(key);
+            await settle();
+            const by = lastKey().by, opened = el.getAttribute('aria-expanded') === 'true';
+            if (el.closest('[role=listbox]')) {
+              // A list in the page, a plot's signals, keeps every key pressed in it but Escape, however focus came: its keys are its own.
+              expect(lastKey().page ? by : null, `${said}: the page did nothing`).toBe(null);
+              expect(live(), `${said}: nothing paused`).toBe(before);
+            } else if (how === 'keys') {
+              expect(opened, `${said}: opened`).toBe(true);
+              expect(by, `${said}: the page did nothing`).toBe(null);
+              expect(live(), `${said}: nothing paused`).toBe(before);
+            } else {
+              expect(opened, `${said}: opened nothing`).toBe(false);
+              // Space pauses; Enter in a plot goes into its signals.
+              if (key === ' ') expect([by, live() !== before], `${said}: paused`).toEqual(['pause', true]);
+              else if (plot) expect(by, `${said}: into its signals`).toBe('plot');
+            }
+            expect(page.history.undos.length, `${said}: no edit`).toBe(steps);
+            if (document.querySelector(OPEN)) await closeAll();
+          }
+        }
+      }
+      expect(tried.size).toBe(count);
+    } finally {
+      page.dispose();
+    }
+  }, 300_000);
 });

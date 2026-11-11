@@ -66,6 +66,15 @@ export function keepsKey(e, at = e.target) {
 }
 
 /**
+ * Whether key event `e`, pressed on `at`, is a key that presses what it was
+ * pressed on, which a click left focus on and so keeps none of: the page's,
+ * which neither the element nor the browser's own press may act on.
+ */
+export function withheld(e, at = e.target) {
+  return at instanceof Element && PRESS.includes(e.key) && !!at.closest(PRESSABLE) && !keepsKey(e, at);
+}
+
+/**
  * Escape in a text field, key event `e`: while what is typed, `typed`,
  * differs from what the field was filled with, `filled`, `restore()` puts
  * that back and the field keeps the key; else the key goes on to the page,
