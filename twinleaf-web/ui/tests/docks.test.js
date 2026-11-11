@@ -10,7 +10,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { page as browser, commands } from 'vitest/browser';
 import { PANELS } from '../src/lib/docks.svelte.js';
 import { SCROLL_REST_MS } from '../src/lib/scrolling.js';
-import { centre, clickOn, mountPage, pickItem, pressKey, rightClick, rested, settle, typeInto, until, wait, watchFrames, withExamples } from './harness/page.js';
+import { centre, clickOn, glide, mountPage, pickItem, pressKey, rightClick, rested, settle, typeInto, until, wait, watchFrames, withExamples } from './harness/page.js';
 
 const LIST = '[data-slot=scroll-area-viewport]';
 const BAR = '[data-slot=scroll-area-scrollbar]';
@@ -580,6 +580,191 @@ describe('what a dock shows', () => {
     expect(Object.entries(seen).filter(([, n]) => n < 1).map(([what]) => what), 'not seen: docks scrolled, a list’s bar beside its dock’s, rings').toEqual([]);
     expect([...looks.keys()].length, `one look for every scroll bar, of ${[...looks].map(([look, where]) => `${look} (${where})`).join('; ')}`).toBe(1);
   }, 180_000);
+});
+
+// The handle between a dock and the tiles sets the dock's width. A drag of
+// it in past the dock's least width hides the dock, a drag of it out again
+// shows the dock at the width dragged to, and the handle beside a hidden
+// dock is dragged as any other. Escape puts back what the drag changed.
+describe('a drag of the handle beside a dock', () => {
+  const SIDES = ['left', 'right'];
+  const frameOf = (side) => document.querySelector(`.dock-frame.${side}`);
+  const paneOf = (side) => document.querySelector(`[data-pane-id="dock-${side}"]`);
+  const handleOf = (side) => document.querySelector(`[data-pane-resizer][aria-label="${side === 'left' ? 'Left' : 'Right'} dock width"]`);
+  /** Whether dock `side` is hidden, as its button says. */
+  const hidden = (side) => !!frameOf(side).querySelector(`button[aria-label="Show the ${side} dock"]`);
+  /** A cursor that resizes, which a drag of a handle shows over the whole page. */
+  const RESIZE = /resize/;
+  /** The cursors the page's root and body show, which no drag may leave behind. */
+  const cursors = () => [document.documentElement, document.body].map((el) => getComputedStyle(el).cursor);
+  /** How dock `side`'s frame stands, in px and by its classes. */
+  const standOf = (side) => {
+    const r = frameOf(side).getBoundingClientRect();
+    return `${frameOf(side).className} at ${Math.round(r.left)}, ${Math.round(r.width)} px wide`;
+  };
+  /**
+   * Whether `stand`, as `standOf` gives it, is `was` give or take a px: the
+   * pane library gives each pane its share to three digits, so the panes a
+   * drag resizes move the edge beside them by up to a px.
+   */
+  const near = (stand, was) => {
+    const [a, b] = [stand, was].map((s) => s.match(/^(.*) at (-?\d+), (\d+) px wide$/));
+    return a[1] === b[1] && Math.abs(a[2] - b[2]) <= 1 && Math.abs(a[3] - b[3]) <= 1;
+  };
+  /** Waits for a dock that hid or showed to come to rest. */
+  const atRest = async () => {
+    await settle(6);
+    await until(() => !document.querySelector('.layout.sliding'));
+    await rested(() => SIDES.map(standOf).join('; '));
+  };
+
+  /** The pane library's sizes, as shares of the panes' room: a dock's least and most width. */
+  const LEAST = 12, MOST = 45;
+  /** The localStorage keys the docks' widths and arrangement are kept under. */
+  const KEPT = ['tl-side-size', 'tl-right-size', 'tl-docks-v1'];
+  /** The panes' room and the pane group's width, in px: the library moves a handle by shares of the group, and sizes panes by shares of the room. */
+  const room = () => [...document.querySelectorAll('.layout > [data-pane-id]')].reduce((n, el) => n + el.getBoundingClientRect().width, 0);
+  const groupWidth = () => document.querySelector('.layout').getBoundingClientRect().width;
+  const widthOf = (side) => paneOf(side).getBoundingClientRect().width;
+
+  /**
+   * A drag: the px the pointer moves out from the handle, the dock's way
+   * (into the tiles), through each of `via`, and how it ends: let go there,
+   * let go off the page, the window losing focus there and the pointer
+   * moving on before it is let go, or Escape and then let go.
+   */
+  const aDrag = fc.record({ via: fc.array(fc.integer({ min: -450, max: 450 }), { minLength: 1, maxLength: 4 }), end: fc.constantFrom('up', 'up', 'outside', 'blur', 'escape') });
+  const cases = fc.record({ side: fc.constantFrom(...SIDES), hiddenFirst: fc.boolean(), drags: fc.array(aDrag, { minLength: 1, maxLength: 3 }) });
+  const EXAMPLES = [
+    // As reported: in past the least width, which hides the dock, and out again.
+    [{ side: 'left', hiddenFirst: false, drags: [{ via: [-250], end: 'up' }, { via: [260], end: 'up' }] }],
+    // In past it and back out within one drag, then off the page.
+    [{ side: 'right', hiddenFirst: false, drags: [{ via: [-300, 120], end: 'up' }, { via: [-200], end: 'outside' }] }],
+    // Out of a hidden dock and Escape: it stays hidden.
+    [{ side: 'left', hiddenFirst: true, drags: [{ via: [200], end: 'escape' }] }],
+    // In past the least width and Escape: it stays shown at its width.
+    [{ side: 'right', hiddenFirst: false, drags: [{ via: [-300, -320], end: 'escape' }, { via: [40], end: 'up' }] }],
+    // The right dock hidden, the page loaded again: the left keeps its width.
+    [{ side: 'right', hiddenFirst: true, drags: [{ via: [0], end: 'up' }] }],
+    // The window loses focus in a drag out of a hidden dock: it ends there.
+    [{ side: 'left', hiddenFirst: true, drags: [{ via: [150], end: 'blur' }] }],
+  ];
+
+  it('hides the dock exactly when let go inside its least width, else shows it at the width dragged to; Escape puts it back; it leaves no resize cursor, never moves the other dock, and its widths load again', async () => {
+    await browser.viewport(1200, 900);
+    const seen = { hid: 0, showed: 0, escaped: 0, outside: 0, blur: 0 };
+    await fc.assert(
+      fc.asyncProperty(cases, async ({ side, hiddenFirst, drags }) => {
+        const other = SIDES.find((s) => s !== side), out = side === 'left' ? 1 : -1;
+        let page = await mountPage([['s0.x']], 'columns', 0, signals(3), tableOf({ setting: 3, report: 3, action: 2, other: 2 }));
+        try {
+          await atRest();
+          if (hiddenFirst) {
+            await clickOn(frameOf(side).querySelector(`button[aria-label="Hide the ${side} dock"]`));
+            await atRest();
+          }
+          for (const [n, { via, end }] of drags.entries()) {
+            const said = `drag ${n + 1} of the ${side} handle, ${via.join(' then ')} px out, ending ${end}`;
+            const was = { hidden: hidden(side), width: widthOf(side), kept: localStorage.getItem(side === 'left' ? KEPT[0] : KEPT[1]) };
+            const r = room(), g = groupWidth(), rail = was.hidden ? was.width : 34;
+            // The pane's share of the room where the pointer is let go. The pane library collapses an open pane below
+            // halfway from its rail to its least width, and opens a collapsed one only at its least width.
+            const share = (was.width / r) * 100 + ((via.at(-1) / g) * 100);
+            const snap = was.hidden ? LEAST : ((rail / r) * 100 + LEAST) / 2;
+            const collapses = share < snap;
+            // A release too near where the pane snaps is left out: the pointer's px round.
+            if (end !== 'escape' && Math.abs(share - snap) < 0.5) continue;
+            const otherWas = standOf(other);
+            const stop = watchFrames(() => standOf(other));
+            const [x, y] = centre(handleOf(side));
+            const steps = [['move', x, y], ['down']];
+            let at = x;
+            for (const d of via) {
+              steps.push(...glide([at, y], [x + out * d, y], 4));
+              at = x + out * d;
+            }
+            if (end === 'outside') steps.push(['move', at, -40], ['up']);
+            await commands.mouse(steps);
+            if (end === 'escape') {
+              await pressKey('Escape');
+              await commands.mouse([['move', at + out * 30, y], ['up']]);
+            } else if (end === 'blur') {
+              window.dispatchEvent(new FocusEvent('blur'));
+              await commands.mouse([['move', at + out * 30, y], ['up']]);
+            } else if (end === 'up') await commands.mouse([['up']]);
+            await atRest();
+            const frames = stop();
+            expect(cursors(), `${said}: the page's cursors after it`).not.toEqual(expect.arrayContaining([expect.stringMatching(RESIZE)]));
+            expect(document.querySelector('[data-pane-resizer][data-active=pointer]'), `${said}: a handle still dragged`).toBe(null);
+            expect(frames.filter((s) => !near(s, otherWas)), `${said}: the ${other} dock's frame, at the frames it was not ${otherWas}`).toEqual([]);
+            expect(near(standOf(other), otherWas), `${said}: the ${other} dock's frame, ${standOf(other)}, was ${otherWas}`).toBe(true);
+            const keep = localStorage.getItem(side === 'left' ? KEPT[0] : KEPT[1]);
+            if (end === 'escape') {
+              seen.escaped++;
+              expect(hidden(side), `${said}: hidden`).toBe(was.hidden);
+              expect(Math.abs(widthOf(side) - was.width), `${said}: px from its width before`).toBeLessThan(1.5);
+              expect(Number(keep ?? 22), `${said}: its width kept`).toBe(Number(was.kept ?? 22));
+              continue;
+            }
+            if (end === 'outside' || end === 'blur') seen[end]++;
+            expect(hidden(side), `${said}: hidden, let go at ${share.toFixed(1)}% of the room`).toBe(collapses);
+            if (collapses) {
+              seen.hid++;
+              // Shown again, it opens to the width it had before: its own kept, or the width it was dragged from.
+              expect(Number(keep ?? 22), `${said}: the width it opens to`).toBeCloseTo(was.hidden ? Number(was.kept ?? 22) : (was.width / r) * 100, 0);
+            } else {
+              seen.showed++;
+              const want = (Math.min(MOST, Math.max(LEAST, share)) / 100) * r;
+              expect(Math.abs(widthOf(side) - want), `${said}: px from the width dragged to, ${want.toFixed(1)} px`).toBeLessThan(2);
+              expect(Number(keep ?? 22), `${said}: its width kept`).toBeCloseTo((widthOf(side) / r) * 100, 0);
+            }
+          }
+          // The page loaded again: each dock as it was, hidden or at its width.
+          const before = SIDES.map((s) => [hidden(s), Math.round(widthOf(s))]);
+          const saved = Object.fromEntries(KEPT.filter((k) => localStorage.getItem(k) !== null).map((k) => [k, JSON.parse(localStorage.getItem(k))]));
+          page.dispose();
+          page = await mountPage([['s0.x']], 'columns', 0, signals(3), tableOf({ setting: 3, report: 3, action: 2, other: 2 }), { saved });
+          await atRest();
+          const after = SIDES.map((s) => [hidden(s), Math.round(widthOf(s))]);
+          after.forEach(([h, w], i) => {
+            expect(h, `loaded again: the ${SIDES[i]} dock hidden`).toBe(before[i][0]);
+            expect(Math.abs(w - before[i][1]), `loaded again: px from the ${SIDES[i]} dock's width`).toBeLessThanOrEqual(1);
+          });
+        } finally {
+          page.dispose();
+        }
+      }),
+      withExamples(EXAMPLES),
+    );
+    expect(Object.entries(seen).filter(([, n]) => n < 1).map(([what]) => what), 'not seen').toEqual([]);
+  }, 600_000);
+
+  it('double-clicked, shows the dock at the width it starts at, hidden or shown', async () => {
+    await browser.viewport(1200, 900);
+    const page = await mountPage([['s0.x']], 'columns', 0, signals(3), tableOf({ setting: 3, report: 3, action: 2, other: 2 }));
+    try {
+      await atRest();
+      const start = widthOf('left');
+      const [x, y] = centre(handleOf('left'));
+      await commands.mouse([['move', x, y], ['down'], ...glide([x, y], [x + 120, y], 4), ['up']]);
+      await atRest();
+      for (const hide of [false, true]) {
+        if (hide) {
+          await clickOn(frameOf('left').querySelector('button[aria-label="Hide the left dock"]'));
+          await atRest();
+        }
+        const said = `double-clicked with the dock ${hide ? 'hidden' : 'shown'}`;
+        expect(Math.abs(widthOf('left') - start), `${said}: px from its first width before`).toBeGreaterThan(20);
+        await commands.mouse([['dblclick', ...centre(handleOf('left'))]]);
+        await atRest();
+        expect(hidden('left'), `${said}: hidden`).toBe(false);
+        expect(Math.abs(widthOf('left') - start), `${said}: px from its first width`).toBeLessThan(1.5);
+        expect(cursors(), `${said}: the page's cursors`).not.toEqual(expect.arrayContaining([expect.stringMatching(RESIZE)]));
+      }
+    } finally {
+      page.dispose();
+    }
+  }, 60_000);
 });
 
 // A press on a header that lets go where it pressed, or within a couple of

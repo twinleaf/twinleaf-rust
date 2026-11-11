@@ -380,26 +380,94 @@
       return [side, DOCK.default];
     }),
   );
+  /**
+   * The panes are laid out anew, left, tiles and right, a hidden dock's
+   * collapsed to its rail. A dock's handle, moving its pane, sets its width;
+   * anything else the pane library lays out, as it does from the panes'
+   * first sizes when a rail's size changes, is put back to the docks'
+   * widths, unless a dock is sliding to its own.
+   */
   function docksResized(sizes) {
-    // The panes are left, tiles and right, a hidden dock's collapsed to its rail.
+    for (const [side, size] of [['left', sizes[0]], ['right', sizes[2]]]) {
+      if (byHandle(side)) {
+        if (docks.shown(side) && size >= DOCK.min) keepDockSize(side, size);
+        continue;
+      }
+      const target = docks.shown(side) ? dockSize[side] : railPct[side];
+      if (settled && !slide[side] && Math.abs(size - target) >= 0.01) dockPanes[side]?.resize(target);
+    }
+  }
+  /** Whether dock `side`'s handle is moving its pane: a drag of it under way, or the keys on it. */
+  const byHandle = (side) => dragFrom[side] !== null || (!!dockHandles[side] && document.activeElement === dockHandles[side]);
+  /** Keeps `size` as dock `side`'s width, the one it shows at. */
+  function keepDockSize(side, size) {
+    dockSize[side] = size;
     try {
-      [['left', sizes[0]], ['right', sizes[2]]].forEach(([side, size]) => {
-        if (docks.shown(side) && size >= DOCK.min) localStorage.setItem(DOCK.keys[side], String((dockSize[side] = size)));
-      });
+      localStorage.setItem(DOCK.keys[side], String(size));
     } catch {}
   }
-  /** Each dock's width as a drag of its handle began, which it opens to again when that drag collapsed it. */
+  /** Each dock's handle, the element. */
+  const dockHandles = $state({ left: null, right: null });
+  /**
+   * Each dock as a drag of its handle began, {width, pane, ends}: its width,
+   * which it opens to again when that drag collapsed it; its pane's size,
+   * which Escape puts back; and what ends the drag. Null while none is
+   * under way.
+   */
   const dragFrom = { left: null, right: null };
-  /** Hides dock `side` when a drag of its handle took its pane below a dock's least width, collapsing it to the rail. */
-  function dockCollapsed(side, size) {
-    if (size >= DOCK.min || !docks.shown(side)) return;
-    if (dragFrom[side] !== null) {
-      dockSize[side] = dragFrom[side];
-      try {
-        localStorage.setItem(DOCK.keys[side], String(dockSize[side]));
-      } catch {}
+  /**
+   * While its handle moves its pane, dock `side` follows the pane: hidden
+   * once the pane collapses to its rail, below the least width, to open
+   * again at the width it had as a drag began; shown at the width the pane
+   * opens to.
+   */
+  function dockResized(side, size) {
+    if (!byHandle(side)) return;
+    if (size < DOCK.min) {
+      if (!docks.shown(side)) return;
+      if (dragFrom[side] !== null) keepDockSize(side, dragFrom[side].width);
+      docks.hide(side, true);
+    } else if (!docks.shown(side) && docks[side].length) {
+      keepDockSize(side, size);
+      docks.hide(side, false);
     }
-    docks.hide(side, true);
+  }
+  /**
+   * A drag of dock `side`'s handle begins or ends, as the pane library says.
+   * It ends where the pointer is let go, on the page or off it, or where it
+   * is as the window loses focus, which then hears no release; Escape ends
+   * it where it began. Every end goes through the pane library's release,
+   * which takes its resize cursor off the page.
+   */
+  function dockDragging(side, dragging) {
+    if (!dragging) {
+      dragFrom[side]?.ends();
+      dragFrom[side] = null;
+      return;
+    }
+    const pane = dockPanes[side], release = () => window.dispatchEvent(new MouseEvent('mouseup'));
+    const from = { width: dockSize[side], pane: pane.getSize() };
+    const unclaim = claim('drag', {
+      on: {
+        cancel: () => {
+          pane.resize(from.pane);
+          keepDockSize(side, from.width);
+          release();
+        },
+      },
+    });
+    window.addEventListener('blur', release);
+    from.ends = () => {
+      unclaim();
+      window.removeEventListener('blur', release);
+    };
+    dragFrom[side] = from;
+  }
+  /** Puts dock `side` back to the width it starts at, showing it if hidden. */
+  function resetDock(side) {
+    keepDockSize(side, DOCK.default);
+    if (docks.shown(side)) dockPanes[side]?.resize(DOCK.default);
+    else if (docks[side].length) docks.hide(side, false);
   }
 
   // A dock that hides or shows slides, as its pane collapses or opens to its
@@ -904,13 +972,14 @@
 
 {#snippet dockHandle(side)}
   <Resizable.Handle
-    disabled={!docks.shown(side)}
-    data-dock-hidden={docks.shown(side) ? undefined : ''}
+    bind:ref={dockHandles[side]}
+    disabled={!docks[side].length}
+    data-dock-empty={docks[side].length ? undefined : ''}
     aria-label="{side === 'left' ? 'Left' : 'Right'} dock width"
     title={prefs.hints ? 'Drag to resize; double-click resets' : undefined}
     class="mx-[3px] bg-transparent transition-colors after:w-3 hover:bg-primary/60 data-[direction=vertical]:mx-0 data-[direction=vertical]:my-[3px] data-[direction=vertical]:after:h-3"
-    ondblclick={() => dockPanes[side]?.resize(DOCK.default)}
-    onDraggingChange={(dragging) => (dragFrom[side] = dragging ? dockSize[side] : null)}
+    ondblclick={() => resetDock(side)}
+    onDraggingChange={(dragging) => dockDragging(side, dragging)}
   />
 {/snippet}
 
@@ -1046,7 +1115,7 @@
     {#key narrow.current}
     <div class="docked" class:narrow={narrow.current}>
     <Resizable.PaneGroup direction={narrow.current ? 'vertical' : 'horizontal'} class="layout" bind:ref={dockGroup} onLayoutChange={docksResized}>
-      <Resizable.Pane id="dock-left" order={1} bind:this={dockPanes.left} defaultSize={startSize('left')} minSize={DOCK.min} maxSize={DOCK.max} collapsible collapsedSize={railPct.left} onResize={(size) => dockCollapsed('left', size)} class="flex min-h-0">
+      <Resizable.Pane id="dock-left" order={1} bind:this={dockPanes.left} defaultSize={startSize('left')} minSize={DOCK.min} maxSize={DOCK.max} collapsible collapsedSize={railPct.left} onResize={(size) => dockResized('left', size)} class="flex min-h-0">
         {@render dockFrame('left')}
       </Resizable.Pane>
       {@render dockHandle('left')}
@@ -1067,7 +1136,7 @@
         </main>
       </Resizable.Pane>
       {@render dockHandle('right')}
-      <Resizable.Pane id="dock-right" order={3} bind:this={dockPanes.right} defaultSize={startSize('right')} minSize={DOCK.min} maxSize={DOCK.max} collapsible collapsedSize={railPct.right} onResize={(size) => dockCollapsed('right', size)} class="flex min-h-0">
+      <Resizable.Pane id="dock-right" order={3} bind:this={dockPanes.right} defaultSize={startSize('right')} minSize={DOCK.min} maxSize={DOCK.max} collapsible collapsedSize={railPct.right} onResize={(size) => dockResized('right', size)} class="flex min-h-0">
         {@render dockFrame('right')}
       </Resizable.Pane>
     </Resizable.PaneGroup>

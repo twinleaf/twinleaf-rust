@@ -72,10 +72,10 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
    medium1 (App.svelte sets --slide-ms), on its standard easing, every pane
    on the same curve so the tiles' edge and the dock's move as one. */
 .layout.sliding > [data-pane] { transition: flex-grow var(--slide-ms, 250ms) cubic-bezier(0.2, 0, 0, 1); }
-/* A hidden dock's handle keeps its room, the gap between the tiles and the
-   rail as between the tiles and the dock, but shows nothing and takes no
-   pointer. */
-.layout > [data-pane-resizer][data-dock-hidden] { visibility: hidden; pointer-events: none; }
+/* The handle of a dock with no panels keeps its room, the gap between the
+   tiles and the rail as between the tiles and a dock, but shows nothing and
+   takes no pointer. A hidden dock's handle is dragged as a shown one's. */
+.layout > [data-pane-resizer][data-dock-empty] { visibility: hidden; pointer-events: none; }
 .dock-frame { position: relative; padding: 6px; }
 .dock-frame.rail { padding: 0; }
 .dock-frame.rail.holding { cursor: pointer; }
