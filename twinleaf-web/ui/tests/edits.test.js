@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
-import { centre, frames, mountPage, pressKey, wait } from './harness/page.js';
+import { centre, focusPage, frames, mountPage, pressKey, settle, until, wait } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const KEYS = [['sine.sine', 'sine.cosine'], ['aux.triangle']];
@@ -90,4 +90,25 @@ describe('a control that edits', () => {
       },
       (page) => page.history.group('Legend', () => page.ws.setPlot(plotIds(page.ws.layout)[0], { legend: true })),
     ));
+});
+
+describe('a page mounted after another', () => {
+  it('shows none of the notices the one before showed', async () => {
+    const first = await mountPage(KEYS, 'columns', 1);
+    try {
+      first.history.group('Legend', () => first.ws.setPlot(plotIds(first.ws.layout)[0], { legend: true }));
+      await focusPage();
+      await pressKey('Control+z');
+      expect(await until(() => document.querySelector('[data-sonner-toast]')), 'the undo notice shown').toBe(true);
+    } finally {
+      first.dispose();
+    }
+    const page = await mountPage(KEYS, 'columns', 1);
+    try {
+      await settle();
+      expect([...document.querySelectorAll('[data-sonner-toast]')].map((t) => t.textContent)).toEqual([]);
+    } finally {
+      page.dispose();
+    }
+  });
 });

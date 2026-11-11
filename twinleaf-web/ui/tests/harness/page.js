@@ -105,6 +105,18 @@ export async function wait(ms) {
   await turn();
 }
 
+/** How long after a notice closes it stays among the notices the next page shows, in ms of real time: the notices' own timer. */
+const NOTICE_REMOVAL_MS = 200;
+/** When the last page disposed of closed its notices, by performance.now(); null when it showed none. */
+let noticesClosed = null;
+/** Waits in real time until the notices a disposed page closed have gone, so the page mounted next shows none of them. */
+async function noticesGone() {
+  if (noticesClosed === null) return;
+  const left = noticesClosed + NOTICE_REMOVAL_MS - performance.now();
+  noticesClosed = null;
+  if (left > 0) await new Promise((done) => setTimeout(done, left + 1));
+}
+
 /** A value typed into a write as the stub's devices take it: a bool, a number, or the text. */
 const typed = (text) => (text === 'true' ? true : text === 'false' ? false : text !== '' && !isNaN(+text) ? +text : text);
 
@@ -216,6 +228,7 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
     }
     return reply({ error: 'no hub in a test' }, 503);
   };
+  await noticesGone();
   const app = mount(App, { target, context: new Map([['page', { hub, ws, history, registry, views }]]) });
   await frames();
   return {
@@ -226,6 +239,12 @@ export async function mountPage(keys = [[], [], [], []], preset = 'grid', more =
     /** The PlotView of plot `id` while it is on the page. */
     pv: (id) => [...registry].find((p) => p.plotId === id),
     dispose: () => {
+      // Its notices close with it, while it still hears of their closing.
+      if (document.querySelector('[data-sonner-toast]')) {
+        notices.dismiss();
+        flushSync();
+        noticesClosed = performance.now();
+      }
       unmount(app);
       target.remove();
       window.fetch = fetched;
