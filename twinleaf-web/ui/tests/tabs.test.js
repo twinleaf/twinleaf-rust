@@ -62,24 +62,30 @@ describe('the tab strip', () => {
   }, 600_000);
 });
 
-// Selecting the tab that is open is no change: a click on it, or Enter on
-// it, leaves the page as it was, whatever is maximized, selected or picked.
+// Selecting the tab that is open is no change: Enter on it leaves the page
+// as it was, whatever is maximized, selected or picked. A click on it is a
+// press as on any other tab, which clears the selection, and changes
+// nothing else.
 describe('the open tab', () => {
   const KEYS = [['sine.sine'], ['aux.triangle'], ['sine.cosine'], ['aux.sawtooth']];
   const RPCS = [{ name: 'sine.freq', channel: 'setting', value: 1 }, { name: 'sine.amp', channel: 'setting', value: 2 }];
-  /** Everything a select of the open tab might change: the saved document, the selection, the maximized plots, and both histories' lengths, the view history's as its buttons offer it. */
+  /** What a select of the open tab might change but the selection: the saved document, the maximized plots, and both histories' lengths, the view history's as its buttons offer it. */
   const stateOf = (page) =>
     JSON.stringify({
       saved: localStorage.getItem(SAVE_KEY),
-      selection: page.ws.selection.snapshot(),
-      rows: [...page.ws.selection.rows],
       maximized: page.ws.maximized,
       undos: page.history.undos.length,
       redos: page.history.redos.length,
       views: [...document.querySelectorAll('.plot-head button.view-step')].map((b) => b.disabled),
     });
+  /** The selection: the plots, the plot clicked last and the rows picked. */
+  const selectionOf = (page) => {
+    const { selected, focusedId, rows } = page.ws.selection.snapshot();
+    return JSON.stringify({ selected, focusedId, rows, shown: [...page.ws.selection.rows] });
+  };
+  const NONE = JSON.stringify({ selected: [], focusedId: null, rows: [], shown: [] });
 
-  it('clicked or given Enter, changes nothing: not the saved document, the selection, the maximized plots or a history', async () => {
+  it('given Enter, changes nothing; clicked, clears the selection and changes nothing else: not the saved document, the maximized plots or a history', async () => {
     const seen = new Set();
     await fc.assert(
       fc.asyncProperty(fc.boolean(), fc.subarray([0, 1, 2, 3]), fc.boolean(), fc.constantFrom('click', 'Enter'), async (max, picked, rows, how) => {
@@ -101,7 +107,7 @@ describe('the open tab', () => {
           if (picked.length) page.ws.selection.only(page.ws.shownIds().filter((_, i) => picked.includes(i)));
           await settle();
           const tab = document.querySelector(`[role=tab][data-tab="${page.ws.activeId}"]`);
-          const before = stateOf(page);
+          const before = stateOf(page), selected = selectionOf(page);
           expect(JSON.parse(before).views, 'the view steps offered').toContain(false);
           seen.add(`${!!page.ws.maximized} ${page.ws.selected.size > 0} ${page.ws.selection.rows.size > 0}`);
           if (how === 'click') await clickOn(tab.querySelector('span'));
@@ -111,6 +117,7 @@ describe('the open tab', () => {
           }
           await settle();
           expect(stateOf(page), `${how} on the open tab`).toBe(before);
+          expect(selectionOf(page), `${how} on the open tab: the selection`).toBe(how === 'click' ? NONE : selected);
         } finally {
           page.dispose();
         }
