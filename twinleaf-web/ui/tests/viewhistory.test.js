@@ -324,8 +324,12 @@ describe('view history on the page', () => {
         { t: 'addX', at: 2 }, { t: 'all', on: true }, { t: 'drag', at: 0, dx: 80, rest: false }, { t: 'follow', at: 0, how: 'Space' }, { t: 'back', at: 1 },
         { t: 'addXFollow', at: 2, how: 'play' }, { t: 'tab' },
         { t: 'addXFollow', at: 0, how: 'toolbar' }, { t: 'undo' }, { t: 'reload' }, { t: 'addX', at: 1 }, { t: 'back', at: 1 },
-      ], 0, 0, 0]]),
+      ], 0, 0, 0],
+      // A press held still on an X cursor's line, after a drag moved it there: it moves no cursor.
+      [[{ t: 'wheel', at: 0, turns: [-120] }, { t: 'wheel', at: 0, turns: [-120] }, { t: 'back', at: 0 }, { t: 'drag', at: 0, dx: 69, rest: false }, { t: 'forward', at: 0 }, { t: 'drag', at: 0, dx: 0, rest: false }], 2147483627, 0, 0]]),
     );
+    // A replay of one failure runs that case alone.
+    if (fc.readConfigureGlobal().path !== undefined) return;
     for (const [rule, n] of Object.entries(count)) expect(n, rule).toBeGreaterThan(0);
   }, 900_000);
 

@@ -19,7 +19,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
 import { flushSync } from 'svelte';
-import { OPEN, editCursors, feed, frames, leafOf, mountPage, settle, until, wait } from './harness/page.js';
+import { OPEN, editCursors, feed, frames, glide, leafOf, mountPage, settle, until, wait } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { xOf, yOf } from '../src/lib/cursors.js';
@@ -243,6 +243,60 @@ describe('the cursors’ readout', () => {
       // The sweeps passed under the readout.
       expect(swept, 'sweeps that moved the readout').toBeGreaterThanOrEqual(3);
     } finally {
+      page.dispose();
+    }
+  }, 600_000);
+});
+
+describe('a press on a cursor’s part held still, or dragged by some pixels', () => {
+  it('moves no cursor and makes no step held still, and moves the cursor exactly as far as the pointer went', async () => {
+    const m = await mounted(), { page, id } = m;
+    const count = { still: 0, dragged: 0, lines: 0, tabs: 0 };
+    try {
+      await fc.assert(
+        fc.asyncProperty(plotCase, fc.constantFrom(-23, -7, 1, 9, 31), async (c, d) => {
+          const cursors = await arrange(m, c);
+          const pv = page.pv(id), kind = c.kind;
+          const parts = pv.pressable.filter((p) => ['line', 'tag', 'tab'].includes(p.part) && !p.edge).map((p) => ({ ...p, name: nameOf(p) }));
+          for (const part of parts) {
+            // Where the press takes this part: its centre, a line's at a share along it.
+            const points = part.part === 'line' ? [0.3, 0.5, 0.7].map((t) => (part.kind === 'x' ? [part.x + part.w / 2, part.y + t * part.h] : [part.x + t * part.w, part.y + part.h / 2])) : [centreOf(part)];
+            const at = points.find((q) => document.elementFromPoint(...q) === pv.overlay && pv.pressAt(...q)?.kind === part.kind && pv.pressAt(...q)?.name === part.name.split(' ')[2] && pv.pressAt(...q)?.part === part.part);
+            if (!at) continue;
+            const where = `${c.kind} ${c.layout}: ${part.name} pressed at ${at.map((v) => v.toFixed(2))}`;
+            const top = pv.pressAt(...at), own = (held) => (top.kind === 'x' ? xOf(held, kind) : yOf(held, kind, top.key))[top.name];
+            // Held still: pressed, the pointer moved to where it is, and let go.
+            const before = structuredClone(page.ws.plots[id].cursors), steps = page.history.undos.length;
+            await commands.mouse([['move', ...at], ['down'], ['move', ...at], ['move', ...at], ['up']]);
+            await settle();
+            expect(page.ws.plots[id].cursors, `${where}, held still: the cursors`).toEqual(before);
+            expect(page.history.undos.length, `${where}, held still: undo steps`).toBe(steps);
+            count.still++;
+            // Dragged by d px along its axis, within the plot and its lane, in steps.
+            const k = top.kind === 'x' ? 0 : 1, P = pv.geo.plot, lane = top.kind === 'y' ? top.axis.lane : P;
+            const to = [...at];
+            to[k] += d;
+            const inside = top.kind === 'x' ? to[0] > P.x + 2 && to[0] < P.x + P.w - 2 : to[1] > lane.y + 2 && to[1] < lane.y + lane.h - 2;
+            if (inside) {
+              const was = own(before), from = top.at;
+              await commands.mouse([['move', ...at], ['down'], ...glide(at, to, 3), ['up']]);
+              await settle();
+              const now = own(page.ws.plots[id].cursors), px = top.kind === 'x' ? pv.pxOf(now) : pv.axisScale(pv.yAxes.find((a) => a.key === top.key))(now);
+              // Held where it was pressed, it moves as far as the pointer did; a tab's cursor comes under the pointer.
+              const want = from === undefined ? to[k] : (top.kind === 'x' ? pv.pxOf(was) : pv.axisScale(pv.yAxes.find((a) => a.key === top.key))(was)) + d;
+              expect(Math.abs(px - want), `${where}, dragged ${d} px: at ${px}, not ${want}`).toBeLessThan(1e-3);
+              count.dragged++;
+              if (top.part === 'line') count.lines++;
+              if (top.part === 'tab') count.tabs++;
+            }
+            await put(page, id, cursors);
+          }
+        }),
+        { examples: EXAMPLES.map(([c], i) => [c, [-23, -7, 1, 9, 31][i % 5]]), numRuns: EXAMPLES.length + Math.ceil(fc.readConfigureGlobal().numRuns / 4) },
+      );
+      for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(5);
+    } finally {
+      await commands.mouse([['up']]);
       page.dispose();
     }
   }, 600_000);

@@ -2128,7 +2128,8 @@ export class PlotView {
       const mode = cursor ? `${cursor.kind}cursor` : e.shiftKey ? 'none' : on?.part === 'xaxis' ? 'axis' : band ? 'y' : (e.ctrlKey || e.metaKey) && on?.part === 'plot' ? 'zoom' : 'plot';
       const targets = band ? this.axisTargets(band, e.clientY) : this.yTargets(e.clientY);
       // How far from the cursor the pointer holds it, along the cursor's axis.
-      const grab = cursor?.at === undefined ? 0 : (cursor.kind === 'x' ? e.clientX : e.clientY) - cursor.at;
+      // Taken from where the cursor is on the scale a drag places it by, not from its line's place on the pixel grid.
+      const grab = cursor?.at === undefined ? 0 : cursor.kind === 'x' ? e.clientX - this.pxOf(this.markers()[cursor.name]) : e.clientY - this.axisScale(cursor.axis)(this.yPair(cursor.key)[cursor.name]);
       drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: 0, mode, targets, band, cursor: cursor?.name, key: cursor?.key, grab, shift: e.shiftKey };
       clickAfter = true;
       unwatchShift?.();
@@ -2168,6 +2169,9 @@ export class PlotView {
     // is held, what it snaps to near there (`snapAt`), noted as `snapped`
     // for the mark drawn on it. Shift is read from the pointer as it moves,
     // and as it goes down or up mid-drag, which places the cursor at once.
+    // A cursor held where it was pressed moves by the pointer's travel from
+    // the press: its grab is taken from where it is, not where its line is
+    // drawn on the pixel grid.
     const placeCursor = () => {
       const x = drag.mode === 'xcursor', at = (x ? drag.x : drag.y) - drag.grab;
       const snap = drag.shift ? this.snapAt(drag.cursor, at, x ? undefined : drag.key) : null;
@@ -2223,6 +2227,8 @@ export class PlotView {
       }
       if (drag.mode === 'none') return;
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      // A move that goes nowhere from the press is no drag yet: a cursor's tab pressed and let go there places nothing.
+      if (!drag.moved && !dx && !dy) return;
       drag.moved += Math.abs(dx) + Math.abs(dy);
       drag.x = e.clientX;
       drag.y = e.clientY;
