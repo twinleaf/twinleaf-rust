@@ -82,10 +82,12 @@ export function aimed(was, shown, now, turned, [lo, hi]) {
 /**
  * The span `ms` into an ease from span `start` toward `goal`: along a log
  * scale, all but e^(-ms / EASE_MS) of the way, and `goal` itself once
- * within REST of it. An ease turned to a new goal starts again from the
- * span it had reached, so the span shown moves on without a jump.
+ * within REST of it; always between `start` and `goal`, ends included. An
+ * ease turned to a new goal starts again from the span it had reached, so
+ * the span shown moves on without a jump.
  */
 export function eased(start, goal, ms) {
   const off = Math.log(start / goal) * Math.exp(-Math.max(0, ms) / EASE_MS);
-  return Math.abs(off) <= REST ? goal : goal * Math.exp(off);
+  if (Math.abs(off) <= REST) return goal;
+  return Math.min(Math.max(goal * Math.exp(off), Math.min(start, goal)), Math.max(start, goal));
 }

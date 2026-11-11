@@ -49,6 +49,15 @@ describe('the wheel’s ease', () => {
     );
   });
 
+  it('gives a span between its start and its goal, ends included, at any time from 0 on', () => {
+    fc.assert(
+      fc.property(span, span, fc.oneof(fc.constant(0), ms, fc.double({ min: 0, max: 1, noNaN: true })), (start, goal, t) => {
+        const s = eased(start, goal, t);
+        expect(s >= Math.min(start, goal) && s <= Math.max(start, goal), `${s} between ${start} and ${goal}`).toBe(true);
+      }),
+    );
+  });
+
   it(`rests exactly on its goal once within ${REST} of it, ${EASE_MS} ms closing all but 1/e of the way`, () => {
     fc.assert(
       fc.property(span, span, (start, goal) => {
@@ -91,11 +100,14 @@ describe('the wheel’s ease', () => {
   it('never takes the span outside the spans the view can zoom to, and at their end rests there', () => {
     fc.assert(
       fc.property(fc.array(fc.record({ dy: fc.constantFrom(-400, -100, 100, 400), gap: fc.nat(6) }), { minLength: 1, maxLength: 20 }), fc.double({ min: 0.5, max: 50, noNaN: true }), fc.double({ min: 0, max: 1, noNaN: true }), (turns, hi, k) => {
-        const lo = 0.01, start = lo * (hi / lo) ** k;
+        // A start within the spans, on `hi` itself at k = 1.
+        const lo = 0.01, start = Math.min(hi, lo * (hi / lo) ** k);
         const { spans, shown, goals } = run(start, turns, [lo, hi]);
         for (const s of spans) expect(s >= lo && s <= hi, `${s} within [${lo}, ${hi}]`).toBe(true);
         expect(shown, 'rests on its last goal').toBe(goals.at(-1));
       }),
+      // Starting on the longest span, zooming in.
+      { examples: [[[{ dy: -400, gap: 1 }], 0.6757174774848128, 1]] },
     );
   });
 });
