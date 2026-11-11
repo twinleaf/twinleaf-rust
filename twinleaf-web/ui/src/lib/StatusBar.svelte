@@ -30,7 +30,7 @@
       <span class="warn" title="Lost: {lost.map((d) => d.route).join(', ')}"><RiWarn />{lost.length} lost</span>
     {/if}
   </span>
-  <span class="item">{plural(session.signals.length, 'signal')} · {hud.rxKBs.toFixed(0)} kB/s</span>
+  <span class="item"><span>{plural(session.signals.length, 'signal')} · <span class="num">{hud.rxKBs.toFixed(0)}</span> kB/s</span></span>
   {#if memory}
     <Popover.Root>
       <Tip text="Raw history: {bytes(memory.bytes)} of {bytes(memory.budget)}, at most {span(memory.maxAge)} of each stream">
