@@ -121,52 +121,87 @@ describe('laneTicks', () => {
   // A number is written 4 px below its tick's pixel row, its digits 9 px up and 2 down;
   // it may reach 2 px past its lane, and keeps 2 px from the next number.
   const UP = 5, DOWN = 6, REACH = 2, CLEAR = 2;
+  /** How far a number may reach past a lane's edge: 2 px into the gap to the next lane, and at a plot's top and foot the room the plot keeps there. */
+  const INNER = { above: REACH, below: REACH }, OUTER = { above: 6, below: 7 };
   const scaleOf = (lo, span, lane, log = false) => (log ? scaleLog() : scaleLinear()).domain([lo, lo + span]).range([lane.y + lane.h, lane.y]);
   /** The box each number of `labels` is drawn in, as plot.js draws it on the pixel grid. */
   const boxes = (sy, labels) => labels.map((v) => Math.round(sy(v)) + 0.5).map((py) => [py - UP, py + DOWN]);
   /** Whether a number at its tick's exact place fits the lane, with the pixel it may be drawn below that. */
-  const fits = (sy, lane, v) => sy(v) - UP >= lane.y - REACH && sy(v) + 1 + DOWN <= lane.y + lane.h + REACH;
+  const fits = (sy, lane, v, reach = INNER) => sy(v) - UP >= lane.y - reach.above && sy(v) + 1 + DOWN <= lane.y + lane.h + reach.below;
   const kind = (labels) => Math.min(2, labels.length);
   const domain = fc.tuple(fc.double({ min: -1e6, max: 1e6, noNaN: true }), fc.double({ min: 1e-6, max: 1e6, noNaN: true }));
-  // Lanes short enough to number one tick or none, as often as taller ones.
+  // Lanes short enough to number none, as often as taller ones.
   const laneAt = fc.record({ y: fc.double({ min: 0, max: 800, noNaN: true }), h: fc.oneof(fc.integer({ min: 1, max: 60 }), fc.integer({ min: 1, max: 400 })) });
+  // A lane's edges: each between two lanes or at the plot's top or foot, its top perhaps under a floating header, 8 px down into it.
+  const reachAt = fc.record({ above: fc.constantFrom(INNER.above, OUTER.above, -8), below: fc.constantFrom(INNER.below, OUTER.below) });
+  /** The step of `grid`, 1, 2 or 5 times a power of ten, which the difference of two ticks far from zero gives only to a few digits. */
+  const stepOf = (grid) => Number((grid[1] - grid[0]).toPrecision(1));
+  /** The ticks of `grid` every `k`th from zero, on its even steps. */
+  const every = (grid, k) => grid.filter((v) => Math.round(v / stepOf(grid)) % k === 0);
 
-  it('numbers ticks of its grid, each within the lane, 2 px past it at most, and 2 px or more from the next', () => {
+  it('numbers ticks of its grid, each within the lane, past it at most as far as its edge lets, and 2 px or more from the next', () => {
     fc.assert(
-      fc.property(domain, laneAt, ([lo, span], lane) => {
-        const sy = scaleOf(lo, span, lane), { grid, labels } = laneTicks(sy, lane);
+      fc.property(domain, laneAt, reachAt, ([lo, span], lane, reach) => {
+        const sy = scaleOf(lo, span, lane), { grid, labels } = laneTicks(sy, lane, undefined, reach);
         expect(grid).toEqual(sy.ticks(Math.max(3, lane.h / 40)));
         for (const v of labels) expect(grid).toContain(v);
         const drawn = boxes(sy, labels).sort((a, b) => a[0] - b[0]);
-        for (const [top, bottom] of drawn) expect(top >= lane.y - REACH && bottom <= lane.y + lane.h + REACH, `${[top, bottom]} in ${lane.y} + ${lane.h}`).toBe(true);
+        for (const [top, bottom] of drawn) expect(top >= lane.y - reach.above && bottom <= lane.y + lane.h + reach.below, `${[top, bottom]} in ${lane.y} + ${lane.h}, ${JSON.stringify(reach)}`).toBe(true);
         drawn.forEach((b, i) => i && expect(b[0] - drawn[i - 1][1], 'the room between two numbers').toBeGreaterThanOrEqual(CLEAR));
       }),
     );
   });
 
-  it('numbers several ticks where they fit, else the one nearest the lane’s middle, else none', () => {
+  it('numbers every kth tick that fits, for the least k of 1, 2, 5, 10… that gives two or more with room between them as between two lanes, else none: never one alone', () => {
     fc.assert(
-      fc.property(domain, laneAt, ([lo, span], lane) => {
-        const sy = scaleOf(lo, span, lane), { grid, labels } = laneTicks(sy, lane);
-        const fitting = grid.filter((v) => fits(sy, lane, v));
-        if (!fitting.length) expect(labels).toEqual([]);
-        else if (labels.length === 1) {
-          const mid = lane.y + lane.h / 2, d = (v) => Math.abs(sy(v) - mid);
-          expect(d(labels[0])).toBeCloseTo(Math.min(...fitting.map(d)), 1);
-          // Every 1st, 2nd, 5th, 10th… tick that fits is no two numbers with room between them.
-          const step = grid[1] - grid[0];
-          for (const k of [1, 2, 5, 10, 20, 50, 100]) {
-            const each = fitting.filter((v) => Math.round(v / step) % k === 0);
-            expect(each.length < 2 || each.some((v, i) => i && Math.abs(sy(v) - sy(each[i - 1])) < 14), `every ${k}th: ${each}`).toBe(true);
-          }
-        } else if (labels.length >= 2) {
-          // Every kth tick of the grid for one k, so the numbers stay round.
-          const step = grid[1] - grid[0], k = Math.round((labels[1] - labels[0]) / step);
-          expect([1, 2, 5, 10, 20, 50, 100]).toContain(k);
-          for (const v of labels) expect(Math.abs(Math.round(v / step) % k), `${v} is a multiple of ${k * step}`).toBe(0);
-        } else expect(fitting).toEqual([]);
+      fc.property(domain, laneAt, reachAt, ([lo, span], lane, reach) => {
+        const sy = scaleOf(lo, span, lane), { grid, labels } = laneTicks(sy, lane, undefined, reach);
+        expect(labels.length, `${labels} in ${lane.y} + ${lane.h}`).not.toBe(1);
+        const spaced = (vs) => vs.length >= 2 && vs.every((v, i) => !i || Math.abs(sy(v) - sy(vs[i - 1])) >= 14);
+        // Decided as between two lanes, or with less room where the lane has less.
+        const inner = { above: Math.min(REACH, reach.above), below: Math.min(REACH, reach.below) };
+        const ks = [1, 2, 5, 10, 20, 50, 100].filter((k) => spaced(every(grid, k).filter((v) => fits(sy, lane, v, inner))));
+        if (!ks.length || grid.length < 2) expect(labels).toEqual([]);
+        else expect(labels, `every ${ks[0]}th tick that reaches no further than its edges let`).toEqual(every(grid, ks[0]).filter((v) => fits(sy, lane, v, reach)));
+      }),
+      // Ticks 0.00001 apart far from zero, whose difference is 0.0000100000179: every 2nd from zero is -133677.194 alone, not the 1st and 3rd.
+      // And ticks 0.0001 apart from 8163.3094, of which no two every 2nd from zero fit, not 8163.3095 and 8163.3097.
+      {
+        examples: [
+          [[-133677.19401357145, 0.000030714247259311385], { y: 0, h: 43 }, INNER],
+          [[-637471.14056, 0.000022307562176138166], { y: 0, h: 29 }, { above: 2, below: 7 }],
+          [[8163.309400000001, 0.00033913043307620683], { y: 0, h: 26 }, INNER],
+        ],
+      },
+    );
+  });
+
+  it('numbers lanes of one height and range alike, or leaves them all bare, whether their edges are between two lanes or at the plot’s top and foot', () => {
+    fc.assert(
+      fc.property(domain, laneAt, fc.double({ min: 0, max: 800, noNaN: true }), reachAt.filter((r) => r.above >= 0), ([lo, span], lane, y, reach) => {
+        const other = { y, h: lane.h };
+        const a = laneTicks(scaleOf(lo, span, lane), lane, undefined, INNER).labels, b = laneTicks(scaleOf(lo, span, other), other, undefined, reach).labels;
+        expect(b.length > 0, `${a} at ${lane.y}, ${b} at ${y} with ${JSON.stringify(reach)}`).toBe(a.length > 0);
       }),
     );
+  });
+
+  it('at a plot’s top and foot, numbers each tick of its stride, those at the very ends of the range among them', () => {
+    // A range set by hand, from one round value to another: m·u to (m + n)·u.
+    const round = fc.tuple(fc.integer({ min: -20, max: 20 }), fc.integer({ min: 1, max: 20 }), fc.integer({ min: -4, max: 4 }));
+    fc.assert(
+      fc.property(round, laneAt, ([m, n, e], lane) => {
+        const u = 10 ** e, sy = scaleOf(m * u, n * u, lane), { grid, labels } = laneTicks(sy, lane, undefined, OUTER);
+        if (labels.length < 2) return;
+        const k = Math.round((labels[1] - labels[0]) / stepOf(grid));
+        expect(labels, `every ${k}th tick of ${grid}`).toEqual(every(grid, k));
+      }),
+      { examples: [[[0, 1, 0], { y: 0, h: 200 }], [[0, 10, -1], { y: 37.4, h: 300 }]] },
+    );
+    const lane = { y: 0, h: 200 };
+    expect(laneTicks(scaleOf(0, 1, lane), lane, undefined, OUTER).labels).toEqual([0, 0.2, 0.4, 0.6, 0.8, 1]);
+    // Between two lanes the same range leaves its ends out, whose numbers would cross into the next lane.
+    expect(laneTicks(scaleOf(0, 1, lane), lane, undefined, INNER).labels).toEqual([0.2, 0.4, 0.6, 0.8]);
   });
 
   it('numbers several ticks in any lane 120 px high or more with four ticks or more', () => {
@@ -195,10 +230,10 @@ describe('laneTicks', () => {
     );
   });
 
-  it('numbers the tick nearest the middle of a lane with room for one', () => {
-    // 0 to 3.2 over 30 px: 1 at 20.6 px from the top, 2 at 11.3, too near each other for both; the middle is at 15.
+  it('numbers nothing in a lane with room for one number and not two', () => {
+    // 0 to 3.2 over 30 px: 1 at 20.6 px from the top, 2 at 11.3, too near each other for both.
     const lane = { y: 0, h: 30 }, sy = scaleOf(0, 3.2, lane);
-    expect(laneTicks(sy, lane)).toEqual({ grid: [0, 1, 2, 3], labels: [2], count: 3 });
+    expect(laneTicks(sy, lane)).toEqual({ grid: [0, 1, 2, 3], labels: [], count: 3 });
   });
 
   it('numbers a log axis at its decades only', () => {

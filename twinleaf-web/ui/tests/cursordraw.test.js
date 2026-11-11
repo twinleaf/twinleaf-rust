@@ -8,15 +8,17 @@
 // be set against a tick. And where the tabs of the Y cursors not yet placed
 // rest: at the foot of each y axis, in plots of every height. And the y
 // numbers of a stacked plot's lanes, of every height and count: clear of
-// each other and of the next lane's, several, one or none by the lane's
-// height, never back as it changes, the gutter as wide as they need and the
-// plot area taking the rest. And two X
+// each other and of the next lane's, several or none by the lane's
+// height, never one alone, never back as it changes, the gutter as wide as
+// they need and the plot area taking the rest; and with a range set by
+// hand, its ends numbered at the plot's top and foot, clear of the time
+// axis and of a floating header. And two X
 // cursors close together: their tags on their outer sides, each against
 // its own line, at every separation, in either order and at the plot's edges.
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 import { flushSync } from 'svelte';
-import { commands } from 'vitest/browser';
+import { commands, page as browser } from 'vitest/browser';
 import { editCursors, feed, frames, leafOf, mountPage, settle, until, wait, withExamples } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
@@ -165,42 +167,57 @@ describe('the tabs Y cursors are dragged out of', () => {
 
 describe('the y numbers of a stacked plot’s lanes', () => {
   const MANY = Array.from({ length: 12 }, (_, i) => `dev.signal${i}`);
-  /** The least room, in px, between two numbers, and between a lane's numbers and the next lane's. */
+  /** The least room, in px, between two numbers, and between a lane's numbers and the next lane's, the time axis's labels or the X cursors' tabs. */
   const CLEAR = 2;
-  /** How far past its lane a lane's numbers may reach: half the gap between lanes, less half the clearance. */
-  const REACH = 2;
-  /** How many numbers a lane shows, as the rule counts them: several, one or none. */
+  /** How far past its lane a lane's numbers may reach: half the gap between lanes, less half the clearance; and past the plot's top and foot, the room the plot keeps there. */
+  const REACH = 2, EDGE = { above: 6, below: 7 };
+  /** How many numbers a lane shows, as the rule counts them: several or none, never one alone. */
   const kindOf = (n) => (n >= 2 ? 2 : n);
+  /** Where VITE_TL_SHOTS names a folder, relative to this file, the screenshots go there. */
+  const SHOTS = import.meta.env.VITE_TL_SHOTS;
 
-  /** A page with one stacked plot of `lanes` signals, paused, its y ranges [lo, lo + span] each, and `at(h)`, which makes the plot's tile `h` px high, draws it, and gives what it drew. */
-  async function stacked(lanes, ranges = []) {
+  /** A page with one plot of `lanes` signals in `mode`, paused, the y ranges of its axes [lo, lo + span] each, and `at(h)`, which makes the plot's tile `h` px high, draws it, and gives what it drew. */
+  async function stacked(lanes, ranges = [], mode = 'stacked') {
     const page = await mountPage([MANY.slice(0, lanes)], 'grid', 0, MANY);
     feed(page.hub);
     const id = plotIds(page.ws.layout)[0];
-    page.history.group('Prepare', () => page.ws.setPlot(id, { mode: 'stacked' }));
+    page.history.group('Prepare', () => page.ws.setPlot(id, { mode }));
     page.views.get(id).pause(clock.now());
     await wait(300);
     await settle();
     const pv = page.pv(id), leaf = leafOf(id);
-    ranges.forEach(([lo, span], i) => i < lanes && pv.setYBounds([MANY[i]], lo, lo + span));
+    ranges.forEach(([lo, span], i) => pv.yAxes[i] && pv.setYBounds([pv.yAxes[i].key], lo, lo + span));
     const at = (h) => {
       leaf.style.height = `${h}px`;
       // The gutter fits what the frame before drew; a second frame draws in it.
       pv.draw(clock.now());
       pv.draw(clock.now());
-      const body = pv.body.getBoundingClientRect(), P = pv.geo.plot;
+      const body = pv.body.getBoundingClientRect(), P = pv.geo.plot, all = pv.geo.lanes;
       const labels = pv.tickLabels.filter((l) => l.axis !== undefined);
-      const lanesDrawn = pv.yAxes.map((a) => ({ key: a.key, lane: a.lane, labels: labels.filter((l) => l.axis === a.key) }));
       // The foot of the header, where it floats over the plot's top.
       const head = leaf.querySelector('.plot-card.monitor .plot-head')?.getBoundingClientRect().bottom ?? -Infinity;
-      return { body, P, labels, lanes: lanesDrawn, head, left: P.x - body.left, right: body.right - P.x - P.w, xLabels: pv.tickLabels.filter((l) => l.axis === undefined) };
+      // How far past each lane its numbers may reach: further at the plot's top and foot, and never above the floating header's foot, with room below it.
+      const lanesDrawn = pv.yAxes.map((a) => {
+        const top = a.lane === all[0], foot = a.lane === all.at(-1);
+        const above = Math.min(top ? EDGE.above : REACH, a.lane.y - head - CLEAR), below = foot ? EDGE.below : REACH;
+        return { key: a.key, axis: a, lane: a.lane, top, foot, above, below, labels: labels.filter((l) => l.axis === a.key) };
+      });
+      const xTabs = pv.pressable.filter((p) => p.part === 'tab' && p.kind === 'x');
+      return { body, P, labels, lanes: lanesDrawn, head, left: P.x - body.left, right: body.right - P.x - P.w, xLabels: pv.tickLabels.filter((l) => l.axis === undefined), xTabs };
     };
-    return { page, pv, at };
+    // As `at`, once the tile has become a monitor or stopped being one, its header slid in or out.
+    const shown = async (h) => {
+      at(h);
+      await wait(300);
+      await settle();
+      return at(h);
+    };
+    return { page, pv, id, leaf, at, shown };
   }
 
-  /** Checks what a stacked plot drew: its numbers clear of each other and within their lanes, and its gutter as wide as they need. */
+  /** Checks what a plot drew: its numbers clear of each other, of the time axis and within their lanes, none alone in a lane, and its gutter as wide as they need. */
   function check(drawn, where) {
-    const { labels, lanes, left, right, body, P, xLabels, head } = drawn;
+    const { labels, lanes, left, right, body, P, xLabels, xTabs, head } = drawn;
     labels.forEach((a, i) =>
       labels.slice(i + 1).forEach((b) => {
         const apart = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h + CLEAR <= b.y || b.y + b.h + CLEAR <= a.y;
@@ -208,8 +225,14 @@ describe('the y numbers of a stacked plot’s lanes', () => {
       }),
     );
     for (const a of labels) for (const b of xLabels) expect(a.y + a.h + CLEAR <= b.y, `${where}: ${a.axis}'s number at ${a.y} is clear of the time labels at ${b.y}`).toBe(true);
-    for (const { key, lane, labels: mine } of lanes)
-      for (const l of mine) expect(l.y >= lane.y - REACH && l.y + l.h <= lane.y + lane.h + REACH, `${where}: ${key}'s number at ${l.y}, ${l.h} high, within its lane ${lane.y} + ${lane.h}`).toBe(true);
+    for (const a of labels)
+      for (const t of xTabs) expect(a.x + a.w <= t.x || t.x + t.w <= a.x || a.y + a.h + CLEAR <= t.y, `${where}: ${a.axis}'s number at ${[a.x, a.y]} is clear of ${t.text}'s tab at ${[t.x, t.y]}`).toBe(true);
+    for (const a of labels) expect(a.y >= body.top && a.y + a.h <= body.bottom, `${where}: ${a.axis}'s number at ${a.y} is in the plot's body, ${body.top} to ${body.bottom}`).toBe(true);
+    for (const a of labels) expect(a.y >= head + CLEAR, `${where}: ${a.axis}'s number at ${a.y} is below the floating header's foot at ${head}`).toBe(true);
+    for (const { key, lane, above, below, labels: mine } of lanes) {
+      expect(mine.length, `${where}: ${key}'s lane, ${lane.h} px high, shows no number alone`).not.toBe(1);
+      for (const l of mine) expect(l.y >= lane.y - above && l.y + l.h <= lane.y + lane.h + below, `${where}: ${key}'s number at ${l.y}, ${l.h} high, within its lane ${lane.y} + ${lane.h}, ${above} px above and ${below} below`).toBe(true);
+    }
     // The gutter: as wide as the widest number and the room about it, at least a tab's room, while any lane draws numbers;
     // else a tab's room while a lane has room below the header for a resting tab, 14 px with 2 about it; else bare. It
     // narrows only once it is 10 px wider than that.
@@ -221,8 +244,8 @@ describe('the y numbers of a stacked plot’s lanes', () => {
     expect(Math.abs(P.w - (body.width - left - right)), `${where}: the plot area's width`).toBeLessThan(0.01);
   }
 
-  it('keep their numbers clear of each other and of the next lane’s, show several, one or none by the lane’s height, and narrow the gutter to what is drawn', async () => {
-    const count = { several: 0, one: 0, none: 0, bare: 0 };
+  it('keep their numbers clear of each other and of the next lane’s, show several or none by the lane’s height, never one alone, reach the plot’s top and foot, and narrow the gutter to what is drawn', async () => {
+    const count = { several: 0, none: 0, bare: 0 };
     const range = fc.tuple(fc.double({ min: -1e4, max: 1e4, noNaN: true }), fc.double({ min: 1e-3, max: 1e4, noNaN: true }));
     await fc.assert(
       fc.asyncProperty(fc.integer({ min: 1, max: 12 }), fc.integer({ min: 100, max: 900 }), fc.array(range, { maxLength: 12 }), async (lanes, h, ranges) => {
@@ -230,7 +253,7 @@ describe('the y numbers of a stacked plot’s lanes', () => {
         try {
           const drawn = at(h);
           check(drawn, `${lanes} lanes in a tile ${h} px high`);
-          for (const l of drawn.lanes) count[['none', 'one', 'several'][kindOf(l.labels.length)]]++;
+          for (const l of drawn.lanes) count[kindOf(l.labels.length) ? 'several' : 'none']++;
           if (!drawn.labels.length && drawn.left === 12) count.bare++;
         } finally {
           page.dispose();
@@ -242,7 +265,7 @@ describe('the y numbers of a stacked plot’s lanes', () => {
     for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(0);
   }, 600_000);
 
-  it('go from several to one to none as the plot shortens a pixel at a time, never back, and the gutter gives its room to the plot', async () => {
+  it('go from several to none as the plot shortens a pixel at a time, never back, and the gutter gives its room to the plot', async () => {
     for (const lanes of [1, 3, 12]) {
       const { page, at } = await stacked(lanes);
       try {
@@ -265,7 +288,81 @@ describe('the y numbers of a stacked plot’s lanes', () => {
           // Each change is a step down, never back up, so a lane never flickers between two.
           list.slice(1).forEach((r, k) => expect(r[0], said).toBeLessThan(list[k][0]));
         }
-        if (lanes === 12) expect(seen.get(0).map((r) => r[0]), '12 lanes reach every kind').toEqual([2, 1, 0]);
+        // The second lane, as the first may lie under the header of a monitor, which floats over it.
+        if (lanes === 12) expect(seen.get(1).map((r) => r[0]), '12 lanes reach both kinds').toEqual([2, 0]);
+      } finally {
+        page.dispose();
+      }
+    }
+  }, 600_000);
+
+  it('number each tick of their stride in a plot with a range set by hand, those at its very top and foot among them, and none under a floating header', async () => {
+    const count = { ends: 0, axes: 0, monitors: 0, allNumbered: 0, allBare: 0 };
+    // A range from one round value to another, m·u to (m + n)·u, on a plot of one axis, of one each side, or of stacked lanes.
+    const round = fc.tuple(fc.integer({ min: -20, max: 20 }), fc.integer({ min: 1, max: 20 }), fc.integer({ min: -3, max: 3 }));
+    const shapes = [['overlay', 1], ['independent', 2], ['stacked', 3]];
+    // Tiles short enough to be monitors, under a floating header, as often as any.
+    const tall = fc.oneof(fc.integer({ min: 100, max: 300 }), fc.integer({ min: 100, max: 900 }));
+    await fc.assert(
+      fc.asyncProperty(fc.constantFrom(...shapes), tall, round, async ([mode, lanes], h, [m, n, e]) => {
+        const u = 10 ** e, lo = m * u, span = n * u;
+        const { page, pv, shown } = await stacked(lanes, Array.from({ length: lanes }, () => [lo, span]), mode);
+        try {
+          const drawn = await shown(h), where = `${mode}, ${lanes} signals, ${lo} to ${lo + span} in a tile ${h} px high`;
+          check(drawn, where);
+          if (drawn.head > -Infinity) count.monitors++;
+          // Its lanes, of one height and range, are all numbered or all bare, but for one a floating header covers the top of.
+          const clear = drawn.lanes.filter((l) => l.above >= REACH), kinds = new Set(clear.map((l) => l.labels.length > 0));
+          expect(kinds.size, `${where}: lanes numbered ${JSON.stringify(drawn.lanes.map((l) => l.labels.length))}`).toBeLessThanOrEqual(1);
+          if (lanes > 1 && clear.length > 1) count[kinds.has(true) ? 'allNumbered' : 'allBare']++;
+          for (const { key, axis, lane, top, foot, above, below, labels } of drawn.lanes) {
+            // The ticks numbered, read from where each number is drawn: 5 px above the pixel row of its tick.
+            const sy = pv.axisScale(axis), grid = sy.ticks(Math.max(3, lane.h / 40));
+            const numbered = grid.filter((v) => labels.some((l) => Math.abs(l.y - (Math.round(sy(v)) + 0.5 - 5)) < 0.01));
+            expect(numbered.length, `${where}: ${key} numbers a tick at each number`).toBe(labels.length);
+            if (numbered.length < 2) continue;
+            // The step, 1, 2 or 5 times a power of ten, which the difference of two ticks gives only to a few digits.
+            const step = Number((grid[1] - grid[0]).toPrecision(1)), k =Math.round((numbered[1] - numbered[0]) / step);
+            const every = grid.filter((v) => Math.round(v / step) % k === 0);
+            // Every kth tick, but where a number would cross into the next lane or run under a floating header.
+            const out = (v) => sy(v) - 5 < lane.y - above || sy(v) + 7 > lane.y + lane.h + below;
+            expect(numbered, `${where}: ${key} numbers every ${k}th tick of ${grid}`).toEqual(every.filter((v) => !out(v)));
+            count.axes++;
+            const has = (end) => numbered.some((v) => Math.abs(v - end) <= span * 1e-9);
+            if (top && has(lo + span)) count.ends++;
+            if (foot && has(lo)) count.ends++;
+          }
+        } finally {
+          page.dispose();
+        }
+      }),
+      // Each shape at a usual height, in a monitor and tall; and stacked lanes in a tile too short for numbers and in one tall enough.
+      withExamples([...shapes.flatMap((s) => [[s, 300, [0, 1, 0]], [s, 150, [0, 1, 0]], [s, 700, [-5, 10, 0]]]), [shapes[2], 100, [0, 1, 0]], [shapes[2], 900, [0, 1, 0]]]),
+    );
+    // The examples alone reach each outcome, whatever the generated cases.
+    for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(0);
+  }, 600_000);
+
+  it('look as they should: a plot of 0 to 1, and four stacked lanes about 40 and about 100 px high', async () => {
+    if (!SHOTS) return;
+    const { page, leaf, at } = await stacked(1, [[0, 1]], 'overlay');
+    try {
+      at(320);
+      await settle();
+      await browser.screenshot({ path: `${SHOTS}/single-0-1.png`, element: leaf });
+    } finally {
+      page.dispose();
+    }
+    // And four lanes of -1 to 1, whose ends are numbered at the plot's top and foot and not between lanes.
+    for (const [want, lo, span, name] of [[40, -1.16, 2.32, 'stacked'], [100, -1.16, 2.32, 'stacked'], [100, -1, 2, 'stacked-edges']]) {
+      const { page, leaf, shown } = await stacked(4, Array.from({ length: 4 }, () => [lo, span]));
+      try {
+        // The tile height whose lanes are `want` px high, the rest of the tile as it is.
+        let h = 400;
+        for (let i = 0; i < 4; i++) h += Math.round(4 * (want - (await shown(h)).lanes[0].lane.h));
+        const drawn = await shown(h);
+        check(drawn, `${name}, a tile ${h} px high`);
+        await browser.screenshot({ path: `${SHOTS}/${name}-4x${Math.round(drawn.lanes[0].lane.h)}.png`, element: leaf });
       } finally {
         page.dispose();
       }

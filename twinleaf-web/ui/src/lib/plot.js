@@ -40,43 +40,60 @@ const LANE_GAP = 6;
  * in a lane.
  */
 const CLEAR = 2;
-/** How far past its lane, in px, a lane's numbers may reach: half the gap between lanes, less half the clearance. */
+/** How far past its lane, in px, a lane's numbers may reach into the gap to the next lane: half the gap, less half the clearance. */
 const LABEL_REACH = (LANE_GAP - CLEAR) / 2;
+/**
+ * How far past a plot's top and foot, in px, its y numbers may reach, so a
+ * number at the very end of the range is drawn whole: as far as a number
+ * reaches past its tick, as `laneTicks` measures it, 5 px above and 7 below,
+ * or further. The body keeps this room above the plot, and the time axis
+ * begins CLEAR px below it.
+ */
+const EDGE = { above: 6, below: 7 };
+/** How far below a plot's foot, in px, its time axis's band begins: its tabs and readout, 3 px into the band, clear the y numbers at the foot by CLEAR px. */
+const AXIS_BELOW = EDGE.below + CLEAR - 3;
 /** Of a y axis's ticks, every how many it numbers when it cannot number each one: so the numbers it keeps stay round. */
 const LABEL_EVERY = [1, 2, 5, 10, 20, 50, 100];
 
 /**
  * The ticks of a y axis over `lane`, {y, h}, with scale `sy` (value to
  * client y), and those it writes numbers at, by the lane's height. The grid
- * is at every tick. The numbers are at ticks whose number lies within the
- * lane, reaching LABEL_REACH px past it, CLEAR px or more apart: each such
- * tick, or else every 2nd, 5th, 10th and so on, while two or more fit; else
- * the one nearest the lane's middle that fits; else none. A tick is
- * numbered only where `numbered(value)` holds, as a log axis numbers its
- * decades. `count` is the tick count asked of the scale, for its format.
+ * is at every tick. A lane numbers every kth tick whose number fits, for
+ * the least k of 1, 2, 5, 10 and so on that gives two or more CLEAR px
+ * apart, and where no k does it numbers none. Whether it numbers and which
+ * k it takes are decided as between two lanes, a number reaching
+ * LABEL_REACH px past the lane's top and foot at most, or less where
+ * `reach` is less; then the lane numbers each kth tick whose number lies
+ * within `reach.above` and `reach.below` px of it, so lanes of one height
+ * and range number alike and a plot's top and foot add their end numbers.
+ * A tick is numbered only where `numbered(value)` holds, as a log axis
+ * numbers its decades. `count` is the tick count asked of the scale, for
+ * its format.
  *
  * It measures from where a tick falls, not the pixel it is drawn on, which
  * is up to 1 px lower: so what a lane shows changes only one way as the
  * lane grows or shrinks, whatever pixel the lane starts on.
  */
-export function laneTicks(sy, lane, numbered = () => true) {
+export function laneTicks(sy, lane, numbered = () => true, reach = { above: LABEL_REACH, below: LABEL_REACH }) {
   const count = Math.max(3, lane.h / 40), grid = sy.ticks(count);
-  const fits = (v) => numbered(v) && sy(v) + 4 - LABEL.up >= lane.y - LABEL_REACH && sy(v) + 1 + 4 + LABEL.down <= lane.y + lane.h + LABEL_REACH;
+  const within = (r) => (v) => numbered(v) && sy(v) + 4 - LABEL.up >= lane.y - r.above && sy(v) + 1 + 4 + LABEL.down <= lane.y + lane.h + r.below;
+  const fits = within({ above: Math.min(LABEL_REACH, reach.above), below: Math.min(LABEL_REACH, reach.below) }), reaches = within(reach);
   const room = LABEL.up + LABEL.down + CLEAR + 1;
   const spaced = (vs) => vs.every((v, i) => i === 0 || Math.abs(sy(v) - sy(vs[i - 1])) >= room);
-  // The kth tick from zero, on a linear axis's even steps, or from the first numbered one.
-  const step = grid.length > 1 ? grid[1] - grid[0] : 1;
-  const even = grid.every((v, i) => i === 0 || Math.abs(v - grid[i - 1] - step) <= Math.abs(step) * 1e-6);
+  // The kth tick from zero, on a linear axis's even steps, or from the first numbered one. A linear
+  // axis steps by 1, 2 or 5 times a power of ten, which the difference of two ticks far from zero
+  // gives only roughly, so the step is that difference rounded to one significant digit.
+  const gap = grid.length > 1 ? grid[1] - grid[0] : 1, unit = 10 ** Math.floor(Math.log10(Math.abs(gap)));
+  const step = Math.round(gap / unit) * unit;
+  const even = grid.every((v, i) => i === 0 || Math.abs(v - grid[i - 1] - step) <= Math.abs(step) * 1e-6 + Math.abs(v) * 1e-15);
   const kth = (v, i, k) => (even ? Math.round(v / step) : i) % k === 0;
   const candidates = grid.filter(numbered);
   for (const k of LABEL_EVERY) {
     const labels = candidates.filter((v, i) => kth(v, i, k) && fits(v));
-    if (labels.length >= 2 && spaced(labels)) return { grid, labels, count };
+    if (labels.length >= 2 && spaced(labels)) return { grid, labels: candidates.filter((v, i) => kth(v, i, k) && reaches(v)), count };
     if (labels.length < 2 && k > 1 && candidates.filter((v, i) => kth(v, i, k)).length < 2) break;
   }
-  const middle = lane.y + lane.h / 2;
-  const one = grid.filter(fits).sort((a, b) => Math.abs(sy(a) - middle) - Math.abs(sy(b) - middle))[0];
-  return { grid, labels: one === undefined ? [] : [one], count };
+  return { grid, labels: [], count };
 }
 
 /** How many y axes an independent plot shows on each side. */
@@ -679,7 +696,7 @@ export class PlotView {
     const counts = this.axisCounts(cfg);
     const width = (side) => Array.from({ length: counts[side] }, (_, i) => this.axisWidth(side, i)).reduce((a, b) => a + b, 0);
     const left = Math.max(width('left'), GUTTER.bare), right = Math.max(width('right'), GUTTER.bare);
-    const plot = { x: body.x + left, y: body.y + 6, w: body.w - left - right, h: body.h - 6 - 22 };
+    const plot = { x: body.x + left, y: body.y + EDGE.above, w: body.w - left - right, h: body.h - EDGE.above - AXIS_BELOW - 22 };
     const count = lanesOf(cfg.mode, n);
     const h = (plot.h - LANE_GAP * (count - 1)) / count;
     const lanes = count === 1 ? [plot] : Array.from({ length: count }, (_, i) => ({ x: plot.x, y: plot.y + i * (h + LANE_GAP), w: plot.w, h }));
@@ -1096,8 +1113,8 @@ export class PlotView {
       if (!label) continue;
       const half = ctx.measureText(label).width / 2;
       if (px - half < labelEnd + X_LABEL_GAP || px + half > body.x + body.w) continue;
-      ctx.fillText(label, px, P.y + P.h + 15);
-      this.tickLabels.push({ x: px - half, y: P.y + P.h + 15 - LABEL.up, w: 2 * half, h: LABEL.up + LABEL.down });
+      ctx.fillText(label, px, P.y + P.h + AXIS_BELOW + 15);
+      this.tickLabels.push({ x: px - half, y: P.y + P.h + AXIS_BELOW + 15 - LABEL.up, w: 2 * half, h: LABEL.up + LABEL.down });
       labelEnd = px + half;
     }
 
@@ -1168,12 +1185,19 @@ export class PlotView {
     // Each axis's grid and numbers, as `laneTicks` picks them by its lane's
     // height, and the width its gutter needs for what it draws: its numbers,
     // or, with none, the tabs of the Y cursors resting in a lane with room
-    // for one, or else nothing but the bare edge.
+    // for one, or else nothing but the bare edge. Numbers reach past the
+    // plot's top and foot as far as the room it keeps there, and past a lane's
+    // edge between two lanes half way into the gap; none reach above a
+    // floating header's foot, with CLEAR px below it.
     const head = this.body.closest('.plot-card.monitor')?.querySelector('.plot-head')?.getBoundingClientRect().bottom ?? -Infinity;
     const need = { left: [], right: [] };
+    const reachOf = (lane) => ({
+      above: Math.min(lane === geo.lanes[0] ? EDGE.above : LABEL_REACH, lane.y - head - CLEAR),
+      below: lane === geo.lanes.at(-1) ? EDGE.below : LABEL_REACH,
+    });
     axes.forEach((ax, i) => {
       const sy = yScale(ax.range, ax.lane);
-      const { grid, labels, count } = laneTicks(sy, ax.lane, logY ? decade : undefined);
+      const { grid, labels, count } = laneTicks(sy, ax.lane, logY ? decade : undefined, reachOf(ax.lane));
       // Numbers take the precision of the ticks they label, so no two read the same.
       const fmt = logY ? (v) => v.toExponential(0) : sy.tickFormat(count);
       // The ticks a Y cursor dragged with Shift snaps to: where the axis draws its grid, or else its numbers.
@@ -1260,7 +1284,7 @@ export class PlotView {
     const open = this.seeking || (!this.view.live && this.axisHover !== null);
     if ((this.seeking || !this.view.live) && !spectrum && this.history) {
       const [h0, h1] = this.history;
-      const [top, height] = open ? [P.y + P.h + 2, 18] : [body.y + body.h - SEEK_BAR, SEEK_BAR];
+      const [top, height] = open ? [P.y + P.h + AXIS_BELOW + 2, 18] : [body.y + body.h - SEEK_BAR, SEEK_BAR];
       const at = (t) => P.x + ((Math.min(Math.max(t, h0), h1) - h0) / (h1 - h0)) * P.w;
       ctx.fillStyle = T.seekBg;
       ctx.fillRect(P.x, top, P.w, height);
@@ -1489,7 +1513,7 @@ export class PlotView {
     }
     if (historyOpen || (this.axisHover === null && !(frameAt < this.windowUntil))) return;
     const text = windowText(span), H = 16;
-    const w = ctx.measureText(text).width + 22, x = P.x + P.w - w, y = P.y + P.h + 3;
+    const w = ctx.measureText(text).width + 22, x = P.x + P.w - w, y = P.y + P.h + AXIS_BELOW + 3;
     ctx.fillStyle = T.tipBg;
     ctx.fillRect(x, y, w, H);
     ctx.strokeStyle = T.tipBorder;
@@ -1652,7 +1676,7 @@ export class PlotView {
     ['a', 'b'].forEach((name, i) => {
       if (marks[name] !== null) return;
       const x = (xTabsBeside ? P.x - 2 * TAB.w - 4 : P.x + 2) + i * (TAB.w + 2);
-      tabs.push({ part: 'tab', kind: 'x', name, fill: color[name], text: xName[name], x, y: P.y + P.h + 3, w: TAB.w, h: TAB.h });
+      tabs.push({ part: 'tab', kind: 'x', name, fill: color[name], text: xName[name], x, y: P.y + P.h + AXIS_BELOW + 3, w: TAB.w, h: TAB.h });
     });
     // The header of a plot too short for one of its own floats over the plot's top, and covers what is under it.
     const head = this.body.closest('.plot-card.monitor')?.querySelector('.plot-head')?.getBoundingClientRect().bottom ?? -Infinity;

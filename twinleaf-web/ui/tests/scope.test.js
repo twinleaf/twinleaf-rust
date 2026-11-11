@@ -48,8 +48,8 @@ function spots(page, id) {
     'a y axis': [(band.x0 + band.x1) / 2, P.y + P.h / 2],
     'the x axis': [P.x + P.w / 2, P.y + P.h + 8],
     'the plot area': [P.x + P.w / 2, P.y + P.h / 2],
-    // Its lower right, which the readout in its corner never covers.
-    'the plot area, clear of the readout': [P.x + P.w * 0.8, P.y + P.h * 0.8],
+    // Its lower right, below the readout where that reaches so far down.
+    'the plot area, clear of the readout': [P.x + P.w * 0.8, Math.min(P.y + P.h - 2, Math.max(P.y + P.h * 0.8, (leaf.querySelector('.cursor-readout')?.getBoundingClientRect().bottom ?? 0) + 4))],
     'the readout': at('.cursor-readout'),
     'the legend': at('.pinned-legend .row'),
     'a chip': at('.trace-chip .name'),
