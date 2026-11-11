@@ -1,3 +1,8 @@
+<script module>
+	/** How near, in px, a tooltip comes to the window's edge: it flips or shifts to stay this far inside, and wraps to fit between the two edges. */
+	export const TIP_EDGE = 4;
+</script>
+
 <script>
 	import { Tooltip as TooltipPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils.js";
@@ -6,6 +11,7 @@
 		ref = $bindable(null),
 		class: className,
 		sideOffset = 0,
+		collisionPadding = TIP_EDGE,
 		side = "top",
 		children,
 		arrowClasses,
@@ -19,9 +25,11 @@
 		bind:ref
 		data-slot="tooltip-content"
 		{sideOffset}
+		{collisionPadding}
 		{side}
+		style="max-width: min(20rem, 100vw - {2 * TIP_EDGE}px); overflow-wrap: anywhere"
 		class={cn(
-			" data-closed:animate-out data-closed:fade-out-0 inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs has-data-[slot=kbd]:pr-1.5 **:data-[slot=kbd]:relative **:data-[slot=kbd]:isolate **:data-[slot=kbd]:z-50 **:data-[slot=kbd]:rounded-sm z-50 w-fit max-w-xs origin-(--bits-tooltip-content-transform-origin) bg-foreground text-background",
+			" data-closed:animate-out data-closed:fade-out-0 inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs has-data-[slot=kbd]:pr-1.5 **:data-[slot=kbd]:relative **:data-[slot=kbd]:isolate **:data-[slot=kbd]:z-50 **:data-[slot=kbd]:rounded-sm z-50 w-fit origin-(--bits-tooltip-content-transform-origin) bg-foreground text-background",
 			className
 		)}
 		{...restProps}
