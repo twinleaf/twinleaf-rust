@@ -378,6 +378,8 @@ describe('the page, played by random runs of gestures and keys', () => {
           [[{ t: 'move', a: 1, b: 0, cell: 'center', by: 'grip', escape: false }, { t: 'key', key: 'f' }, { t: 'quick', a: 'layout', b: 'layout', i: 0 }, { t: 'quick', a: 'header', b: 'layout', i: 0 }]],
           // A plot docked beside another, by its grip and by its header.
           [[{ t: 'move', a: 0, b: 0, cell: 'bottom', by: 'grip', escape: false }, { t: 'move', a: 1, b: 1, cell: 'right', by: 'header', escape: false }]],
+          // A key with the display settings open, which shows the tooltip of the control focused there, placed at the window's edge: the page keeps its size, and the docks their widths.
+          [[{ t: 'click', at: 'window', i: 0, mod: null }, { t: 'toTab', a: 0, b: 0 }, { t: 'click', at: 'settings', i: 0, mod: null }, { t: 'key', key: ']' }]],
           // The left dock hidden from its header's menu, which slides it to its rail, then a box from the dock space left.
           [[{ t: 'right', at: 'dockHead', i: 0 }, { t: 'click', at: 'menuItem', i: 523181528, mod: null }, { t: 'box', k: 0, fx: 0, fy: 0, shift: false, escape: false }, { t: 'move', a: 0, b: 0, cell: 'center', by: 'grip', escape: false }, { t: 'chip', a: 0, b: 0, onto: 'chips' }]],
         ]),

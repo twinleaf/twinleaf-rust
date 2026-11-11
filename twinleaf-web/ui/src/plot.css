@@ -1,4 +1,6 @@
 /* What Tailwind classes do not cover: the shared WebGL layer, tiling, chips and tabs. */
+/* The page fills the window and the document never scrolls: what reaches past the window's edge, as a layer may for a frame while it is placed, is cut off there and brings no scroll bars to take room from the page. */
+html { overflow: hidden; }
 html, body { height: 100%; margin: 0; background: var(--background); color: var(--foreground); }
 .gl-layer { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 0; }
 /* The page is controls, not text: nothing but fields and readouts selects,

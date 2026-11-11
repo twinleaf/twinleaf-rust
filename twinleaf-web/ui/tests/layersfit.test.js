@@ -52,4 +52,25 @@ describe('a popup layer', () => {
     }
     expect(scrolled).toBeGreaterThan(0);
   }, 300_000);
+
+  it('brings the page no scroll bars while it reaches past an edge of the window, as it may for a frame while it is placed', async () => {
+    await browser.viewport(1200, 900);
+    const page = await menuPage();
+    const sizes = () => JSON.stringify({ page: [document.documentElement.clientWidth, document.documentElement.clientHeight], docks: [...document.querySelectorAll('.dock-frame')].map((f) => f.getBoundingClientRect().width) });
+    const past = document.createElement('div');
+    try {
+      const was = sizes();
+      expect(JSON.parse(was).page, 'the page fills the window').toEqual([window.innerWidth, window.innerHeight]);
+      document.body.append(past);
+      // Past the right edge, then past the bottom one, by a px or by much.
+      for (const [left, top] of [[window.innerWidth - 19, 40], [40, window.innerHeight - 19], [window.innerWidth + 300, window.innerHeight + 300]]) {
+        past.style.cssText = `position: absolute; left: ${left}px; top: ${top}px; width: 20px; height: 20px;`;
+        await settle();
+        expect(sizes(), `the page and its docks with a layer at ${left}, ${top}`).toBe(was);
+      }
+    } finally {
+      past.remove();
+      page.dispose();
+    }
+  });
 });
