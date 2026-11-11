@@ -9,6 +9,7 @@ import fc from 'fast-check';
 import { afterAll, describe, expect, it } from 'vitest';
 import { page as browser, commands } from 'vitest/browser';
 import { PANELS } from '../src/lib/docks.svelte.js';
+import { SCROLL_REST_MS } from '../src/lib/scrolling.js';
 import { centre, clickOn, mountPage, pickItem, pressKey, rightClick, rested, settle, typeInto, until, wait, watchFrames, withExamples } from './harness/page.js';
 
 const LIST = '[data-slot=scroll-area-viewport]';
@@ -358,7 +359,11 @@ describe("the filter of a dock's properties", () => {
 // What a person presses or reads in a dock, its top row too, found on the
 // page: every control, every run of text, every scroll bar's thumb, and the focus ring
 // around a header. No two of them overlap, however tall the window and
-// wherever the dock is scrolled, and every scroll bar has one look.
+// wherever the dock is scrolled, and every scroll bar has one look at rest.
+// A dock's scroll bars, its own and its lists', are faint at rest, where
+// each still shows that there is more, and plain in use: with the pointer
+// over the dock, while it or a list in it scrolls, and with the keys' focus
+// in it. Only the colour changes, so nothing moves.
 describe('what a dock shows', () => {
   const PRESSED = 'button, input, a[href], [role=button], [role=checkbox], [role=switch]';
   const THUMB = '[data-slot=scroll-area-thumb]';
@@ -434,7 +439,96 @@ describe('what a dock shows', () => {
     return out;
   }
 
-  it('overlaps no two things a person presses or reads, a focused header’s ring among them, at any window height and wherever it is scrolled; and gives every scroll bar one look', async () => {
+  /** Leaves every dock at rest: the pointer on the plots, no focus in a dock, and no scroll within the time one still counts. */
+  async function atRest() {
+    await commands.mouse([['move', ...centre(document.querySelector('.tiles'))]]);
+    document.activeElement?.blur();
+    await wait(SCROLL_REST_MS + 50);
+    await settle();
+  }
+  /** How opaque CSS colour `colour` is, from 0 to 1. */
+  const alphaOf = (colour) => (colour === 'transparent' ? 0 : +(colour.match(/[/,]\s*([\d.]+)\)$/)?.[1] ?? (/^rgba\(/.test(colour) ? colour.split(',')[3].replace(')', '') : 1)));
+  /** Each scroll bar `dock` shows, its own and its lists', as {what, look}. */
+  function barsOf(dock) {
+    const own = ownBar(dock);
+    const lists = [...dock.querySelectorAll(THUMB)].filter((thumb) => some(box(thumb.getBoundingClientRect()))).map((thumb) => ({ what: `the list of ${titleOf(thumb.closest('.dock-panel'))}`, look: lookOf(thumb) }));
+    return [...(own ? [{ what: 'the dock', look: own.look }] : []), ...lists];
+  }
+
+  it('has every scroll bar faint at rest and plain in use: under the pointer, while the dock or a list in it scrolls, and with the keys’ focus in it; every bar of the dock alike, the other dock’s at rest, and nothing moves', async () => {
+    await browser.viewport(1200, 520);
+    const page = await mountPage([['s0.x']], 'columns', 0, signals(30), tableOf({ setting: 14, report: 14, action: 10, other: 6 }), { routes: ['/', '/0', '/1'] });
+    const seen = { own: 0, lists: 0 };
+    try {
+      await settle(6);
+      await clickOn(document.querySelector('.dock-panel[aria-label=Other] .dock-title'));
+      await settle(6);
+      /** Where everything a dock shows is: its bars' lanes and its rows. */
+      const placed = (dock) => JSON.stringify([...dock.querySelectorAll(`${BAR}, ${LIST}, tr, .chip, .dock-head`)].map((el) => box(el.getBoundingClientRect())));
+      for (const dock of docks()) {
+        const side = dock.getAttribute('aria-label'), other = docks().find((d) => d !== dock);
+        await atRest();
+        const rest = barsOf(dock), at = placed(dock);
+        expect(rest.length, `${side}: scroll bars`).toBeGreaterThan(0);
+        if (rest.some((b) => b.what === 'the dock')) seen.own++;
+        if (rest.some((b) => b.what !== 'the dock')) seen.lists++;
+        const faint = rest[0].look;
+        /** Holds every bar of the dock to one look, `plain` or faint, with its lane and thumb where they were. */
+        const check = (when, plain) => {
+          const bars = barsOf(dock);
+          expect(bars.map((b) => b.what), `${side}, ${when}: its bars`).toEqual(rest.map((b) => b.what));
+          for (const { what, look } of bars) {
+            expect({ ...look, colour: 0 }, `${side}, ${when}: the lane and thumb of ${what}`).toEqual({ ...faint, colour: 0 });
+            expect(look.colour, `${side}, ${when}: ${what} as the dock's other bars`).toBe(bars[0].look.colour);
+          }
+          const alpha = alphaOf(bars[0].look.colour);
+          // Faint, and still a sign there is more; plain, at least twice as strong.
+          if (plain) expect(alpha, `${side}, ${when}: plain`).toBeGreaterThanOrEqual(2 * alphaOf(faint.colour));
+          else expect([look0(bars), alpha > 0.08 && alpha < 0.3], `${side}, ${when}: faint, ${bars[0].look.colour}`).toEqual([faint.colour, true]);
+          expect(placed(dock), `${side}, ${when}: nothing moved`).toBe(at);
+        };
+        const look0 = (bars) => bars[0].look.colour;
+        check('at rest', false);
+        // The pointer over the dock: its bars are plain, the other dock's faint.
+        await commands.mouse([['move', ...centre(dock)]]);
+        await settle();
+        check('under the pointer', true);
+        for (const b of barsOf(other)) expect(alphaOf(b.look.colour), `${side} under the pointer: ${b.what} of the other dock`).toBeLessThan(0.3);
+        await atRest();
+        check('at rest again', false);
+        // The dock scrolls, then a list in it: plain meanwhile and for a moment after, then faint.
+        const scrollers = [dock, ...[...dock.querySelectorAll(LIST)].filter((l) => l.scrollHeight > l.clientHeight)].filter((el) => el.scrollHeight > el.clientHeight);
+        for (const el of scrollers) {
+          const was = el.scrollTop;
+          el.scrollTop = was ? 0 : 1;
+          await settle();
+          el.scrollTop = was;
+          await settle();
+          check(`while ${el === dock ? 'it' : 'a list in it'} scrolls`, true);
+          await wait(SCROLL_REST_MS / 2);
+          check('half the rest time after a scroll', true);
+          await atRest();
+          check('once the scroll has rested', false);
+        }
+        // Focus from the keys on a header of the dock.
+        await pressKey('Shift');
+        dock.querySelector('.dock-head').focus({ preventScroll: true });
+        await settle();
+        await wait(SCROLL_REST_MS + 50);
+        await settle();
+        check('with the keys’ focus in it', true);
+        expect(document.activeElement.closest('.dock'), 'focus in the dock').toBe(dock);
+        dock.scrollTop = 0;
+        await atRest();
+      }
+    } finally {
+      page.dispose();
+      await browser.viewport(1200, 900);
+    }
+    expect(Object.entries(seen).filter(([, n]) => n < 1).map(([what]) => what), 'not seen: a dock’s own bar, a list’s bar').toEqual([]);
+  }, 180_000);
+
+  it('overlaps no two things a person presses or reads, a focused header’s ring among them, at any window height and wherever it is scrolled; and gives every scroll bar one look at rest', async () => {
     const seen = { scrolled: 0, both: 0, rings: 0 }, looks = new Map();
     for (const height of [900, 520, 340]) {
       await browser.viewport(1200, height);
@@ -454,6 +548,8 @@ describe('what a dock shows', () => {
             const all = things(dock);
             expect(all.length, `${side}: things found`).toBeGreaterThan(8);
             expect(overlaps(all), `${side}, scrolled to its ${where}: what overlaps`).toEqual([]);
+            // The looks are read at rest: a dock's bars are plain while it scrolls.
+            await atRest();
             const own = ownBar(dock);
             // A dock that scrolls has a bar in a lane of its own, beside its panels and not over them.
             expect(most > 0 && !own, `${side}: its scroll bar is drawn over its panels`).toBe(false);

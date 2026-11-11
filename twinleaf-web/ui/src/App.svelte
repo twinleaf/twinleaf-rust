@@ -89,6 +89,7 @@
   import RiCheck from '@lucide/svelte/icons/check';
   import RiChevron from '@lucide/svelte/icons/chevron-down';
   import * as clock from './lib/clock.js';
+  import './lib/scrolling.js';
 
   // The hub, the tabs as the page edits them, their undo and redo, the
   // PlotViews on the page, which the frame loop draws, and each plot's view,

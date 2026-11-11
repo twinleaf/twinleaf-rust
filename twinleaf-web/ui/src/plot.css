@@ -104,9 +104,9 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 /* The dock scrolls its panels itself: the box panels are dragged within is
    the box that holds them all and whose height their shares are of. So its
    scroll bar is the browser's, given the look of a list's: a 10 px lane of
-   its own beside the panels, never over them, and in it a round thumb of
-   the border's colour, 7 px wide, 2 px in from the lane's left and 1 px
-   from its other sides, with no buttons. An open dock reaches 3 px into
+   its own beside the panels, never over them, and in it a round thumb, 7 px
+   wide, 2 px in from the lane's left and 1 px from its other sides, with no
+   buttons. An open dock reaches 3 px into
    its frame's padding on either side, as far as the focus ring stands
    outside a header, so a header's ring lies within the dock and the bar's
    lane outside the ring. A list that scrolls inside a dock that scrolls
@@ -114,10 +114,30 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .dock-side:not(.rail) .dock { margin: 0 -3px; padding: 0 3px; }
 .dock { scrollbar-width: auto; scrollbar-color: auto; }
 .dock::-webkit-scrollbar { width: 10px; }
-.dock::-webkit-scrollbar-thumb { border: solid transparent; border-width: 1px 1px 1px 2px; border-radius: 9999px; background: var(--border); background-clip: padding-box; }
+.dock::-webkit-scrollbar-thumb { border: solid transparent; border-width: 1px 1px 1px 2px; border-radius: 9999px; background: var(--thumb-rest); background-clip: padding-box; }
+/* A dock's scroll bars, its own and its lists', are quiet at rest and plain
+   in use. At rest a thumb is faint, so a dock or a list cut short still
+   shows it has more. Every thumb of a dock has its full colour while the
+   pointer is over the dock, while the dock or a list in it scrolls
+   (scrolling.js), and while the keys have focus in it. Only the colour
+   changes: the lanes stay, so nothing moves. */
+.dock-frame { --thumb-rest: color-mix(in oklch, var(--muted-foreground) 14%, transparent); --thumb-used: color-mix(in oklch, var(--muted-foreground) 50%, transparent); }
+.dock-frame [data-slot=scroll-area-thumb] { background-color: var(--thumb-rest); }
+.dock-frame:is(:hover, [data-scrolling], :has(:focus-visible)) [data-slot=scroll-area-thumb] { background-color: var(--thumb-used); }
+.dock-frame:is(:hover, [data-scrolling], :has(:focus-visible)) .dock::-webkit-scrollbar-thumb { background-color: var(--thumb-used); }
 @supports not selector(::-webkit-scrollbar) {
-  .dock { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+  .dock { scrollbar-width: thin; scrollbar-color: var(--thumb-rest) transparent; }
+  .dock-frame:is(:hover, [data-scrolling], :has(:focus-visible)) .dock { scrollbar-color: var(--thumb-used) transparent; }
 }
+/* The other look, on a root of class `scroll-fade`: no thumb at rest, and a
+   list that has more rows above or below fades out at that edge, by how
+   far it is scrolled. */
+@property --fade-top { syntax: '<length>'; inherits: false; initial-value: 0px; }
+@property --fade-bottom { syntax: '<length>'; inherits: false; initial-value: 0px; }
+@keyframes fade-top { from { --fade-top: 0px; } to { --fade-top: 20px; } }
+@keyframes fade-bottom { from { --fade-bottom: 20px; } to { --fade-bottom: 0px; } }
+:root.scroll-fade .dock-frame { --thumb-rest: transparent; }
+:root.scroll-fade .dock-body [data-slot=scroll-area-viewport] { mask-image: linear-gradient(to bottom, transparent, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent); animation: fade-top linear both, fade-bottom linear both; animation-timeline: scroll(self), scroll(self); animation-range: 0px 20px, calc(100% - 20px) 100%; }
 .dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: -1px; border-radius: var(--radius); }
 /* A dock's top row, as tall as a field: the dock's button at its right end
    and, before it, the filter of the dock's properties where it has one. The
