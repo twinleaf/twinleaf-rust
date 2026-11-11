@@ -7,11 +7,14 @@
   // a hidden dock's rail shows it. Only docks take panels, so none lands on the tiles.
   //
   // A dock that has panels has one button, which hides it and shows it
-  // again, in the dock's top row whether it is shown or is its rail: shown,
+  // again, at one height whether the dock is shown or is its rail: shown,
   // at the dock's top right, the left dock's beside the tiles and the right
-  // dock's at the page's edge; hidden, on the rail. Shown, the dock's top
-  // row holds the button and, before it, what `top` draws, and its panels
-  // scroll beneath that row, so nothing is under the button.
+  // dock's at the page's edge; hidden, on the rail. Shown with `top`, the
+  // dock's top row holds the button and, before it, what `top` draws, and
+  // its panels scroll beneath that row. Shown without, the dock has no top
+  // row: the button shares the first panel header's row, which ends short
+  // of it, and what scrolls up past that row is cut away at the button's
+  // corner (plot.css). Either way nothing is under the button.
   //
   // Property rows or actions carried over the page land on the panel that
   // takes them, the Favorites panel, anywhere on it: its header alone while
@@ -56,7 +59,7 @@
   /**
    * `docks` is the page's Docks, `side` this dock's, and `content(id)` draws
    * a panel's body. `top(side)` draws what the dock's top row holds beside
-   * its button. `railed` draws the rail in the panels' place: the page says
+   * its button; without it the dock has no top row. `railed` draws the rail in the panels' place: the page says
    * when, as a dock sliding shut keeps its panels until it has.
    * `carrying` is what the page's Drags carries, property rows or actions,
    * or null: while it is something, the panel that takes rows shows it
@@ -144,6 +147,7 @@
 <div
   class="dock-side {side}"
   class:rail
+  class:bare={!rail && !top}
   class:hidden={rail && docks[side].length > 0}
   class:awaiting={rail && docks.dragging}
   title={rail ? (docks[side].length ? `Show the ${side} dock` : 'Drop a panel here') : undefined}
@@ -163,7 +167,7 @@
       {/snippet}
     </Tip>
   {/if}
-  {#if !rail}<div class="dock-top">{@render top?.(side)}</div>{/if}
+  {#if !rail && top}<div class="dock-top">{@render top(side)}</div>{/if}
 <div
   class="dock"
   role="list"

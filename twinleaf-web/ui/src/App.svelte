@@ -980,10 +980,8 @@
   {/if}
 {/snippet}
 
-{#snippet dockTop(side)}
-  {#if holdsFilter(side)}
-    <Input class="h-7 min-w-0 flex-1 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows onkeydown={filterKey} />
-  {/if}
+{#snippet dockTop()}
+  <Input class="h-7 min-w-0 flex-1 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows onkeydown={filterKey} />
 {/snippet}
 
 {#snippet dockFrame(side)}
@@ -999,7 +997,7 @@
     style:--content={contentSize[side] !== null ? `${contentSize[side]}px` : null}
     onpointerdown={(e) => drags.startMarquee(e)}
   >
-    <Dock {docks} {side} content={panelBody} top={dockTop} railed={railed[side]} carrying={drags.carrying} />
+    <Dock {docks} {side} content={panelBody} top={holdsFilter(side) ? dockTop : undefined} railed={railed[side]} carrying={drags.carrying} />
   </aside>
 {/snippet}
 

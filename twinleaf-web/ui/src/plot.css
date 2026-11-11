@@ -147,13 +147,24 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 :root.scroll-fade .dock-frame { --thumb-rest: transparent; }
 :root.scroll-fade .dock-body [data-slot=scroll-area-viewport] { mask-image: linear-gradient(to bottom, transparent, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent); animation: fade-top linear both, fade-bottom linear both; animation-timeline: scroll(self), scroll(self); animation-range: 0px 20px, calc(100% - 20px) 100%; }
 .dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: -1px; border-radius: var(--radius); }
-/* A dock's top row, as tall as a field: the dock's button at its right end
-   and, before it, the filter of the dock's properties where it has one. The
-   row keeps the button's width and a gap clear of what it holds. The panels
-   scroll below the row, not under it, and no panel's fold moves it. */
+/* A dock's top row, as tall as a field, in a dock with a panel of
+   properties: the dock's button at its right end and, before it, the filter
+   of the dock's properties. The row keeps the button's width and a gap
+   clear of what it holds. The panels scroll below the row, not under it,
+   and no panel's fold moves it. */
 .dock-top { flex: none; display: flex; align-items: center; height: 28px; margin-bottom: 6px; padding-right: 26px; }
+/* A dock with nothing for a top row has none. Its button shares the first
+   panel header's row, centred in it as in a top row, so it is at one height
+   in every dock; that header, whichever panel is first, open or folded, and
+   the place a dragged panel would land there, end 4 px short of it. What
+   scrolls up past that row is cut away at the button's corner, and the
+   dock's scroll bar runs below it, so nothing of the dock is under it. */
+.dock-side.bare .dock { padding-top: 1px; clip-path: polygon(0 0, calc(100% - 26px) 0, calc(100% - 26px) 28px, 100% 28px, 100% 100%, 0 100%); }
+.dock-side.bare .dock > .dock-panel:first-child > .dock-head, .dock-side.bare .dock > .dock-panel.shadow:first-child { margin-right: 24px; }
+.dock-side.bare .dock::-webkit-scrollbar-track { margin-top: 28px; }
 /* A dock's button, which hides it and shows it, 6 px in from the frame's
-   border each way and centred in the top row's height. Shown, it is in the
+   border each way and centred in the top row's height, or the first
+   header's. Shown, it is in the
    frame's top right corner: the right dock's at the page's edge, the left
    dock's beside the tiles, moving with that edge as the dock slides. Hidden,
    it is on the rail, which is as wide as the button and that inset each
