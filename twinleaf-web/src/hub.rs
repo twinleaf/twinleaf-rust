@@ -142,22 +142,27 @@ pub(crate) struct Hub {
 
 /// A `memory` message as a page shows it: its bytes, budget, seconds,
 /// maximum age and rate, where the oldest trace's history begins, and the
-/// held history's bytes. Another goes out when this changes.
-type MemoryShown = (u64, u64, i64, i64, i64, i64, Option<u64>);
+/// held history's bytes and seconds. Another goes out when this changes.
+type MemoryShown = (u64, u64, i64, i64, i64, i64, Option<(u64, i64)>);
 
 /// The history as it was when it was held: a frozen copy of the buffer, and
 /// of each trace's decimations of it, by trace id. Both share what the hub
-/// goes on with and keep what it drops, as much as the room left them holds.
+/// goes on with and keep what it drops, as much as the room left them holds
+/// and no more of each stream's time before its newest row than `live` keeps.
 struct Held {
     buffer: Buffer,
     reduced: Vec<Vec<Level>>,
 }
 
 impl Held {
-    /// Keeps at most `room` bytes of the rows `live` no longer holds,
-    /// dropping the oldest first, and drops the decimations of the rows no
-    /// longer held.
+    /// Keeps each stream's rows no older than its newest by more than `live`
+    /// keeps of its own, and at most `room` bytes of the rows `live` no
+    /// longer holds, dropping the oldest first, and drops the decimations of
+    /// the rows no longer held.
     fn trim(&mut self, live: &Buffer, room: usize, traces: &[Trace]) {
+        if self.buffer.max_age() != live.max_age() {
+            self.buffer.set_max_age(live.max_age());
+        }
         self.buffer.trim_not_in(live, room);
         for (levels, trace) in self.reduced.iter_mut().zip(traces) {
             let run = self.buffer.run(&trace.key.stream_key());
@@ -755,9 +760,10 @@ impl Hub {
         self.send_memory();
     }
 
-    /// Trims the held history to the room the buffer leaves of the budget:
-    /// the budget less what the buffer holds, as the chunks both hold are
-    /// counted once, in the buffer.
+    /// Trims the held history to the span the buffer keeps of each stream,
+    /// before the held history's own newest row, and to the room the buffer
+    /// leaves of the budget: the budget less what the buffer holds, as the
+    /// chunks both hold are counted once, in the buffer.
     fn trim_held(&mut self) {
         let Some(held) = &mut self.held else { return };
         let room =
@@ -808,23 +814,13 @@ impl Hub {
 
     /// What the buffer holds and may hold, as a `memory` message.
     fn memory(&self) -> Message {
-        let (mut rate, mut seconds) = (0.0, f64::INFINITY);
-        for key in self.buffer.stream_keys() {
-            let Some(run) = self.buffer.run(key) else {
-                continue;
-            };
-            rate += run.row_bytes() as f64 * run.metadata().rate_hz();
-            let rows = run.retained_rows();
-            let first = run
-                .rows(rows.start..rows.start + 1)
-                .first()
-                .and_then(|b| b.timestamps().first().copied());
-            if let (Some(first), Some(last)) = (first, run.last_timestamp()) {
-                seconds = seconds.min(last - first);
-            }
-        }
+        let rate = (self.buffer.stream_keys())
+            .filter_map(|key| self.buffer.run(key))
+            .map(|run| run.row_bytes() as f64 * run.metadata().rate_hz())
+            .sum();
         let held = self.held.as_ref().map(|held| protocol::Held {
             bytes: held.buffer.bytes_not_in(&self.buffer) as u64,
+            seconds: self.seconds_of(&held.buffer),
         });
         let oldest = self
             .traces
@@ -834,12 +830,7 @@ impl Hub {
         Message::Memory {
             bytes: self.buffer.bytes() as u64,
             budget: self.buffer.budget().unwrap_or(0) as u64,
-            // The setting and what is held of it: the headroom is not history a page counts.
-            seconds: if seconds.is_finite() {
-                seconds.min(self.history_seconds)
-            } else {
-                0.0
-            },
+            seconds: self.seconds_of(&self.buffer),
             max_age: self.history_seconds,
             rate,
             held,
@@ -847,10 +838,24 @@ impl Hub {
         }
     }
 
+    /// The seconds of its own time every stream of `buffer` holds, the
+    /// least of any, up to the History setting, as the headroom is not
+    /// history a page counts; 0 with no row.
+    fn seconds_of(&self, buffer: &Buffer) -> f64 {
+        let held = (buffer.stream_keys())
+            .filter_map(|key| buffer.run(key))
+            .filter_map(|run| Some(run.last_timestamp()? - run.first_timestamp()?))
+            .reduce(f64::min);
+        held.map_or(0.0, |seconds| seconds.min(self.history_seconds))
+    }
+
     /// Sets the raw history the buffer keeps, `seconds` and
     /// HISTORY_HEADROOM more of each stream within `bytes`, dropping what no
     /// longer fits at once, and the most each level of the decimation keeps,
-    /// and tells every page.
+    /// and tells every page. The held history keeps the same span before its
+    /// own newest row, and the room the buffer leaves of `bytes`, so a lower
+    /// setting frees what it held beyond them at once and a higher one
+    /// brings back nothing it dropped.
     fn set_history(&mut self, seconds: f64, bytes: usize) {
         self.history_seconds = seconds;
         for trace in &mut self.traces {
@@ -889,7 +894,7 @@ impl Hub {
             oldest.values().map(|t| t.floor() as i64).min().unwrap_or(0),
             // What the held history holds beyond the buffer grows as the
             // buffer moves on, while all else stays as it was.
-            held.map(|held| held.bytes),
+            held.map(|held| (held.bytes, held.seconds.round() as i64)),
         );
         if self.memory_sent != Some(shown) {
             self.memory_sent = Some(shown);
@@ -2127,6 +2132,219 @@ mod tests {
         let window = checked(&mut hub, 0.0, 1e9, 400).unwrap();
         assert_eq!(window.chunks.len(), 1);
         assert_eq!(window.chunks[0].x.first(), Some(&live_from));
+    }
+
+    /// The last `memory` message among the frames `rx` holds.
+    fn last_memory(rx: &mut broadcast::Receiver<Arc<Frame>>) -> Option<serde_json::Value> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|frame| match &*frame {
+                Frame::Text(text) => serde_json::from_str(text).ok(),
+                Frame::Binary(_) => None,
+            })
+            .filter(|message: &serde_json::Value| message["type"] == "memory")
+            .last()
+    }
+
+    /// The key of the stream `parser` describes.
+    fn stream_key() -> StreamKey {
+        StreamKey::new(DeviceRoute::root(), StreamId::new(1))
+    }
+
+    /// Where the held history of the one stream begins and ends.
+    fn held_span(hub: &Hub) -> Option<(f64, f64)> {
+        let run = hub.held.as_ref()?.buffer.run(&stream_key())?;
+        Some((run.first_timestamp()?, run.last_timestamp()?))
+    }
+
+    /// How many points of each level held with the history are before
+    /// `time`, the most of any level.
+    fn held_points_before(hub: &Hub, time: f64) -> usize {
+        let held = hub.held.as_ref().unwrap();
+        (held.reduced.iter().flatten())
+            .map(|level| {
+                (level.between(f64::MIN, time).iter())
+                    .map(|slice| slice.points().iter().filter(|p| p.0 < time).count())
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Lowering History while a page holds the history cuts the held
+    /// history by the buffer's rule, from its own newest row, with its
+    /// levels, and frees what it held. Raising History again brings
+    /// nothing back.
+    #[test]
+    fn lowering_the_history_while_held_cuts_the_held_history_too() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        let (_, mut rx) = hub.feed.subscribe();
+        // At 100 Hz, row n stands at (n + 1) / 100 s: held at 2000 s, the
+        // buffer on to 3000 s, all of it within History.
+        hub.set_history(3000.0, RAW_BYTES);
+        for start in (0..200_000).step_by(10_000) {
+            feed(&mut hub, &mut parser, start, 10_000, 3);
+        }
+        hub.hold(1, true);
+        for start in (200_000..300_000).step_by(10_000) {
+            feed(&mut hub, &mut parser, start, 10_000, 3);
+        }
+        assert_eq!(held_span(&hub), Some((0.01, 2000.0)));
+        assert!(held_points_before(&hub, 1000.0) > pyramid::BLOCK);
+
+        hub.set_history(100.0, RAW_BYTES);
+        let (first, last) = held_span(&hub).unwrap();
+        assert_eq!(last, 2000.0, "the held history keeps its newest");
+        let from = 2000.0 - 100.0 - HISTORY_HEADROOM;
+        assert!((from..from + 0.011).contains(&first), "{first}");
+        assert!(held_points_before(&hub, first) < pyramid::BLOCK);
+        let live = hub.buffer.run(&stream_key()).unwrap();
+        let live_first = live.first_timestamp().unwrap();
+        assert!((2898.0..2898.011).contains(&live_first), "{live_first}");
+        // What it holds beyond the buffer is its 102 s at 16 bytes a row,
+        // and the pages are told so.
+        let Message::Memory { held, seconds, .. } = hub.memory() else {
+            unreachable!()
+        };
+        let held = held.unwrap();
+        assert!((160_000..=165_000).contains(&held.bytes), "{held:?}");
+        assert_eq!((seconds, held.seconds), (100.0, 100.0));
+        let told = last_memory(&mut rx).unwrap();
+        assert_eq!(told["held"]["bytes"].as_u64(), Some(held.bytes));
+        assert_eq!(told["held"]["seconds"].as_f64(), Some(100.0));
+        assert_eq!(told["seconds"].as_f64(), Some(100.0));
+
+        hub.set_history(3000.0, RAW_BYTES);
+        assert_eq!(held_span(&hub), Some((first, last)), "nothing comes back");
+        let live = hub.buffer.run(&stream_key()).unwrap();
+        assert_eq!(live.first_timestamp(), Some(live_first));
+        let told = last_memory(&mut rx).unwrap();
+        assert_eq!(told["held"]["bytes"].as_u64(), Some(held.bytes));
+        assert_eq!(told["max_age"].as_f64(), Some(3000.0));
+    }
+
+    /// What a hub holds after a History setting: where the buffer's rows
+    /// begin and end, where the held history's do, and the bytes of each.
+    #[derive(Debug, PartialEq)]
+    struct Kept {
+        live: (f64, f64),
+        held: Option<(f64, f64)>,
+        bytes: u64,
+        held_bytes: Option<u64>,
+    }
+
+    /// Sets History on `hub` and checks that the buffer and the held
+    /// history keep no more than the setting leaves, the held history its
+    /// newest row and the levels of its rows, and that the pages were told
+    /// what `memory` says.
+    fn set_and_check(
+        hub: &mut Hub,
+        rx: &mut broadcast::Receiver<Arc<Frame>>,
+        seconds: f64,
+        bytes: usize,
+    ) -> Result<Kept, TestCaseError> {
+        let held_before = held_span(hub);
+        hub.set_history(seconds, bytes);
+        let memory = hub.memory();
+        let mut told = last_memory(rx).unwrap();
+        told.as_object_mut().unwrap().remove("seq");
+        let json = serde_json::to_string(&memory).unwrap();
+        prop_assert_eq!(
+            told,
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()
+        );
+        let Message::Memory {
+            bytes: live_bytes,
+            seconds: said,
+            held,
+            ref oldest,
+            ..
+        } = memory
+        else {
+            unreachable!()
+        };
+        let run = hub.buffer.run(&stream_key()).unwrap();
+        let live = (
+            run.first_timestamp().unwrap(),
+            run.last_timestamp().unwrap(),
+        );
+        prop_assert!(
+            live.1 - live.0 <= seconds + HISTORY_HEADROOM + 1e-9,
+            "{live:?}"
+        );
+        prop_assert_eq!(said, (live.1 - live.0).min(seconds));
+        prop_assert!(live_bytes + held.map_or(0, |h| h.bytes) <= bytes as u64);
+        let span = held_span(hub);
+        if let (Some((first, last)), Some((first_before, last_before))) = (span, held_before) {
+            prop_assert_eq!(last, last_before, "the held history keeps its newest");
+            prop_assert!(first >= first_before, "and gets back nothing");
+            prop_assert!(last - first <= seconds + HISTORY_HEADROOM + 1e-9);
+            prop_assert!(held_points_before(hub, first) < pyramid::BLOCK);
+            prop_assert_eq!(held.unwrap().seconds, (last - first).min(seconds));
+            prop_assert_eq!(oldest[&0], first.min(live.0));
+        } else {
+            prop_assert_eq!(held.is_some(), hub.held.is_some());
+        }
+        Ok(Kept {
+            live,
+            held: span,
+            bytes: live_bytes,
+            held_bytes: held.map(|h| h.bytes),
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// From any History setting and fill, held or not, a new setting
+        /// holds the buffer and the held history to it at once, a lower one
+        /// frees what they held beyond it, and setting the old one again
+        /// brings nothing back.
+        #[test]
+        fn a_new_history_setting_holds_the_buffer_and_the_held_history_to_it(
+            history in 10.0..300.0f64,
+            budget in 300_000usize..2_000_000,
+            new_history in 10.0..300.0f64,
+            new_budget in 300_000usize..2_000_000,
+            fill in 0.2..2.5f64,
+            held_for in prop::option::of(0.0..2.0f64),
+        ) {
+            let mut hub = Hub::new();
+            let mut parser = parser();
+            let (_, mut rx) = hub.feed.subscribe();
+            // At 100 Hz, row n stands at (n + 1) / 100 s, 16 bytes a row.
+            let rows = |seconds: f64| ((seconds * 100.0).round() as u32).max(1);
+            let mut fed = 0;
+            let mut feed_to = |hub: &mut Hub, until: u32| {
+                for batch in samples(&mut parser, fed, until - fed) {
+                    hub.ingest(&batch);
+                }
+                fed = until;
+            };
+            hub.set_history(history, budget);
+            feed_to(&mut hub, rows(fill * history));
+            if let Some(held_for) = held_for {
+                hub.hold(1, true);
+                feed_to(&mut hub, rows((fill + held_for) * history));
+            }
+            let before = set_and_check(&mut hub, &mut rx, history, budget)?;
+            let after = set_and_check(&mut hub, &mut rx, new_history, new_budget)?;
+            if new_history <= history && new_budget <= budget {
+                // The held history counts a chunk whole once the buffer
+                // has dropped any of its rows, so the chunk where the
+                // buffer now begins may count in both.
+                let together = |kept: &Kept| kept.bytes + kept.held_bytes.unwrap_or(0);
+                prop_assert!(together(&after) <= together(&before) + CHUNK);
+            }
+            // The old setting again gets back nothing, and where it raises
+            // both limits drops nothing either.
+            let again = set_and_check(&mut hub, &mut rx, history, budget)?;
+            prop_assert!(again.live.0 >= after.live.0, "the buffer gets back nothing");
+            if history >= new_history && budget >= new_budget {
+                prop_assert_eq!(again.live, after.live);
+                prop_assert_eq!(again.held, after.held);
+            }
+        }
     }
 
     /// The lowest and the highest the line through `window`'s points goes

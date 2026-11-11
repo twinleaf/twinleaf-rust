@@ -42,7 +42,7 @@ pub(crate) const FINEST: usize = 128;
 /// before. The coarsest has windows of FINEST·2¹⁵ rows, about four million.
 pub(crate) const LEVELS: usize = 16;
 /// The points in a full block of a level.
-const BLOCK: usize = 1024;
+pub(crate) const BLOCK: usize = 1024;
 
 /// The level whose windows are the longest of no more than `ratio` rows, and
 /// the rows in its windows, or `None` when even the finest level's are

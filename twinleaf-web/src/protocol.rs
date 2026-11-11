@@ -144,11 +144,14 @@ impl Message {
 
 /// The raw history the hub captured while a page holds a plot paused: the
 /// bytes it holds that the live buffer no longer does, which is what holding
-/// it costs. It gives up its oldest rows first as the buffer leaves it less
-/// room.
+/// it costs, and the seconds of each stream's time it holds, up to its
+/// newest row, as the live history's `seconds` counts them. It gives up its
+/// oldest rows first as the buffer leaves it less room, and those older
+/// than the History setting before its newest row.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Held {
     pub(crate) bytes: u64,
+    pub(crate) seconds: f64,
 }
 
 /// A text frame the page sends on the socket.
