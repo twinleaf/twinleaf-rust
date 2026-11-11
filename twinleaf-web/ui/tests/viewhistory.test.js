@@ -80,7 +80,11 @@ async function press(id, label) {
   await frames();
 }
 
-/** Right-clicks plot `id`'s body and picks the menu item that starts `label`. */
+/**
+ * Right-clicks plot `id`'s body, picks the menu item that starts `label`,
+ * and waits until the menu has gone: while it closes it still lies over the
+ * plots under it, where it takes the mouse's presses, and keeps the page's keys.
+ */
 async function pickFromMenu(id, label) {
   const [x, y] = centre(bodyOf(id));
   bodyOf(id).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: x, clientY: y }));
@@ -89,6 +93,7 @@ async function pickFromMenu(id, label) {
   [...document.querySelectorAll('[role=menuitem]')].find((m) => m.textContent.trim().startsWith(label)).click();
   flushSync();
   await frames();
+  expect(await until(() => !document.querySelector('[role=menu]')), 'the menu gone').toBe(true);
 }
 
 /**
@@ -237,7 +242,6 @@ describe('view history on the page', () => {
               await frames();
               if (moved('wheel', xs) && g.turns.length > 1) count.bursts++;
             } else if (g.t === 'follow' || g.t === 'pause') {
-              await until(() => !document.querySelector('[role=menu]'));
               await followBy(p, id, g.t === 'pause' ? 'play' : g.how);
               if (g.t === 'follow') count[g.how]++;
               moved(g.how ?? 'pause', xs);

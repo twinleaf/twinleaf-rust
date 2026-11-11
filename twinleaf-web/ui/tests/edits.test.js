@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
-import { centre, focusPage, frames, mountPage, pressKey, settle, until, wait } from './harness/page.js';
+import { centre, focusPage, frames, mountPage, pressKey, rested, settle, until, wait } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const KEYS = [['sine.sine', 'sine.cosine'], ['aux.triangle']];
@@ -84,7 +84,10 @@ describe('a control that edits', () => {
     oneStep(
       /^Move the legend/,
       async (page) => {
-        const [x, y] = centre(plotEl(page).querySelector('.pinned-legend'));
+        // The legend slides to its place as its plot makes room for it, by a transition of the browser's: it is pressed once it rests.
+        const legend = plotEl(page).querySelector('.pinned-legend');
+        expect(await rested(() => centre(legend).join()), 'the legend at rest').toBe(true);
+        const [x, y] = centre(legend);
         await commands.mouse([['move', x, y], ['down'], ['move', x - 40, y + 30], ['move', x - 80, y + 60], ['up']]);
         await wait(50);
       },

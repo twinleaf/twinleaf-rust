@@ -16,7 +16,7 @@ import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { commands } from 'vitest/browser';
-import { centre, clickOn, dropped, frames, glide, mountPage, pressKey, settle, wait, withExamples } from './harness/page.js';
+import { centre, clickOn, dropped, frames, glide, mountPage, pressKey, settle, until, wait, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { KEY as DOCKS_KEY, PANELS } from '../src/lib/docks.svelte.js';
 
@@ -66,17 +66,20 @@ const isOpen = (id) => panelHead(id).getAttribute('aria-expanded') === 'true';
 
 /** A click on `el` with the real mouse, Ctrl or Shift held as `init` says. */
 const click = (el, init = {}) => clickOn(el, { ctrl: !!init.ctrlKey, shift: !!init.shiftKey });
-/** Opens the row menu on `el` with a right-click of the real mouse, and waits for it. */
-async function rightClick(el) {
+/** Right-clicks `el` with the real mouse, and waits for the row menu that opens, or with `opens` false, as on what has none, a few frames in which none does. */
+async function rightClick(el, opens = true) {
   await clickOn(el, { right: true });
   flushSync();
-  for (let i = 0; i < 30 && !document.querySelector('[role=menu]'); i++) await frames();
+  if (opens) expect(await until(() => document.querySelector('[role=menu]')), 'the row menu open').toBe(true);
+  else {
+    await frames(4);
+    expect(document.querySelector('[role=menu]'), 'no menu').toBe(null);
+  }
 }
-/** Closes an open menu with Escape, and waits until it has gone. */
+/** Closes the menu, if one is open, with Escape, and waits until none is left on the page, one that was closing too. */
 async function closeMenu() {
-  if (!document.querySelector('[role=menu]')) return;
-  await pressKey('Escape');
-  for (let i = 0; i < 20 && document.querySelector('[role=menu]'); i++) await frames();
+  if (document.querySelector('[role=menu][data-state=open]')) await pressKey('Escape');
+  expect(await until(() => !document.querySelector('[role=menu]')), 'the menu gone').toBe(true);
 }
 const menuItems = () => [...document.querySelectorAll('[role=menu] [role=menuitem]')];
 
@@ -92,7 +95,7 @@ describe('a property row', () => {
     async function shiftPress(el) {
       const hides = el.getAttribute('aria-label').startsWith('Hide');
       await clickOn(el, { shift: true });
-      for (let i = 0; i < 90 && hidden() !== hides; i++) await frames();
+      expect(await until(() => hidden() === hides), hides ? 'the dock hidden' : 'the dock shown').toBe(true);
       await frames(2);
     }
     try {
@@ -163,7 +166,7 @@ describe('a property row', () => {
                   if (button) seen.rightButton++;
                   else if (shownPicks().includes(key)) seen.rightPicked++;
                   else (seen.rightUnpicked++, (picks = [key]), (anchor = key), (at = key));
-                  await rightClick(cell);
+                  await rightClick(cell, !button);
                   if (!button) {
                     // Copy counts what it copies: every picked row that shows, each property once.
                     const n = new Set(shownPicks().map(nameOf)).size;
