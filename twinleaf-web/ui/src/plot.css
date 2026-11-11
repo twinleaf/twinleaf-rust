@@ -309,12 +309,13 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 
 /* The plot's signals, in its header, each with its value. The header is one
    row at every size: signals past its end scroll sideways under a fade,
-   and the pinned legend shows them all at once. */
+   and the pinned legend shows them all at once. The fade's width, --fade,
+   is the one PlotCard.svelte judges a chip in view by. */
 .trace-zone { flex: 1; min-width: 0; height: 24px; display: flex; align-items: center; gap: 10px; padding: 0 4px; overflow: auto hidden; scrollbar-width: none; border-radius: calc(var(--radius) - 4px); }
 .trace-zone::-webkit-scrollbar { display: none; }
-.trace-zone.more-right { mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent); }
-.trace-zone.more-left { mask-image: linear-gradient(to left, #000 calc(100% - 24px), transparent); }
-.trace-zone.more-left.more-right { mask-image: linear-gradient(to right, transparent, #000 24px, #000 calc(100% - 24px), transparent); }
+.trace-zone.more-right { mask-image: linear-gradient(to right, #000 calc(100% - var(--fade)), transparent); }
+.trace-zone.more-left { mask-image: linear-gradient(to left, #000 calc(100% - var(--fade)), transparent); }
+.trace-zone.more-left.more-right { mask-image: linear-gradient(to right, transparent, #000 var(--fade), #000 calc(100% - var(--fade)), transparent); }
 /* Under a row that runs past an edge, a dash per signal in its colour, dim
    while its chip is out of view, on the header's foot below the chips. Each
    is a 4 px band to press, its 2 px dash drawn in the middle. Too many to

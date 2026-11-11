@@ -5,13 +5,16 @@
 // every step each plot's row shows its signals in order, and the tab keeps
 // every signal it had: a move takes a signal somewhere, never away. And
 // under a row that runs past an edge, a dash per signal, in its colour and
-// order, dim exactly while its chip is out of view, which a click on it
-// brings into view; under a row that fits, none.
+// order, dim exactly while its chip is out of view as a person would say it,
+// one lit while the row shows any chip, as it scrolls, resizes and its chips
+// and their values change; a click on a dim one brings its chip into view.
+// Under a row that fits, none.
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { commands } from 'vitest/browser';
-import { centre, clickOn, drag, dropped, frames, leafOf, mountPage, settle, until, withExamples } from './harness/page.js';
+import { centre, clickOn, drag, dropped, feed, frames, leafOf, mountPage, settle, until, wait, withExamples } from './harness/page.js';
+import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
 import { chip } from '../src/lib/tabs.js';
@@ -80,12 +83,32 @@ describe('chip rows', () => {
   }, 600_000);
 });
 
-const MANY = Array.from({ length: 14 }, (_, i) => `dev.signal${i}`);
-/** Whether `chip` is in view in its row: wholly within the box the row shows, or, wider than the row, filling it. */
+/** Each signal's name as long as `signal`, and two values, for the examples. */
+const L = Array(14).fill(6), Y = [0.5, -0.25];
+/** Whether `chip` is wholly within the box its row shows, or, wider than the row, filling it. */
 const wholly = (chip, row) => {
   const c = chip.getBoundingClientRect(), r = row.getBoundingClientRect();
   return (c.left >= r.left - 0.5 && c.right <= r.right + 0.5) || (c.left <= r.left + 0.5 && c.right >= r.right - 0.5);
 };
+/**
+ * Whether each of `chips` is in view in `row`, as a person would say it,
+ * from their boxes on the page: most of its width clear of the fades at the
+ * row's edges, or covering most of the row, or, failing any such, holding
+ * as much of the row as any chip does.
+ */
+function inView(chips, row) {
+  const b = row.getBoundingClientRect(), fade = parseFloat(getComputedStyle(row).getPropertyValue('--fade'));
+  const l = b.left + (row.classList.contains('more-left') ? fade : 0), r = b.right - (row.classList.contains('more-right') ? fade : 0);
+  const span = (c, a, z) => Math.max(0, Math.min(c.right, z) - Math.max(c.left, a));
+  const boxes = chips.map((c) => c.getBoundingClientRect()), held = boxes.map((c) => span(c, b.left, b.right)), most = Math.max(0, ...held);
+  return boxes.map((c, i) => span(c, l, r) >= c.width / 2 || held[i] >= b.width / 2 || (most > 0 && held[i] >= most - 0.5));
+}
+/** Gives each of `hub`'s traces one sample more, at time `t` in s, of value `y`, as a live device sends it. */
+function sample(hub, t, y) {
+  const session = hub.session, perf = clock.now();
+  for (const tr of session.traces.values()) session.apply({ kind: 'points', chunks: [{ id: tr.meta.id, level: 0, brk: false, xs: Float64Array.of(t), ys: Float32Array.of(y) }] }, perf);
+  session.tick(perf);
+}
 
 /**
  * Checks plot `id`'s row of chips against the dashes under it, and gives
@@ -106,8 +129,10 @@ function checkDashes(id, where) {
   // One per signal, in the chips' order and colours.
   expect(dashes.map((d) => d.dataset.key), `${where}: a dash per chip, in order`).toEqual(chips.map((c) => c.dataset.key));
   dashes.forEach((d, i) => expect(getComputedStyle(d, '::after').backgroundColor, `${where}: dash ${i}'s colour`).toBe(getComputedStyle(chips[i].querySelector('.swatch i')).backgroundColor));
-  // Dim exactly while its chip is not wholly in view.
-  dashes.forEach((d, i) => expect(getComputedStyle(d, '::after').opacity, `${where}: dash ${i}, its chip ${wholly(chips[i], row) ? '' : 'not '}wholly in view`).toBe(wholly(chips[i], row) ? '1' : '0.25'));
+  // Dim exactly while its chip is out of view, and, while the row shows any chip, one lit.
+  const seen = inView(chips, row), boxes = () => JSON.stringify({ row: row.getBoundingClientRect(), chips: chips.map((c) => [Math.round(c.getBoundingClientRect().left), Math.round(c.getBoundingClientRect().right)]) });
+  dashes.forEach((d, i) => expect(getComputedStyle(d, '::after').opacity, `${where}: dash ${i}, its chip ${seen[i] ? '' : 'not '}in view, ${boxes()}`).toBe(seen[i] ? '1' : '0.25'));
+  expect(dashes.some((d) => !d.classList.contains('out')), `${where}: a dash lit, ${boxes()}`).toBe(true);
   // Within the row's width, between their least width and their full one; past that the strip clips them under a fade.
   const s = strip.getBoundingClientRect(), r = row.getBoundingClientRect();
   expect(s.left >= r.left && s.right <= r.right && s.top >= r.bottom - 2 && s.bottom <= head.getBoundingClientRect().bottom + 1, `${where}: the strip ${JSON.stringify(s)} is under the row ${JSON.stringify(r)}`).toBe(true);
@@ -119,27 +144,76 @@ function checkDashes(id, where) {
 }
 
 describe('the dashes under a row of chips', () => {
-  it('are there only while the row runs past an edge, one per signal in its colour, dim while its chip is out of view, and a click on one brings its chip into view', async () => {
-    const count = { fits: 0, over: 0, out: 0, crowded: 0, revealed: 0 };
-    const change = fc.constantFrom('none', 'add', 'remove', 'reverse', 'narrow', 'hide');
+  it('are there only while the row runs past an edge, one per signal in its colour, dim while its chip is out of view, one lit, and a click on a dim one brings its chip into view', async () => {
+    const count = { fits: 0, over: 0, out: 0, crowded: 0, revealed: 0, unlit: 0, edge: 0 };
+    const change = fc.constantFrom('none', 'add', 'remove', 'reverse', 'narrow', 'hide', 'values', 'legend', 'widen', 'wheel');
+    // How far along the row is scrolled: a fraction of the way, or chip `chip`'s left edge put `at` px from the row's.
+    const scroll = fc.oneof(fc.double({ min: 0, max: 1, noNaN: true }), fc.record({ chip: fc.nat(), at: fc.integer({ min: -80, max: 80 }) }));
+    const values = fc.array(fc.oneof(fc.double({ min: -1e6, max: 1e6, noNaN: true }), fc.double({ min: -1e-3, max: 1e-3, noNaN: true })), { minLength: 2, maxLength: 2 });
+    const names = fc.array(fc.integer({ min: 1, max: 22 }), { minLength: 14, maxLength: 14 });
     await fc.assert(
-      fc.asyncProperty(fc.integer({ min: 1, max: 14 }), fc.integer({ min: 1, max: 4 }), fc.double({ min: 0, max: 1, noNaN: true }), fc.nat(), change, async (n, columns, scrolled, pick, then) => {
-        const keys = [MANY.slice(0, n), ...Array.from({ length: columns - 1 }, () => [])];
-        const page = await mountPage(keys, 'columns', 0, MANY);
+      fc.asyncProperty(fc.integer({ min: 1, max: 14 }), fc.integer({ min: 1, max: 4 }), fc.option(fc.integer({ min: 150, max: 900 })), names, scroll, fc.nat(), change, values, async (n, columns, width, lengths, scrolled, pick, then, [y0, y1]) => {
+        const signals = lengths.map((len, i) => `dev.${'signalnamewithmanyparts'.slice(0, len)}${i}`);
+        const keys = [signals.slice(0, n), ...Array.from({ length: columns - 1 }, () => [])];
+        const page = await mountPage(keys, 'columns', 0, signals);
         try {
+          feed(page.hub);
+          sample(page.hub, 20, y0);
+          const id = plotIds(page.ws.layout)[0];
+          // A plot `width` px wide, or as wide as its pane where that is narrower.
+          if (width) Object.assign(leafOf(id).querySelector('.plot-card').style, { flex: `0 0 ${width}px`, maxWidth: '100%' });
+          await wait(200);
           await settle();
-          const id = plotIds(page.ws.layout)[0], where = `${n} signals, a plot ${columns === 1 ? 'the page' : `a ${columns}th of the page`} wide, scrolled ${scrolled.toFixed(2)} along`;
           const row = leafOf(id).querySelector('.trace-zone');
-          row.scrollLeft = scrolled * (row.scrollWidth - row.clientWidth);
+          if (typeof scrolled === 'number') row.scrollLeft = scrolled * (row.scrollWidth - row.clientWidth);
+          else {
+            const c = row.querySelectorAll(':scope > .trace-chip')[scrolled.chip % n];
+            row.scrollLeft += c.getBoundingClientRect().left - row.getBoundingClientRect().left - scrolled.at;
+          }
           await frames();
+          const where = `${n} signals of names ${JSON.stringify(lengths.slice(0, n))} long, a plot ${width ? `${width} px` : columns === 1 ? 'the page' : `a ${columns}th of the page`} wide, scrolled ${JSON.stringify(scrolled)}`;
           let seen = checkDashes(id, where);
           count[seen.over ? 'over' : 'fits']++;
           if (seen.over) {
             count.out += seen.dashes.some((d) => d.classList.contains('out')) ? 1 : 0;
             count.crowded += seen.strip.classList.contains('crowded') ? 1 : 0;
-            // A dash that shows: a click on it brings its chip wholly into view.
+            // Rows where no chip is wholly in view, nor fills it, though a person sees one in it.
+            count.unlit += seen.chips.some((c) => wholly(c, seen.row)) ? 0 : 1;
+            // Rows where a chip lit is not wholly in view.
+            count.edge += seen.chips.some((c, i) => !wholly(c, seen.row) && !seen.dashes[i].classList.contains('out')) ? 1 : 0;
+          }
+          // The row changes: a signal added or taken away, the signals reordered, one hidden, the header
+          // narrowed, the legend taking the values from the chips, a value's text widened in its chip, or
+          // the wheel turned over the row; and the values change.
+          const items = page.ws.plots[id].items;
+          if (then === 'add' || then === 'remove' || then === 'reverse' || then === 'hide' || then === 'legend')
+            page.history.group('Change', () =>
+              page.ws.setPlot(
+                id,
+                then === 'legend'
+                  ? { legend: true }
+                  : {
+                      items: then === 'add' ? [...items, ...signals.filter((k) => !items.some((it) => it.key === k)).slice(0, 1).map(chip)] : then === 'remove' ? items.slice(1) : then === 'reverse' ? items.toReversed() : items.map((it, k) => (k === pick % items.length ? { ...it, hidden: true } : it)),
+                    },
+              ),
+            );
+          else if (then === 'narrow') leafOf(id).querySelector('.plot-card').style.flex = '0 0 55%';
+          else if (then === 'widen') row.querySelectorAll(':scope > .trace-chip .val')[pick % n].style.width = '30ch';
+          else if (then === 'wheel') row.dispatchEvent(new WheelEvent('wheel', { deltaY: 40 + (pick % 120), bubbles: true, cancelable: true }));
+          sample(page.hub, 21, y1);
+          flushSync();
+          await wait(200);
+          await frames(4);
+          seen = checkDashes(id, `${where}, after '${then}'`);
+          if (then === 'hide' && seen.over) {
+            const k = pick % items.length;
+            expect(getComputedStyle(seen.dashes[k]).opacity, `${where}: the hidden signal's dash looks as its chip does`).toBe(getComputedStyle(seen.chips[k]).opacity);
+          }
+          if (seen.over) {
+            // A dash that shows, dim if any is: a click on it brings its chip wholly into view, and lights it.
             const shown = seen.dashes.filter((d) => d.getBoundingClientRect().right <= seen.strip.getBoundingClientRect().right - 1);
-            const dash = shown[pick % shown.length], i = seen.dashes.indexOf(dash);
+            const dim = shown.filter((d) => d.classList.contains('out')), from = dim.length ? dim : shown;
+            const dash = from[pick % from.length], i = seen.dashes.indexOf(dash);
             const was = wholly(seen.chips[i], seen.row);
             // A plot too small for its header shows it floating while the pointer is over it.
             const head = leafOf(id).querySelector('.plot-head');
@@ -152,30 +226,28 @@ describe('the dashes under a row of chips', () => {
             const c = seen.chips[i].getBoundingClientRect(), r = seen.row.getBoundingClientRect();
             if (c.width >= r.width) expect(Math.abs(c.left - r.left), `${where}: chip ${i}, wider than the row, at its start`).toBeLessThan(1);
             if (!was) count.revealed++;
-            checkDashes(id, `${where}, after a click on dash ${i}`);
-          }
-          // The row changes: a signal added or taken away, the signals reordered, one hidden, or the header narrowed.
-          const items = page.ws.plots[id].items;
-          if (then === 'add' || then === 'remove' || then === 'reverse' || then === 'hide')
-            page.history.group('Change', () =>
-              page.ws.setPlot(id, {
-                items: then === 'add' ? [...items, ...MANY.filter((k) => !items.some((it) => it.key === k)).slice(0, 1).map(chip)] : then === 'remove' ? items.slice(1) : then === 'reverse' ? items.toReversed() : items.map((it, k) => (k === pick % items.length ? { ...it, hidden: true } : it)),
-              }),
-            );
-          else if (then === 'narrow') leafOf(id).querySelector('.plot-card').style.width = '55%';
-          flushSync();
-          await frames(4);
-          seen = checkDashes(id, `${where}, after '${then}'`);
-          if (then === 'hide' && seen.over) {
-            const k = pick % items.length;
-            expect(getComputedStyle(seen.dashes[k]).opacity, `${where}: the hidden signal's dash looks as its chip does`).toBe(getComputedStyle(seen.chips[k]).opacity);
+            expect(dash.classList.contains('out'), `${where}: dash ${i} after a click on it`).toBe(false);
+            checkDashes(id, `${where}, after '${then}' and a click on dash ${i}`);
           }
         } finally {
           page.dispose();
         }
       }),
-      // Three that fit; twelve scrolled to the left, the middle and the right; fourteen in a quarter of the page.
-      withExamples([[1, 1, 0, 0, 'none'], [2, 1, 0, 0, 'none'], [3, 1, 0, 0, 'none'], [12, 1, 0, 11, 'none'], [12, 1, 0.5, 0, 'reverse'], [12, 1, 1, 0, 'narrow'], [14, 4, 0.3, 2, 'hide']]),
+      // Three that fit; twelve scrolled to the left, the middle and the right; fourteen in a quarter of the
+      // page; four in a plot with room for about one, the third chip cut at both edges of the row, its left
+      // in the fade; and the second chip mostly out of view at the left, its value's text widened after
+      // the last scroll so that it, not the third, is mostly in view.
+      withExamples([
+        [1, 1, null, L, 0, 0, 'none', Y],
+        [2, 1, null, L, 0, 0, 'none', Y],
+        [3, 1, null, L, 0, 0, 'none', Y],
+        [12, 1, null, L, 0, 11, 'none', Y],
+        [12, 1, null, L, 0.5, 0, 'reverse', Y],
+        [12, 1, null, L, 1, 0, 'narrow', Y],
+        [14, 4, null, L, 0.3, 2, 'hide', Y],
+        [4, 1, 500, L, { chip: 2, at: 8 }, 0, 'none', Y],
+        [4, 1, 600, L, { chip: 1, at: -100 }, 1, 'widen', Y],
+      ]),
     );
     for (const [what, k] of Object.entries(count)) expect(k, what).toBeGreaterThan(0);
   }, 600_000);

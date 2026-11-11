@@ -299,14 +299,13 @@
    * The row of chips as last measured, for the dashes under it while it runs
    * past an edge: whether it does, where the strip of dashes lies in the
    * header (its content box, `left` and `width` in px), and the ids of the
-   * chips out of view: not wholly in the row, nor, wider than the row,
-   * filling it.
+   * chips out of view, as `outOfView` decides.
    */
   let chipRow = $state.raw({ over: false, left: 0, width: 0, out: new Set() });
   /** A dash under the row of chips, in px: its full width, its least, and the gap between two. */
   const DASH = { w: 14, min: 4, gap: 3 };
-  /** How far in from an edge of the row, at most, a chip brought into view by its dash comes to rest: clear of the fade there. */
-  const REVEAL_CLEAR = 24;
+  /** How wide the fade at an edge of the row of chips is, in px, while the row runs past that edge: its `--fade`. */
+  const FADE = 24;
 
   /**
    * Marks a row of chips that runs past either edge, for the fade there, and
@@ -315,16 +314,14 @@
    * follows it as it scrolls, resizes and its chips change.
    */
   function overflowEdges(node) {
+    node.style.setProperty('--fade', `${FADE}px`);
     const mark = () => {
-      node.classList.toggle('more-left', node.scrollLeft > 1);
-      node.classList.toggle('more-right', node.scrollLeft + node.clientWidth < node.scrollWidth - 1);
+      const left = node.scrollLeft > 1, right = node.scrollLeft + node.clientWidth < node.scrollWidth - 1;
+      node.classList.toggle('more-left', left);
+      node.classList.toggle('more-right', right);
       const over = node.scrollWidth > node.clientWidth + 1, pad = parseFloat(getComputedStyle(node).paddingLeft) || 0;
-      const box = node.getBoundingClientRect(), out = new Set();
-      if (over)
-        for (const c of node.querySelectorAll(':scope > .trace-chip')) {
-          const r = c.getBoundingClientRect();
-          if (!shows(r, box)) out.add(c.id);
-        }
+      const chips = over ? [...node.querySelectorAll(':scope > .trace-chip')].map((c) => [c.id, c.getBoundingClientRect()]) : [];
+      const out = outOfView(chips, node.getBoundingClientRect(), { left: left ? FADE : 0, right: right ? FADE : 0 });
       chipRow = { over, left: node.offsetLeft + pad, width: node.clientWidth - 2 * pad, out };
     };
     const wheel = (e) => {
@@ -350,8 +347,19 @@
     };
   }
 
-  /** Whether a chip at client box `r` is in view in a row at `box`: wholly in it, or, wider than the row, filling it. */
-  const shows = (r, box) => (r.left >= box.left - 0.5 && r.right <= box.right + 0.5) || (r.left <= box.left + 0.5 && r.right >= box.right - 0.5);
+  /**
+   * The ids of the chips out of view in a row at client box `box` that fades
+   * `fade.left` and `fade.right` px in from its edges, of `chips`, each
+   * [id, client box]. A chip is in view when most of its width lies clear of
+   * the fades, or when it holds as much of the row as any chip does, as one
+   * covering most of the row does: while the row shows any chip, one is in view.
+   */
+  function outOfView(chips, box, fade) {
+    const span = (r, a, b) => Math.max(0, Math.min(r.right, b) - Math.max(r.left, a));
+    const most = Math.max(0, ...chips.map(([, r]) => span(r, box.left, box.right)));
+    const shows = (r) => span(r, box.left + fade.left, box.right - fade.right) >= r.width / 2 || (most > 0 && span(r, box.left, box.right) >= most - 0.5);
+    return new Set(chips.filter(([, r]) => !shows(r)).map(([id]) => id));
+  }
 
   /**
    * Scrolls the row of chips just far enough that chip `id` is wholly in
@@ -362,7 +370,7 @@
     const c = document.getElementById(`chip-${id}`);
     if (!c || !zone) return;
     const r = c.getBoundingClientRect(), box = zone.getBoundingClientRect();
-    const clear = Math.max(0, Math.min(REVEAL_CLEAR, (box.width - r.width) / 2));
+    const clear = Math.max(0, Math.min(FADE, (box.width - r.width) / 2));
     if (r.width >= box.width) zone.scrollLeft += r.left - box.left;
     else if (r.left < box.left + clear) zone.scrollLeft -= box.left + clear - r.left;
     else if (r.right > box.right - clear) zone.scrollLeft += r.right - (box.right - clear);
