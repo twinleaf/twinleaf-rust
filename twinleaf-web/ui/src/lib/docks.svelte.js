@@ -23,7 +23,9 @@ export const KEY = 'tl-docks-v1';
 
 /**
  * Every panel, by id. `channels` names the RPC channels a Properties panel
- * shows (null for entries with none). A panel is as tall as what it shows
+ * shows (null for entries with none). `takes: 'rows'` marks the panel that
+ * property rows and actions carried onto it star (drag.svelte.js
+ * `carryRows`). A panel is as tall as what it shows
  * while its dock has the room. Where the panels do not fit, a panel taller
  * than the share of the dock's height that plot.css gives every panel gives
  * way, down to that share, its list scrolling inside it, and the dock
@@ -39,7 +41,7 @@ export const PANELS = {
   actions: { title: 'Actions', channels: ['action'] },
   diagnostics: { title: 'Diagnostics', channels: ['diagnostic'] },
   other: { title: 'Other', channels: [null] },
-  favorites: { title: 'Favorites', channels: ['favorite'] },
+  favorites: { title: 'Favorites', channels: ['favorite'], takes: 'rows' },
 };
 
 export const SIDES = ['left', 'right'];

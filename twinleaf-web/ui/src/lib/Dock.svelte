@@ -13,6 +13,10 @@
   // row holds the button and, before it, what `top` draws, and its panels
   // scroll beneath that row, so nothing is under the button.
   //
+  // Property rows or actions carried over the page land on the panel that
+  // takes them, the Favorites panel, anywhere on it: its header alone while
+  // it is folded (drag.svelte.js `carryRows`).
+  //
   // The header's menu moves a panel without dragging, and the header folds
   // it on Enter, so the keyboard reaches all of it.
   //
@@ -54,8 +58,11 @@
    * a panel's body. `top(side)` draws what the dock's top row holds beside
    * its button. `railed` draws the rail in the panels' place: the page says
    * when, as a dock sliding shut keeps its panels until it has.
+   * `carrying` is what the page's Drags carries, property rows or actions,
+   * or null: while it is something, the panel that takes rows shows it
+   * does, and shows it more while the pointer is on it.
    */
-  let { docks, side, content, top = undefined, railed } = $props();
+  let { docks, side, content, top = undefined, railed, carrying = null } = $props();
 
   // Panels slide only while one is dragged, so a fold resizes them in place.
   const FLIP_MS = 150;
@@ -168,7 +175,7 @@
   {#each items as p, i (p.id)}
     <!-- The drag library's placeholder for a panel from the other dock has an id of its own. -->
     {@const panel = PANELS[p.id] ?? { title: '' }}
-    <section class="dock-panel" class:shadow={p[SHADOW]} class:open={p.open} role="listitem" aria-label={panel.title} animate:flip={{ duration: docks.dragging ? FLIP_MS : 0 }}>
+    <section class="dock-panel" class:shadow={p[SHADOW]} class:open={p.open} class:awaiting={carrying && panel.takes === 'rows'} class:drop-target={carrying?.over && panel.takes === 'rows'} data-takes={panel.takes} role="listitem" aria-label={panel.title} animate:flip={{ duration: docks.dragging ? FLIP_MS : 0 }}>
       <ContextMenu.Root>
         <ContextMenu.Trigger>
           {#snippet child({ props })}

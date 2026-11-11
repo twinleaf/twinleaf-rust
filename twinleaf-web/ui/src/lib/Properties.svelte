@@ -23,7 +23,9 @@
   // Ctrl+C, or Copy in the right-click menu, copies the picked rows, a
   // property and each device's value apiece, as a sheet pastes them. A star
   // pins a property to the Favorites panel, which shows every starred
-  // property of the checked devices.
+  // property of the checked devices; so does dragging a row or an action
+  // onto that panel, which carries every picked row when it is one of
+  // them, as the star sets them. Nothing dragged out of Favorites leaves it.
   //
   // Up to MAX_COLUMNS devices get a column each; more share one column,
   // which shows the value they agree on or how many values they differ in.
@@ -55,8 +57,9 @@
    * the RPC channels shown, as properties.js names them, every one by
    * default. `panel` names the panel, so its rows' picks are told from
    * another panel's. `filter` is the words every row shown has in its name.
+   * `drags` is the page's Drags, which carries rows to Favorites.
    */
-  let { devices, channels = undefined, panel = 'properties', filter = '' } = $props();
+  let { devices, channels = undefined, panel = 'properties', filter = '', drags = null } = $props();
 
   /** The rows PageUp and PageDown move by. */
   const PAGE = 10;
@@ -213,11 +216,14 @@
     const what = `${on ? 'Add' : 'Remove'} ${changed.length > 1 ? `${changed.length} ` : ''}${on ? 'to' : 'from'} Favorites`;
     history.group(what, () => favorites.pin(changed, on));
   }
+  /** The names a star or a drag on row `name` acts on: every picked row when it is one of them, else it alone. */
+  const carried = (name) => (picked.has(name) ? pickedNames() : [name]);
   /** A star clicked on row `name`: on a picked row it sets every picked row as this one turns, on another just this one. */
   function starClicked(name) {
-    const on = !favorites.has(name);
-    pin(picked.has(name) ? pickedNames() : [name], on);
+    pin(carried(name), !favorites.has(name));
   }
+  /** A press on row or action `name`, which a drag carries, with the rows picked with it, to Favorites, starring them as the star does. */
+  const carry = (name, e) => drags?.carryRows(carried(name), e, (names) => pin(names, true));
   /** The rows Copy copies: every picked row, each property once, in page order, or the active one. */
   function copied() {
     const byName = new Map(mergeRows(devices).map((r) => [r.name, r]));
@@ -320,6 +326,7 @@
               data-name={row.name}
               aria-pressed={picked.has(row.name)}
               onclick={(e) => pillClick(row, e)}
+              onpointerdown={(e) => carry(row.name, e)}
             >
               {#if order}<b class="run-order" aria-label="runs {order}">{order}</b>{/if}{row.name}{#if failed.length}<b class="mark bad">✕{devices.length > 1 ? failed.length : ''}</b>{/if}
             </Button>
@@ -372,6 +379,7 @@
           class={picked.has(row.original.name) ? 'picked' : ''}
           aria-selected={picked.has(row.original.name)}
           onclick={(e) => (pick(i, e), tableEl?.focus())}
+          onpointerdown={(e) => carry(row.original.name, e)}
         >
           {#each row.getVisibleCells() as cell (cell.id)}
             <Table.Cell class={cell.column.id === 'name' ? '' : 'text-right'}>

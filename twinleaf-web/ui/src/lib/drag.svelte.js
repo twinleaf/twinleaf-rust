@@ -1,5 +1,6 @@
 // The page's pointer drags over the tiles: moving plots, dropping signals on
-// a plot's edge, and the selection box. `Drags` holds what the overlay
+// a plot's edge, and the selection box; and property rows carried to the
+// Favorites panel. `Drags` holds what the overlay
 // draws while one goes on (DragOverlay.svelte), and edits the workspace.
 //
 // The compass: drop cells over the plot under the pointer, and cells along
@@ -38,6 +39,23 @@ function follow(move, up) {
   return stop;
 }
 
+/** Keeps the click a pointerup that ends a drag makes from reaching anything; one that does not come by the next frame or press is none. */
+function swallowClick() {
+  const swallow = (ev) => {
+    ev.stopPropagation();
+    ev.preventDefault();
+    done();
+  };
+  const done = () => {
+    window.removeEventListener('click', swallow, true);
+    window.removeEventListener('pointerdown', done, true);
+    clock.cancel(frame);
+  };
+  window.addEventListener('click', swallow, true);
+  window.addEventListener('pointerdown', done, true);
+  const frame = clock.frame(done);
+}
+
 export class Drags {
   /** The plot being moved: {plotId, group, x, y, target}. */
   moving = $state(null);
@@ -55,6 +73,8 @@ export class Drags {
   marquee = $state(null);
   /** Plots that just landed, flashed so the eye finds them. */
   landed = $state(null);
+  /** Property rows or actions being carried, {names, x, y, over}: `over` while the pointer is on a panel that takes them. */
+  carrying = $state(null);
   /**
    * Which side's axes a signal dropped at (x, y) on plot `plotId` would
    * join, as {side, rect}, or null: set by the page, which has the plots.
@@ -230,6 +250,47 @@ export class Drags {
         } else ws.setLayout(target.cell.next);
       });
       if (!target.tabId) this.flash(group);
+    };
+  }
+
+  /**
+   * Picks up property rows or actions `names`, pressed with `e`, once the
+   * pointer moves a few pixels, so a click on a row or an action stays one.
+   * A panel marked data-takes="rows", the Favorites panel, takes them
+   * anywhere on it, its header alone while it is folded: let go there,
+   * `land(names)` runs. Let go anywhere else, or after Escape, nothing
+   * changes. The click that ends a carry clicks nothing, so an action
+   * carried back onto its own button does not run. A move with the button
+   * up, as after a press whose release went unheard, ends it with nothing
+   * put down.
+   */
+  carryRows(names, e, land) {
+    if (e.button !== 0 || !names.length) return;
+    const [x0, y0] = [e.clientX, e.clientY];
+    let unclaim = null; // Escape's claim, once picked up
+    const takes = (x, y) => !!document.elementsFromPoint(x, y).find((el) => !el.closest('.move-ghost'))?.closest('[data-takes=rows]');
+    const stop = follow(
+      (ev) => {
+        if (!(ev.buttons & 1)) return cancel();
+        if (!unclaim) {
+          if (Math.hypot(ev.clientX - x0, ev.clientY - y0) < DRAG_START) return;
+          unclaim = claim('drag', { on: { cancel } });
+          document.getSelection()?.removeAllRanges();
+        }
+        this.carrying = { names, x: ev.clientX, y: ev.clientY, over: takes(ev.clientX, ev.clientY) };
+      },
+      (ev) => end(ev.type === 'pointerup' && takes(ev.clientX, ev.clientY)),
+    );
+    const cancel = () => {
+      stop();
+      end(false);
+    };
+    const end = (lands) => {
+      this.carrying = null;
+      if (!unclaim) return;
+      unclaim();
+      swallowClick();
+      if (lands) land(names);
     };
   }
 

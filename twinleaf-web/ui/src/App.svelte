@@ -943,7 +943,7 @@
       <SignalList session={hub.session} {drags} bind:query={signalQuery} />
     </div>
   {:else}
-    {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} panel={id} filter={propertyFilter} />{/key}
+    {#key hub.session}<Properties devices={checked} channels={PANELS[id].channels} panel={id} filter={propertyFilter} {drags} />{/key}
   {/if}
 {/snippet}
 
@@ -966,7 +966,7 @@
     style:--content={contentSize[side] !== null ? `${contentSize[side]}px` : null}
     onpointerdown={(e) => drags.startMarquee(e)}
   >
-    <Dock {docks} {side} content={panelBody} top={dockTop} railed={railed[side]} />
+    <Dock {docks} {side} content={panelBody} top={dockTop} railed={railed[side]} carrying={drags.carrying} />
   </aside>
 {/snippet}
 
@@ -986,7 +986,7 @@
 <!-- A tooltip opens on hover and on keyboard focus, not on the focus a
      closing popover or menu hands back to its trigger. -->
 <Tooltip.Provider delayDuration={300} ignoreNonKeyboardFocus>
-  <div class="app" class:moving={drags.moving}>
+  <div class="app" class:moving={drags.moving || drags.carrying}>
     <!-- One row: what acts on the plots, then the page's own settings. -->
     <header class="top-bar" data-focus="toolbar" tabindex="-1">
       <span class="brand">Twinleaf Hub</span>

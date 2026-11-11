@@ -3,10 +3,13 @@
   // moved plot would land, the selection box, and the ghost of the plots
   // being moved, beside the pointer, below and to the right so the cells
   // stay in view. Several plots moved together show as a stack of cards,
-  // one row apiece.
+  // one row apiece. Property rows carried to Favorites show as a card of
+  // their names, which says what a drop there does.
   import { colorOf } from './plot.js';
 
   let { drags, ws, session } = $props();
+  /** The room a card of carried rows takes right of the pointer, in px: its widest and its offset. */
+  const CARD_ROOM = 290;
 </script>
 
 {#if drags.preview}
@@ -28,6 +31,17 @@
 {#if drags.marquee}
   {@const m = drags.marquee}
   <div class="marquee" style="left: {m.x}px; top: {m.y}px; width: {m.w}px; height: {m.h}px"></div>
+{/if}
+
+{#if drags.carrying}
+  {@const c = drags.carrying}
+  <!-- Near the page's right edge, as over the right dock, it sits left of the pointer. -->
+  {@const left = c.x > window.innerWidth - CARD_ROOM}
+  <div class="move-ghost carry-ghost" class:stack={c.names.length > 1} class:left style="left: {left ? c.x - 18 : c.x + 18}px; top: {c.y + 18}px">
+    <div class="ghost-head">{c.names.length > 1 ? `${c.names.length} properties` : c.names[0]}</div>
+    {#if c.names.length > 1}<div class="ghost-body">{#each c.names.slice(0, 5) as name (name)}<span>{name}</span>{/each}{#if c.names.length > 5}<span>{c.names.length - 5} more</span>{/if}</div>{/if}
+    <div class="ghost-action">{c.over ? 'Add to Favorites' : 'Drop on Favorites to star'}</div>
+  </div>
 {/if}
 
 {#if drags.moving}

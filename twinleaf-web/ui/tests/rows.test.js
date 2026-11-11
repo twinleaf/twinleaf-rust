@@ -6,13 +6,17 @@
 // that no pick of property rows takes in, and a right-click on a row not
 // picked picks it alone. Add to and
 // Remove from Favorites, from the menu or a picked row's star, act on every picked row as
-// one undo step. In a table, the table's keys act on its rows, the page's
+// one undo step, and so does dragging a row or an action onto Favorites,
+// which carries the picked rows with it when it is one of them; a drop
+// anywhere else, or Escape, changes nothing, and a panel's header still
+// drags the panel. In a table, the table's keys act on its rows, the page's
 // keys act as anywhere, and the plots' keys do nothing. Every press is the
 // real mouse's.
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { clickOn, frames, mountPage, pressKey, withExamples } from './harness/page.js';
+import { commands } from 'vitest/browser';
+import { centre, clickOn, dropped, frames, glide, mountPage, pressKey, settle, wait, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { KEY as DOCKS_KEY, PANELS } from '../src/lib/docks.svelte.js';
 
@@ -295,6 +299,167 @@ describe('a property row', () => {
       page.dispose();
     }
   }, 600_000);
+});
+
+describe('a row or an action dragged', () => {
+  /** The Favorites panel, on `side`, open or folded, after one panel there or first, among panels of rows in both docks. */
+  const docksWith = (side, open, first) => {
+    const fav = { id: 'favorites', open };
+    const left = [{ id: 'devices', open: false }, { id: 'settings', open: true }, { id: 'actions', open: true }];
+    const right = [{ id: 'reports', open: true }, { id: 'diagnostics', open: false }, { id: 'other', open: true }];
+    const at = (list) => (first ? [fav, ...list] : [list[0], fav, ...list.slice(1)]);
+    return { left: side === 'left' ? at(left) : left, right: side === 'right' ? at(right) : right, hidden: { left: false, right: false } };
+  };
+  const favoritesPanel = () => document.querySelector('.dock-panel[data-takes=rows]');
+  /** The panels as the docks show them, in order, each id and whether it is open. */
+  const arrangement = () => [...document.querySelectorAll('.dock-side')].map((d) => [...d.querySelectorAll('.dock-panel')].map((s) => `${s.getAttribute('aria-label')}:${s.querySelector('.dock-head').getAttribute('aria-expanded')}`).join(','));
+  /** A spot on the Favorites panel, at fractions `fx`, `fy` of what shows of it: its header alone while it is folded. */
+  function onFavorites(fx, fy) {
+    const panel = favoritesPanel();
+    panel.scrollIntoView({ block: 'nearest' });
+    const open = panel.querySelector('.dock-head').getAttribute('aria-expanded') === 'true';
+    const r = (open ? panel : panel.querySelector('.dock-head')).getBoundingClientRect(), frame = panel.closest('.dock-frame').getBoundingClientRect();
+    const top = Math.max(r.top, frame.top) + 2, bottom = Math.min(r.bottom, frame.bottom) - 2;
+    return [r.left + 2 + fx * (r.width - 4), top + fy * (bottom - top)];
+  }
+  /** Spots where a drop does nothing: a plot, the status bar, another panel's header, or back on the row carried. */
+  const elsewhere = (from) => ({
+    plot: () => centre(document.querySelector('.tiles .leaf .plot-body')),
+    status: () => centre(document.querySelector('.status-bar')),
+    header: () => centre([...document.querySelectorAll('.dock-panel:not([data-takes]) .dock-head')].at(-1)),
+    self: () => from,
+  });
+
+  it('stars what it carries, the picked rows with it when it is one of them, when let go on Favorites, open or folded, in either dock, as the star does, as one step; anywhere else, or after Escape, nothing changes', async () => {
+    const seen = { favorites: 0, folded: 0, left: 0, right: 0, several: 0, action: 0, fromFavorites: 0, equalsStar: 0, cancel: 0, plot: 0, status: 0, header: 0, self: 0, nothing: 0 };
+    await fc.assert(
+      fc.asyncProperty(
+        fc.record({
+          side: fc.constantFrom('left', 'right'),
+          open: fc.boolean(),
+          first: fc.boolean(),
+          pinned: fc.subarray(RPCS.map((r) => r.name)),
+          picks: fc.array(fc.nat(), { maxLength: 4 }),
+          from: fc.nat(),
+          end: fc.constantFrom('favorites', 'favorites', 'cancel', 'plot', 'status', 'header', 'self'),
+          fx: fc.double({ min: 0, max: 1, noNaN: true }),
+          fy: fc.double({ min: 0, max: 1, noNaN: true }),
+        }),
+        async (c) => {
+          const page = await mountPage(KEYS, 'columns', 0, SIGNALS, RPCS, { saved: { [DOCKS_KEY]: docksWith(c.side, c.open, c.first) } });
+          try {
+            const favorites = page.history.favorites;
+            page.history.group('Seed', () => favorites.set(c.pinned));
+            flushSync();
+            await frames();
+            const order = shown();
+            const keys = [...new Set(c.picks.map((i) => order[i % order.length]))];
+            page.ws.selection.pickRows(keys);
+            flushSync();
+            await frames();
+            const key = order[c.from % order.length];
+            const el = rowEl(key);
+            el.scrollIntoView({ block: 'nearest' });
+            await frames();
+            const from = centre(el.matches('tr') ? el.querySelector('td:last-child') : el);
+            // What it carries: every picked row when it is one, each name once, else it alone.
+            const carried = keys.includes(key) ? [...new Set(keys.map(nameOf))] : [nameOf(key)];
+            const before = [...favorites.names].sort(), last = page.history.undos.at(-1), calls = page.hub.calls.length, docksBefore = arrangement();
+            const to = c.end === 'favorites' || c.end === 'cancel' ? onFavorites(c.fx, c.fy) : elsewhere(from)[c.end]();
+            // Whether that spot is on Favorites: a row of Favorites let go on itself is.
+            const over = !!document.elementFromPoint(...to)?.closest('.dock-panel')?.matches('[data-takes=rows]');
+            await commands.mouse([['move', ...from], ['down'], ['move', from[0] + 8, from[1] + 8], ...glide([from[0] + 8, from[1] + 8], to, 5)]);
+            flushSync();
+            // Mid-drag: Favorites shows it takes the rows, the more while the pointer is on it, and no panel is being dragged.
+            expect(favoritesPanel().classList.contains('awaiting'), 'Favorites shows it takes rows').toBe(true);
+            if (c.end === 'favorites' || c.end === 'cancel') expect(over, 'the spot is on Favorites').toBe(true);
+            expect(favoritesPanel().classList.contains('drop-target'), `Favorites marked under the pointer exactly when it is, ${c.end}`).toBe(over);
+            expect(document.getElementById('dnd-action-dragged-el'), 'no panel drag').toBe(null);
+            if (c.end === 'cancel') await pressKey('Escape');
+            await commands.mouse([['up']]);
+            flushSync();
+            await frames();
+            expect(favoritesPanel().classList.contains('awaiting'), 'the look goes with the drag').toBe(false);
+            expect(arrangement(), 'the docks as they were').toEqual(docksBefore);
+            expect(page.hub.calls.length, 'no action ran').toBe(calls);
+            // The picks as they were: the drop is no click.
+            expect([...page.ws.selection.rows].sort(), 'the picks as they were').toEqual(keys.filter((k) => shown().includes(k)).sort());
+            const lands = over && c.end !== 'cancel';
+            const want = lands ? [...new Set([...before, ...carried])].sort() : before;
+            expect([...favorites.names].sort(), `${c.end}: the stars`).toEqual(want);
+            if (want.join() === before.join()) {
+              expect(page.history.undos.at(-1), 'no step').toBe(last);
+              seen.nothing++;
+            } else {
+              // One step, named as the star's and the menu's, which undo takes back.
+              const added = want.length - before.length;
+              expect(page.history.undoLabel).toBe(`Add ${added > 1 ? `${added} ` : ''}to Favorites`);
+              page.history.undo();
+              flushSync();
+              await frames();
+              expect([...favorites.names].sort(), 'undo takes it back').toEqual(before);
+              // The star of a row not starred, clicked instead, makes the same stars and the same step.
+              const star = rowEl(key)?.querySelector('button.star');
+              if (star && !before.includes(nameOf(key))) {
+                page.ws.selection.pickRows(keys);
+                flushSync();
+                await clickOn(star);
+                flushSync();
+                expect([...favorites.names].sort(), 'as the star does').toEqual(want);
+                expect(page.history.undoLabel).toBe(`Add ${added > 1 ? `${added} ` : ''}to Favorites`);
+                seen.equalsStar++;
+              }
+            }
+            seen[c.end]++;
+            if (lands) (seen[c.side]++, c.open || seen.folded++);
+            if (carried.length > 1) seen.several++;
+            if (!el.matches('tr')) seen.action++;
+            if (key.startsWith('favorites:')) seen.fromFavorites++;
+          } finally {
+            await commands.mouse([['up']]);
+            page.dispose();
+          }
+        },
+      ),
+      withExamples([
+        // One row onto open Favorites on the right, below a panel.
+        [{ side: 'right', open: true, first: false, pinned: [], picks: [], from: 1, end: 'favorites', fx: 0.5, fy: 0.5 }],
+        // Several picked rows, one of them dragged, onto folded Favorites on the left.
+        [{ side: 'left', open: false, first: true, pinned: ['gain'], picks: [1, 2, 6], from: 2, end: 'favorites', fx: 0.3, fy: 0.5 }],
+        // An action onto Favorites, then each place a drop does nothing.
+        [{ side: 'left', open: true, first: false, pinned: [], picks: [], from: 3, end: 'favorites', fx: 0.9, fy: 0.9 }],
+        [{ side: 'right', open: true, first: true, pinned: ['temp'], picks: [0, 1], from: 0, end: 'cancel', fx: 0.5, fy: 0.2 }],
+        [{ side: 'right', open: false, first: false, pinned: [], picks: [], from: 4, end: 'plot', fx: 0, fy: 0 }],
+        [{ side: 'left', open: true, first: true, pinned: ['gain', 'reboot'], picks: [], from: 0, end: 'status', fx: 0, fy: 0 }],
+        [{ side: 'left', open: true, first: false, pinned: ['gain'], picks: [], from: 0, end: 'header', fx: 0, fy: 0 }],
+        [{ side: 'right', open: true, first: false, pinned: [], picks: [3, 4], from: 3, end: 'self', fx: 0, fy: 0 }],
+      ]),
+    );
+    for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0);
+  }, 600_000);
+
+  it('leaves a panel’s header to drag the panel, after a row was carried to Favorites', async () => {
+    const page = await mountPage(KEYS, 'columns', 0, SIGNALS, RPCS, { saved: { [DOCKS_KEY]: docksWith('right', true, true) } });
+    try {
+      const row = centre(rowEl('settings:gain').querySelector('td:last-child')), fav = onFavorites(0.5, 0.5);
+      await commands.mouse([['move', ...row], ['down'], ['move', row[0] + 8, row[1] + 8], ...glide([row[0] + 8, row[1] + 8], fav, 5), ['up']]);
+      flushSync();
+      expect([...page.history.favorites.names]).toEqual(['gain']);
+      // Favorites' header, picked up, carried to the left dock and let go there.
+      const a = centre(favoritesPanel().querySelector('.dock-title'));
+      await commands.mouse([['move', ...a], ['down'], ['move', a[0] + 6, a[1] + 6], ['wait', 60], ['move', a[0] + 12, a[1] + 12]]);
+      await wait(500);
+      const r = document.querySelector('.dock-side.left .dock').getBoundingClientRect(), b = [r.left + r.width / 2, r.top + 40];
+      await commands.mouse([...glide([a[0] + 12, a[1] + 12], b, 5), ['wait', 120], ['move', b[0] + 2, b[1] + 3], ['wait', 120], ['up']]);
+      await dropped();
+      await settle(4);
+      expect(favoritesPanel().closest('.dock-side').classList.contains('left'), 'Favorites moved to the left dock').toBe(true);
+      expect([...page.history.favorites.names], 'a panel drag stars nothing').toEqual(['gain']);
+    } finally {
+      await commands.mouse([['up']]);
+      page.dispose();
+    }
+  });
 });
 
 describe('a key pressed in a table', () => {
