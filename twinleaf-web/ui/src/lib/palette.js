@@ -10,16 +10,19 @@
 // panels' order.
 //
 // Space or Tab on a property locks it: the field takes its argument. Enter
-// then reads a readable property with no argument, the value showing in
-// place, after which Enter or Escape closes; writes the argument to a
+// with no argument reads a readable property, the value showing in place,
+// after which Enter or Escape closes; Enter writes the argument to a
 // writable one, once it passes the edit bar's check (editbar.js
 // `checkValue`), and closes; and runs an action, which takes no argument,
-// and closes. A switch with no argument offers On and Off. Enter on a
-// property not locked reads a read-only one, and locks any other, so an
-// action never runs but from a lock. Backspace on an empty argument, and
-// Escape, unlock it; Escape with an argument typed clears it first. Nothing
-// is written or run but by Enter on a locked property with a value it
-// takes, or a switch's On or Off.
+// and closes. A switch with no argument offers On and Off, and Enter
+// writes the one highlighted. Enter on a property not locked reads a
+// readable one, locked, as a read-only one is, and locks any other, so an
+// action never runs but from a lock. Space or Tab on a writable property
+// locked with no argument turns it to taking one, the read shown gone, so
+// a switch read offers On and Off again. Backspace on an empty argument,
+// and Escape, unlock it; Escape with an argument typed clears it first.
+// Nothing is written or run but by Enter on a locked property with a value
+// it takes, or a switch's On or Off.
 
 import { controlOf } from './properties.js';
 import { checkValue } from './editbar.js';
@@ -137,13 +140,15 @@ export function step(state, key, { row = null, devices = [], pick = null } = {})
     const acts = actsOf(row);
     if (key === ' ' || key === 'Tab') return to(locked(row.name, state.query));
     if (key !== 'Enter') return stay;
-    if (acts.action || acts.writable) return to(locked(row.name, state.query));
     if (acts.readable) return to(locked(row.name, state.query, '', true), { act: { type: 'read', name: row.name, text: '' } });
+    if (acts.action || acts.writable) return to(locked(row.name, state.query));
     return stay;
   }
   const { arg } = state;
-  if (key === ' ') return arg === '' ? to(state) : stay;
-  if (key === 'Tab') return to(state);
+  // With nothing typed, Space or Tab turns a writable property to taking a value: a read shown goes.
+  const typing = () => to(arg === '' && row && actsOf(row).writable ? { ...state, read: false } : state);
+  if (key === ' ') return arg === '' ? typing() : stay;
+  if (key === 'Tab') return typing();
   if (key === 'Backspace') return arg === '' ? to(searching(state.query)) : stay;
   if (key === 'Escape') {
     if (arg !== '') return to({ ...state, arg: '', read: false });

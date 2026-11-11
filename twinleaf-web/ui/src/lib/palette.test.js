@@ -87,16 +87,19 @@ function expected(s, key, row, pick) {
   if (s.mode === 'search') {
     if (key === ' ' || key === 'Tab') return { mode: 'locked', arg: '', read: false, keep: true, act: null, close: false };
     if (key === 'Enter') {
-      if (acts.action || acts.writable) return { mode: 'locked', arg: '', read: false, keep: true, act: null, close: false };
-      return { mode: 'locked', arg: '', read: true, keep: true, act: 'read', close: false };
+      // Enter with nothing typed reads what can be read.
+      if (acts.readable) return { mode: 'locked', arg: '', read: true, keep: true, act: 'read', close: false };
+      return { mode: 'locked', arg: '', read: false, keep: true, act: null, close: false };
     }
     return { mode: 'search', keep: false, act: null, close: false };
   }
   const same = { mode: 'locked', arg: s.arg, read: s.read, keep: true, act: null, close: false };
   const pass = { ...same, keep: false };
+  /** Space or Tab with nothing typed turns a writable property to taking a value. */
+  const typing = s.arg === '' && acts.writable ? { ...same, read: false } : same;
   switch (key) {
-    case ' ': return s.arg === '' ? same : pass;
-    case 'Tab': return same;
+    case ' ': return s.arg === '' ? typing : pass;
+    case 'Tab': return typing;
     case 'Backspace': return s.arg === '' ? { mode: 'search', keep: true, act: null, close: false } : pass;
     case 'Escape':
       if (s.arg !== '') return { ...same, arg: '', read: false };
@@ -170,6 +173,22 @@ describe('the palette’s lock', () => {
       expect(argProblem(ROWS.get(n), DEVICES, arg)).toContain(why);
     }
     expect(step(at('gain', '200'), 'Enter', { row: ROWS.get('gain'), devices: DEVICES }).act).toEqual({ type: 'write', name: 'gain', text: '200' });
+  });
+
+  it('reads on Enter with nothing typed: a setting highlighted, as a read-only one, and one locked', () => {
+    for (const n of ['gain', 'enable', 'temp']) {
+      const r = step(searching(n), 'Enter', { row: ROWS.get(n), devices: DEVICES });
+      expect([r.act, r.state.mode, r.state.read], n).toEqual([{ type: 'read', name: n, text: '' }, 'locked', true]);
+    }
+    const locked = step(searching('gain'), 'Tab', { row: ROWS.get('gain'), devices: DEVICES }).state;
+    expect(step(locked, 'Enter', { row: ROWS.get('gain'), devices: DEVICES }).act).toEqual({ type: 'read', name: 'gain', text: '' });
+    // A property that cannot be read locks, to take a value.
+    expect(step(searching('secret'), 'Enter', { row: ROWS.get('secret'), devices: DEVICES })).toMatchObject({ act: null, state: { mode: 'locked', read: false } });
+    // A switch read, Space turns it to taking a value, and On or Off highlighted is written.
+    const read = step(searching('enable'), 'Enter', { row: ROWS.get('enable'), devices: DEVICES }).state;
+    const typing = step(read, ' ', { row: ROWS.get('enable'), devices: DEVICES }).state;
+    expect(typing.read).toBe(false);
+    expect(step(typing, 'Enter', { row: ROWS.get('enable'), devices: DEVICES, pick: 'false' }).act).toEqual({ type: 'write', name: 'enable', text: 'false' });
   });
 
   it('runs an action only from a lock: Enter on one not locked locks it', () => {

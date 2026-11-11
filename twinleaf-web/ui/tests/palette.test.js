@@ -1,7 +1,8 @@
 // Device properties in the command palette, on the whole page: a fragment
 // typed finds a property, Space or Tab locks it, a value typed and Enter
 // writes it to the checked devices through the same path as the edit bar,
-// with the same notice and Revert; a read shows the fresh value in place;
+// with the same notice and Revert; Enter with nothing typed reads, a
+// setting as a read-only property, and the fresh value shows in place;
 // an action runs only from a lock; a value a property does not take shows
 // the edit bar's reason and writes nothing; devices that differ show ≠;
 // the list draws only the best matches; and no key but Enter on a valid
@@ -148,6 +149,53 @@ describe('a device property in the command palette', () => {
       await pressKey('Enter');
       expect(await closed()).toBe(true);
       expect(page.hub.calls).toEqual([]);
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('reads a setting afresh on Enter with nothing typed, highlighted or locked, and shows its value in place; a value typed then writes', async () => {
+    const page = await mountPage([['sine.sine']], 'columns', 0, [], RPCS, { routes: ROUTES });
+    const reads = [];
+    page.hub.read = async (route, names) => (reads.push({ route, names }), { values: Object.fromEntries(names.map((n) => [n, { state: 'ok', value: n === 'enable' ? false : 42 }])) });
+    try {
+      await openPalette();
+      await type('gain');
+      await pressKey('Enter');
+      expect(await until(() => document.querySelector('.pal-read')?.textContent.includes('gain = 42'), 2000), 'Enter on the setting highlighted reads it').toBe(true);
+      expect(reads.map((r) => r.route).sort()).toEqual(ROUTES);
+      expect(chip(), 'locked, to take a value').toBe('gain');
+      await shot('5-setting-read');
+      await type('12');
+      expect(document.querySelector('.pal-read'), 'a value typed hides the read').toBe(null);
+      await pressKey('Enter');
+      await settle();
+      expect(page.hub.calls).toEqual([{ name: 'gain', value: '12', routes: ROUTES }]);
+      expect(await closed()).toBe(true);
+      // Locked by Tab, Enter with nothing typed reads it too.
+      page.hub.calls = [];
+      reads.length = 0;
+      await openPalette();
+      await type('gain');
+      await pressKey('Tab');
+      await settle();
+      expect(document.querySelector('.pal-read')).toBe(null);
+      await pressKey('Enter');
+      expect(await until(() => document.querySelector('.pal-read')?.textContent.includes('gain = 42'), 2000), 'Enter on the setting locked reads it').toBe(true);
+      expect(reads.length).toBe(2);
+      await pressKey('Enter');
+      expect(await closed()).toBe(true);
+      // A switch reads on Enter; Space then offers On and Off.
+      await openPalette();
+      await type('enable');
+      await pressKey('Enter');
+      expect(await until(() => document.querySelector('.pal-read')?.textContent.includes('enable = false'), 2000), 'Enter on a switch reads it').toBe(true);
+      expect(dialog().querySelectorAll('[data-pick]').length, 'no On or Off while the read shows').toBe(0);
+      await pressKey(' ');
+      await settle();
+      expect(document.querySelector('.pal-read'), 'Space turns to taking a value').toBe(null);
+      expect([...dialog().querySelectorAll('[data-pick]')].map((i) => i.textContent.trim())).toEqual(['On2 devices', 'Off2 devices']);
+      expect(page.hub.calls, 'nothing written by reading or locking').toEqual([]);
     } finally {
       page.dispose();
     }
