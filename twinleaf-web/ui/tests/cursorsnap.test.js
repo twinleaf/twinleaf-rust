@@ -4,8 +4,10 @@
 // own with none that near. Shift pressed or let go mid-drag places it at
 // once. The drag is one undo step and moves the cursor on the same plots
 // as a drag without Shift, each to the snapped value. Shift held at the
-// press selects the plot as it did, and starts no drag; Shift pressed
-// during a press does not make its release a Shift+click.
+// press on a cursor's line, tag or tab drags it snapped from its first
+// move; off the cursors it starts no drag. A drag whose pointer went off
+// its press is no click, with or without Shift; a press let go where it
+// was is a click, a Shift+click by Shift as it was at the press.
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
@@ -267,7 +269,7 @@ describe('a cursor dragged with Shift held', () => {
     }
   }, 600_000);
 
-  it('held at the press selects the plot and moves no cursor; pressed during a press, its release is no Shift+click', async () => {
+  it('held at the press on a cursor drags it snapped from its first move, off the cursors moves nothing; a drag never selects, a Shift+click on a cursor does', async () => {
     const { page, ids } = await mounted();
     try {
       for (const n of [0, 2]) {
@@ -276,20 +278,39 @@ describe('a cursor dragged with Shift held', () => {
         page.ws.selection.only([other]);
         flushSync();
         await settle();
-        const before = page.ws.plots[id].cursors, from = pressOn(pv, 'x', 'a');
-        // A drag with Shift held from before the press: nothing moves, and the selection stays.
-        await commands.mouse([['move', ...from], ['hold', 'Shift'], ['down'], ['move', from[0] + 15, from[1]], ['move', from[0] + 30, from[1]], ['up'], ['let go', 'Shift']]);
+        const before = page.ws.plots[id].cursors, from = pressOn(pv, 'x', 'a'), view = () => [pv.view.state(), page.ws.plots[id].fRange ?? null];
+        const k = known(pv, 'x', 'a'), mid = k.px((k.view[0] + k.view[1]) / 2);
+        const tick = k.tick.reduce((a, b) => (Math.abs(k.px(b) - mid) < Math.abs(k.px(a) - mid) ? b : a));
+        // Shift held from before a press off the cursors: a drag there pans nothing and moves no cursor.
+        const P = pv.geo.plot, off = [k.px(tick) + 20, P.y + 0.6 * P.h], was = view();
+        expect(pv.pressAt(...off)?.part, `${what}: a press on the plot off the cursors`).toBe('plot');
+        await commands.mouse([['move', ...off], ['hold', 'Shift'], ['down'], ['move', off[0] + 15, off[1]], ['move', off[0] + 30, off[1]], ['up'], ['let go', 'Shift']]);
         await settle();
-        expect(page.ws.plots[id].cursors, `${what}: Shift+drag moves no cursor`).toEqual(before);
-        expect([...page.ws.selection.plots], `${what}: Shift+drag leaves the selection`).toEqual([other]);
-        // A Shift+click on the cursor's line adds the plot.
+        expect([page.ws.plots[id].cursors, view()], `${what}: Shift+drag off the cursors moves nothing`).toEqual([before, was]);
+        expect([...page.ws.selection.plots], `${what}: Shift+drag off the cursors leaves the selection`).toEqual([other]);
+        // Shift held from before the press on X1's line: its first move snaps it, near the tick, and the drag leaves the selection.
+        await commands.mouse([['move', ...from], ['hold', 'Shift'], ['down'], ['move', k.px(tick) + 4, from[1]]]);
+        await settle();
+        expect([xOf(pv.placed, KIND[n]).a, pv.pressable.some((p) => p.part === 'snap')], `${what}: the first move snaps`).toEqual([tick, true]);
+        await commands.mouse([['up'], ['let go', 'Shift']]);
+        await settle();
+        expect([cursorOf(page, id, 'x', 'a'), [...page.ws.selection.plots]], `${what}: let go on the tick, the selection as it was`).toEqual([tick, [other]]);
+        await pressKey('Control+z');
+        flushSync();
+        await settle();
+        // A drag that went away and came back to its press is no click either.
+        await commands.mouse([['move', ...from], ['hold', 'Shift'], ['down'], ['move', from[0] + 30, from[1]], ['move', from[0] + 1, from[1]], ['up'], ['let go', 'Shift']]);
+        await settle();
+        expect([...page.ws.selection.plots], `${what}: a drag back to its press leaves the selection`).toEqual([other]);
+        await pressKey('Control+z');
+        flushSync();
+        await settle();
+        // A Shift+click on the cursor's line, let go where it was pressed, adds the plot and moves no cursor.
         await commands.mouse([['move', ...from], ['hold', 'Shift'], ['down'], ['up'], ['let go', 'Shift']]);
         await settle();
         expect([...page.ws.selection.plots].sort(), `${what}: Shift+click adds the plot`).toEqual([other, id].sort());
         expect(page.ws.plots[id].cursors, `${what}: Shift+click moves no cursor`).toEqual(before);
         // A cursor 3 px from a tick, pressed, nudged 1 px and snapped with Shift: let go there, it is a click without Shift, which keeps the plot selected.
-        const k = known(pv, 'x', 'a'), mid = k.px((k.view[0] + k.view[1]) / 2);
-        const tick = k.tick.reduce((a, b) => (Math.abs(k.px(b) - mid) < Math.abs(k.px(a) - mid) ? b : a));
         place(page, ids, (p) => ({ ...START(p), x: { a: p.dataAt(k.px(tick) + 3), b: START(p).x.b } }));
         await settle();
         const at = pressOn(pv, 'x', 'a');

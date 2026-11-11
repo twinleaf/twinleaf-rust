@@ -2053,13 +2053,16 @@ export class PlotView {
       const on = this.pressAt(e.clientX, e.clientY);
       const cursor = on?.kind ? on : null;
       const band = on?.part === 'yaxis' ? on.band : null;
-      // With Shift a click selects the plot, so a press does nothing here: no
-      // pan, offset or cursor moves the plot by accident.
-      const mode = e.shiftKey ? 'none' : cursor ? `${cursor.kind}cursor` : on?.part === 'xaxis' ? 'axis' : band ? 'y' : (e.ctrlKey || e.metaKey) && on?.part === 'plot' ? 'zoom' : 'plot';
+      // With Shift a click selects the plot, so a press off the cursors does
+      // nothing here: no pan or offset moves the plot by accident. On a
+      // cursor's part it drags the cursor, snapping from its first move; let
+      // go where it was pressed, it is a Shift+click as anywhere.
+      const mode = cursor ? `${cursor.kind}cursor` : e.shiftKey ? 'none' : on?.part === 'xaxis' ? 'axis' : band ? 'y' : (e.ctrlKey || e.metaKey) && on?.part === 'plot' ? 'zoom' : 'plot';
       const targets = band ? this.axisTargets(band, e.clientY) : this.yTargets(e.clientY);
       // How far from the cursor the pointer holds it, along the cursor's axis.
       const grab = cursor?.at === undefined ? 0 : (cursor.kind === 'x' ? e.clientX : e.clientY) - cursor.at;
-      drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: 0, mode, targets, band, cursor: cursor?.name, key: cursor?.key, grab, shift: false };
+      drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: 0, mode, targets, band, cursor: cursor?.name, key: cursor?.key, grab, shift: e.shiftKey };
+      clickAfter = true;
       unwatchShift?.();
       unwatchShift = watchShift(onShift);
       // A time cursor holds a moment the live view would scroll away, so
@@ -2097,8 +2100,6 @@ export class PlotView {
     // is held, what it snaps to near there (`snapAt`), noted as `snapped`
     // for the mark drawn on it. Shift is read from the pointer as it moves,
     // and as it goes down or up mid-drag, which places the cursor at once.
-    // Shift held at the press selects the plot and starts no drag, so
-    // snapping begins with Shift pressed once a drag is under way.
     const placeCursor = () => {
       const x = drag.mode === 'xcursor', at = (x ? drag.x : drag.y) - drag.grab;
       const snap = drag.shift ? this.snapAt(drag.cursor, at, x ? undefined : drag.key) : null;
@@ -2107,6 +2108,11 @@ export class PlotView {
       else this.draftY(drag.key, drag.cursor, snap ? snap.v : this.yValueAt(drag.key, at));
     };
     let unwatchShift = null;
+    // Whether the click that follows a press is one: not after a drag whose
+    // pointer went DRAG_START px or more from the press, wherever it was let
+    // go, so a drag never selects or deselects the plot.
+    let clickAfter = true;
+    el.addEventListener('click', (e) => clickAfter || e.stopPropagation());
     const onShift = (held) => {
       if (!drag?.moved || (drag.mode !== 'xcursor' && drag.mode !== 'ycursor')) return;
       drag.shift = held;
@@ -2139,6 +2145,7 @@ export class PlotView {
       else if (mode === 'zoom' || (!drag && (e.ctrlKey || e.metaKey) && this.inPlot(e.clientX, e.clientY))) el.style.cursor = 'zoom-in';
       else el.style.cursor = mode === 'xcursor' || over?.kind === 'x' || this.axisHover !== null ? 'ew-resize' : yAxis ? 'ns-resize' : 'grab';
       if (!drag) return;
+      if (Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) >= DRAG_START) clickAfter = false;
       // A pan, an offset or a pull starts once the pointer has moved off the
       // press, and its first step counts from the press, so nothing is lost.
       if ((drag.mode === 'axis' || (drag.mode === 'y' && !drag.started)) && !decide(e)) return;
