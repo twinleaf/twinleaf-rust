@@ -82,9 +82,11 @@ pub(crate) enum Message {
     /// `budget`, and `seconds` of history in the stream that keeps the
     /// least, of the `max_age` each keeps at most. `rate` is the bytes per
     /// second the streams add, so the budget lasts `budget / rate` seconds.
-    /// `held` is the history captured while a page holds a plot paused, and
-    /// `oldest` the oldest time the history holds of each trace, by id,
-    /// captured or not, where a paused plot's history begins.
+    /// `held` is the history captured while a page holds a plot paused,
+    /// which keeps only what of the budget the buffer leaves, so `bytes` and
+    /// its bytes come to at most `budget`, and `oldest` the oldest time the
+    /// history holds of each trace, by id, captured or not, where a paused
+    /// plot's history begins.
     Memory {
         bytes: u64,
         budget: u64,
@@ -142,7 +144,8 @@ impl Message {
 
 /// The raw history the hub captured while a page holds a plot paused: the
 /// bytes it holds that the live buffer no longer does, which is what holding
-/// it costs.
+/// it costs. It gives up its oldest rows first as the buffer leaves it less
+/// room.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Held {
     pub(crate) bytes: u64,

@@ -215,19 +215,45 @@ impl Buffer {
 
     /// Returns the bytes of this buffer's completed chunks that `newer`, the
     /// buffer this one was frozen from, no longer holds, which are those that
-    /// arrived before the oldest chunk `newer` keeps of the same stream. The
+    /// arrived before the oldest row `newer` keeps of the same stream. The
     /// chunks both hold are shared, and count once, in `newer`.
     pub fn bytes_not_in(&self, newer: &Buffer) -> usize {
         self.runs
             .iter()
-            .map(|(key, run)| {
-                let kept_from = newer
-                    .run(key)
-                    .and_then(Run::front_arrival)
-                    .unwrap_or(u64::MAX);
-                run.bytes_arrived_before(kept_from)
-            })
+            .map(|(key, run)| run.bytes_arrived_before(newer.kept_from(key)))
             .sum()
+    }
+
+    /// Drops the chunks of this buffer that `newer`, the buffer it was
+    /// frozen from, no longer holds, the one that arrived first going first,
+    /// until they come to at most `bytes`. The chunks both hold stay. Returns
+    /// the bytes of those `newer` no longer holds that remain.
+    pub fn trim_not_in(&mut self, newer: &Buffer, bytes: usize) -> usize {
+        let mut not_in = self.bytes_not_in(newer);
+        while not_in > bytes {
+            let oldest = self
+                .runs
+                .iter()
+                .filter_map(|(key, run)| {
+                    let arrived = run.front_arrival()?;
+                    (arrived < newer.kept_from(key)).then_some((arrived, *key))
+                })
+                .min();
+            let Some((_, key)) = oldest else { break };
+            if let Some(run) = self.runs.get_mut(&key) {
+                not_in -= run.drop_front_chunk();
+            }
+        }
+        not_in
+    }
+
+    /// The arrival number of the oldest row this buffer keeps of the
+    /// stream, before which a copy frozen from it holds what it no longer
+    /// does. A stream it keeps no row of keeps none.
+    fn kept_from(&self, key: &StreamKey) -> u64 {
+        self.run(key)
+            .and_then(Run::first_arrival)
+            .unwrap_or(u64::MAX)
     }
 
     /// Returns the stream's current run, or `None` if it has delivered no data.
@@ -464,21 +490,30 @@ impl Run {
         self.forget_dropped_boundaries();
     }
 
-    /// Drops the oldest completed chunk, if any. The rows still
-    /// accumulating are never dropped this way.
-    fn drop_front_chunk(&mut self) {
+    /// Drops the oldest completed chunk, if any, and returns its bytes. The
+    /// rows still accumulating are never dropped this way.
+    fn drop_front_chunk(&mut self) -> usize {
         let Some(chunk) = self.chunks.pop_front() else {
-            return;
+            return 0;
         };
         self.starts.pop_front();
         self.arrived.pop_front();
         self.rows -= chunk.len();
         self.forget_dropped_boundaries();
+        chunk.len() * self.row_bytes
     }
 
     /// The arrival number of the oldest completed chunk's first row.
     fn front_arrival(&self) -> Option<u64> {
         self.arrived.front().copied()
+    }
+
+    /// The arrival number of the oldest retained row, in a completed chunk
+    /// or among the rows still accumulating.
+    fn first_arrival(&self) -> Option<u64> {
+        let accumulating = self.coalescer.buffered_len() > 0;
+        self.front_arrival()
+            .or(accumulating.then_some(self.tail_arrived))
     }
 
     /// The bytes of the completed chunks whose first row arrived before
@@ -1429,6 +1464,46 @@ mod tests {
         push_chunks(&fx, &mut buffer, 2 * CHUNK, 2);
         // The buffer moved on past both, which the copy alone now holds.
         assert_eq!(frozen.bytes_not_in(&buffer), 2 * CHUNK as usize * ROW);
+    }
+
+    #[test]
+    fn a_frozen_copy_of_rows_still_accumulating_costs_nothing_while_the_buffer_keeps_them() {
+        let fx = test_fixture(&[DataType::F64]);
+        let mut buffer = Buffer::new(usize::MAX);
+        fx.push_floats(&mut buffer, 0, 0..10);
+        let mut frozen = buffer.frozen();
+        fx.push_floats(&mut buffer, 0, 10..20);
+        assert_eq!(frozen.bytes_not_in(&buffer), 0);
+        assert_eq!(frozen.trim_not_in(&buffer, 0), 0);
+        assert_eq!(frozen.run(&fx.stream_key).unwrap().retained_rows(), 0..10);
+    }
+
+    #[test]
+    fn a_frozen_copy_trimmed_beside_the_buffer_drops_its_oldest_it_alone_holds() {
+        let fx = test_fixture(&[DataType::F64]);
+        let c = u64::from(CHUNK);
+        let mut buffer = Buffer::with_budget(2 * CHUNK as usize * ROW);
+        push_chunks(&fx, &mut buffer, 0, 2);
+        let mut frozen = buffer.frozen();
+        // Every chunk is the buffer's too, so none goes.
+        assert_eq!(frozen.trim_not_in(&buffer, 0), 0);
+        assert_eq!(
+            frozen.run(&fx.stream_key).unwrap().retained_rows(),
+            0..2 * c
+        );
+        push_chunks(&fx, &mut buffer, 2 * CHUNK, 1);
+        // The buffer dropped the first, which goes from the copy over one
+        // chunk's room, and the second, which the buffer still holds, stays.
+        let chunk = CHUNK as usize * ROW;
+        assert_eq!(frozen.trim_not_in(&buffer, chunk), chunk);
+        assert_eq!(frozen.trim_not_in(&buffer, 0), 0);
+        assert_eq!(
+            frozen.run(&fx.stream_key).unwrap().retained_rows(),
+            c..2 * c
+        );
+        push_chunks(&fx, &mut buffer, 3 * CHUNK, 2);
+        assert_eq!(frozen.trim_not_in(&buffer, 0), 0);
+        assert_eq!(frozen.run(&fx.stream_key).unwrap().first_timestamp(), None);
     }
 
     #[test]
