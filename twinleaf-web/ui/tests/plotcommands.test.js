@@ -260,6 +260,8 @@ describe('maximized plots', () => {
           document.activeElement?.blur();
           await pressKey('f');
           flushSync();
+          // A press on a plot is read against what it last drew: the plots draw at their maximized size first, as after each step.
+          await frames();
           expect([...page.ws.maximized].sort()).toEqual(max.map((i) => ids[i]).sort());
           for (const s of steps) {
             await clearNotices();
@@ -332,6 +334,8 @@ describe('maximized plots', () => {
         [[0], [{ t: 'split', k: 0 }, { t: 'undo' }, { t: 'select', ks: [0] }, { t: 'max', by: 'button', k: 0 }, { t: 'redo' }, { t: 'tab' }, { t: 'tab' }]],
         // Restored by the key and maximized from a header, focus left in the plot's signals: Escape leaves the view.
         [[3], [{ t: 'max', by: 'key', k: 0 }, { t: 'max', by: 'header', k: 0 }, { t: 'escape' }]],
+        // Restored first from a plot's menu, which a right-click opens where the plot is drawn at its maximized size.
+        [[0, 1], [{ t: 'max', by: 'menu', k: 0 }, { t: 'escape' }]],
       ]),
     );
     // A replay of one failure runs that case alone.
