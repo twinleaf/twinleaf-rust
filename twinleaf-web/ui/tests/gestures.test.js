@@ -20,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, drag, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, until, withExamples } from './harness/page.js';
+import { EMPTY, centre, drag, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pickItem, plotMenu, pressKey, quietApi, until, withExamples } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
 import { lastKey } from '../src/lib/keyrouter.js';
@@ -73,8 +73,15 @@ describe('a box', () => {
           expect([...page.ws.selected].sort()).toEqual([...want].sort());
           expect(document.querySelector('.marquee')).toBe(null);
           boxes++;
-        })
+        }),
+        // The two cases that, with spots taken without room around them, started 1 px below the Signals list's row, which grows onto it as its font loads; then random runs.
+        withExamples([
+          [1687448287, 0, 0, [], false],
+          [495722447, 0, 0, [], false],
+        ]),
       );
+      // The starts, taken as the page mounted, are empty space still once it has laid itself out.
+      for (const at of starts) expect(document.elementFromPoint(...at).matches(EMPTY), `a start at ${at} is still empty space`).toBe(true);
       // A drag that starts on a property row picks rows, and draws no box.
       const row = document.querySelector('tr[id^=prop-]');
       page.ws.selection.only([plotIds(page.ws.layout)[0]]);

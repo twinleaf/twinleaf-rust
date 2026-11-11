@@ -413,15 +413,22 @@ export async function pickItem(...labels) {
 /** Empty dock or panel space, where a box starts: a dock's frame, a dock below its panels, a panel's body, a list's space below its items. */
 export const EMPTY = '.dock-frame, .dock-side, .dock, .dock-body, .palette, [data-slot=scroll-area-viewport]';
 
-/** Points in the docks where a press lands on empty space, each [x, y]. */
+/** How far, in px, empty space reaches around a point `emptySpots` gives: a row beside it may still grow by less, as its font loads. */
+const EMPTY_MARGIN = 4;
+
+/** Points in the docks where a press lands on empty space, with empty space EMPTY_MARGIN px each way within the same frame, each [x, y]. */
 export function emptySpots() {
   const out = [];
   for (const frame of document.querySelectorAll('.dock-frame')) {
     const r = frame.getBoundingClientRect();
+    const empty = (x, y) => {
+      const el = document.elementFromPoint(Math.min(Math.max(x, r.left + 1), r.right - 1), Math.min(Math.max(y, r.top + 1), r.bottom - 1));
+      return !!el && frame.contains(el) && el.matches(EMPTY);
+    };
+    const m = EMPTY_MARGIN;
     for (let y = r.top + 4; y < r.bottom - 2; y += 6) {
       for (const x of [r.left + 3, r.left + r.width / 2, r.right - 3]) {
-        const el = document.elementFromPoint(x, y);
-        if (el && frame.contains(el) && el.matches(EMPTY)) out.push([x, y]);
+        if (empty(x, y) && empty(x, y - m) && empty(x, y + m) && empty(x - m, y) && empty(x + m, y)) out.push([x, y]);
       }
     }
   }
