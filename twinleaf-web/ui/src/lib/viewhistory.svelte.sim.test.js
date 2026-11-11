@@ -119,9 +119,21 @@ const action = fc.oneof(
   { weight: 2, arbitrary: fc.constant({ t: 'forward' }) },
 );
 
+/** `n` wheel turns `gap` ms apart on the plots of `mask`, each zooming by `f` about the middle. */
+const turns = (mask, n, f, gap) => ({ t: 'wheel', mask, turns: Array.from({ length: n }, () => ({ gap, f, anchor: 0.5 })) });
+/** Ten seconds' rest, which ends any burst. */
+const rest = { t: 'idle', ms: 10_000 };
+/**
+ * Runs that reach the burst on several plots one of which stops at its
+ * narrowest or widest while another goes on, whatever the random runs do:
+ * one plot zoomed to its narrowest or widest alone, then a burst on it and
+ * the next, which goes on while the first stays.
+ */
+const EXAMPLES = [0.05, 3].flatMap((f) => [1, 2].map((first) => [[turns(first, 6, f, 0), rest, turns(first | (first << 1), 6, f, 50), rest, rest, rest, rest, rest, { t: 'back' }, { t: 'back' }]]));
+
 describe('view history, against a model of its rules', () => {
   it('makes one entry of each drag, command and burst of a tab, and Back and Forward show the tab as it was at the entry before and after', () => {
-    // A run is quick, so there are always enough for each rule to be reached.
+    // A run is quick, so there are always enough for each rule to be reached; the examples come on top of the random runs.
     const numRuns = Math.max(100, fc.readConfigureGlobal().numRuns);
     const count = { entries: 0, joined: 0, cameBack: 0, keptForward: 0, rested: 0, otherKind: 0, oneStopped: 0, several: 0, shown: 0, startup: 0, gone: 0, spectra: 0, frequencies: 0, yRanges: 0, cursorsKept: 0 };
     fc.assert(
@@ -312,7 +324,7 @@ describe('view history, against a model of its rules', () => {
           while (model.get(tab.id).at < model.get(tab.id).line.length - 1) act({ t: 'forward' });
         }
       }),
-      { numRuns },
+      { examples: EXAMPLES, numRuns: EXAMPLES.length + numRuns },
     );
     // Each rule had cases that reached it, a few in every hundred runs.
     for (const [rule, n] of Object.entries(count)) expect(n, rule).toBeGreaterThanOrEqual(numRuns / 25);
