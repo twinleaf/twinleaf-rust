@@ -225,8 +225,9 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .status-bar .item { display: inline-flex; align-items: center; gap: 5px; padding: 0 6px; height: 20px; border-radius: 4px; }
 .status-bar .item + .item { border-left: 1px solid var(--border); border-radius: 0; }
 .status-bar .spacer { flex: 1; }
-/* A number that changes as data streams keeps one width, so what follows it in the bar stays put. */
-.status-bar .num { display: inline-block; min-width: 4ch; text-align: right; font-variant-numeric: tabular-nums; }
+/* A number in the bar keeps one width, `--digits` wide, four unless it says, and a count keeps room for its plural's s, so what follows stays put as they change. */
+.status-bar .num { display: inline-block; min-width: calc(var(--digits, 4) * 1ch); text-align: right; font-variant-numeric: tabular-nums; }
+.status-bar .plural.one { visibility: hidden; }
 .status-bar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--destructive); }
 .status-bar .dot.on { background: var(--primary); }
 .status-bar .warn { display: inline-flex; align-items: center; gap: 3px; color: var(--cursor-a); }

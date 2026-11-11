@@ -25,22 +25,25 @@
   const lost = $derived(devices.filter((d) => d.presence === 'lost'));
   const memory = $derived(session.memory);
   const full = $derived(memory?.budget ? Math.min(1, memory.bytes / memory.budget) : 0);
-  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   const loss = $derived(hub.loss);
   let lossOpen = $state(false);
 </script>
+
+<!-- A count of `n` `word`s, its number `digits` wide and room kept for the
+     plural's s, so what follows it in the bar stays put as the count changes. -->
+{#snippet counted(n, word, digits)}<span class="num" style="--digits: {digits}">{n}</span> {word}<span class="plural" class:one={n === 1}>s</span>{/snippet}
 
 <footer class="status-bar" data-focus="status" tabindex="-1">
   <span class="item" title={hub.connected ? 'The page reaches the hub' : 'The page lost the hub and tries again each second'}>
     <i class="dot" class:on={hub.connected}></i>{hub.connected ? 'Connected' : 'Reconnecting…'}
   </span>
   <span class="item">
-    {plural(devices.length, 'device')}
+    <span>{@render counted(devices.length, 'device', 2)}</span>
     {#if lost.length}
-      <span class="warn" title="Lost: {lost.map((d) => d.route).join(', ')}"><RiWarn />{lost.length} lost</span>
+      <span class="warn" title="Lost: {lost.map((d) => d.route).join(', ')}"><RiWarn /><span class="num" style="--digits: 2">{lost.length}</span> lost</span>
     {/if}
   </span>
-  <span class="item"><span>{plural(session.signals.length, 'signal')} · <span class="num">{hud.rxKBs.toFixed(0)}</span> kB/s</span></span>
+  <span class="item"><span>{@render counted(session.signals.length, 'signal', 3)} · <span class="num">{hud.rxKBs.toFixed(0)}</span> kB/s</span></span>
   {#if loss.recent.length || lossOpen}
     <Popover.Root bind:open={lossOpen}>
       <Tip text={LOSS_TIP}>
@@ -51,7 +54,7 @@
                 <RiWarn />
                 {#each loss.recent as cause, i (cause.kind)}
                   {#if i}<span aria-hidden="true">·</span>{/if}
-                  <span class="cause" data-cause={cause.kind}>{#each lossWords(cause) as part}{#if part.num}<span class="num" style:min-width="{part.ch}ch">{part.num}</span>{:else}{part}{/if}{/each}</span>
+                  <span class="cause" data-cause={cause.kind}>{#each lossWords(cause) as part}{#if part.num}<span class="num" style="--digits: {part.ch}">{part.num}</span>{:else}{part}{/if}{/each}</span>
                 {:else}
                   <span class="cause">{LOSS_NONE_RECENT}</span>
                 {/each}

@@ -10,12 +10,14 @@
 // Its waterline marks where the time limit fills the budget, and the band
 // on from there a full paused history takes, pinned at the bar's end with
 // an arrow past it; the line under it says what a paused plot keeps; and
-// neither changes as the hub notes what it holds.
+// neither changes as the hub notes what it holds. While it is open, the
+// status bar's counts and data rate change and nothing before the History
+// button moves, nor the popover.
 // The hub here says what it holds by `memory` messages, and the page's
 // /api/history requests are counted.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { page as browser } from 'vitest/browser';
-import { clickOn, closeAll, frames, mountPage, pressKey, settle, until } from './harness/page.js';
+import { clickOn, closeAll, frames, mountPage, pressKey, settle, until, wait } from './harness/page.js';
 import { pausing } from '../src/lib/session.svelte.js';
 import { pausedKeeps } from '../src/lib/words.js';
 import { prefs } from '../src/lib/prefs.svelte.js';
@@ -243,6 +245,41 @@ describe('the History waterline', () => {
     } finally {
       prefs.setTheme('system');
     }
+  });
+});
+
+describe('the status bar, with the History popover open', () => {
+  /** Where each of the bar's items before the History button is, and the button and the popover, as text. */
+  const places = () => {
+    const items = [...document.querySelectorAll('.status-bar > *')];
+    const history = document.querySelector('.status-bar .history');
+    const box = (el) => (({ left, right, top }) => [left, right, top])(el.getBoundingClientRect());
+    return JSON.stringify({ items: items.slice(0, items.indexOf(history) + 1).map(box), popover: box(popover()) });
+  };
+  /** Has the hub send `bytes` in the next half second, which the bar reads out as the data rate. */
+  const receive = async (bytes) => {
+    page.hub.bytes += bytes;
+    await wait(500);
+    await settle();
+  };
+
+  it('keeps every item before the History button, and the popover, in place while the counts and the data rate change', async () => {
+    await open(FULL);
+    await receive(0);
+    const was = places(), digits = new Set();
+    /** The data rate the bar shows, as its digits. */
+    const rateShown = () => [...document.querySelectorAll('.status-bar .num')].find((n) => n.nextSibling?.textContent.includes('kB/s')).textContent.trim();
+    // The rate through each count of digits it shows, as the devices and the signals come and go.
+    for (const [kBs, devices, signals] of [[3, 0, 1], [42, 1, 2], [512, 2, 9], [9999, 10, 10], [1234, 12, 120], [0, 1, 1], [77, 0, 150]]) {
+      const routes = Array.from({ length: devices }, (_, i) => `/d${i}`);
+      page.hub.text({ type: 'routes', seq: page.hub.seq + 1, mounts: {}, routes });
+      for (let id = page.hub.session.signals.length; id < signals; id++) page.hub.text({ type: 'trace', seq: page.hub.seq + 1, trace: { id: 100 + id, route: '/', stream: 'more', column: `c${id}`, units: 'V', rate: 100 } });
+      await receive(kBs * 500);
+      const rate = rateShown();
+      digits.add(rate.length);
+      expect(places(), `${rate} kB/s, ${page.hub.session.devices.size} devices, ${page.hub.session.signals.length} signals`).toBe(was);
+    }
+    expect([...digits].sort(),'the rate shown with 1 to 4 digits').toEqual([1, 2, 3, 4]);
   });
 });
 
