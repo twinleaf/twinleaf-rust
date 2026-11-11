@@ -460,6 +460,10 @@
    * which takes its resize cursor off the page. A drag lasts no longer than
    * the pane group it drags in (`$effect.pre` below), and a press that
    * begins one ends any other of the same handle.
+   *
+   * The pane library lays the panes out by how far the pointer is from the
+   * press, and does nothing for a move that is no way from it: the pointer
+   * back on the press puts the dock back here, as the drag found it.
    */
   function dockDragging(side, dragging) {
     dragFrom[side]?.ends();
@@ -468,14 +472,22 @@
     const from = { width: dockSize[side], hidden: !docks.shown(side), narrow: narrow.current };
     const unclaim = claim('drag', { on: { cancel: () => (putBack(side, from), release(), from.ends()) } });
     const blur = () => (release(), from.ends());
+    const pressed = handlePress;
+    const moved = (e) => pressed !== null && along(e, from.narrow) === along(pressed, from.narrow) && putBack(side, from);
     window.addEventListener('blur', blur);
+    document.body.addEventListener('mousemove', moved);
     from.ends = () => {
       unclaim();
       window.removeEventListener('blur', blur);
+      document.body.removeEventListener('mousemove', moved);
       window.removeEventListener('pointerup', from.ends);
     };
     dragFrom[side] = from;
   }
+  /** The press on a dock's handle that began the drag of it under way, the mouse event, or null. */
+  let handlePress = null;
+  /** Where mouse event `e` is along the way a handle moves: down the page in a `narrow` window, else across it, in px. */
+  const along = (e, narrow) => (narrow ? e.clientY : e.clientX);
   /**
    * Puts dock `side` back as a drag of its handle found it, `from`: at its
    * width, hidden or shown, in the panes there are now. With none, as the
@@ -1023,6 +1035,7 @@
     title={prefs.hints ? 'Drag to resize; double-click resets' : undefined}
     class="mx-[3px] bg-transparent transition-colors after:w-3 hover:bg-primary/60 data-[direction=vertical]:mx-0 data-[direction=vertical]:my-[3px] data-[direction=vertical]:after:h-3"
     ondblclick={() => resetDock(side)}
+    onmousedown={(e) => (handlePress = e)}
     onDraggingChange={(dragging) => dockDragging(side, dragging)}
   />
 {/snippet}

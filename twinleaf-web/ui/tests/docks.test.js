@@ -741,6 +741,12 @@ describe('a drag of the handle beside a dock', () => {
     [{ side: 'right', hiddenFirst: true, drags: [{ via: [0], end: 'up' }] }],
     // The window loses focus in a drag out of a hidden dock: it ends there.
     [{ side: 'left', hiddenFirst: true, drags: [{ via: [150], end: 'blur' }] }],
+    // In a little and back onto the press, where the pane library hears no move: the dock is as wide as the drag found it.
+    [{ side: 'left', hiddenFirst: false, drags: [{ via: [-5, 0], end: 'up' }] }],
+    // In past the least width, which hides it, and back onto the press: shown again at its width.
+    [{ side: 'right', hiddenFirst: false, drags: [{ via: [-200, 0], end: 'up' }, { via: [60, 0], end: 'outside' }] }],
+    // Out of a hidden dock, which shows it, and back onto the press: hidden again.
+    [{ side: 'left', hiddenFirst: true, drags: [{ via: [200, 0], end: 'up' }] }],
   ];
 
   it('hides the dock exactly when let go inside its least width, else shows it at the width dragged to; Escape puts it back; it leaves no resize cursor, never moves the other dock, and its widths load again', async () => {
