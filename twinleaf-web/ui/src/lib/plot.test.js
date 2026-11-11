@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import fc from 'fast-check';
 import { Detail, Points, Trace } from './session.svelte.js';
-import { axisSlots, blurred, onPixelGrid, pickLevel, pickSource, PlotView, rowCounts, timeAxis, View } from './plot.js';
+import { scaleLinear, scaleLog } from 'd3-scale';
+import { axisSlots, blurred, laneTicks, onPixelGrid, pickLevel, pickSource, PlotView, rowCounts, timeAxis, View } from './plot.js';
 
 const meta = { id: 0, route: '/', stream: 'sine', column: 'sine', units: 'V', rate: 1000 };
 
@@ -113,6 +114,99 @@ describe('axisSlots', () => {
   it('places each signal where it was put, a full side showing no more', () => {
     expect(axisSlots(['a', 'b', 'c'], { a: 'right', b: 'right', c: 'right' })).toEqual({ left: [], right: ['a', 'b'] });
     expect(axisSlots(['a', 'b'], { a: 'none' })).toEqual({ left: [], right: ['b'] });
+  });
+});
+
+describe('laneTicks', () => {
+  // A number is written 4 px below its tick's pixel row, its digits 9 px up and 2 down;
+  // it may reach 2 px past its lane, and keeps 2 px from the next number.
+  const UP = 5, DOWN = 6, REACH = 2, CLEAR = 2;
+  const scaleOf = (lo, span, lane, log = false) => (log ? scaleLog() : scaleLinear()).domain([lo, lo + span]).range([lane.y + lane.h, lane.y]);
+  /** The box each number of `labels` is drawn in, as plot.js draws it on the pixel grid. */
+  const boxes = (sy, labels) => labels.map((v) => Math.round(sy(v)) + 0.5).map((py) => [py - UP, py + DOWN]);
+  /** Whether a number at its tick's exact place fits the lane, with the pixel it may be drawn below that. */
+  const fits = (sy, lane, v) => sy(v) - UP >= lane.y - REACH && sy(v) + 1 + DOWN <= lane.y + lane.h + REACH;
+  const kind = (labels) => Math.min(2, labels.length);
+  const domain = fc.tuple(fc.double({ min: -1e6, max: 1e6, noNaN: true }), fc.double({ min: 1e-6, max: 1e6, noNaN: true }));
+  // Lanes short enough to number one tick or none, as often as taller ones.
+  const laneAt = fc.record({ y: fc.double({ min: 0, max: 800, noNaN: true }), h: fc.oneof(fc.integer({ min: 1, max: 60 }), fc.integer({ min: 1, max: 400 })) });
+
+  it('numbers ticks of its grid, each within the lane, 2 px past it at most, and 2 px or more from the next', () => {
+    fc.assert(
+      fc.property(domain, laneAt, ([lo, span], lane) => {
+        const sy = scaleOf(lo, span, lane), { grid, labels } = laneTicks(sy, lane);
+        expect(grid).toEqual(sy.ticks(Math.max(3, lane.h / 40)));
+        for (const v of labels) expect(grid).toContain(v);
+        const drawn = boxes(sy, labels).sort((a, b) => a[0] - b[0]);
+        for (const [top, bottom] of drawn) expect(top >= lane.y - REACH && bottom <= lane.y + lane.h + REACH, `${[top, bottom]} in ${lane.y} + ${lane.h}`).toBe(true);
+        drawn.forEach((b, i) => i && expect(b[0] - drawn[i - 1][1], 'the room between two numbers').toBeGreaterThanOrEqual(CLEAR));
+      }),
+    );
+  });
+
+  it('numbers several ticks where they fit, else the one nearest the lane’s middle, else none', () => {
+    fc.assert(
+      fc.property(domain, laneAt, ([lo, span], lane) => {
+        const sy = scaleOf(lo, span, lane), { grid, labels } = laneTicks(sy, lane);
+        const fitting = grid.filter((v) => fits(sy, lane, v));
+        if (!fitting.length) expect(labels).toEqual([]);
+        else if (labels.length === 1) {
+          const mid = lane.y + lane.h / 2, d = (v) => Math.abs(sy(v) - mid);
+          expect(d(labels[0])).toBeCloseTo(Math.min(...fitting.map(d)), 1);
+          // Every 1st, 2nd, 5th, 10th… tick that fits is no two numbers with room between them.
+          const step = grid[1] - grid[0];
+          for (const k of [1, 2, 5, 10, 20, 50, 100]) {
+            const each = fitting.filter((v) => Math.round(v / step) % k === 0);
+            expect(each.length < 2 || each.some((v, i) => i && Math.abs(sy(v) - sy(each[i - 1])) < 14), `every ${k}th: ${each}`).toBe(true);
+          }
+        } else if (labels.length >= 2) {
+          // Every kth tick of the grid for one k, so the numbers stay round.
+          const step = grid[1] - grid[0], k = Math.round((labels[1] - labels[0]) / step);
+          expect([1, 2, 5, 10, 20, 50, 100]).toContain(k);
+          for (const v of labels) expect(Math.abs(Math.round(v / step) % k), `${v} is a multiple of ${k * step}`).toBe(0);
+        } else expect(fitting).toEqual([]);
+      }),
+    );
+  });
+
+  it('numbers several ticks in any lane 120 px high or more with four ticks or more', () => {
+    fc.assert(
+      fc.property(domain, laneAt, ([lo, span], lane) => {
+        const tall = { ...lane, h: 120 + lane.h }, { grid, labels } = laneTicks(scaleOf(lo, span, tall), tall);
+        // Two of them at most are at the lane's ends, where a number would run past it.
+        if (grid.length >= 4) expect(labels.length).toBeGreaterThanOrEqual(2);
+      }),
+    );
+  });
+
+  it('goes from several to one to none as the lane shortens a pixel at a time, never back, wherever the lane starts', () => {
+    fc.assert(
+      fc.property(domain, fc.array(fc.double({ min: 0, max: 800, noNaN: true }), { minLength: 400, maxLength: 400 }), fc.boolean(), ([lo, span], ys, log) => {
+        // A log axis numbers its decades only.
+        if (log) [lo, span] = [10 ** (Math.abs(lo) % 6 - 3), 10 ** (Math.abs(lo) % 6 - 3) * (1 + (span % 1e4))];
+        const decade = (v) => Number.isInteger(Math.round(Math.log10(v) * 1e6) / 1e6);
+        let was = 2;
+        for (let h = 400; h >= 1; h--) {
+          const lane = { y: ys[h - 1], h }, now = kind(laneTicks(scaleOf(lo, span, lane, log), lane, log ? decade : undefined).labels);
+          expect(now, `${h} px high, from ${lane.y}`).toBeLessThanOrEqual(was);
+          was = now;
+        }
+      }),
+    );
+  });
+
+  it('numbers the tick nearest the middle of a lane with room for one', () => {
+    // 0 to 3.2 over 30 px: 1 at 20.6 px from the top, 2 at 11.3, too near each other for both; the middle is at 15.
+    const lane = { y: 0, h: 30 }, sy = scaleOf(0, 3.2, lane);
+    expect(laneTicks(sy, lane)).toEqual({ grid: [0, 1, 2, 3], labels: [2], count: 3 });
+  });
+
+  it('numbers a log axis at its decades only', () => {
+    const lane = { y: 0, h: 300 }, sy = scaleOf(1e-3, 1e3 - 1e-3, lane, true);
+    const decade = (v) => Number.isInteger(Math.round(Math.log10(v) * 1e6) / 1e6);
+    const { labels } = laneTicks(sy, lane, decade);
+    expect(labels.length).toBeGreaterThanOrEqual(2);
+    for (const v of labels) expect(decade(v), `${v}`).toBe(true);
   });
 });
 

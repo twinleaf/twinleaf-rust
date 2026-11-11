@@ -32,6 +32,50 @@ function cssRgba(css) {
   return [r / 255, g / 255, b / 255, a / 255];
 }
 const LANE_GAP = 6;
+/**
+ * The least room, in px, between two of a y axis's numbers, between a lane's
+ * numbers and the next lane's, and about the tabs of the Y cursors resting
+ * in a lane.
+ */
+const CLEAR = 2;
+/** How far past its lane, in px, a lane's numbers may reach: half the gap between lanes, less half the clearance. */
+const LABEL_REACH = (LANE_GAP - CLEAR) / 2;
+/** Of a y axis's ticks, every how many it numbers when it cannot number each one: so the numbers it keeps stay round. */
+const LABEL_EVERY = [1, 2, 5, 10, 20, 50, 100];
+
+/**
+ * The ticks of a y axis over `lane`, {y, h}, with scale `sy` (value to
+ * client y), and those it writes numbers at, by the lane's height. The grid
+ * is at every tick. The numbers are at ticks whose number lies within the
+ * lane, reaching LABEL_REACH px past it, CLEAR px or more apart: each such
+ * tick, or else every 2nd, 5th, 10th and so on, while two or more fit; else
+ * the one nearest the lane's middle that fits; else none. A tick is
+ * numbered only where `numbered(value)` holds, as a log axis numbers its
+ * decades. `count` is the tick count asked of the scale, for its format.
+ *
+ * It measures from where a tick falls, not the pixel it is drawn on, which
+ * is up to 1 px lower: so what a lane shows changes only one way as the
+ * lane grows or shrinks, whatever pixel the lane starts on.
+ */
+export function laneTicks(sy, lane, numbered = () => true) {
+  const count = Math.max(3, lane.h / 40), grid = sy.ticks(count);
+  const fits = (v) => numbered(v) && sy(v) + 4 - LABEL.up >= lane.y - LABEL_REACH && sy(v) + 1 + 4 + LABEL.down <= lane.y + lane.h + LABEL_REACH;
+  const room = LABEL.up + LABEL.down + CLEAR + 1;
+  const spaced = (vs) => vs.every((v, i) => i === 0 || Math.abs(sy(v) - sy(vs[i - 1])) >= room);
+  // The kth tick from zero, on a linear axis's even steps, or from the first numbered one.
+  const step = grid.length > 1 ? grid[1] - grid[0] : 1;
+  const even = grid.every((v, i) => i === 0 || Math.abs(v - grid[i - 1] - step) <= Math.abs(step) * 1e-6);
+  const kth = (v, i, k) => (even ? Math.round(v / step) : i) % k === 0;
+  const candidates = grid.filter(numbered);
+  for (const k of LABEL_EVERY) {
+    const labels = candidates.filter((v, i) => kth(v, i, k) && fits(v));
+    if (labels.length >= 2 && spaced(labels)) return { grid, labels, count };
+    if (labels.length < 2 && k > 1 && candidates.filter((v, i) => kth(v, i, k)).length < 2) break;
+  }
+  const middle = lane.y + lane.h / 2;
+  const one = grid.filter(fits).sort((a, b) => Math.abs(sy(a) - middle) - Math.abs(sy(b) - middle))[0];
+  return { grid, labels: one === undefined ? [] : [one], count };
+}
 
 /** How many y axes an independent plot shows on each side. */
 export const AXES_PER_SIDE = 2;
@@ -511,7 +555,7 @@ export class PlotView {
     this.pressable = [];
     this.tagsParted = {}; // the pairs of tags that are on their outer sides, by pair, see `parted`
     this.tagsPlaced = [];
-    this.tickLabels = []; // the box of each tick label, {x, y, w, h} in client px, as last drawn
+    this.tickLabels = []; // the box of each tick label, {x, y, w, h} in client px, as last drawn, and a y label's axis, its range key
     this.cursorStubs = []; // each cursor line's run past the plot's edge into the axis, {x0, y0, x1, y1}
     this.axisHover = null; // clientX over the x axis, where a drag seeks
     this.phosphor = new Map(); // signal key -> the shares its axis column shows, eased frame to frame
@@ -622,7 +666,7 @@ export class PlotView {
   geometry(body, cfg, n) {
     const counts = this.axisCounts(cfg);
     const width = (side) => Array.from({ length: counts[side] }, (_, i) => this.axisWidth(side, i)).reduce((a, b) => a + b, 0);
-    const left = Math.max(width('left'), 12), right = Math.max(width('right'), 12);
+    const left = Math.max(width('left'), GUTTER.bare), right = Math.max(width('right'), GUTTER.bare);
     const plot = { x: body.x + left, y: body.y + 6, w: body.w - left - right, h: body.h - 6 - 22 };
     const count = lanesOf(cfg.mode, n);
     const h = (plot.h - LANE_GAP * (count - 1)) / count;
@@ -1042,36 +1086,42 @@ export class PlotView {
         drawStrip(ctx, shown, colorOf(p.t), x, AXIS_STRIP.w, hoverLane.y, AXIS_STRIP.alpha);
       });
     }
-    const widest = { left: [], right: [] };
+    // Each axis's grid and numbers, as `laneTicks` picks them by its lane's
+    // height, and the width its gutter needs for what it draws: its numbers,
+    // or, with none, the tabs of the Y cursors resting in a lane with room
+    // for one, or else nothing but the bare edge.
+    const head = this.body.closest('.plot-card.monitor')?.querySelector('.plot-head')?.getBoundingClientRect().bottom ?? -Infinity;
+    const need = { left: [], right: [] };
     axes.forEach((ax, i) => {
       const sy = yScale(ax.range, ax.lane);
-      // Labels take the precision of the ticks they label, so no two read the same.
-      const count = Math.max(3, ax.lane.h / 40);
-      const ticks = sy.ticks(count);
-      const fmt = logY ? (v) => (decade(v) ? v.toExponential(0) : '') : sy.tickFormat(count);
-      ctx.textAlign = ax.side === 'left' ? 'right' : 'left';
-      for (const tv of ticks) {
-        const py = Math.round(sy(tv)) + 0.5;
-        if (i === 0 || cfg.mode === 'stacked') {
+      const { grid, labels, count } = laneTicks(sy, ax.lane, logY ? decade : undefined);
+      // Numbers take the precision of the ticks they label, so no two read the same.
+      const fmt = logY ? (v) => v.toExponential(0) : sy.tickFormat(count);
+      if (i === 0 || cfg.mode === 'stacked')
+        for (const tv of grid) {
+          const py = Math.round(sy(tv)) + 0.5;
           ctx.strokeStyle = T.grid;
           ctx.beginPath();
           ctx.moveTo(ax.lane.x, py);
           ctx.lineTo(ax.lane.x + ax.lane.w, py);
           ctx.stroke();
         }
-        const label = fmt(tv);
-        if (!label) continue;
-        const w = ctx.measureText(label).width;
-        widest[ax.side][ax.slot] = Math.max(widest[ax.side][ax.slot] ?? 0, w);
-        ctx.fillStyle = ax.color;
+      ctx.textAlign = ax.side === 'left' ? 'right' : 'left';
+      ctx.fillStyle = ax.color;
+      let widest = 0;
+      for (const tv of labels) {
+        const py = Math.round(sy(tv)) + 0.5, label = fmt(tv), w = ctx.measureText(label).width;
+        widest = Math.max(widest, w);
         ctx.fillText(label, ax.side === 'left' ? ax.x1 - GUTTER.gap : ax.x0 + GUTTER.gap, py + 4);
-        this.tickLabels.push({ x: ax.side === 'left' ? ax.x1 - GUTTER.gap - w : ax.x0 + GUTTER.gap, y: py + 4 - LABEL.up, w, h: LABEL.up + LABEL.down });
+        this.tickLabels.push({ axis: ax.key, x: ax.side === 'left' ? ax.x1 - GUTTER.gap - w : ax.x0 + GUTTER.gap, y: py + 4 - LABEL.up, w, h: LABEL.up + LABEL.down });
       }
+      const want = labels.length ? Math.max(GUTTER.min, Math.ceil(widest + GUTTER.gap + GUTTER.pad)) : this.tabRoom(ax.lane, head) > 0 ? GUTTER.min : GUTTER.bare;
+      need[ax.side][ax.slot] = Math.max(need[ax.side][ax.slot] ?? 0, want);
     });
     for (const side of ['left', 'right'])
-      this.gutter[side] = widest[side].map((w, slot) => {
-        const need = Math.max(GUTTER.min, Math.ceil((w ?? 0) + GUTTER.gap + GUTTER.pad)), had = this.gutter[side][slot];
-        return had !== undefined && need <= had && need >= had - GUTTER.slack ? had : need;
+      this.gutter[side] = need[side].map((want, slot) => {
+        const had = this.gutter[side][slot];
+        return had !== undefined && want <= had && want >= had - GUTTER.slack ? had : want;
       });
     ctx.strokeStyle = T.frame;
     for (const lane of geo.lanes) ctx.strokeRect(lane.x + 0.5, lane.y + 0.5, lane.w - 1, lane.h - 1);
@@ -1527,8 +1577,7 @@ export class PlotView {
     for (const a of axes) {
       const yc = this.yPair(a.key);
       const resting = ['a', 'b'].filter((name) => !yc || yc[name] === null);
-      // How many tabs the lane has room for, one above another from its foot, below a floating header.
-      const room = Math.max(0, Math.floor((a.lane.y + a.lane.h - Math.max(a.lane.y, head) - 2) / (TAB.h + 2)));
+      const room = this.tabRoom(a.lane, head);
       const x = a.side === 'left' ? a.x0 + 2 : a.x1 - TAB.w - 2;
       for (const name of room >= 2 ? resting : resting.slice(0, room)) {
         const up = room >= 2 && name === 'b' ? TAB.h + 2 : 0;
@@ -1623,6 +1672,16 @@ export class PlotView {
   parted(key, a, b) {
     const gap = Math.max(a.x, b.x) - Math.min(a.x + a.w, b.x + b.w);
     return (this.tagsParted[key] = gap < TAG_NEAR + (this.tagsParted[key] ? TAG_HELD : 0));
+  }
+
+  /**
+   * How many tabs of Y cursors `lane` has room for, one above another from
+   * its foot, CLEAR px about each, below a floating header whose foot is at
+   * client y `head`. As with its numbers (`laneTicks`), what does not fit in
+   * the lane with that room about it is not drawn.
+   */
+  tabRoom(lane, head) {
+    return Math.max(0, Math.floor((lane.y + lane.h - Math.max(lane.y, head) - CLEAR) / (TAB.h + CLEAR)));
   }
 
   /**
@@ -2096,11 +2155,14 @@ export class PlotView {
 
 /**
  * A y axis's width: its widest label, `gap` px from the plot and `pad` px
- * from the edge, never narrower than `min`. It widens at once for a wider
- * label, and narrows only once it is `slack` px wider than it needs, so
+ * from the edge, never narrower than `min`, the room of a Y cursor's tab
+ * resting there. An axis that draws no numbers in any lane, nor has a lane
+ * with room for a tab, is `bare`, as is the plot's edge on a side with no
+ * axis: room for the cursors' lines to run past the plot. It widens at
+ * once, and narrows only once it is `slack` px wider than it needs, so
  * labels that change width as the plot moves do not shift it.
  */
-const GUTTER = { gap: 6, pad: 6, min: 24, slack: 10 };
+const GUTTER = { gap: 6, pad: 6, min: 24, bare: 12, slack: 10 };
 /**
  * A paused plot's history scrollbar: its height, and its thumb's least
  * width, in px. The thumb is as wide as the window is a share of the history,
