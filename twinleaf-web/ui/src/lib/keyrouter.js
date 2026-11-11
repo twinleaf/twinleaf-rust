@@ -14,7 +14,7 @@
 //     signals     a plot's signals
 //     list        the Signals list, and its search field
 //     properties  a table of property rows
-//     slider      the window slider
+//     window      the window field's arrows
 //     kind        a plot's kind and layout dropdowns, while one is open
 //   The element with focus
 //     element     what is typed into a field, an open menu's, list's or
@@ -76,7 +76,7 @@ export const ORDER = [
   { id: 'signals', place: 'signals' },
   { id: 'list', place: 'list' },
   { id: 'properties', place: 'properties' },
-  { id: 'slider', place: 'slider' },
+  { id: 'window', place: 'window' },
   { id: 'kind', place: 'kind' },
   { id: ELEMENT },
   { id: 'palette', place: 'page', kept: true, taken: true },

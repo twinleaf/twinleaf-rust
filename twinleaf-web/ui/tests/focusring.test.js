@@ -136,7 +136,7 @@ describe('the focus ring', () => {
       seen.page = await walk(document, 'the page', colour);
       // Each popover a control of the page opens, found by its trigger: one of each kind.
       const kinds = new Map([...document.querySelectorAll('[aria-haspopup=dialog]')].filter((t) => places().includes(t)).map((t) => [(t.getAttribute('aria-label') ?? t.textContent).trim().split(/\s+/).slice(0, 2).join(' '), t]));
-      expect(kinds.size).toBeGreaterThan(2);
+      expect(kinds.size).toBeGreaterThan(1);
       seen.popovers = { ringed: 0, bare: 0 };
       for (const trigger of kinds.values()) {
         await focusPage();

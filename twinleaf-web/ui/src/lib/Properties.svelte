@@ -31,6 +31,7 @@
   // only its cells.
   import { getContext, onDestroy, tick, untrack } from 'svelte';
   import { claim } from './keyrouter.js';
+  import { escapeTyped } from './keys.js';
   import { getCoreRowModel } from '@tanstack/table-core';
   import { createSvelteTable, FlexRender, renderSnippet } from '$lib/components/ui/data-table/index.js';
   import * as Table from '$lib/components/ui/table/index.js';
@@ -265,10 +266,7 @@
     if (e.key === 'Enter' && bar && draft.trim() !== '') {
       e.preventDefault();
       writeBar(draft.trim());
-    } else if (e.key === 'Escape' && draft !== filled()) {
-      e.preventDefault();
-      draft = filled();
-    }
+    } else escapeTyped(e, draft, filled(), () => (draft = filled()));
   }
 </script>
 

@@ -51,6 +51,19 @@ export function keepsKey(e, at = e.target) {
   return !!pressable && keyboardFocused.has(pressable);
 }
 
+/**
+ * Escape in a text field, key event `e`: while what is typed, `typed`,
+ * differs from what the field was filled with, `filled`, `restore()` puts
+ * that back and the field keeps the key; else the key goes on to the page,
+ * which goes out a level (keyrouter.js). Whether the field kept it.
+ */
+export function escapeTyped(e, typed, filled, restore) {
+  if (e.key !== 'Escape' || typed === filled) return false;
+  e.preventDefault();
+  restore();
+  return true;
+}
+
 /** Whether the keyboard moved focus to `el`, rather than a click. */
 export function focusedByKeyboard(el) {
   return keyboardFocused.has(el);

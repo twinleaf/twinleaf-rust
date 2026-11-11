@@ -26,7 +26,7 @@
   import { claim } from './lib/keyrouter.js';
   import { commands as plotCommands } from './lib/commands.js';
   import CommandItem from './lib/CommandItem.svelte';
-  import { keepsKey, plotPickers } from './lib/keys.js';
+  import { escapeTyped, keepsKey, plotPickers } from './lib/keys.js';
   import { api } from './lib/protocol.js';
   import { THEMES, TRACE_WIDTH, prefs } from './lib/prefs.svelte.js';
   import RiSun from '@lucide/svelte/icons/sun';
@@ -53,8 +53,8 @@
   import { navigate, remember } from './lib/focus.js';
   import KeysDialog from './lib/KeysDialog.svelte';
   import ExportDialog from './lib/ExportDialog.svelte';
-  import WindowSlider from './lib/WindowSlider.svelte';
-  import { windowText } from './lib/window.js';
+  import WindowField from './lib/WindowField.svelte';
+  import { WINDOW_LIMITS } from './lib/window.js';
   import StatusBar from './lib/StatusBar.svelte';
   import HistorySettings from './lib/HistorySettings.svelte';
   import CommandPalette from './lib/CommandPalette.svelte';
@@ -87,7 +87,6 @@
   import RiUpload from '@lucide/svelte/icons/upload';
   import { counted } from './lib/menus.js';
   import RiCheck from '@lucide/svelte/icons/check';
-  import RiChevron from '@lucide/svelte/icons/chevron-down';
   import * as clock from './lib/clock.js';
   import './lib/scrolling.js';
 
@@ -241,8 +240,10 @@
   /** Reads the toolbar's window: what the first view it acts on can show of its window, which grows as a hub fills. */
   function readWindow() {
     const vs = chosen();
-    if (vs.length) span = +vs[0].windowShown(clock.now()).toFixed(3);
+    if (vs.length) span = vs[0].windowShown(clock.now());
   }
+  /** The widest window the first view the toolbar acts on can show now. */
+  const widestWindow = () => chosen()[0]?.spans(clock.now())[1] ?? WINDOW_LIMITS[1];
   /** Shows the views' state in the toolbar, and keeps every paused view's points. */
   function refreshToolbar() {
     live = tabViews().every((v) => v.live);
@@ -344,11 +345,7 @@
   /** The words every property row shown has in its name: one filter for every panel of properties. */
   let propertyFilter = $state('');
   /** Escape in the filter's field clears what is typed, before it does anything else. */
-  function filterKey(e) {
-    if (e.key !== 'Escape' || !propertyFilter) return;
-    propertyFilter = '';
-    e.preventDefault();
-  }
+  const filterKey = (e) => escapeTyped(e, propertyFilter, '', () => (propertyFilter = ''));
   /** Whether dock `side` has a panel of properties, open or folded, and so holds the filter's field, in its top row. */
   const holdsFilter = (side) => docks[side].some((p) => PANELS[p.id].channels);
   /** What the Signals list's search holds: the signals it shows are those that match. */
@@ -611,9 +608,11 @@
     };
   });
 
-  function setSpan(v) {
-    const vs = chosen();
-    viewHistory.burst('window', vs, () => vs.forEach((vw) => vw.setSpan(v)));
+  /** Sets the window of the views the toolbar acts on: a window typed is a step of its own, the field's arrows and wheel one burst. */
+  function setSpan(v, typed) {
+    const vs = chosen(), set = () => vs.forEach((vw) => vw.setSpan(v));
+    if (typed) viewHistory.step(set);
+    else viewHistory.burst('window', vs, set);
   }
   /**
    * The toolbar's Live button: pauses every time plot of the tab while all
@@ -931,23 +930,8 @@
           </Button>
         {/snippet}
       </Tip>
-      <!-- The time window: a slider over the spans, a step apiece, each step
-           about a doubling or more, with the span it stands at named. -->
-      <Popover.Root>
-        <Tip text="The time window the plots show">
-          {#snippet children(tip)}
-            <Popover.Trigger {...tip}>
-              {#snippet child({ props })}<Button {...props} size="xs" variant="outline" class="window-button" aria-label="Time window" data-keeps-selection>{windowText(span)} s<RiChevron /></Button>{/snippet}
-            </Popover.Trigger>
-          {/snippet}
-        </Tip>
-        <Popover.Content class="axis-pop w-auto gap-0 p-1.5" align="start" sideOffset={BAR_OFFSET}>
-          <div class="axis-row">
-            <span>Window</span>
-            <WindowSlider value={span} onchange={setSpan} onstart={() => viewHistory.begin()} onend={() => viewHistory.end()} widest={hub.liveSeconds()} />
-          </div>
-        </Popover.Content>
-      </Popover.Root>
+      <!-- The time window the plots show, typed or stepped. -->
+      <WindowField value={span} onchange={setSpan} widest={widestWindow} />
       <IconButton icon={RiEraser} label="Clear the cursors" data-keeps-selection data-command="clearCursors" onclick={() => commands.run('clearCursors', { from: 'toolbar' })} />
       <DropdownMenu.Root>
         <Tip text="Arrange this tab's plots">

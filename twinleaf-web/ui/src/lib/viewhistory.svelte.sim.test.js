@@ -1,6 +1,6 @@
 // View history against a model of its rules (round 2, View history #2 to
 // #8, round 1 #29), each stated here on its own. Random runs of drags,
-// wheel and arrow-key bursts with gaps around IDLE_MS, the window's slider,
+// wheel and arrow-key bursts with gaps around IDLE_MS, the window field's,
 // y zooms, commands (follow live, pause, cursors placed and cleared, y set
 // and fitted, a spectrum's frequencies), gestures on several plots, tab
 // switches, and idle time, on a hub that has just started and holds two
@@ -111,7 +111,7 @@ const action = fc.oneof(
   // A zoom in and straight back out, as ArrowUp then ArrowDown: a burst that ends where it began.
   { weight: 3, arbitrary: fc.record({ t: fc.constant('keys'), mask, presses: fc.constant([{ gap: 50, kind: 'zoom', back: false }, { gap: 50, kind: 'zoom', back: true }]) }) },
   { weight: 1, arbitrary: fc.record({ t: fc.constant('wheelY'), at: fc.nat(), turns: fc.array(fc.record({ gap, f: factor }), { minLength: 1, maxLength: 4 }) }) },
-  { weight: 1, arbitrary: fc.record({ t: fc.constant('slider'), mask, held: fc.boolean(), spans: fc.array(fc.record({ gap, s: fc.constantFrom(1, 2, 5, 10, 20, 60) }), { minLength: 1, maxLength: 4 }) }) },
+  { weight: 1, arbitrary: fc.record({ t: fc.constant('window'), mask, spans: fc.array(fc.record({ gap, s: fc.constantFrom(1, 2, 5, 10, 20, 60) }), { minLength: 1, maxLength: 4 }) }) },
   { weight: 3, arbitrary: fc.record({ t: fc.constant('command'), mask, what: fc.constantFrom('follow', 'follow', 'addX', 'addX', 'pause', 'clearX', 'addY', 'clearCursors', 'setY', 'fitY', 'frequencies', 'everyFrequency') }) },
   { weight: 2, arbitrary: fc.record({ t: fc.constant('idle'), ms: fc.oneof(fc.integer({ min: 0, max: 2000 }), fc.integer({ min: 20_000, max: 200_000 })) }) },
   { weight: 1, arbitrary: fc.constant({ t: 'tab' }) },
@@ -242,29 +242,28 @@ describe('view history, against a model of its rules', () => {
           else if (what === 'everyFrequency' && kindOf(id) === 'spectrum') ws.setView(id, { fRange: null });
         };
         const act = (a) => {
-          const here = tabIds(), targets = here.filter((_, i) => a.mask & (1 << i)), vs = targets.map((id) => views.get(id));
-          if (a.t === 'drag' || a.t === 'command' || (a.t === 'slider' && a.held)) {
-            // A drag, the slider dragged, or a command: one group, whatever it passes through.
+          const here = tabIds(), targets = here.filter((_, i) => a.mask & (1 << i));
+          if (a.t === 'drag' || a.t === 'command') {
+            // A drag or a command: one group, whatever it passes through.
             group = null;
             const g = begin(null, targets);
             if (a.t === 'command') vh.step(() => targets.forEach((id) => command(id, a.what)));
             else {
               vh.begin();
-              for (const p of a.moves ?? a.spans) {
+              for (const p of a.moves) {
                 t.ms += p.gap;
-                if (a.t === 'drag') targets.forEach((id) => moveOn(id, p.move));
-                else vh.burst('window', vs, () => vh.step(() => targets.forEach((id) => kindOf(id) === 'time' && views.get(id).setSpan(p.s))));
+                targets.forEach((id) => moveOn(id, p.move));
               }
               vh.end();
             }
             frame();
             settle(g);
-          } else if (a.t === 'wheel' || a.t === 'keys' || a.t === 'wheelY' || a.t === 'slider') {
+          } else if (a.t === 'wheel' || a.t === 'keys' || a.t === 'wheelY' || a.t === 'window') {
             // A burst: each turn or press joins the group before it when of the same kind on the same plots less than IDLE_MS on.
             const on = a.t === 'wheelY' ? [here[a.at % here.length]] : targets;
             for (const p of a.turns ?? a.presses ?? a.spans) {
               t.ms += p.gap;
-              const kind = { wheel: 'zoom', wheelY: 'zoomY', slider: 'window' }[a.t] ?? p.kind;
+              const kind = { wheel: 'zoom', wheelY: 'zoomY', window: 'window' }[a.t] ?? p.kind;
               const near = group && group.tab === ws.activeId && group.targets.join() === on.join();
               if (near && group.kind === kind && t.ms - group.last >= IDLE_MS) count.rested++;
               if (near && group.kind !== kind && t.ms - group.last < IDLE_MS) count.otherKind++;
@@ -276,11 +275,11 @@ describe('view history, against a model of its rules', () => {
               vh.burst(kind, on.map((id) => views.get(id)), () => {
                 for (const id of on) {
                   const v = views.get(id), st = yOf(id);
-                  // The wheel, the keys and the slider move time on time plots only, as the page does.
+                  // The wheel, the keys and the window field move time on time plots only, as the page does.
                   const time = kindOf(id) === 'time';
                   if (a.t === 'wheel' && time) v.zoom(p.f, p.anchor, t.ms);
                   else if (a.t === 'wheelY' && st?.range) Object.assign(st, { range: st.range.map((r) => r * p.f), auto: false });
-                  else if (a.t === 'slider' && time) vh.step(() => v.setSpan(p.s));
+                  else if (a.t === 'window' && time) v.setSpan(p.s);
                   else if (kind === 'pan' && time) v.pan(p.back ? -0.1 : 0.1, t.ms);
                   else if (kind === 'zoom' && time) v.zoom(p.back ? 1.25 : 0.8, v.live ? 1 : 0.5, t.ms);
                 }

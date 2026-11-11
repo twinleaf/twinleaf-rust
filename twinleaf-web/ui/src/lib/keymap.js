@@ -130,7 +130,7 @@ export const KEYMAP = [
       { show: ['☆'], what: 'Add to Favorites' },
     ],
   },
-  // What the sheet does not list: a panel's header, the window slider, a
+  // What the sheet does not list: a panel's header, the window field, a
   // plot's kind and layout dropdowns side by side, and a drag under way.
   {
     place: 'panel',
@@ -140,12 +140,8 @@ export const KEYMAP = [
     ],
   },
   {
-    place: 'slider',
-    entries: [
-      { keys: ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'], action: 'step' },
-      { keys: ['Home'], action: 'narrowest' },
-      { keys: ['End'], action: 'widest' },
-    ],
+    place: 'window',
+    entries: [{ keys: ['ArrowUp', 'ArrowDown'], action: 'step' }],
   },
   { place: 'kind', entries: [{ keys: ['ArrowLeft', 'ArrowRight'], action: 'across' }] },
   { place: 'drag', entries: [{ keys: ['Escape'], action: 'cancel' }] },

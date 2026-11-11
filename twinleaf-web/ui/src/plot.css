@@ -469,8 +469,6 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .theme-seg button:hover { color: var(--foreground); }
 .theme-seg button.on { background: var(--secondary); color: var(--foreground); }
 .theme-seg svg { width: 14px; height: 14px; }
-/* The time window's button and its slider, the spans named under their steps. */
-.top-bar .window-button { min-width: 64px; justify-content: space-between; font-variant-numeric: tabular-nums; }
 /* The export dialog: its choices as an axis popover's rows, then a note. */
 .export-dialog .axis-row { padding: 0; font-size: 13px; }
 .export-note { margin: 0; color: var(--muted-foreground); font-size: 12px; line-height: 16px; }
@@ -681,18 +679,11 @@ label > [data-slot=checkbox]::after { content: none; }
 .focus-ring { position: fixed; z-index: 46; pointer-events: none; border-style: solid; border-color: var(--ring); box-sizing: border-box; }
 .focus-ring.in-layer { position: absolute; z-index: 1; }
 
-/* The window slider: a rail on a log scale, a detent and its label at each
-   preset, the thumb, and the exact window typed at its end. The scale sits
-   10 px inside the track at each end, so the end labels and the thumb stay
-   in the track's box, where the page's focus ring goes around it. */
-.window-slider { display: flex; align-items: flex-start; gap: 10px; }
-.window-track { position: relative; width: 220px; height: 30px; cursor: pointer; touch-action: none; border-radius: var(--radius); outline: none; }
-.window-track .scale { position: absolute; inset: 0 10px; }
-.window-track .rail { position: absolute; top: 7px; left: 0; right: 0; height: 4px; border-radius: 2px; background: var(--secondary); }
-.window-track .fill { position: absolute; top: 0; bottom: 0; left: 0; width: var(--at); border-radius: 2px; background: var(--primary); }
-.window-track .thumb { position: absolute; top: 9px; left: var(--at); width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--primary); background: var(--background); transform: translate(-50%, -50%); }
-.window-track .detent { position: absolute; top: 14px; left: var(--p); transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; font: 10px/12px var(--font-data); color: var(--muted-foreground); pointer-events: none; }
-.window-track .detent i { width: 1px; height: 4px; background: currentColor; }
-.window-track .detent.on { color: var(--foreground); }
-.window-field { display: inline-flex; align-items: center; gap: 2px; height: 24px; padding-right: 6px; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--muted-foreground); font: 11px var(--font-data); }
-.window-field input { width: 44px; height: 22px; padding: 0 2px 0 6px; border: 0; outline: none; background: none; color: var(--foreground); font: 12px var(--font-data); font-variant-numeric: tabular-nums; text-align: right; }
+/* The time window's field: the number, then its unit, inside one outline,
+   each of a fixed width, as wide as the longest reading ("1.5 min" typed,
+   "18.3" and "min" shown), so nothing moves as the text changes. A window
+   refused marks the outline. The page's focus ring goes around the whole. */
+.window-field { display: inline-flex; flex: none; align-items: center; gap: 3px; height: 24px; padding-right: 6px; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--muted-foreground); font: 11px var(--font-data); font-variant-numeric: tabular-nums; cursor: text; }
+.window-field.invalid { border-color: var(--destructive); }
+.window-field input { width: 7ch; height: 22px; padding: 0 0 0 6px; box-sizing: content-box; border: 0; outline: none; background: none; color: var(--foreground); font: 12px var(--font-data); font-variant-numeric: tabular-nums; text-align: right; }
+.window-field .unit { width: 3ch; }

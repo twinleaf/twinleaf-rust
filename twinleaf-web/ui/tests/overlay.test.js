@@ -46,7 +46,6 @@ const button = (text) => [...document.querySelectorAll('button')].find((b) => b.
 const TARGETS = {
   Layout: () => button('Layout') && [centre(button('Layout')), 'left'],
   File: () => button('File') && [centre(button('File')), 'left'],
-  'the time window': () => [centre(button('Time window')), 'left'],
   'display settings': () => [centre(button('Display settings')), 'left'],
   'the decimation list': () => {
     const el = document.querySelector('[data-slot=popover-content] [aria-label=Decimation]');

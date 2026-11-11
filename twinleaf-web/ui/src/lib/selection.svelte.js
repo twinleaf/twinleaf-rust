@@ -19,7 +19,7 @@
 //
 // A press anywhere clears them, but in what works on the plots: the plots
 // themselves, a menu or popover, and what is marked data-keeps-selection
-// (the window slider, the eraser, File, Commands and the Signals panel). A
+// (the window field, the eraser, File, Commands and the Signals panel). A
 // press with Shift keeps them, to add to them; the wheel is no press; a
 // press among property rows, a table, a panel's action buttons or the
 // edit bar that acts on the rows picked, lets go of the plots only. A press

@@ -7,8 +7,8 @@
 // moves a view is one step of the tab's, whatever plots it moves, and Back
 // and Forward go through them, each plot's buttons pressable just when the
 // tab has a step to go to, and neither moves a cursor: cursors are edits,
-// which Ctrl+Z undoes. The window's slider, dragged through its detents
-// with a rest midway, or stepped by its keys in a burst, is one step too.
+// which Ctrl+Z undoes. The window field's arrows and wheel turns in a
+// burst are one step too, and so is each window typed in it.
 // Then each kind of gesture once: arrow keys, the toolbar's Live, a plot's
 // Pause on a selection, Y cursors, a spectrum's pan and y zoom,
 // tabs and a plot moved between them, a maximized plot, and a plot that
@@ -28,7 +28,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, frames, mountPage, pickItem, plotMenu, pressKey, turnWheel, until, wait, wheelRest } from './harness/page.js';
+import { centre, clickOn, frames, mountPage, pickItem, plotMenu, pressKey, turnWheel, typeInto, until, wait, wheelRest } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { GONE, IDLE_MS } from '../src/lib/viewhistory.svelte.js';
@@ -236,37 +236,34 @@ describe('view history on the page', () => {
     for (const [rule, n] of Object.entries(count)) expect(n, rule).toBeGreaterThan(0);
   }, 600_000);
 
-  it('makes the window slider one step, dragged through its detents with a rest midway, or stepped by its keys in a burst', async () => {
+  it('makes the window field one step: its arrows and wheel turns in a burst, and each window typed', async () => {
     const p = await page();
     try {
       const ids = plotIds(p.ws.layout), id = ids[0];
+      const windows = () => [...new Set(ids.map((i) => p.views.get(i).window))];
+      const input = document.querySelector('.top-bar input[aria-label="Time window"]');
       const start = shown(p);
-      document.querySelector('button[aria-label="Time window"]').click();
+      expect(windows()).toEqual([10]);
+      await clickOn(input);
+      await pressKey('ArrowDown');
+      await pressKey('ArrowDown');
+      input.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -100 }));
       flushSync();
-      await frames();
-      const track = document.querySelector('[role=slider][aria-label="Time window"]');
-      const r = track.getBoundingClientRect(), y = r.top + r.height / 2;
-      const along = (f) => r.left + f * r.width;
-      await commands.mouse([['move', along(0.2), y], ['down'], ['move', along(0.35), y], ['move', along(0.5), y]]);
-      await wait(IDLE_MS + 200);
-      await commands.mouse([['move', along(0.65), y], ['move', along(0.8), y], ['up']]);
-      const dragged = shown(p);
-      expect(dragged).not.toBe(start);
-      // Every plot's window moved: none was selected, so the slider set them all.
-      expect(new Set(ids.map((i) => p.views.get(i).window)).size).toBe(1);
-      track.focus();
-      for (const k of ['ArrowLeft', 'ArrowLeft', 'ArrowLeft']) await pressKey(k);
+      // Every plot's window moved: none was selected, so the field set them all.
+      expect(windows()).toEqual([1]);
+      const stepped = shown(p);
+      // A window typed is a step of its own, however soon after the steps.
+      await typeInto(input, '45');
+      await pressKey('Enter');
       flushSync();
-      const keyed = shown(p);
-      expect(keyed).not.toBe(dragged);
-      await pressKey('Escape');
+      expect(windows()).toEqual([45]);
       await press(id, 'Back');
-      expect(shown(p), 'Back past the keys').toBe(dragged);
+      expect(shown(p), 'Back past the window typed').toBe(stepped);
       await press(id, 'Back');
-      expect(shown(p), 'Back past the drag').toBe(start);
+      expect(shown(p), 'Back past the steps').toBe(start);
       expect(button(id, 'Back').disabled).toBe(true);
       await press(id, 'Forward');
-      expect(shown(p)).toBe(dragged);
+      expect(shown(p)).toBe(stepped);
     } finally {
       p.dispose();
     }

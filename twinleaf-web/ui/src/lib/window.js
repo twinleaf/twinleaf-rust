@@ -1,7 +1,6 @@
-// A time plot's window, the seconds it shows, as its slider sets it: on a log
-// scale from the shortest preset to the longest, settling into a preset's
-// detent near it, and the exact value written beside it.
-import { SPANS } from './constants.js';
+// A time plot's window, the seconds it shows, as the window field reads and
+// writes it: typed as "90", "5m", "1.5 min", "2h" or "500ms", and shown back
+// in the unit that reads shortest.
 
 /**
  * The narrowest a time plot's window goes, and the widest while live until
@@ -11,41 +10,66 @@ import { SPANS } from './constants.js';
  */
 export const WINDOW_LIMITS = [0.002, 120];
 
-const SHORTEST = SPANS[0], LONGEST = SPANS.at(-1);
+/** The units a span is written in, longest first, each with its seconds. */
+const UNITS = [
+  ['h', 3600],
+  ['min', 60],
+  ['s', 1],
+  ['ms', 0.001],
+];
 
-/** How near a preset, in px along the slider, a drag settles into it. */
-export const DETENT_PX = 7;
+/** What a typed unit means, in seconds. */
+const TYPED_UNITS = { ms: 0.001, s: 1, sec: 1, m: 60, min: 60, h: 3600, hr: 3600 };
 
-/** Where window `s` sits along the slider, 0 at the shortest preset and 1 at the longest. */
-export function positionOf(s) {
-  return Math.min(1, Math.max(0, Math.log(s / SHORTEST) / Math.log(LONGEST / SHORTEST)));
+/** The significant figures a span is written to. */
+const FIGURES = 3;
+
+/**
+ * Span `s` as the window field shows it, [number, unit], to three figures:
+ * in the longest unit that writes it exactly ("1.5 min" for 90 s, "2 h"),
+ * else the longest in which it is at least 1 ("7.41 s", "18.3 min"). A unit
+ * but hours writes under 1000 of it.
+ */
+export function windowParts(s) {
+  let longest = null;
+  for (const [unit, u] of UNITS) {
+    const n = +(s / u).toPrecision(FIGURES);
+    if (!(n >= 1 && (n < 1000 || unit === 'h'))) continue;
+    if (Math.abs(n * u - s) <= s * 1e-9) return [String(n), unit];
+    longest ??= [String(n), unit];
+  }
+  return longest ?? [String(+(s / 0.001).toPrecision(FIGURES)), 'ms'];
+}
+
+/** Span `s` as the window's readouts write it: "30 s", "1.5 min", "2 h", "250 ms". */
+export function windowText(s) {
+  return windowParts(s).join(' ');
 }
 
 /**
- * The window at fraction `p` along a slider `width` px wide: the preset
- * within DETENT_PX of it, else the scale's value there to two figures.
+ * The seconds `text` is as a span, typed as "90", "90s", "5 m", "1.5 min",
+ * "2H" or "500ms", a number alone in `unit`, one of the units a span is
+ * shown in; or null when it is none or not over 0.
  */
-export function windowFrom(p, width) {
-  p = Math.min(1, Math.max(0, p));
-  const preset = SPANS.find((s) => Math.abs(p - positionOf(s)) * width < DETENT_PX);
-  return preset ?? +(SHORTEST * (LONGEST / SHORTEST) ** p).toPrecision(2);
+export function parseSpan(text, unit = 's') {
+  const m = /^\s*(\d+\.?\d*|\.\d+)\s*([a-z]*)\s*$/i.exec(String(text));
+  const u = m && TYPED_UNITS[(m[2] || unit).toLowerCase()];
+  const s = u ? +m[1] * u : 0;
+  return s > 0 && isFinite(s) ? s : null;
 }
 
-/** The next preset past window `s`, longer for `dir` 1 and shorter for -1, or the last there is. */
-export function nextPreset(s, dir) {
-  const past = dir > 0 ? SPANS.filter((x) => x > s * 1.0001) : SPANS.filter((x) => x < s / 1.0001).reverse();
-  return past[0] ?? (dir > 0 ? LONGEST : SHORTEST);
-}
+/** How far past a limit a typed window may go and be taken as the limit: the precision a span is shown to. */
+const SLACK = 1 + 0.5 * 10 ** (1 - FIGURES);
 
-/** A window as the slider's field writes it, in seconds: 30, 7.4, 0.25. */
-export function windowText(s) {
-  if (s >= 10) return s.toFixed(0);
-  if (s >= 1) return String(+s.toFixed(1));
-  return String(+s.toPrecision(2));
-}
-
-/** The window typed `text` asks for, from the narrowest to `widest`, or null when it is not one. */
-export function windowTyped(text, widest = WINDOW_LIMITS[1]) {
-  const n = parseFloat(String(text).replace(/s$/i, ''));
-  return n > 0 ? Math.min(widest, Math.max(WINDOW_LIMITS[0], n)) : null;
+/**
+ * The window typed `text` asks for, a number alone in `unit`: {s}, or
+ * {refused} when it is 'none' (not a span) or 'long' (more than `widest`
+ * beyond the precision it is shown to). One under the narrowest window is
+ * the narrowest, and one just over `widest` is `widest`.
+ */
+export function windowTyped(text, widest = WINDOW_LIMITS[1], unit = 's') {
+  const s = parseSpan(text, unit);
+  if (s === null) return { refused: 'none' };
+  if (s > widest * SLACK) return { refused: 'long' };
+  return { s: Math.min(widest, Math.max(WINDOW_LIMITS[0], s)) };
 }

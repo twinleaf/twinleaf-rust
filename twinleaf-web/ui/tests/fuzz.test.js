@@ -90,12 +90,12 @@ const TARGETS = {
   layout: () => topButton('Layout'),
   file: () => topButton('File'),
   settings: () => document.querySelector('.top-bar button[aria-label="Display settings"]'),
-  window: () => document.querySelector('.top-bar button[aria-label="Time window"]'),
+  window: () => document.querySelector('.top-bar input[aria-label="Time window"]'),
   eraser: () => document.querySelector('.top-bar button[aria-label="Clear the cursors"]'),
   status: () => document.querySelector('.status-bar'),
   menuItem: (i) => nth(all('[role^=menuitem]:not([data-disabled])').filter((m) => !OFF_LIMITS.test(m.textContent.trim())), i),
 };
-const TRIGGERS = ['layout', 'file', 'settings', 'window'];
+const TRIGGERS = ['layout', 'file', 'settings'];
 /** How long the pointer rests on each menu button: a moment, or past a tooltip's delay. */
 const rest = fc.constantFrom(60, 400);
 

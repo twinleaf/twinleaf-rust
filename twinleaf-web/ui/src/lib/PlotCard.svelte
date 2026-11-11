@@ -52,7 +52,7 @@
   import { toast } from './toast.svelte.js';
   import { stepIn } from './keymap.js';
   import { chip } from './tabs.js';
-  import WindowSlider from './WindowSlider.svelte';
+  import WindowField from './WindowField.svelte';
   import * as clock from './clock.js';
 
   let {
@@ -386,9 +386,17 @@
     };
   }
 
-  // Whether the plot's view streams, for its play and pause button, and its window, for the time axis's slider.
+  // Whether the plot's view streams, for its play and pause button, and its window, for the time axis's window field.
   let streaming = $state(true);
   let windowSpan = $state(10);
+  /** The widest window the plot's view can show now. */
+  const widestWindow = () => view.spans(clock.now())[1];
+  /** Sets the window of the plots a command here acts on: a window typed is a step of its own, the field's arrows and wheel one burst. */
+  function setWindow(s, typed) {
+    const set = () => forTargets((v) => v.setSpan(s));
+    if (typed) viewHistory.step(set);
+    else viewHistory.burst('window', targets(), set);
+  }
 
   onMount(() => {
     // The window read is what the view can show of it, which grows as a hub fills.
@@ -892,7 +900,7 @@
       {#if plot.kind === 'time'}
         <div class="axis-row">
           <span>Window</span>
-          <WindowSlider value={windowSpan} onchange={(s) => viewHistory.burst('window', targets(), () => forTargets((v) => v.setSpan(s)))} onstart={() => viewHistory.begin()} onend={() => viewHistory.end()} widest={hub.liveSeconds()} />
+          <WindowField value={windowSpan} onchange={setWindow} widest={widestWindow} />
         </div>
       {:else}
         <!-- The range as a phrase, low to high, in Hz, with the fit to every bin beside it. -->

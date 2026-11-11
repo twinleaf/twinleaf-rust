@@ -105,7 +105,7 @@ describe('the oldest time a view can show', () => {
     for (const h of HISTORY_SPANS) {
       for (const lag of [0, 0.15, 0.65, 1.2, HEADROOM]) {
         const newest = 100_000.37, time = newest - lag, widest = time - oldestShown(filled(newest, h), time, h);
-        expect(windowText(widest), `${h} s, the view ${lag} s behind`).toBe(String(h));
+        expect(windowText(widest), `${h} s, the view ${lag} s behind`).toBe(windowText(h));
         expect(spanText(widest)).toBe(spanText(h));
       }
     }
@@ -162,7 +162,7 @@ describe('a view on a hub that holds hours', () => {
         for (let i = 0; i < 60; i++) v.zoom(2, 1, 0);
         expect(v.live).toBe(!pause);
         expect(Math.abs(v.span - h)).toBeLessThanOrEqual(step(now));
-        expect(windowText(v.span)).toBe(String(h));
+        expect(windowText(v.span)).toBe(windowText(h));
         if (pause) expect(v.right).toBe(v.pausedAt);
         else expect(v.window).toBe(v.span);
       }),
@@ -199,7 +199,7 @@ describe('a view on a hub that holds hours', () => {
         v.hubHolds = { ...v.hubHolds, history: later };
         expect(v.limits()).toEqual([at - Math.min(h, later), at]);
         for (let i = 0; i < 60; i++) v.zoom(2, 0.5, 0);
-        expect(windowText(v.span), 'the widest view reads as the shorter setting').toBe(String(Math.min(h, later)));
+        expect(windowText(v.span), 'the widest view reads as the shorter setting').toBe(windowText(Math.min(h, later)));
         // Set back, it is as wide as it paused.
         v.hubHolds = { ...v.hubHolds, history: h };
         expect(v.limits()).toEqual([at - h, at]);
@@ -372,7 +372,7 @@ describe('what a view shows, live or paused, on a hub at any fill', () => {
     // A double-click and End go back to the window; Space goes on at the span shown.
     fc.record({ t: fc.constant('follow'), restore: fc.boolean() }),
     fc.record({ t: fc.constant('pause') }),
-    // The window field and the window slider.
+    // The window field.
     fc.record({ t: fc.constant('window'), share: fc.double({ min: 0.001, max: 3, noNaN: true }) }),
     fc.record({ t: fc.constant('zoom'), factor: fc.double({ min: 0.01, max: 100, noNaN: true }), anchor: fc.double({ min: 0, max: 1, noNaN: true }) }),
     fc.record({ t: fc.constant('pan'), by: fc.double({ min: -3, max: 3, noNaN: true }) }),

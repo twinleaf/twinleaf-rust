@@ -1357,7 +1357,7 @@ export class PlotView {
       this.shownSpan = asked;
     }
     if (historyOpen || (this.axisHover === null && !(frameAt < this.windowUntil))) return;
-    const text = `${windowText(span)} s`, H = 16;
+    const text = windowText(span), H = 16;
     const w = ctx.measureText(text).width + 22, x = P.x + P.w - w, y = P.y + P.h + 3;
     ctx.fillStyle = T.tipBg;
     ctx.fillRect(x, y, w, H);
@@ -2225,7 +2225,7 @@ export class View {
 
   /**
    * The seconds of its window the view can show at page time `perf`: what
-   * the window field and slider read. The window asked for is kept, and
+   * the window fields read. The window asked for is kept, and
    * reads again once the limits hold it.
    */
   windowShown(perf) {

@@ -28,7 +28,7 @@ const LIST = [
   ['the status bar', () => [...document.querySelectorAll('.status-bar')], false],
   ['the gaps between plots', () => [...document.querySelectorAll('.tiles .separator')], false],
   ['the plots: their bodies and headers', () => [...document.querySelectorAll('.tiles .leaf .plot-body, .tiles .leaf .plot-head')], true],
-  ['the window slider', () => [...document.querySelectorAll('button[aria-label="Time window"]')], true],
+  ['the window field', () => [...document.querySelectorAll('.top-bar .window-field, .top-bar input[aria-label="Time window"]')], true],
   ['the eraser', () => [...document.querySelectorAll('button[aria-label="Clear the cursors"]')], true],
   ['File', () => [...document.querySelectorAll('button')].filter((b) => b.textContent.trim() === 'File'), true],
   ['Commands', () => [...document.querySelectorAll('button.search')], true],

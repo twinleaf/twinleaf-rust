@@ -1,8 +1,5 @@
 // The choices the page offers in more than one place.
 
-/** The time windows a time plot offers, in seconds. */
-export const SPANS = [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120];
-
 /** The spans of raw history the settings offer, in seconds of each stream. */
 export const HISTORY_SPANS = [60, 300, 600, 1800, 3600, 4 * 3600, 86400];
 

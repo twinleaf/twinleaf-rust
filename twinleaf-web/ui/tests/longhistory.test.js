@@ -95,7 +95,7 @@ describe('a plot on a hub that holds hours', () => {
         expect(view.right, 'ends at the pause').toBe(at);
         if (h.fill.full) {
           expect(view.span, `as wide as History ${h.history}`).toBeCloseTo(h.history, 6);
-          expect(windowText(view.span), 'and reads so').toBe(String(h.history));
+          expect(windowText(view.span), 'and reads so').toBe(windowText(h.history));
           expect(oldest, 'the hub holds all of it').toBeLessThanOrEqual(left);
         } else {
           expect(left, `starts at the oldest time held, ${oldest}`).toBeCloseTo(oldest, 6);
@@ -124,7 +124,7 @@ describe('a plot on a hub that holds hours', () => {
         expect(right).toBe(now - view.delay);
         if (h.fill.full) {
           expect(view.span, `as wide as History ${h.history}`).toBeCloseTo(h.history, 6);
-          expect(windowText(view.span), 'and reads so').toBe(String(h.history));
+          expect(windowText(view.span), 'and reads so').toBe(windowText(h.history));
           expect(oldest, 'the hub holds all of it').toBeLessThanOrEqual(left);
         } else expect(view.span, 'as wide as what the hub holds, or its window').toBeCloseTo(Math.max(10, right - oldest), 6);
         // Paused there, it shows the same.
@@ -260,7 +260,8 @@ describe('a plot on a hub that holds hours', () => {
     const reads = async () => {
       await wait(600);
       flushSync();
-      return document.querySelector('.window-button').textContent.trim();
+      const field = document.querySelector('.top-bar .window-field');
+      return `${field.querySelector('input').value} ${field.querySelector('.unit').textContent}`;
     };
     const zoomIn = async () => {
       await turnWheelToRest(page, id, -400, { n: 4, at: 0.3 });
@@ -269,11 +270,11 @@ describe('a plot on a hub that holds hours', () => {
     for (const share of [0.1, 0.5, 1]) {
       const hub = await live({ history, fill: share === 1 ? { full: true } : { full: false, share }, behind: 0, now: 100_000 });
       const widest = Math.min(history, hub.now - view.delay - hub.oldest), most = Math.min(WINDOW, widest);
-      // The window field and the slider set it.
+      // The window field sets it.
       view.setSpan(WINDOW);
       expect(await drawn(hub, `${share}: the window set`)).toBeCloseTo(most, 6);
       expect(view.window, 'the window asked for is kept').toBe(WINDOW);
-      expect(await reads(), 'the toolbar reads what is shown').toBe(`${windowText(most)} s`);
+      expect(await reads(), 'the toolbar reads what is shown').toBe(windowText(most));
       await zoomIn();
       await drawn(hub, `${share}: zoomed in`);
       // A double-click on the plot follows live at the window.
@@ -305,9 +306,9 @@ describe('a plot on a hub that holds hours', () => {
     view.setSpan(1000);
     const held = hub.now - view.delay - hub.oldest;
     expect(await drawn(hub, 'a tenth full')).toBeCloseTo(held, 6);
-    expect(await reads()).toBe(`${windowText(held)} s`);
+    expect(await reads()).toBe(windowText(held));
     const fuller = holdHistory(page, { history, seconds: 2000, now: 100_000 });
     expect(await drawn(fuller, 'holding the window')).toBeCloseTo(1000, 6);
-    expect(await reads()).toBe(`${windowText(1000)} s`);
+    expect(await reads()).toBe(windowText(1000));
   }, 60_000);
 });
