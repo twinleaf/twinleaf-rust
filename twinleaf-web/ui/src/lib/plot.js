@@ -19,7 +19,7 @@ import { WINDOW_LIMITS, windowText } from './window.js';
 import { placedIn, withX, withY, withoutX, withoutY, xOf, yOf } from './cursors.js';
 import * as clock from './clock.js';
 import { aimed, eased, LINE_PX, STILL, turn } from './wheelzoom.js';
-import { pickSnap, SNAP_PX, snapCandidates, STAND } from './snap.js';
+import { pickSnap, SNAP, snapCandidates, STAND } from './snap.js';
 import { watchShift } from './keys.js';
 
 /** A CSS colour as [r, g, b, a] in 0..1, resolved by the browser, so theme tokens work. */
@@ -2104,24 +2104,38 @@ export class PlotView {
   /**
    * What a cursor dragged with Shift held snaps to, from what the plot last
    * drew (snap.js), when without Shift it would be at client px `at` along
-   * its axis: X cursor `name`, or with `key` Y cursor `name` of that y axis.
-   * As {v, from, key, point} with `v` where the cursor goes, or null to
+   * its axis with the pointer at client px `across` the other way: X cursor
+   * `name`, or with `key` Y cursor `name` of that y axis. `held` is the id
+   * of what it snapped to on the move before, or null. As
+   * {v, from, id, key, point} with `v` where the cursor goes, or null to
    * follow the pointer.
+   *
+   * Each target is placed as the plot draws it: a tick of the x axis at its
+   * mark on the plot's bottom edge, of a y axis at its mark on the edge of
+   * the axis's gutter by the plot, and a signal's point where its lane
+   * draws it.
    */
-  snapAt(name, at, key) {
+  snapAt(name, at, across, key, held = null) {
     const P = this.geo?.plot, xd = this.xd, plans = this.drawn?.plans;
     if (!P || !xd || !plans) return null;
     const other = name === 'a' ? 'b' : 'a';
+    const pointer = { along: at, across };
     if (key === undefined) {
-      const near = [this.dataAt(at - SNAP_PX), this.dataAt(at + SNAP_PX)];
+      const near = [this.dataAt(at - SNAP.jump), this.dataAt(at + SNAP.jump)];
       const candidates = snapCandidates({ axis: 'x', view: xd, ticks: this.xTicks, other: this.markers()[other], signals: this.snapSignals(plans), near });
-      return pickSnap(candidates, at, (v) => this.pxOf(v));
+      const drawnAt = (key, y) => {
+        const axis = this.yAxes.find((a) => a.plans.some((p) => p.t.key === key));
+        return axis ? this.axisScale(axis)(y) : null;
+      };
+      const placed = candidates.map((c) => ({ ...c, along: this.pxOf(c.v), across: c.from === 'tick' ? P.y + P.h : c.point ? drawnAt(c.key, c.point.y) : null }));
+      return pickSnap(placed, pointer, held);
     }
     const axis = this.yAxes.find((a) => a.key === key);
     if (!axis) return null;
-    const sy = this.axisScale(axis), { a, b } = this.markers();
+    const sy = this.axisScale(axis), { a, b } = this.markers(), edge = axis.side === 'left' ? axis.x1 : axis.x0;
     const candidates = snapCandidates({ axis: 'y', view: [sy.invert(axis.lane.y + axis.lane.h), sy.invert(axis.lane.y)], ticks: axis.ticks, other: this.yPair(key)[other], signals: this.snapSignals(axis.plans), xs: [a, b], xView: xd });
-    return pickSnap(candidates, at, sy);
+    const placed = candidates.map((c) => ({ ...c, along: sy(c.v), across: c.from === 'tick' ? edge : c.point ? this.pxOf(c.point.x) : null }));
+    return pickSnap(placed, pointer, held);
   }
 
   /** The data x under clientX, and back. */
@@ -2373,14 +2387,14 @@ export class PlotView {
     };
     // A dragged cursor's place: where the pointer holds it, or, while Shift
     // is held, what it snaps to near there (`snapAt`), noted as `snapped`
-    // for the mark drawn on it. Shift is read from the pointer as it moves,
+    // for the mark drawn on it and as the target the next move holds to. Shift is read from the pointer as it moves,
     // and as it goes down or up mid-drag, which places the cursor at once.
     // A cursor held where it was pressed moves by the pointer's travel from
     // the press: its grab is taken from where it is, not where its line is
     // drawn on the pixel grid.
     const placeCursor = () => {
       const x = drag.mode === 'xcursor', at = (x ? drag.x : drag.y) - drag.grab;
-      const snap = drag.shift ? this.snapAt(drag.cursor, at, x ? undefined : drag.key) : null;
+      const snap = drag.shift ? this.snapAt(drag.cursor, at, x ? drag.y : drag.x, x ? undefined : drag.key, this.snapped?.id ?? null) : null;
       this.snapped = snap && { ...snap, kind: x ? 'x' : 'y', name: drag.cursor, axisKey: drag.key };
       if (x) this.draftX(drag.cursor, snap ? snap.v : this.dataAt(at));
       else this.draftY(drag.key, drag.cursor, snap ? snap.v : this.yValueAt(drag.key, at));

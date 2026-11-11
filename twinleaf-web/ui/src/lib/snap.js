@@ -1,6 +1,6 @@
-// Where a cursor dragged with Shift held comes to rest: the nearest of the
-// points it snaps to within SNAP_PX of where it would be without Shift,
-// along its axis, or nowhere, when it follows the pointer freely.
+// Where a cursor dragged with Shift held comes to rest, by where the
+// pointer is: a target near it, or nowhere, when the cursor follows the
+// pointer freely.
 //
 // What it snaps to, in the cursor's own units, of what the plot shows:
 //
@@ -11,8 +11,17 @@
 //           signal's value at the X cursors, its least and greatest in
 //           view, and 0
 //
-// The nearest wins; at one distance, a tick, then the other cursor, then
-// data, in SNAP_ORDER. Every point is in view.
+// Every target is in view. A target is a point, with a place on the plot
+// across the cursor's direction as well as along it, or a line, with a
+// place along it alone. A tick is both: its mark on the axis a point, its
+// grid line a line. A signal's point is a point; the other cursor and 0
+// are lines. From the pointer, in CSS px as the plot draws them, a
+// target's jump is its distance along the cursor's direction and its
+// sideways distance the one across it. A point qualifies within SNAP.jump
+// and SNAP.sideways, and the qualifying point of least cost wins,
+// hypot(jump, SNAP.weight * sideways), the target of the move before taken
+// at SNAP.hold of its cost. With no point qualifying, the line of least
+// jump within SNAP.jump catches. At one cost or one jump, the first.
 //
 // A signal is its points as the plot draws them, {key, n, x(i), y(i)}, in
 // order of x. A feature is a point higher (or lower) than both its
@@ -22,11 +31,13 @@
 // out by STAND.spectrumDb, in amplitude; a time plot's by STAND.timeShare
 // of the y range its axis shows.
 
-/** How near a point must be, in px along the cursor's axis, for a cursor dragged with Shift to snap to it. */
-export const SNAP_PX = 10;
-
-/** What a cursor snaps to, in the order a tie at one distance goes by. */
-export const SNAP_ORDER = ['tick', 'cursor', 'data'];
+/**
+ * How a cursor dragged with Shift held picks its target, in CSS px: the
+ * farthest `jump` along its direction, the farthest a point is `sideways`,
+ * the `weight` sideways distance has in a point's cost, and the share of
+ * its cost the target of the move before is taken at, `hold`.
+ */
+export const SNAP = Object.freeze({ jump: 6, sideways: 100, weight: 0.5, hold: 0.7 });
 
 /** How far a feature stands out from the points about it: on a spectrum in dB of amplitude, on a time plot as a share of the y range shown. */
 export const STAND = { spectrumDb: 6, timeShare: 0.1 };
@@ -97,9 +108,12 @@ function standsOut(s, i, first, last, sign, stand, level) {
 }
 
 /**
- * The points a cursor along `axis`, 'x' or 'y', may snap to, as
- * {v, from, key?, point?}: `v` in the cursor's units, `from` one of
- * SNAP_ORDER, and of a point of a signal its key and {x, y}.
+ * The targets a cursor along `axis`, 'x' or 'y', may snap to, as
+ * {v, from, id, line, key?, point?}: `v` in the cursor's units, `from`
+ * 'tick', 'cursor' or 'data', `id` alike for the target of one place from
+ * frame to frame, `line` whether it catches as a line, and of a signal's
+ * point its key and {x, y}. A tick and a signal's point are points, a tick
+ * at its mark on the axis; the other cursor and 0 are lines alone.
  *
  * `view` is what the axis shows, [lo, hi]; `ticks` its ticks; `other` the
  * other cursor of the pair, or null. `signals` are the signals the cursor
@@ -111,9 +125,9 @@ function standsOut(s, i, first, last, sign, stand, level) {
 export function snapCandidates({ axis, view, ticks = [], other = null, signals = [], near = view, xs = [], xView = null }) {
   const inView = (v) => Number.isFinite(v) && v >= view[0] && v <= view[1];
   const out = [];
-  for (const v of ticks) if (inView(v)) out.push({ v, from: 'tick' });
-  if (other !== null && inView(other)) out.push({ v: other, from: 'cursor' });
-  const point = (s, i, v) => ({ v, from: 'data', key: s.key, point: { x: s.x(i), y: s.y(i) } });
+  for (const v of ticks) if (inView(v)) out.push({ v, from: 'tick', id: `tick ${v}`, line: true });
+  if (other !== null && inView(other)) out.push({ v: other, from: 'cursor', id: 'cursor', line: true });
+  const point = (s, i, v) => ({ v, from: 'data', id: `${s.key} ${s.x(i)}`, line: false, key: s.key, point: { x: s.x(i), y: s.y(i) } });
   if (axis === 'x') {
     for (const s of signals) for (const i of features(s, view, near, s)) out.push(point(s, i, s.x(i)));
     return out.filter((c) => inView(c.v));
@@ -131,21 +145,31 @@ export function snapCandidates({ axis, view, ticks = [], other = null, signals =
     }
     if (least >= 0) out.push(point(s, least, s.y(least)), point(s, most, s.y(most)));
   }
-  out.push({ v: 0, from: 'data' });
+  out.push({ v: 0, from: 'data', id: 'zero', line: true });
   return out.filter((c) => inView(c.v));
 }
 
 /**
- * Of `candidates`, the one a cursor that would be at `at` px snaps to, with
- * `px(v)` the px of a value along its axis: the nearest within `reach` px,
- * a tie going by SNAP_ORDER; or null for none that near.
+ * Of `targets`, the one a cursor dragged with Shift held snaps to with the
+ * pointer at `pointer`, {along, across}, in px along the cursor's direction
+ * and across it, by the rule above; or null for none, when the cursor
+ * follows the pointer. Each target is placed at `along` and a point at
+ * `across` too, null for a line alone; a target catches as a line by its
+ * `line`. `held` is the id of the target of the move before, or null.
  */
-export function pickSnap(candidates, at, px, reach = SNAP_PX) {
-  let best = null, bestD = Infinity;
-  for (const c of candidates) {
-    const d = Math.abs(px(c.v) - at);
-    if (!(d <= reach)) continue;
-    if (d < bestD || (d === bestD && SNAP_ORDER.indexOf(c.from) < SNAP_ORDER.indexOf(best.from))) [best, bestD] = [c, d];
+export function pickSnap(targets, pointer, held = null) {
+  let best = null, least = Infinity;
+  for (const t of targets) {
+    if (t.across === null || t.across === undefined) continue;
+    const jump = Math.abs(t.along - pointer.along), side = Math.abs(t.across - pointer.across);
+    if (!(jump <= SNAP.jump && side <= SNAP.sideways)) continue;
+    const cost = Math.hypot(jump, SNAP.weight * side) * (held !== null && t.id === held ? SNAP.hold : 1);
+    if (cost < least) [best, least] = [t, cost];
+  }
+  if (best) return best;
+  for (const t of targets) {
+    const jump = Math.abs(t.along - pointer.along);
+    if (t.line && jump <= SNAP.jump && jump < least) [best, least] = [t, jump];
   }
   return best;
 }

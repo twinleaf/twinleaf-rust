@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { features, nearestPeak, peaks, pickSnap, SNAP_ORDER, SNAP_PX, snapCandidates, STAND, stepPeak } from './snap.js';
+import { features, nearestPeak, peaks, pickSnap, SNAP, snapCandidates, STAND, stepPeak } from './snap.js';
+import { cost, oracleSnap, qualifies, reach, RULE } from '../../tests/harness/snaporacle.js';
 
 /** A signal of points (xs[i], ys[i]), as snap.js reads one. */
 const signal = (key, xs, ys, more = {}) => ({ key, n: xs.length, x: (i) => xs[i], y: (i) => ys[i], stand: 0, ...more });
-/** A plot `w` px wide showing [lo, hi]: value to px. */
-const scale = ([lo, hi], w) => (v) => ((v - lo) / (hi - lo)) * w;
 
 const view = fc.tuple(fc.double({ min: -1e3, max: 1e3, noNaN: true }), fc.double({ min: 1, max: 1e3, noNaN: true })).map(([lo, span]) => [lo, lo + span]);
 /** Values about `v`, some in it and some past its ends. */
@@ -16,44 +15,108 @@ const points = ([lo, hi]) =>
     return [xs, ys];
   });
 const xCase = view.chain((v) =>
-  fc.record({ view: fc.constant(v), ticks: about(v, 12), other: fc.option(about(v, 1).map((a) => a[0] ?? null)), sets: fc.array(points(v), { maxLength: 3 }), at: fc.double({ min: -20, max: 620, noNaN: true }), stand: fc.double({ min: 0, max: 3, noNaN: true }) }),
+  fc.record({ view: fc.constant(v), ticks: about(v, 12), other: fc.option(about(v, 1).map((a) => a[0] ?? null)), sets: fc.array(points(v), { maxLength: 3 }), stand: fc.double({ min: 0, max: 3, noNaN: true }) }),
 );
 
-/** The candidate a cursor at `at` px should snap to, found the long way: every one by its distance, then by SNAP_ORDER. */
-function expected(cands, at, px) {
-  const near = cands.map((c) => ({ c, d: Math.abs(px(c.v) - at) })).filter(({ d }) => d <= SNAP_PX);
-  near.sort((a, b) => a.d - b.d || SNAP_ORDER.indexOf(a.c.from) - SNAP_ORDER.indexOf(b.c.from));
-  return near[0]?.c ?? null;
-}
+/**
+ * Targets placed about a pointer at the origin, on a grid of half px so
+ * that ties and the thresholds come up: a tick (a point and a line), a
+ * signal's point, or a line alone, each with its own id.
+ */
+const half = (lo, hi) => fc.integer({ min: 2 * lo, max: 2 * hi }).map((v) => v / 2);
+const target = fc.record({ kind: fc.constantFrom('tick', 'point', 'line'), along: half(-12, 12), across: half(-160, 160) }).map(({ kind, along, across }) => ({ kind, along, across: kind === 'line' ? null : across, line: kind !== 'point' }));
+const placed = fc.array(target, { maxLength: 10 }).map((ts) => ts.map((t, i) => ({ ...t, id: `t${i}` })));
+const pointerAt = fc.record({ along: half(-3, 3), across: half(-40, 40) });
 
-describe('the points a cursor dragged with Shift snaps to', () => {
-  it('are in view, and the one chosen is the nearest within 10 px of where the cursor would be, a tie going to a tick, then the other cursor, then data, or none', () => {
+describe('the target a cursor dragged with Shift snaps to', () => {
+  it('is the rule’s, found the long way: a qualifying point of least cost, a line only when no point qualifies, never more than 6 px along from the pointer, or none', () => {
     fc.assert(
-      fc.property(xCase, ({ view, ticks, other, sets, at, stand }) => {
-        const px = scale(view, 600);
-        const signals = sets.map(([xs, ys], i) => signal(`s${i}`, xs, ys, { stand }));
-        const near = [view[0] + ((at - SNAP_PX) / 600) * (view[1] - view[0]), view[0] + ((at + SNAP_PX) / 600) * (view[1] - view[0])];
-        const cands = snapCandidates({ axis: 'x', view, ticks, other, signals, near });
-        for (const c of cands) {
-          expect(c.v, `${c.from} in view`).toBeGreaterThanOrEqual(view[0]);
-          expect(c.v, `${c.from} in view`).toBeLessThanOrEqual(view[1]);
+      fc.property(placed, pointerAt, fc.option(fc.nat(9)), (targets, pointer, h) => {
+        const held = h === null ? null : `t${h}`;
+        const got = pickSnap(targets, pointer, held), want = oracleSnap(targets, pointer, held);
+        expect(got).toBe(want.target);
+        if (!got) {
+          expect(targets.some((t) => qualifies(t, pointer)), 'no point qualifies').toBe(false);
+          expect(targets.some((t) => t.line && reach(t, pointer).jump <= RULE.jump), 'no line within the jump').toBe(false);
+          return;
         }
-        expect(cands.filter((c) => c.from === 'tick').map((c) => c.v)).toEqual(ticks.filter((v) => v >= view[0] && v <= view[1]));
-        const got = pickSnap(cands, at, px);
-        expect(got).toBe(expected(cands, at, px));
-        if (got) expect(Math.abs(px(got.v) - at)).toBeLessThanOrEqual(SNAP_PX);
+        expect(reach(got, pointer).jump, 'within the jump').toBeLessThanOrEqual(RULE.jump);
+        const points = targets.filter((t) => qualifies(t, pointer));
+        if (points.length) {
+          expect(qualifies(got, pointer), 'a point that qualifies').toBe(true);
+          for (const t of points) expect(cost(got, pointer, held), `no lower cost than ${t.id}`).toBeLessThanOrEqual(cost(t, pointer, held));
+        } else {
+          expect(got.line, 'a line, with no point qualifying').toBe(true);
+          for (const t of targets.filter((u) => u.line)) if (reach(t, pointer).jump <= RULE.jump) expect(reach(got, pointer).jump).toBeLessThanOrEqual(reach(t, pointer).jump);
+        }
       }),
     );
   });
 
-  it('break a tie at one distance by the order tick, other cursor, data, and look no further than 10 px', () => {
-    const px = (v) => v;
-    const tick = { v: 5, from: 'tick' }, cursor = { v: 5, from: 'cursor' }, data = { v: 5, from: 'data' };
-    expect(pickSnap([data, cursor, tick], 0, px)).toBe(tick);
-    expect(pickSnap([data, cursor], 0, px)).toBe(cursor);
-    expect(pickSnap([data, { v: -6, from: 'tick' }], 0, px)).toBe(data);
-    expect(pickSnap([{ v: 10.01, from: 'tick' }, { v: -10.5, from: 'data' }], 0, px)).toBeNull();
-    expect(pickSnap([{ v: 10, from: 'data' }], 0, px)?.v).toBe(10);
+  it('held from the move before, stays within the 0.7 of its cost and gives way past it', () => {
+    fc.assert(
+      fc.property(placed, pointerAt, (targets, pointer) => {
+        const points = targets.filter((t) => qualifies(t, pointer));
+        for (const h of points) {
+          const others = points.filter((t) => t !== h).map((t) => cost(t, pointer));
+          const kept = RULE.hold * cost(h, pointer), got = pickSnap(targets, pointer, h.id);
+          // Kept while its share is below every other's cost; given way when another's is below it.
+          if (others.every((c) => kept < c)) expect(got, `${h.id} kept`).toBe(h);
+          if (others.some((c) => c < kept)) expect(got, `${h.id} given way`).not.toBe(h);
+        }
+        // A line held is no point: it catches only with no point qualifying.
+        for (const l of targets.filter((t) => t.kind === 'line')) if (points.length) expect(pickSnap(targets, pointer, l.id)).not.toBe(l);
+      }),
+    );
+  });
+
+  it('goes by each branch of the rule', () => {
+    const p = { along: 0, across: 0 };
+    const pt = (id, along, across) => ({ id, along, across, line: false });
+    const tick = (id, along, across) => ({ id, along, across, line: true });
+    const line = (id, along) => ({ id, along, across: null, line: true });
+    expect(SNAP).toEqual(RULE);
+    // A point 3 px off beats a line 1 px off; a line catches with the point gone.
+    expect(pickSnap([line('l', 1), pt('p', 3, 0)], p)?.id).toBe('p');
+    expect(pickSnap([line('l', 1), pt('p', 7, 0)], p)?.id).toBe('l');
+    // Within the jump, to 6 px and not past it; sideways to 100 px and not past it.
+    expect(pickSnap([pt('p', 6, 0)], p)?.id).toBe('p');
+    expect(pickSnap([pt('p', 6.01, 0)], p)).toBeNull();
+    expect(pickSnap([pt('p', 0, 100)], p)?.id).toBe('p');
+    expect(pickSnap([pt('p', 0, 100.01)], p)).toBeNull();
+    expect(pickSnap([line('l', -6)], p)?.id).toBe('l');
+    expect(pickSnap([line('l', 6.01)], p)).toBeNull();
+    // Sideways counts at half: 8 px to the side costs 4, less than a jump of 5; 12 px costs 6, more.
+    expect(pickSnap([pt('side', 0, 8), pt('jump', 5, 0)], p)?.id).toBe('side');
+    expect(pickSnap([pt('side', 0, 12), pt('jump', 5, 0)], p)?.id).toBe('jump');    // A tick far to the side is no point, but its grid line catches.
+    expect(pickSnap([tick('t', 2, 300)], p)?.id).toBe('t');
+    expect(pickSnap([tick('t', 2, 300), pt('p', 5, 50)], p)?.id).toBe('p');
+    // Of lines, the least jump; at one cost, the first.
+    expect(pickSnap([line('a', 4), line('b', -3)], p)?.id).toBe('b');
+    expect(pickSnap([pt('a', 3, 0), pt('b', -3, 0)], p)?.id).toBe('a');
+    // Held: 5 px kept at 3.5 against 4 px, given up against 3 px.
+    expect(pickSnap([pt('a', 4, 0), pt('b', 5, 0)], p, 'b')?.id).toBe('b');
+    expect(pickSnap([pt('a', 3, 0), pt('b', 5, 0)], p, 'b')?.id).toBe('a');
+    // Held, but no longer qualifying: gone.
+    expect(pickSnap([pt('a', 4, 0), pt('b', 7, 0)], p, 'b')?.id).toBe('a');
+  });
+});
+
+describe('the targets a cursor dragged with Shift snaps to', () => {
+  it('are in view, each a point or a line as it is: a tick both, a signal’s point a point, the other cursor and 0 lines alone', () => {
+    fc.assert(
+      fc.property(xCase, ({ view, ticks, other, sets, stand }) => {
+        const signals = sets.map(([xs, ys], i) => signal(`s${i}`, xs, ys, { stand }));
+        const cands = snapCandidates({ axis: 'x', view, ticks, other, signals });
+        for (const c of cands) {
+          expect(c.v, `${c.from} in view`).toBeGreaterThanOrEqual(view[0]);
+          expect(c.v, `${c.from} in view`).toBeLessThanOrEqual(view[1]);
+          expect([c.from, c.line, !!c.point]).toEqual([c.from, c.from !== 'data', c.from === 'data']);
+        }
+        expect(cands.filter((c) => c.from === 'tick').map((c) => c.v)).toEqual(ticks.filter((v) => v >= view[0] && v <= view[1]));
+        expect(cands.filter((c) => c.from === 'cursor').map((c) => c.v)).toEqual(other !== null && other >= view[0] && other <= view[1] ? [other] : []);
+      }),
+    );
   });
 
   it('of an X cursor, hold the peaks and troughs of each signal near it that stand out, and of a spectrum its peaks alone', () => {

@@ -1,7 +1,8 @@
-// A cursor dragged with Shift held snaps: its place is the nearest of the
-// axis's drawn ticks, the other cursor of its pair and the shown signals'
-// features within 10 px of where the pointer holds it, or the pointer's
-// own with none that near. Shift pressed or let go mid-drag places it at
+// A cursor dragged with Shift held snaps: its place is that of the axis's
+// drawn ticks, the other cursor of its pair or the shown signals' features
+// the rule of snap.js picks by where the pointer is, placed as the page
+// draws them (tests/harness/snaporacle.js states the rule), or the
+// pointer's own with none near. Shift pressed or let go mid-drag places it at
 // once. The drag is one undo step and moves the cursor on the same plots
 // as a drag without Shift, each to the snapped value. Shift held at the
 // press on a cursor's line, tag or tab drags it snapped from its first
@@ -9,9 +10,11 @@
 // its press is no click, with or without Shift; a press let go where it
 // was is a click, a Shift+click by Shift as it was at the press.
 import { describe, expect, it } from 'vitest';
-import { commands } from 'vitest/browser';
+import { commands, page as browser } from 'vitest/browser';
 import { flushSync } from 'svelte';
-import { editCursors, feed, mountPage, pressKey, settle, wait } from './harness/page.js';
+import fc from 'fast-check';
+import { editCursors, feed, leafOf, mountPage, pressKey, settle, wait, withExamples } from './harness/page.js';
+import { oracleSnap, RULE } from './harness/snaporacle.js';
 import * as clock from '../src/lib/clock.js';
 import { withX, withY, xOf, yOf } from '../src/lib/cursors.js';
 import { plotIds } from '../src/lib/layout.js';
@@ -104,12 +107,12 @@ function clearest(px, avoid, from, to) {
   return best;
 }
 
-/** Where on PlotView `pv` a press takes the line of cursor `name` of `axis`, as the page draws it now; or null where none does. */
-function pressOn(pv, axis, name) {
-  const p = pv.pressable.find((q) => q.part === 'line' && q.kind === axis && q.name === name);
+/** Where on PlotView `pv` a press takes the line of cursor `name` of `axis`, of y axis `key` if given, as the page draws it now; or null where none does. */
+function pressOn(pv, axis, name, key) {
+  const p = pv.pressable.find((q) => q.part === 'line' && q.kind === axis && q.name === name && (key === undefined || q.key === key));
   if (!p) return null;
   const points = [0.35, 0.5, 0.65, 0.2, 0.8].map((t) => (axis === 'x' ? [p.at, p.y + t * p.h] : [p.x + t * p.w, p.at]));
-  return points.find((at) => document.elementFromPoint(...at) === pv.overlay && pv.pressAt(...at)?.kind === axis && pv.pressAt(...at)?.name === name) ?? null;
+  return points.find((at) => document.elementFromPoint(...at) === pv.overlay && pv.pressAt(...at)?.kind === axis && pv.pressAt(...at)?.name === name && (key === undefined || pv.pressAt(...at)?.key === key)) ?? null;
 }
 
 /** Gives every plot of `page`, each of `kind`, the cursors `make(pv)` gives: {x: {a, b}, y: {a, b}} in its units, y on its shared axis. */
@@ -136,8 +139,375 @@ const PRESS_AT = (axis, pv) => (at) => {
   return axis === 'x' ? [at, P.y + 0.55 * P.h] : [lane.x + 0.45 * lane.w, at];
 };
 
+/** Where VITE_TL_SHOTS names a folder, relative to this file, the screenshots go there. */
+const SHOTS = import.meta.env.VITE_TL_SHOTS;
+
+/** The one signal of `oneSine`: a sine of x lifted by LIFT, its peaks at x 1.797 + 2πn and its troughs halfway between. */
+const LIFT = 0.07, PHASE = -0.226;
+
+/**
+ * The page with one time plot of 'sine.sine', sin(x + PHASE) + LIFT over
+ * 20 s, paused on [3.34, 12.74]: a trough near 4.94, a peak at 8.08 near
+ * the tick at 8, a trough near 11.22. X1 and X2 placed at the view's ends,
+ * Y1 and Y2 at a tenth and nine tenths up the y axis, which shows `range`.
+ */
+async function oneSine(range) {
+  const page = await mountPage([['sine.sine']], 'grid', 0, ['sine.sine']);
+  const session = page.hub.session, perf = clock.now(), trace = [...session.traces.values()][0];
+  const xs = Float64Array.from({ length: 2000 }, (_, i) => i / 100);
+  session.apply({ kind: 'points', chunks: [{ id: trace.meta.id, level: 0, brk: false, xs, ys: Float32Array.from(xs, (x) => Math.sin(x + PHASE) + LIFT) }] }, perf);
+  session.tick(perf);
+  const [id] = plotIds(page.ws.layout), view = page.views.get(id);
+  page.history.group('Prepare', () => page.ws.setPlot(id, { readoutAt: { x: 0, y: 1 } }));
+  view.pause(perf);
+  view.show(3.34, 12.74, perf);
+  page.ws.selection.only([id]);
+  flushSync();
+  await wait(300);
+  await settle(6);
+  const pv = page.pv(id);
+  pv.y.set('shared', { range: range(pv), auto: false });
+  editCursors(page, id, () => withY(withY(withX(withX(undefined, 'time', 'a', 3.5), 'time', 'b', 12.6), 'time', 'shared', 'a', along(pv, 'y', 0.1)), 'time', 'shared', 'b', along(pv, 'y', 0.9)));
+  await settle(6);
+  return { page, id, pv };
+}
+
+/** Of PlotView `pv`'s drawn points, the first of the lowest (`sign` -1) or highest (1) within half a second of x, as [x, y] and where it is drawn, [px, py]. */
+function extremeNear(pv, x, sign) {
+  const pts = drawnPoints(pv).filter(([u]) => Math.abs(u - x) <= 0.5);
+  const [px, py] = pts.reduce((best, p) => (sign * p[1] > sign * best[1] ? p : best));
+  return { x: px, y: py, at: [pv.pxOf(px), pv.axisScale(pv.yAxes[0])(py)] };
+}
+
+/**
+ * Drags cursor `name` of `axis` of PlotView `pv` with Shift held from the
+ * press to `to`, the pointer at client [x, y] with the cursor's grab taken
+ * off along its axis, so its place without Shift is `to`'s; then saves a
+ * screenshot as `shot`, lets go and gives the value the drag left.
+ */
+async function shiftDrag(page, id, pv, axis, name, to, shot) {
+  const from = pressOn(pv, axis, name);
+  expect(from, `a press finds ${axis}${name}`).not.toBeNull();
+  const grab = (axis === 'x' ? from[0] : from[1]) - pv.pressAt(...from).at;
+  const at = axis === 'x' ? [to[0] + grab, to[1]] : [to[0], to[1] + grab];
+  await commands.mouse([['move', ...from], ['hold', 'Shift'], ['down'], ['move', ...at]]);
+  await settle();
+  if (SHOTS) await browser.screenshot({ path: `${SHOTS}/${shot}.png`, element: leafOf(id) });
+  const shown = (axis === 'x' ? xOf(pv.placed, 'time') : yOf(pv.placed, 'time', 'shared'))[name];
+  await commands.mouse([['up'], ['let go', 'Shift']]);
+  await settle();
+  return shown;
+}
+
+describe('a cursor dragged with Shift held, by where the pointer is', () => {
+  it('as a Y cursor at a trough’s height 99 px to its side, with a tick 12 px off along y, takes the trough', async () => {
+    // The y axis at 12 px to 0.07: the tick at -1 is 12 px from the trough at -0.93.
+    const { page, id, pv } = await oneSine((p) => {
+      const span = (p.yAxes[0].lane.h * LIFT) / 12;
+      return [-0.93 - 0.4 * span, -0.93 + 0.6 * span];
+    });
+    try {
+      const sy = pv.axisScale(pv.yAxes[0]);
+      editCursors(page, id, (c) => withX(c, 'time', 'a', extremeNear(pv, 4.94, -1).x));
+      await settle();
+      const trough = extremeNear(pv, 4.94, -1);
+      const tick = pv.yAxes[0].ticks.reduce((a, b) => (Math.abs(sy(b) - trough.at[1]) < Math.abs(sy(a) - trough.at[1]) ? b : a));
+      expect(Math.abs(sy(tick) - trough.at[1]), 'the nearest tick 12 px from the trough').toBeCloseTo(12, 0);
+      const got = await shiftDrag(page, id, pv, 'y', 'a', [trough.at[0] + 99, trough.at[1]], 'case1-y-trough-beside');
+      expect(got, 'the trough').toBe(trough.y);
+    } finally {
+      await commands.mouse([['up'], ['let go', 'Shift']]);
+      page.dispose();
+    }
+  }, 120_000);
+
+  it('as an X cursor low by the time axis, 4 px in x from a trough far above, does not jump to it', async () => {
+    const { page, id, pv } = await oneSine(() => [-2.5, 1.2]);
+    try {
+      const trough = extremeNear(pv, 11.22, -1), P = pv.geo.plot, low = P.y + P.h - 8;
+      expect(low - trough.at[1], 'the trough far above the pointer').toBeGreaterThan(130);
+      const aim = trough.at[0] + 4;
+      expect(Math.min(...pv.xTicks.map((t) => Math.abs(pv.pxOf(t) - aim))), 'no tick within 10 px').toBeGreaterThan(10);
+      const got = await shiftDrag(page, id, pv, 'x', 'a', [aim, low], 'case2-x-low-under-trough');
+      expect(Math.abs(pv.pxOf(got) - aim), 'free at the pointer').toBeLessThan(0.5);
+    } finally {
+      await commands.mouse([['up'], ['let go', 'Shift']]);
+      page.dispose();
+    }
+  }, 120_000);
+
+  it('as an X cursor on a peak’s height, a tick 1 px nearer along x than the peak, takes the peak', async () => {
+    const { page, id, pv } = await oneSine((p) => p.yBounds('shared'));
+    try {
+      const peak = extremeNear(pv, 8.08, 1), d = peak.at[0] - pv.pxOf(8);
+      expect(d, 'the peak a few px right of the tick at 8').toBeGreaterThan(3);
+      expect(d).toBeLessThan(11);
+      // The pointer between them, (d - 1) / 2 from the tick and (d + 1) / 2 from the peak.
+      const aim = pv.pxOf(8) + (d - 1) / 2;
+      const got = await shiftDrag(page, id, pv, 'x', 'a', [aim, peak.at[1]], 'case3-x-peak-by-tick');
+      expect(got, 'the peak').toBe(peak.x);
+    } finally {
+      await commands.mouse([['up'], ['let go', 'Shift']]);
+      page.dispose();
+    }
+  }, 120_000);
+
+  it('as an X cursor by the time axis, a peak just above it 1 px nearer along x than a tick, takes the tick at its mark on the axis', async () => {
+    // The y axis from just under the peak's 1.07, so that the peak is drawn a little above the time axis.
+    const { page, id, pv } = await oneSine(() => [0.95, 2.5]);
+    try {
+      const peak = extremeNear(pv, 8.08, 1), P = pv.geo.plot, low = P.y + P.h - 2, d = peak.at[0] - pv.pxOf(8);
+      expect(low - peak.at[1], 'the peak within 100 px above the pointer').toBeLessThan(90);
+      expect(d, 'the peak a few px right of the tick at 8').toBeGreaterThan(2);
+      expect(d).toBeLessThan(11);
+      // The pointer between them, (d - 1) / 2 from the peak and (d + 1) / 2 from the tick.
+      const got = await shiftDrag(page, id, pv, 'x', 'a', [peak.at[0] - (d - 1) / 2, low], 'case4-x-tick-by-axis');
+      expect(got, 'the tick').toBe(8);
+    } finally {
+      await commands.mouse([['up'], ['let go', 'Shift']]);
+      page.dispose();
+    }
+  }, 120_000);
+
+  it('as a Y cursor by the y axis, X1’s point just in from it 1 px nearer along y than a tick, takes the tick at its mark on the gutter’s edge', async () => {
+    // The y axis at 5 px to 0.0617, X1's point at 3.5 s, -0.0617 under the tick at 0.
+    const value = Math.fround(Math.sin(3.5 + PHASE) + LIFT);
+    const { page, id, pv } = await oneSine((p) => {
+      const span = (p.yAxes[0].lane.h * Math.abs(value)) / 5;
+      return [value - 0.5 * span, value + 0.5 * span];
+    });
+    try {
+      const sy = pv.axisScale(pv.yAxes[0]), x1 = pointAt(drawnPoints(pv), 3.5), d = sy(x1[1]) - sy(0);
+      expect(pv.yAxes[0].ticks, 'a tick at 0').toContain(0);
+      expect(d, 'X1’s point a few px under the tick at 0').toBeGreaterThan(2);
+      expect(d).toBeLessThan(11);
+      const edge = pv.yAxes[0].x1;
+      expect(pv.pxOf(x1[0]) - edge, 'X1’s point in from the gutter').toBeGreaterThan(6);
+      // The pointer 2 px in from the gutter's edge, between them: (d - 1) / 2 from the point and (d + 1) / 2 from the tick.
+      const got = await shiftDrag(page, id, pv, 'y', 'a', [edge + 2, sy(x1[1]) - (d - 1) / 2], 'case5-y-tick-by-gutter');
+      expect(got, 'the tick').toBe(0);
+    } finally {
+      await commands.mouse([['up'], ['let go', 'Shift']]);
+      page.dispose();
+    }
+  }, 120_000);
+});
+
+/** The plots of `layouts`: an overlay, a stacked and an independent time plot of two sines, the last with an axis on the right, and a spectrum of both. */
+const LAYOUTS = [{ kind: 'time', mode: 'overlay' }, { kind: 'time', mode: 'stacked' }, { kind: 'time', mode: 'independent', axisSides: { 'sine.cos': 'right' } }, { kind: 'spectrum', mode: 'overlay' }];
+const TWO = ['sine.sine', 'sine.cos'];
+
+/**
+ * The page with the plots of LAYOUTS: the sines, sin(x) and sin(x + 1),
+ * paused on [2.64, 8.93], whose ends are a second or more from every peak
+ * and trough of either; the spectra with the peak PEAK on a 1/f slope.
+ * Every y axis holds the range it fitted itself to.
+ */
+async function layouts() {
+  const page = await mountPage(LAYOUTS.map(() => TWO), 'grid', 0, TWO);
+  feed(page.hub);
+  const session = page.hub.session, perf = clock.now(), traces = [...session.traces.values()];
+  const f = Float32Array.from({ length: 50 }, (_, i) => i + 1);
+  session.apply({ kind: 'spectra', spectra: traces.map((t) => ({ id: t.meta.id, f, a: f.map((v) => (v === PEAK.hz ? PEAK.a : 1 / v)), floor: 0.02 })) }, perf);
+  session.tick(perf);
+  const ids = plotIds(page.ws.layout);
+  page.history.group('Prepare', () => ids.forEach((id, n) => page.ws.setPlot(id, { ...LAYOUTS[n], readoutAt: { x: 1, y: 0 } })));
+  for (const n of [0, 1, 2]) {
+    const v = page.views.get(ids[n]);
+    v.pause(perf);
+    v.show(2.64, 8.93, perf);
+  }
+  flushSync();
+  await wait(300);
+  await settle(6);
+  // Each y axis held where it fitted itself, so that what the test reads off the page stays put while a drag goes on.
+  for (const id of ids) for (const [key, st] of page.pv(id).y) if (st.range) page.pv(id).y.set(key, { range: [...st.range], auto: false });
+  await settle(6);
+  return { page, ids };
+}
+
+/** At share `f` along y axis `key` of PlotView `pv`, in its units, a log axis's along its log. */
+function alongY(pv, key, f) {
+  const [lo, hi] = pv.yBounds(key);
+  return pv.logY ? 10 ** (Math.log10(lo) + f * (Math.log10(hi) - Math.log10(lo))) : lo + f * (hi - lo);
+}
+
+/** The points PlotView `pv` draws in view of the signal of `plan`, as [x, y] pairs. */
+function planPoints(pv, plan) {
+  const [x0, x1] = pv.xd, out = [];
+  if (plan.s) plan.s.f.forEach((x, i) => x >= x0 && x <= x1 && out.push([x, plan.s.a[i]]));
+  else for (let k = plan.a0; k < plan.a1; k++) if (plan.src.xAt(k) >= x0 && plan.src.xAt(k) <= x1) out.push([plan.src.xAt(k), plan.src.yAt(k)]);
+  return out;
+}
+
+/**
+ * What cursor `name` of `axis` of PlotView `pv`, of y axis `key` for a Y
+ * cursor, may snap to, as this test finds it on the page: targets as the
+ * oracle takes them, {id, v, along, across, line}, placed in client px as
+ * the page draws them. Ticks are points at their mark, an X cursor's on the
+ * bottom edge of the plot and a Y cursor's on the edge of its axis's gutter
+ * by the plot, and lines; the other cursor and 0 lines. A sine's features
+ * are its points highest or lowest, the first of them, within half a second
+ * each side, the view's ends a second from each; the spectrum's its peak.
+ * Of a Y cursor, each signal's points at the X cursors, nearest each, and
+ * its least and greatest, the first of them, all in view.
+ */
+function onPage(pv, axis, name, key) {
+  const P = pv.geo.plot, other = name === 'a' ? 'b' : 'a', out = [];
+  const scaleOf = (k) => pv.axisScale(pv.yAxes.find((a) => a.plans.some((p) => p.t.key === k)));
+  const point = (k, [x, y], v) => ({ id: `${k} ${x}`, v, line: false, x, y, key: k });
+  if (axis === 'x') {
+    const [x0, x1] = pv.xd, inView = (v) => v !== null && v >= x0 && v <= x1;
+    for (const v of pv.xTicks.filter(inView)) out.push({ id: `tick ${v}`, v, line: true, across: P.y + P.h });
+    if (inView(pv.markers()[other])) out.push({ id: 'cursor', v: pv.markers()[other], line: true, across: null });
+    for (const plan of pv.drawn.plans) {
+      const pts = planPoints(pv, plan), k = plan.t.key;
+      const found = plan.s
+        ? pts.filter(([x]) => x === PEAK.hz)
+        : pts.filter(([x, y], i) => {
+            if (x < x0 + 1 || x > x1 - 1) return false;
+            const about = pts.filter(([u]) => Math.abs(u - x) <= 0.5), first = (sign) => about.find(([, w]) => sign * w >= Math.max(...about.map(([, u]) => sign * u)));
+            return first(1) === pts[i] || first(-1) === pts[i];
+          });
+      for (const p of found) out.push({ ...point(k, p, p[0]), across: scaleOf(k)(p[1]) });
+    }
+    return out.map((t) => ({ ...t, along: pv.pxOf(t.v) }));
+  }
+  const a = pv.yAxes.find((ax) => ax.key === key), sy = pv.axisScale(a);
+  const [lo, hi] = [sy.invert(a.lane.y + a.lane.h), sy.invert(a.lane.y)], inView = (v) => v !== null && v >= lo && v <= hi;
+  const edge = a.side === 'left' ? a.x1 : a.x0;
+  for (const v of a.ticks.filter(inView)) out.push({ id: `tick ${v}`, v, line: true, across: edge });
+  if (inView(pv.yPair(key)[other])) out.push({ id: 'cursor', v: pv.yPair(key)[other], line: true, across: null });
+  for (const plan of a.plans) {
+    const pts = planPoints(pv, plan), k = plan.t.key, { a: xa, b: xb } = pv.markers();
+    for (const x of [xa, xb]) if (x !== null && x >= pv.xd[0] && x <= pv.xd[1] && pts.length) out.push(point(k, pointAt(pts, x), pointAt(pts, x)[1]));
+    if (!pts.length) continue;
+    const least = pts.reduce((m, p) => (p[1] < m[1] ? p : m)), most = pts.reduce((m, p) => (p[1] > m[1] ? p : m));
+    out.push(point(k, least, least[1]), point(k, most, most[1]));
+  }
+  if (inView(0)) out.push({ id: 'zero', v: 0, line: true, across: null });
+  return out.filter((t) => inView(t.v)).map((t) => ({ ...t, along: sy(t.v), across: t.x === undefined ? t.across : pv.pxOf(t.x) }));
+}
+
+/** A drag: on plot `plot` of LAYOUTS, its cursor X1 or Y1 of its y axis `lane` (of those it has), through `moves`, each near target `pick` of those on the page, by dAlong and dAcross px, or at shares fa and fc of the lane's length and the plot's width or height. */
+const DRAG = fc.record({
+  plot: fc.nat(3),
+  axis: fc.constantFrom('x', 'y'),
+  lane: fc.nat(1),
+  moves: fc.array(fc.record({ pick: fc.option(fc.nat(40), { freq: 4 }), fa: fc.double({ min: 0, max: 1, noNaN: true }), fc: fc.double({ min: 0, max: 1, noNaN: true }), dAlong: fc.double({ min: -9, max: 9, noNaN: true }), dAcross: fc.double({ min: -140, max: 140, noNaN: true }) }), { minLength: 1, maxLength: 4 }),
+});
+/** A drag on each plot and axis, near a target, as the generated ones come after. */
+const DRAG_EXAMPLES = LAYOUTS.flatMap((_, plot) => ['x', 'y'].map((axis) => [{ plot, axis, lane: 1, moves: [{ pick: 3, fa: 0.5, fc: 0.5, dAlong: 2, dAcross: 30 }, { pick: 5, fa: 0.5, fc: 0.5, dAlong: -4, dAcross: -110 }, { pick: null, fa: 0.4, fc: 0.6, dAlong: 0, dAcross: 0 }] }]));
+
+describe('a cursor dragged with Shift held, over generated drags', () => {
+  it('lands where the rule puts it, from the ticks and features on the page, on overlay, stacked, independent and spectrum plots', async () => {
+    const { page, ids } = await layouts();
+    const seen = { point: 0, line: 0, free: 0 };
+    try {
+      await fc.assert(
+        fc.asyncProperty(DRAG, async ({ plot, axis, lane, moves }) => {
+          const id = ids[plot], pv = page.pv(id), kind = LAYOUTS[plot].kind;
+          // X1 and X2 at a third and two thirds of the view, Y1 and Y2 so on each y axis, a tenth further up on each after the first.
+          editCursors(page, id, () => {
+            let c = withX(withX(undefined, kind, 'a', along(pv, 'x', 0.3)), kind, 'b', along(pv, 'x', 0.7));
+            pv.yAxes.forEach((a, j) => (c = withY(withY(c, kind, a.key, 'a', alongY(pv, a.key, 0.3 + 0.1 * j)), kind, a.key, 'b', alongY(pv, a.key, 0.7 + 0.1 * j))));
+            return c;
+          });
+          page.ws.selection.only([id]);
+          await settle();
+          const key = axis === 'y' ? pv.yAxes[lane % pv.yAxes.length].key : undefined;
+          const P = pv.geo.plot, ln = axis === 'y' ? pv.yAxes.find((a) => a.key === key).lane : null;
+          const [lo, hi] = axis === 'x' ? [P.x + 3, P.x + P.w - 3] : [ln.y + 3, ln.y + ln.h - 3];
+          const [clo, chi] = axis === 'x' ? [P.y + 3, P.y + P.h - 3] : [P.x + 3, P.x + P.w - 3];
+          const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+          const from = pressOn(pv, axis, 'a', key);
+          expect(from, `${kind} ${LAYOUTS[plot].mode} ${axis}: a press finds the line`).not.toBeNull();
+          // The page drawn with the pointer over it, as it is when the drag begins.
+          await commands.mouse([['move', ...from]]);
+          await settle();
+          await commands.mouse([['hold', 'Shift'], ['down']]);
+          const sy = () => pv.axisScale(pv.yAxes.find((a) => a.key === key));
+          const grab = axis === 'x' ? pv.hover.x - pv.pxOf(pv.markers().a) : pv.hover.y - sy()(pv.yPair(key).a);
+          let targets = onPage(pv, axis, 'a', key), held = null;
+          try {
+            for (const m of moves) {
+              const base = m.pick !== null && targets.length ? targets[m.pick % targets.length] : null;
+              const at = clamp(base ? base.along + m.dAlong : lo + m.fa * (hi - lo), lo, hi);
+              const across = clamp(base?.across != null ? base.across + m.dAcross : clo + m.fc * (chi - clo), clo, chi);
+              await commands.mouse([['move', ...(axis === 'x' ? [at + grab, across] : [across, at + grab])]]);
+              await settle();
+              // What the move was placed by: the page as last drawn.
+              targets = onPage(pv, axis, 'a', key);
+              const pointer = axis === 'x' ? { along: pv.hover.x - grab, across: pv.hover.y } : { along: pv.hover.y - grab, across: pv.hover.x };
+              const want = oracleSnap(targets, pointer, held);
+              // Within a hair of a threshold or of a tie, either way is the rule's: the drag ends there.
+              if (want.close < 1e-6) break;
+              const shown = (axis === 'x' ? xOf(pv.placed, kind) : yOf(pv.placed, kind, key)).a;
+              const px = axis === 'x' ? pv.pxOf(shown) : sy()(shown), what = `${kind} ${LAYOUTS[plot].mode} ${axis}${key ? ` ${key}` : ''} at ${pointer.along.toFixed(2)}, ${pointer.across.toFixed(2)}`;
+              if (want.target) expect(shown, `${what}: ${want.tier} ${want.target.id}`).toBe(want.target.v);
+              else expect(Math.abs(px - pointer.along), `${what}: free`).toBeLessThan(0.01);
+              expect(Math.abs(px - pointer.along), `${what}: within the jump`).toBeLessThanOrEqual(RULE.jump + 1e-9);
+              seen[want.tier ?? 'free']++;
+              held = want.target?.id ?? null;
+            }
+          } finally {
+            await commands.mouse([['up'], ['let go', 'Shift']]);
+            await settle();
+          }
+        }),
+        withExamples(DRAG_EXAMPLES),
+      );
+      // Over the drags, each way the rule goes.
+      expect(Object.values(seen).every((n) => n > 0), `points, lines and free: ${JSON.stringify(seen)}`).toBe(true);
+    } finally {
+      await commands.mouse([['up'], ['let go', 'Shift']]);
+      page.dispose();
+    }
+  }, 600_000);
+
+  it('holds to what it snapped to while another is nearer by less than the hold, and gives way past it', async () => {
+    const { page, ids } = await layouts();
+    try {
+      // X1 at 4.26 s, where the two sines are a few px apart on the overlay's y axis: the Y cursor's points A and B, one above the other.
+      const id = ids[0], pv = page.pv(id), X1 = 4.26;
+      editCursors(page, id, () => withY(withY(withX(withX(undefined, 'time', 'a', X1), 'time', 'b', along(pv, 'x', 0.8)), 'time', 'shared', 'a', alongY(pv, 'shared', 0.6)), 'time', 'shared', 'b', alongY(pv, 'shared', 0.9)));
+      page.ws.selection.only([id]);
+      await settle();
+      const targets = onPage(pv, 'y', 'a', 'shared');
+      const at = (key) => targets.find((t) => t.key === key && Math.abs(t.x - X1) < 0.006);
+      const [A, B] = [at('sine.sine'), at('sine.cos')], gap = B.along - A.along;
+      expect(Math.abs(gap), 'A and B a few px apart').toBeGreaterThan(2);
+      expect(Math.abs(gap), 'A and B a few px apart').toBeLessThan(10);
+      const from = pressOn(pv, 'y', 'a', 'shared');
+      // The page drawn with the pointer over it, as it is when the drag begins.
+      await commands.mouse([['move', ...from]]);
+      await settle();
+      await commands.mouse([['hold', 'Shift'], ['down']]);
+      const grab = pv.hover.y - pv.axisScale(pv.yAxes[0])(pv.yPair('shared').a);
+      // Past A from B; then 0.55 of the way to B, B nearer but A at 0.7 of its jump nearer still; then 0.75 of the way, past the hold.
+      const got = [], rule = [];
+      let held = null;
+      for (const share of [-1 / Math.abs(gap), 0.55, 0.75]) {
+        await commands.mouse([['move', A.across, A.along + share * gap + grab]]);
+        await settle();
+        // What the move was placed by: the page as last drawn.
+        const now = onPage(pv, 'y', 'a', 'shared'), pointer = { along: pv.hover.y - grab, across: pv.hover.x }, want = oracleSnap(now, pointer, held);
+        if (share === 0.55) expect(oracleSnap(now, pointer).target?.id, 'without the hold, B').toBe(B.id);
+        got.push(yOf(pv.placed, 'time', 'shared').a);
+        rule.push(want.target?.v);
+        held = want.target?.id ?? null;
+      }
+      expect(rule, 'the rule: A, A held, B').toEqual([A.v, A.v, B.v]);
+      expect(got, 'the page: A, A held, B').toEqual(rule);
+    } finally {
+      await commands.mouse([['up'], ['let go', 'Shift']]);
+      page.dispose();
+    }
+  }, 120_000);
+});
+
 describe('a cursor dragged with Shift held', () => {
-  it('snaps to the nearest of a tick, the other cursor and a feature of the data within 10 px, or follows the pointer, on every plot it moves, as one undo step', async () => {
+  it('snaps to a tick, the other cursor or a feature of the data near the pointer, or follows it, with a mark on what it snapped to, on every plot it moves, as one undo step', async () => {
     const { page, ids } = await mounted();
     const done = [];
     try {
@@ -187,7 +557,11 @@ describe('a cursor dragged with Shift held', () => {
             }
             const from = pressOn(pv, axis, 'a');
             expect(from, `${what}: a press finds the line`).not.toBeNull();
-            const to = PRESS_AT(axis, pv)(aim), mid = [(from[0] + to[0]) / 2, (from[1] + to[1]) / 2];
+            // Near data, the pointer level with the point along the other direction.
+            const to = PRESS_AT(axis, pv)(aim), pts = drawnPoints(pv);
+            if (target === 'data' && axis === 'x') to[1] = pv.axisScale(pv.yAxes[0])(pointAt(pts, want)[1]);
+            if (target === 'data' && axis === 'y') to[0] = pv.pxOf(pointAt(pts, pv.markers().a)[0]);
+            const mid = [(from[0] + to[0]) / 2, (from[1] + to[1]) / 2];
             const before = ids.map((i) => page.ws.plots[i].cursors), steps = page.history.undos.length;
             const grab = (axis === 'x' ? from[0] : from[1]) - pv.pressAt(...from).at;
             await commands.mouse([['move', ...from], ['down'], ['move', ...mid], ['hold', 'Shift'], ['move', ...to]]);
