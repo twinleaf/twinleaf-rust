@@ -617,11 +617,13 @@ export class PlotView {
    * back at the windows they had before they paused. `renderer` is the
    * Renderer of the canvas its traces are drawn on (gl.js), whose pixel
    * ratio its overlay is drawn at too. `colors` is the Colors its signals'
-   * colours are read from.
+   * colours are read from. `onReadout(legend)` is given the `legend` a
+   * frame drew whose cursors read other than the last one's, as a cursor is
+   * placed, moved or cleared.
    */
-  constructor({ body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors, colors }) {
+  constructor({ body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, onReadout, viewHistory, cursors, colors }) {
     cursorTargets ??= (key) => [[this, key]];
-    Object.assign(this, { body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, viewHistory, cursors, colors });
+    Object.assign(this, { body, overlay, config, hub, view, targets, cursorTargets, hoverTime, plotId, renderer, onFocus, onFrequencies, onFitY, onFollow, onReadout, viewHistory, cursors, colors });
     this.zoomBand = null; // [x0, x1] in client px while a Ctrl+drag marks a range to zoom to
     this.ctx = overlay.getContext('2d');
     this.specHover = null;
@@ -1688,7 +1690,9 @@ export class PlotView {
       });
     }
     const cursors = xs || ys.length ? { x: xs, ys } : null;
+    const moved = JSON.stringify(cursors) !== JSON.stringify(this.legend?.cursors ?? null);
     this.legend = { rows, cursors };
+    if (moved) this.onReadout?.(this.legend);
     if (!hold) this.hoverRead = this.hover ? { x: this.hover.x, y: this.hover.y, at: now, reads } : null;
     if (near) {
       const u = near.t.meta.units, key = this.rangeKey(cfg, near.t);

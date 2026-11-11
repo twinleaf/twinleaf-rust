@@ -340,7 +340,9 @@
   let pv;
 
   // The readouts come from the plot view each frame; the page shows them a
-  // few times a second, which is as fast as anyone reads.
+  // few times a second, which is as fast as anyone reads, and at once in a
+  // frame that draws the cursors elsewhere, so the readout reads them as
+  // their tags do.
   const LEGEND_MS = 66;
   let legend = $state({ rows: {}, cursors: null });
 
@@ -479,6 +481,7 @@
       cursors,
       colors,
       onFollow: () => runHere('follow'),
+      onReadout: (drawn) => (legend = drawn),
       hoverTime: hover,
       plotId: plot.id,
       renderer,

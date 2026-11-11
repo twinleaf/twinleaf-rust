@@ -8,12 +8,14 @@
 // press on a cursor's line, tag or tab drags it snapped from its first
 // move; off the cursors it starts no drag. A drag whose pointer went off
 // its press is no click, with or without Shift; a press let go where it
-// was is a click, a Shift+click by Shift as it was at the press.
+// was is a click, a Shift+click by Shift as it was at the press. At every
+// frame of a drag, with Shift or without, the readout reads the cursor as
+// its tag does.
 import { describe, expect, it } from 'vitest';
 import { commands, page as browser } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { editCursors, feed, leafOf, mountPage, pressKey, settle, wait, withExamples } from './harness/page.js';
+import { editCursors, feed, frames, leafOf, mountPage, pressKey, settle, wait, withExamples } from './harness/page.js';
 import { oracleSnap, RULE } from './harness/snaporacle.js';
 import * as clock from '../src/lib/clock.js';
 import { withX, withY, xOf, yOf } from '../src/lib/cursors.js';
@@ -642,6 +644,53 @@ describe('a cursor dragged with Shift held', () => {
       page.dispose();
     }
   }, 600_000);
+
+  it('is read in the readout as its tag reads it, at every frame of the drag, with Shift or without', async () => {
+    const { page, id, pv } = await oneSine(() => [-2.5, 1.2]);
+    const start = page.ws.plots[id].cursors;
+    /** The text of cursor `name` of `axis`'s value tag as the frame drew it, or null while it is out of view. */
+    const tagOf = (axis, name) => pv.pressable.find((p) => p.part === 'tag' && p.kind === axis && p.name === name && !p.edge && !/^[XY][12]$/.test(p.text))?.text ?? null;
+    /** What the readout's row of `axis` shows of cursor `name`. */
+    const readOf = (axis, name) => {
+      const row = [...pv.body.querySelectorAll('.cursor-readout tr.position')].find((r) => r.querySelector('th').textContent.trim().startsWith(axis.toUpperCase()));
+      return row?.querySelectorAll('td')[name === 'a' ? 0 : 1].textContent ?? null;
+    };
+    const share = fc.double({ min: 0.08, max: 0.92, noNaN: true });
+    const drag = fc.record({ axis: fc.constantFrom('x', 'y'), name: fc.constantFrom('a', 'b'), shift: fc.boolean(), path: fc.array(share, { minLength: 1, maxLength: 6 }) });
+    try {
+      await fc.assert(
+        fc.asyncProperty(drag, async ({ axis, name, shift, path }) => {
+          // Every case from the cursors oneSine places.
+          editCursors(page, id, () => start);
+          await settle();
+          const from = pressOn(pv, axis, name);
+          expect(from, `a press finds ${axis}${name}`).not.toBeNull();
+          const P = pv.geo.plot, lane = pv.yAxes[0].lane;
+          const at = (f) => (axis === 'x' ? [P.x + f * P.w, from[1]] : [from[0], lane.y + f * lane.h]);
+          await commands.mouse([['move', ...from], ...(shift ? [['hold', 'Shift']] : []), ['down']]);
+          try {
+            for (const [i, f] of path.entries()) {
+              await commands.mouse([['move', ...at(f)]]);
+              // Each frame the page draws as the pointer rests there.
+              for (let k = 0; k < 3; k++) {
+                await frames(1);
+                const tag = tagOf(axis, name);
+                if (tag !== null) expect(readOf(axis, name), `${shift ? 'Shift+' : ''}${axis.toUpperCase()}${name === 'a' ? 1 : 2} at move ${i + 1}, frame ${k + 1}: the readout as the tag`).toBe(tag);
+              }
+            }
+          } finally {
+            await commands.mouse([['up'], ...(shift ? [['let go', 'Shift']] : [])]);
+            await settle();
+          }
+        }),
+        // The case of the report: Y1 dragged with Shift to the trough near the bottom, and X2 dragged without.
+        withExamples([[{ axis: 'y', name: 'a', shift: true, path: [0.9, 0.8] }], [{ axis: 'x', name: 'b', shift: false, path: [0.2, 0.6] }]]),
+      );
+    } finally {
+      await commands.mouse([['up'], ['let go', 'Shift']]);
+      page.dispose();
+    }
+  }, 300_000);
 
   it('held at the press on a cursor drags it snapped from its first move, off the cursors moves nothing; a drag never selects, a Shift+click on a cursor does', async () => {
     const { page, ids } = await mounted();
