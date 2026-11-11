@@ -17,7 +17,13 @@
 // A menu row that shows a key is a command's, drawn by CommandItem from the
 // command table (commands.js), so its key is the key that runs it: no other
 // component writes a `<kbd>` into a menu row, but the rows of commands the
-// table does not hold yet (OWN_KEYS).
+// table does not hold yet (OWN_KEYS). Every menu row is drawn by
+// CommandItem, but the rows of what the table does not hold (OWN_ROWS): a
+// row written where it shows, in any component, fails until it is listed
+// there. A command's keys are in the keymap (keymap.js) from the table
+// alone: no entry there names a command by hand or changes what the table
+// says of its keys. The command palette is handed no actions: the commands
+// it lists are the table's.
 //
 // The key router (keyrouter.js) is the one listener for keys: no other
 // module listens for a key on the window or an element, and a component
@@ -35,13 +41,16 @@
 // no other prop. The plot's own modules (PLOT) import none of the page's
 // (PAGE), nor the page's colours, and read the window's size and pixel
 // ratio nowhere but in gl.js's `windowFrame`, the page's frame: a plot is
-// drawn at the size and pixel ratio of the surface its host has. And the
+// drawn at the size and pixel ratio of the surface its host has. A plot's
+// component asks its host which plots a command acts on only to tell its
+// gestures what they move, and edits no other plot itself. And the
 // host is the one maker of what its plots share (MADE): the cursors'
 // writer, the view steps, the commands and the surface's renderer.
 import { describe, expect, it } from 'vitest';
 import { compile, parse } from 'svelte/compiler';
 import fs from 'node:fs';
 import path from 'node:path';
+import { COMMANDS } from './lib/commands.js';
 
 /** Svelte's PROPS_IS_UPDATED and PROPS_IS_BINDABLE flags (svelte/src/constants.js). */
 const UPDATED = 1 << 2, BINDABLE = 1 << 3;
@@ -151,6 +160,70 @@ describe('a menu row’s key', () => {
   });
 });
 
+/** A row of a menu, as a component writes one: an item, a submenu's trigger, or a choice. */
+const MENU_ROW = /^(ContextMenu|DropdownMenu)\.(Item|SubTrigger|RadioItem|CheckboxItem)$/;
+/** The one component that draws a command's row. */
+const COMMAND_ITEM = 'lib/CommandItem.svelte';
+/**
+ * The menu rows still written where they show, by file, each by its words,
+ * or {…} for a row whose words are all worked out: the rows of what the
+ * command table does not hold.
+ */
+const OWN_ROWS = {
+  // A signal of a plot, on its chip and its legend row: what it shows, its colour, the plot it moves to, and its removal; and the heading of the peak commands' submenu.
+  'lib/PlotCard.svelte': ['Show all', 'Show only this', '{…}', 'Colour', 'Move to', 'New plot', '{…}', 'Remove', 'X cursors to peaks'],
+  // A dock's panels.
+  'lib/Dock.svelte': ['{…}', 'Move up', 'Move down', 'Move to the dock', 'Hide the dock', 'Reset every panel'],
+  // Property rows.
+  'lib/Properties.svelte': ['Copy', 'Add to Favorites', 'Remove from Favorites'],
+  // A signal of the Signals list: its colour and its name.
+  'lib/SignalList.svelte': ['Colour', 'Copy name'],
+};
+
+/** The menu rows component `source` writes, each by its words, in order. */
+function menuRows(source) {
+  const found = [];
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (node.type === 'Component' && MENU_ROW.test(node.name)) found.push((node.fragment?.nodes ?? []).filter((n) => n.type === 'Text').map((n) => n.data).join(' ').replace(/\s+/g, ' ').trim() || '{…}');
+    Object.values(node).forEach(walk);
+  };
+  walk(parse(source, { modern: true }).fragment);
+  return found;
+}
+
+describe('a menu row', () => {
+  const found = Object.fromEntries(
+    sources(SRC)
+      .filter((file) => file.endsWith('.svelte') && rel(file) !== COMMAND_ITEM && !rel(file).startsWith('lib/components/ui/'))
+      .map((file) => [rel(file), menuRows(fs.readFileSync(file, 'utf8'))])
+      .filter(([, rows]) => rows.length),
+  );
+
+  it('is found where a component writes one, by its words', () => {
+    expect(menuRows('<ContextMenu.Item onSelect={f}><Icon />Close<span>{n}</span></ContextMenu.Item><DropdownMenu.SubTrigger>{name}</DropdownMenu.SubTrigger><ContextMenu.Separator />')).toEqual(['Close', '{…}']);
+    expect(menuRows('<CommandItem id="close" /><Command.Item value="x">Close</Command.Item><Select.Item value="a">A</Select.Item>')).toEqual([]);
+  });
+  it('is drawn by CommandItem from the command table, or is a row of what the table does not hold', () => {
+    expect(found).toEqual(OWN_ROWS);
+  });
+});
+
+describe('a command’s key', () => {
+  const keymap = fs.readFileSync(path.join(SRC, 'lib/keymap.js'), 'utf8');
+  /** The lines of keymap source `source` that give a command its keys by hand: an entry that names a command as its action, or one that changes what the table says. */
+  const byHand = (source) => source.split('\n').flatMap((line, i) => (!/^\s*(\/\/|\*)/.test(line) && (COMMANDS.some((c) => new RegExp(`action:\\s*['"\`]${c.id}['"\`]`).test(line)) || /\{\s*\.\.\.keysOf\(/.test(line)) ? [i + 1] : []));
+
+  it('is found where the keymap gives one by hand', () => {
+    expect(byHand("{ show: ['F2'], keys: ['F2'], action: 'renameTab', what: 'Rename tab' },\n{ ...keysOf(commandOf('copyData')), keys: ['c'], ctrl: true },\n// action: 'close'\nkeysOf(commandOf('pause')),\n{ keys: ['Enter'], action: 'open' },")).toEqual([1, 2]);
+  });
+  it('is listed in the keymap from the command table alone', () => {
+    expect(byHand(keymap)).toEqual([]);
+    expect(keymap).toContain('keysOf(commandOf(');
+  });
+});
+
 describe.each(OWNED)('$what', ({ owner, writes, once }) => {
   /** The lines of `files` that match `pattern`, comments left out, as `file:line`. */
   const matching = (files, pattern) =>
@@ -215,11 +288,25 @@ describe('a plot', () => {
     expect([...PLOT, HOST].flatMap((file) => lines(file, (line) => WINDOW_READ.test(line) && !line.includes('export const windowFrame')))).toEqual([]);
     expect(lines('lib/gl.js', (line) => WINDOW_READ.test(line))).toHaveLength(1);
   });
+  it('asks its host what a command acts on for its gestures alone, and edits no other plot itself: what a command acts on is the table’s', () => {
+    /** What gives a plot's gestures the plots they move. */
+    const GESTURE = /^\s*(targets|cursorTargets):/;
+    const asked = (source) => source.split('\n').flatMap((line, i) => (/\.(targets|each|editEach)\(/.test(line) && !GESTURE.test(line) && !/^\s*(\/\/|\*|\/\*)/.test(line) ? [i + 1] : []));
+    expect(asked('const targetIds = () => host.targets(plot.id);\n  targets: () => host.targets(plot.id).map((id) => host.view(id)),\nconst onEach = (what, fn) => host.each(plot.id, what, fn);\n{#each items as item}')).toEqual([1, 3]);
+    expect(PLOT.filter((file) => file.endsWith('.svelte')).flatMap((file) => asked(read(file)).map((n) => `${file}:${n}`))).toEqual([]);
+    expect(read('lib/PlotCard.svelte')).toMatch(/^\s*targets: \(\) => host\.targets\(plot\.id\)/m);
+  });
   it('shares what its host makes, each made by the host alone, once', () => {
     for (const made of MADE) {
       const found = sources(SRC).flatMap((file) => lines(rel(file), (line) => line.includes(made)));
       expect(found.map((at) => at.split(':')[0]), made).toEqual([HOST]);
     }
+  });
+});
+
+describe('the command palette', () => {
+  it('takes the signals and the devices it names, and no actions: the commands it lists and runs are the table’s', () => {
+    expect(props(fs.readFileSync(path.join(SRC, 'lib/CommandPalette.svelte'), 'utf8'))).toEqual(['open', 'session', 'devices']);
   });
 });
 
