@@ -693,7 +693,10 @@ impl Worker {
         }
         match packet.payload() {
             Payload::ProxyRx(ProxyRx::Alive) => return true,
-            Payload::ProxyRx(ProxyRx::Reply(_) | ProxyRx::Error(_)) => {
+            // The replies to the pump's requests go in however full the
+            // inlet is, and so does the proxy's count of the samples it
+            // dropped, which says where the samples after it are missing.
+            Payload::ProxyRx(ProxyRx::Reply(_) | ProxyRx::Error(_) | ProxyRx::Dropped { .. }) => {
                 if let Some(inlet) = &mut self.inlet {
                     inlet.send_always(Received::Packet(packet));
                 }
@@ -1804,6 +1807,38 @@ pub(crate) mod tests {
             Some(crate::chan::RecvTimeoutError::Disconnected),
             "a second pump gets an inlet that has ended"
         );
+    }
+
+    /// The proxy's count of the samples it dropped goes into a full inlet,
+    /// behind the count of the packets the inlet had no room for, as it
+    /// says where the samples after it are missing.
+    #[test]
+    fn the_proxys_count_of_dropped_samples_goes_into_a_full_inlet() {
+        let (session, proxy) = Session::test_pair();
+        let root = Handle::root(session.clone());
+        let inlet = session.attach(1);
+        for _ in 0..2 {
+            proxy.send(Packet::heartbeat(DeviceRoute::root()));
+        }
+        proxy.send(Packet::dropped(1, 5));
+        // A reply comes after every packet sent ahead of it.
+        let reply = root.submit(DeviceRoute::root(), "dev.name", &[]);
+        let (route, _, _, id) = proxy.call();
+        proxy.reply(id, b"after", route);
+        assert_eq!(reply.recv_timeout(WAIT).unwrap().unwrap(), b"after");
+
+        assert!(matches!(inlet.try_recv(), Ok(Queued::Item(_))));
+        assert!(matches!(inlet.try_recv(), Ok(Queued::Gap(1))));
+        let Ok(Queued::Item(Received::Packet(count))) = inlet.try_recv() else {
+            panic!("the count did not go in");
+        };
+        assert!(matches!(
+            count.payload(),
+            Payload::ProxyRx(ProxyRx::Dropped {
+                stream_id: 1,
+                packets: 5
+            })
+        ));
     }
 
     /// A reply to the pump's control request goes into a full inlet, in the

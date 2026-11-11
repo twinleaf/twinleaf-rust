@@ -304,7 +304,59 @@ pub struct Loss {
     /// add up over its batches to that stream's share of the counts
     /// [`RecvError::Lagged`](crate::RecvError::Lagged) reports.
     pub dropped_batches: u64,
-    /// The rows of those batches, which `samples` counts too. The rest of
-    /// `samples` never reached the receiver's queue.
+    /// The rows of `samples` that reached the receiver's connection and that
+    /// it dropped. They are the rows of the batches its queue dropped, and
+    /// the rows lost next after its connection had no room for a packet.
     pub dropped_samples: u64,
+    /// The rows of `samples` lost while the link to the device was down,
+    /// between the proxy and the device or between the receiver and its
+    /// proxy.
+    pub link_samples: u64,
+    /// The rows of `samples` the proxy dropped from its queue for this
+    /// receiver's connection, as the proxy said, because the connection read
+    /// too slowly.
+    pub proxy_samples: u64,
+}
+
+impl Loss {
+    /// Returns the rows the device never sent, or that a link that stayed up
+    /// lost. They are the rows of `samples` that no other field counts.
+    pub fn skipped_samples(&self) -> u64 {
+        self.samples
+            .saturating_sub(self.dropped_samples)
+            .saturating_sub(self.link_samples)
+            .saturating_sub(self.proxy_samples)
+    }
+}
+
+/// Where the rows a stream loses next were lost, as far as its parser was
+/// told since the stream's last rows. The later a place is listed, the
+/// more it explains, so the latest listed of those told is the one blamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(crate) enum LossSite {
+    /// Nothing was told, so the device sent none or a live link lost them.
+    #[default]
+    Device,
+    /// The proxy said it dropped packets of the stream for this connection.
+    Proxy,
+    /// The connection had no room for a packet.
+    Receiver,
+    /// The link was lost.
+    Link,
+}
+
+impl Loss {
+    /// Returns the loss of `samples` rows before the row `expected`, lost
+    /// at `site`.
+    pub(crate) fn at(site: LossSite, samples: u64, expected: Option<SampleNumber>) -> Loss {
+        let of = |blamed: LossSite| if site == blamed { samples } else { 0 };
+        Loss {
+            samples,
+            expected,
+            dropped_batches: 0,
+            dropped_samples: of(LossSite::Receiver),
+            link_samples: of(LossSite::Link),
+            proxy_samples: of(LossSite::Proxy),
+        }
+    }
 }

@@ -79,6 +79,16 @@ pub enum ProxyRx<'a> {
     Link(LinkStatus),
     /// A sign that the proxy is alive, kind 3, sent when nothing else was.
     Alive,
+    /// The proxy dropped sample packets from its queue for this client,
+    /// which read too slowly, kind 4. They were `packets` packets of stream
+    /// `stream_id` of the device the packet's route names, and the samples
+    /// that stream sends next come after them.
+    Dropped {
+        /// The stream the packets were of.
+        stream_id: u8,
+        /// How many of its packets were dropped.
+        packets: u32,
+    },
     /// A kind this build does not know, with the body after its kind byte.
     Unknown(u8, &'a [u8]),
 }
@@ -91,6 +101,9 @@ const PROXY_RX_ERROR: u8 = 1;
 const PROXY_RX_LINK: u8 = 2;
 /// `PROXY_RX` kind byte of a sign of life.
 const PROXY_RX_ALIVE: u8 = 3;
+/// `PROXY_RX` kind byte of a count of dropped sample packets. Its body is
+/// the stream id, one byte, and the count, a little endian `u32`.
+const PROXY_RX_DROPPED: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -245,6 +258,14 @@ fn parse_proxy_rx(payload: &[u8]) -> Result<ProxyRx<'_>, DecodeError> {
         PROXY_RX_ERROR => ProxyRx::Error(wire_rpc::ErrorReply::parse(body).ok_or(too_short)?),
         PROXY_RX_LINK => ProxyRx::Link(LinkStatus::from(*body.first().ok_or(too_short)?)),
         PROXY_RX_ALIVE => ProxyRx::Alive,
+        PROXY_RX_DROPPED => {
+            let (&stream_id, count) = body.split_first().ok_or(too_short)?;
+            let count = count.first_chunk::<4>().ok_or(too_short)?;
+            ProxyRx::Dropped {
+                stream_id,
+                packets: u32::from_le_bytes(*count),
+            }
+        }
         _ => ProxyRx::Unknown(kind, body),
     })
 }
@@ -403,6 +424,20 @@ impl Packet {
     #[allow(clippy::missing_panics_doc)]
     pub fn alive() -> Packet {
         proxy_rx(PROXY_RX_ALIVE, 0, |_| Some(0)).expect("a sign of life always fits")
+    }
+
+    /// Creates the count of `packets` sample packets of stream `stream_id`
+    /// that a proxy dropped from its queue for a client. The packet has no
+    /// route until [`with_route`](Self::with_route) names the device.
+    // A six byte payload always fits a packet.
+    #[allow(clippy::missing_panics_doc)]
+    pub fn dropped(stream_id: u8, packets: u32) -> Packet {
+        proxy_rx(PROXY_RX_DROPPED, 5, |body| {
+            body[0] = stream_id;
+            body[1..5].copy_from_slice(&packets.to_le_bytes());
+            Some(5)
+        })
+        .expect("a count of dropped packets always fits")
     }
 
     /// Creates a control request to the proxy itself, calling `name` with
@@ -922,6 +957,16 @@ mod tests {
         assert_eq!(link.route(), route("/1/2"));
 
         assert_eq!(proxy_rx_of(&received(&Packet::alive())), ProxyRx::Alive);
+
+        let dropped = received(&Packet::dropped(3, 70_000).with_route(route("/1")));
+        assert_eq!(
+            proxy_rx_of(&dropped),
+            ProxyRx::Dropped {
+                stream_id: 3,
+                packets: 70_000,
+            }
+        );
+        assert_eq!(dropped.route(), route("/1"));
 
         // Kind 9, which this build does not know, with a two byte body.
         let unknown = Packet::from_wire(Bytes::from_static(&[67, 0, 3, 0, 9, 0xaa, 0xbb])).unwrap();

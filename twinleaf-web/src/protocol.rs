@@ -13,7 +13,8 @@
 //!   of every point the hub has sent, a [`Message::Config`], and the newest
 //!   [`Message::Routes`], [`Message::Device`], [`Message::Table`],
 //!   [`Message::Settings`], [`Message::Captures`] and [`Message::Capture`]
-//!   of every device. The page replaces all it holds of any hub with it.
+//!   of every device, and the newest [`Message::Loss`] of every device
+//!   that lost anything. The page replaces all it holds of any hub with it.
 //! - A change comes after it, numbered one more than the change before. It
 //!   is a points frame as each flush has new points, a spectrum frame per
 //!   trace as each is estimated, a [`Message::Trace`] as a new column
@@ -39,6 +40,19 @@
 //! value, as the proxy keeps them, so the hub keeps the newest of each and a
 //! snapshot holds it. Only points and spectra are a stream, and the snapshot
 //! holds the decimated history of the points.
+//!
+//! # What was lost
+//!
+//! A sample is lost in one of five places, and the page is told of each
+//! apart. Four are before the hub's history, and [`Message::Loss`] counts
+//! them by device, since the hub started: the rows of each stream the
+//! device skipped, those lost with its link down, those the proxy dropped
+//! for the hub's connection and those the hub's own queue dropped
+//! ([`Lost`]), and how often and for how long the device's link was down
+//! ([`Link`]). Each is the newest value, sent at most once a second while
+//! it grows, and a snapshot holds it. The fifth is the page's own, the
+//! changes it fell behind the hub, which the snapshot sent in their place
+//! says in `behind` of its [`Message::Hub`].
 //!
 //! # Captures
 //!
@@ -95,8 +109,10 @@ pub(crate) enum Frame {
 pub(crate) enum Message {
     /// Starts a snapshot. `id` names the hub, which a window request names
     /// back, as trace ids start over in each hub. `seq` is the number of the
-    /// last change the snapshot holds.
-    Hub { id: String, seq: u64 },
+    /// last change the snapshot holds. `behind` is how many changes the
+    /// page fell behind, when the snapshot is sent in their place, and 0 in
+    /// the snapshot a socket opens with.
+    Hub { id: String, seq: u64, behind: u64 },
     /// A trace, one float column of a stream, which points and spectra name
     /// by its id.
     Trace { trace: TraceInfo },
@@ -136,6 +152,14 @@ pub(crate) enum Message {
         serial: Option<String>,
         firmware: Option<String>,
         presence: Presence,
+    },
+    /// What was lost of one device before the hub's history held it, since
+    /// the hub started: its `link`'s drops, and the rows lost of each of its
+    /// `streams`, by the stream's name, as a trace names it.
+    Loss {
+        route: String,
+        link: Link,
+        streams: BTreeMap<String, Lost>,
     },
     /// One device's RPC table, or why it did not load.
     Table {
@@ -197,6 +221,28 @@ impl Message {
 #[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Held {
     pub(crate) bytes: u64,
+    pub(crate) seconds: f64,
+}
+
+/// The rows of one stream lost before the hub's history held them, by
+/// where: `skipped` the device did not send, or its link lost while it
+/// stayed up, `link` were lost while the device's link or the hub's
+/// connection was down, `proxy` the proxy dropped from its queue for the
+/// hub's connection, and `hub` the hub's connection dropped as the hub fell
+/// behind.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Lost {
+    pub(crate) skipped: u64,
+    pub(crate) link: u64,
+    pub(crate) proxy: u64,
+    pub(crate) hub: u64,
+}
+
+/// How often the link to a device dropped, and for how many seconds in all
+/// it was down, up to now while it is.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Link {
+    pub(crate) times: u64,
     pub(crate) seconds: f64,
 }
 
@@ -581,9 +627,37 @@ mod tests {
         assert_eq!(
             json_of(&Message::Hub {
                 id: "7".into(),
-                seq: 3
+                seq: 3,
+                behind: 1500
             }),
-            json!({"type": "hub", "id": "7", "seq": 3})
+            json!({"type": "hub", "id": "7", "seq": 3, "behind": 1500})
+        );
+    }
+
+    #[test]
+    fn a_loss_counts_a_devices_link_and_each_stream_by_where() {
+        let streams = BTreeMap::from([(
+            "sine".to_string(),
+            Lost {
+                skipped: 312,
+                link: 55000,
+                proxy: 2000,
+                hub: 100,
+            },
+        )]);
+        let message = Message::Loss {
+            route: "/0".into(),
+            link: Link {
+                times: 4,
+                seconds: 11.2,
+            },
+            streams,
+        };
+        assert_eq!(
+            json_of(&message),
+            json!({"type": "loss", "route": "/0",
+                "link": {"times": 4, "seconds": 11.2},
+                "streams": {"sine": {"skipped": 312, "link": 55000, "proxy": 2000, "hub": 100}}})
         );
     }
 

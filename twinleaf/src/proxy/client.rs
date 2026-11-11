@@ -1202,7 +1202,8 @@ mod tests {
 
     /// A client that falls behind loses samples, the oldest first, and
     /// nothing else, and holds up neither its link nor another client of the
-    /// link, which hears every packet the device sent. Once more than the
+    /// link, which hears every packet the device sent. It is told how many
+    /// samples it lost, where they are missing. Once more than the
     /// hard limit of other packets waits for it, it is let go as too slow,
     /// and the link and the other client go on.
     #[tokio::test(start_paused = true)]
@@ -1232,20 +1233,33 @@ mod tests {
         assert!(whole, "the other client lost a packet");
 
         let (mut kept, mut kept_samples) = (Vec::new(), Vec::new());
+        // The samples the proxy said it dropped, and the last sample kept
+        // ahead of each time it said so.
+        let (mut told, mut told_after) = (0, Vec::new());
         while let Some(pkt) = timeout(PAUSED_WAIT, behind.end.recv()).await.unwrap() {
             kept.extend(beat_number(&pkt));
-            if let Payload::Samples(data) = pkt.payload() {
-                kept_samples.push(data.first.value());
+            match pkt.payload() {
+                Payload::Samples(data) => kept_samples.push(data.first.value()),
+                Payload::ProxyRx(ProxyRx::Dropped { packets, .. }) => {
+                    told += packets;
+                    told_after.push(kept_samples.last().copied());
+                }
+                _ => {}
             }
         }
         let in_order = kept.iter().copied().eq(0..kept.len() as u32);
         assert!(in_order, "a beat was lost");
         let refused_early = kept.len() * big_beat(0).as_bytes().len() <= limit;
         assert!(!refused_early, "beats were refused below the hard limit");
-        let gaps = kept_samples
+        let gaps: Vec<_> = kept_samples
             .windows(2)
-            .filter(|pair| pair[1] - pair[0] > 400);
-        assert_eq!(gaps.count(), 1, "the oldest samples waiting were lost");
+            .filter(|pair| pair[1] - pair[0] > 400)
+            .collect();
+        assert_eq!(gaps.len(), 1, "the oldest samples waiting were lost");
+        let (before, after) = (gaps[0][0], gaps[0][1]);
+        assert_eq!(told, (after - before) / 400 - 1, "the count told");
+        let at_the_gap = told_after.iter().all(|last| *last == Some(before));
+        assert!(at_the_gap, "a count came away from the gap: {told_after:?}");
         let served = timeout(PAUSED_WAIT, &mut behind.served).await.unwrap();
         assert!(matches!(served, Ok(Some(Err(ClientError::TooSlow)))));
 

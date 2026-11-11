@@ -569,7 +569,7 @@ mod tests {
             let runtime = tokio::runtime::Handle::current();
             let live = Live::over(connection.clone(), None, &runtime).unwrap();
             let live = Arc::new(live);
-            let (snapshot, changes) = live.snapshot().await.unwrap();
+            let (snapshot, changes) = live.snapshot(0).await.unwrap();
             let mut bench = Bench {
                 stop,
                 proxy,
@@ -700,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn a_device_lists_its_captures_with_what_each_is_of() {
         let bench = Bench::start().await;
-        let (snapshot, _) = bench.live.snapshot().await.unwrap();
+        let (snapshot, _) = bench.live.snapshot(0).await.unwrap();
         let listed: Vec<Value> = snapshot
             .iter()
             .filter_map(|frame| match frame {

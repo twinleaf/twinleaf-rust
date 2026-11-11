@@ -745,6 +745,8 @@ mod tests {
             expected: Some(SampleNumber::new(2)),
             dropped_batches: 0,
             dropped_samples: 0,
+            link_samples: 0,
+            proxy_samples: 0,
         }
     }
 

@@ -18,6 +18,7 @@
 
 use crate::captures::is_capture;
 use crate::feed::Feed;
+use crate::loss::Losses;
 use crate::protocol::{
     Access, CallReply, CaptureInfo, CaptureLabel, Frame, Message, MountInfo, Outcome, Presence,
     ReadReply, Refusal, RpcInfo, TableInfo, TableState,
@@ -186,11 +187,13 @@ impl Devices {
 
 /// Starts the watchers of every device `connection` sees, on `runtime`, for
 /// as long as the connection lasts. `mounts` is what the hub mounted, or
-/// `None` for the proxy's default.
+/// `None` for the proxy's default. Each drop of a device's link is counted
+/// in `losses`.
 pub(crate) fn watch(
     connection: &Connection,
     mounts: Option<Vec<MountInfo>>,
     devices: Arc<Devices>,
+    losses: Arc<Losses>,
     runtime: &tokio::runtime::Handle,
 ) {
     let tree = connection.tree(DeviceRoute::root());
@@ -208,7 +211,8 @@ pub(crate) fn watch(
             for route in seen {
                 if watched.insert(route) {
                     let device = tree.device(route).expect("a route the tree heard is in it");
-                    spawner.spawn(watch_device(device, route, devices.clone()));
+                    let (devices, losses) = (devices.clone(), losses.clone());
+                    spawner.spawn(watch_device(device, route, devices, losses));
                 }
             }
         }
@@ -225,8 +229,13 @@ struct Identity {
 }
 
 /// Sends what the proxy keeps of `device` as it changes, until the
-/// connection ends.
-async fn watch_device(device: Device, route: DeviceRoute, devices: Arc<Devices>) {
+/// connection ends, and counts each drop of its link in `losses`.
+async fn watch_device(
+    device: Device,
+    route: DeviceRoute,
+    devices: Arc<Devices>,
+    losses: Arc<Losses>,
+) {
     let presence = device.presence_updates();
     let metadata = device.metadata_updates();
     let table = device.rpc_registry_updates();
@@ -248,8 +257,14 @@ async fn watch_device(device: Device, route: DeviceRoute, devices: Arc<Devices>)
         tokio::select! {
             update = presence.recv_async() => match update {
                 Ok(update) => identity.presence = match update {
-                    twinleaf::device::Presence::Alive { .. } => Presence::Alive,
-                    twinleaf::device::Presence::Lost { .. } => Presence::Lost,
+                    twinleaf::device::Presence::Alive { .. } => {
+                        losses.link_up(route);
+                        Presence::Alive
+                    }
+                    twinleaf::device::Presence::Lost { since } => {
+                        losses.link_down(route, since);
+                        Presence::Lost
+                    }
                     _ => Presence::Connecting,
                 },
                 Err(RecvError::Lagged(_)) => continue,

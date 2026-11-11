@@ -5,6 +5,7 @@
 //! decodes its rows and accumulates them into [`SampleBatch`] values.
 
 use crate::data::decode::state::{DataError, PacketEvent, ParseState, ScannedRows};
+use crate::data::model::continuity::LossSite;
 use crate::data::model::sample::{RowSource, SampleBatch};
 use crate::data::model::schema::{DeviceMetadataSnapshot, MetadataQuery, StreamKey};
 use crate::data::store::coalesce::BatchCoalescer;
@@ -248,6 +249,15 @@ impl PacketParser {
     pub fn reset_subtree(&mut self, subtree: DeviceRoute) {
         self.flush();
         self.state.reset(|route| route.starts_with(&subtree));
+    }
+
+    /// Tells the parser that packets received for it were dropped before
+    /// they reached it, as by a receiver whose queue had no room for them.
+    /// The rows each stream loses before its next rows then count as
+    /// dropped by the receiver, in
+    /// [`Loss::dropped_samples`](crate::data::Loss::dropped_samples).
+    pub fn note_dropped_packets(&mut self) {
+        self.state.blame(LossSite::Receiver, |_| true);
     }
 
     /// Drops the device metadata of the absolute route `route` alone to learn
@@ -1055,6 +1065,8 @@ mod tests {
                     expected: Some(SampleNumber::new(1)),
                     dropped_batches: 0,
                     dropped_samples: 0,
+                    link_samples: 0,
+                    proxy_samples: 0,
                 }),
             })
         );
@@ -1098,6 +1110,8 @@ mod tests {
             expected: Some(SampleNumber::new(1)),
             dropped_batches: 0,
             dropped_samples: 0,
+            link_samples: 0,
+            proxy_samples: 0,
         });
         let restarted = Change::Restarted {
             old_id: crate::proto::SegmentId::new(0),
@@ -1164,6 +1178,8 @@ mod tests {
                     expected: Some(SampleNumber::new(1)),
                     dropped_batches: 0,
                     dropped_samples: 0,
+                    link_samples: 2,
+                    proxy_samples: 0,
                 }),
             })
         );
@@ -1174,6 +1190,84 @@ mod tests {
                 new_id: crate::proto::SegmentId::new(1),
             }))
         );
+    }
+
+    /// The rows a stream loses are counted where the parser was told they
+    /// went since the stream's last rows. A lost link explains more than a
+    /// receiver that dropped packets, that more than a proxy that dropped
+    /// packets of the stream, and with nothing told the device skipped them.
+    /// What a proxy dropped of another stream explains nothing, and what was
+    /// told is forgotten at the stream's next rows.
+    #[test]
+    fn a_loss_is_counted_where_the_parser_was_told_the_rows_went() {
+        #[derive(Clone, Copy, Debug)]
+        enum Told {
+            Link,
+            Receiver,
+            Proxy(u8),
+        }
+        // The rows lost before the next batch, as those the receiver
+        // dropped, those the link lost, those the proxy dropped and those
+        // skipped.
+        let lost = |told: &[Told]| {
+            let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
+            parser
+                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .unwrap();
+            for told in told {
+                match *told {
+                    Told::Link => {
+                        let lost = tio::Packet::link(LinkStatus::SensorDisconnected);
+                        parser
+                            .push_packet(&lost.with_route(DeviceRoute::root()))
+                            .unwrap();
+                        announce_schema(&mut parser, &[DataType::F32], 4, 4, 1, 1);
+                        announce(
+                            &mut parser,
+                            wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+                        );
+                    }
+                    Told::Receiver => parser.note_dropped_packets(),
+                    Told::Proxy(stream) => {
+                        let dropped = tio::Packet::dropped(stream, 2);
+                        parser
+                            .push_packet(&dropped.with_route(DeviceRoute::root()))
+                            .unwrap();
+                    }
+                }
+            }
+            for first in [3, 6] {
+                parser
+                    .push_packet(&stream_data_packet(first, vec![0; 4]))
+                    .unwrap();
+            }
+            parser.flush();
+            let losses: Vec<_> = std::iter::from_fn(|| parser.pop_batch())
+                .filter_map(|batch| batch.boundary().and_then(|b| b.loss.clone()))
+                .map(|loss| {
+                    assert_eq!(loss.samples, 2, "{told:?}");
+                    (
+                        loss.dropped_samples,
+                        loss.link_samples,
+                        loss.proxy_samples,
+                        loss.skipped_samples(),
+                    )
+                })
+                .collect();
+            assert_eq!(losses.len(), 2, "{told:?}");
+            assert_eq!(losses[1], (0, 0, 0, 2), "{told:?} is forgotten");
+            losses[0]
+        };
+        assert_eq!(lost(&[]), (0, 0, 0, 2));
+        assert_eq!(lost(&[Told::Proxy(STREAM_ID)]), (0, 0, 2, 0));
+        assert_eq!(lost(&[Told::Proxy(STREAM_ID + 1)]), (0, 0, 0, 2));
+        assert_eq!(lost(&[Told::Receiver]), (2, 0, 0, 0));
+        assert_eq!(
+            lost(&[Told::Receiver, Told::Proxy(STREAM_ID)]),
+            (2, 0, 0, 0)
+        );
+        assert_eq!(lost(&[Told::Receiver, Told::Link]), (0, 2, 0, 0));
+        assert_eq!(lost(&[Told::Link, Told::Proxy(STREAM_ID)]), (0, 2, 0, 0));
     }
 
     /// A device that declares a revision may send its next session's heartbeat and record ahead
@@ -1258,6 +1352,8 @@ mod tests {
                     expected: Some(SampleNumber::new(1)),
                     dropped_batches: 0,
                     dropped_samples: 0,
+                    link_samples: 0,
+                    proxy_samples: 0,
                 }),
             })
         );

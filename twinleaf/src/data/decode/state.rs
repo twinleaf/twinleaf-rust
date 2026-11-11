@@ -5,7 +5,7 @@
 //! validated bytes immediately or retain only their metadata and boundaries.
 
 use crate::data::decode::body::{decode_samples, decodes};
-use crate::data::model::continuity::{Boundary, Change, Generations, Loss};
+use crate::data::model::continuity::{Boundary, Change, Generations, Loss, LossSite};
 use crate::data::model::sample::{sample_time, BatchContext, RowSource, SampleBatchBuilder};
 use crate::data::model::schema::{
     rate_hz, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery, SegmentRecord,
@@ -147,6 +147,9 @@ struct StreamTracker {
     /// Whether the device sent a closing record, or the record a start opened of a segment other
     /// than the last rows', since them.
     restarted: bool,
+    /// Where the rows lost before the stream's next rows were lost, as far
+    /// as the parser was told since its last rows.
+    blamed: LossSite,
 }
 
 impl StreamTracker {
@@ -169,7 +172,14 @@ impl StreamTracker {
             renewed: false,
             rate_hz: 0.0,
             restarted: false,
+            blamed: LossSite::Device,
         }
+    }
+
+    /// Blames `site` for the rows lost before the stream's next rows, unless
+    /// a place that explains more is blamed already.
+    fn blame(&mut self, site: LossSite) {
+        self.blamed = self.blamed.max(site);
     }
 
     /// Whether `segment` is the segment of the last accepted rows.
@@ -297,12 +307,7 @@ impl StreamTracker {
         }
 
         let expected = SampleNumber::new(self.last_sample_number.value() + 1);
-        let lost = |samples: u64| Loss {
-            samples,
-            expected: Some(expected),
-            dropped_batches: 0,
-            dropped_samples: 0,
-        };
+        let lost = |samples: u64| Loss::at(self.blamed, samples, Some(expected));
 
         // Rows in the last rows' slot are of a later lap of the ring when
         // that slot's segment starts at another time. A device never moves a
@@ -531,6 +536,7 @@ impl StreamTracker {
         self.relearned = false;
         self.renewed = false;
         self.restarted = false;
+        self.blamed = LossSite::Device;
         self.rate_hz = new_rate;
 
         let schema = self
@@ -571,6 +577,7 @@ impl StreamTracker {
         self.relearn();
         self.last_segment = None;
         self.relearned = false;
+        self.blamed = LossSite::Device;
     }
 
     fn metadata_snapshot(&self, device: DeviceRecord) -> Option<StreamMetadataSnapshot> {
@@ -1037,8 +1044,21 @@ impl ParseState {
                 packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped
             ) {
                 self.relearn(|device| device.starts_with(&route));
+                self.blame(LossSite::Link, |device| device.starts_with(&route));
                 return Ok(PacketEvent::Reset);
             }
+            return Ok(PacketEvent::Applied);
+        }
+
+        // The proxy dropped packets of one stream, whose next rows come
+        // after them.
+        if let packet::Payload::ProxyRx(packet::ProxyRx::Dropped { stream_id, .. }) =
+            packet.payload()
+        {
+            let index = self.device_index(route);
+            self.devices[index]
+                .stream_mut(StreamId::new(stream_id))
+                .blame(LossSite::Proxy);
             return Ok(PacketEvent::Applied);
         }
 
@@ -1057,6 +1077,18 @@ impl ParseState {
                 let index = self.device_index(route);
                 self.devices[index].apply_control_packet(packet, &mut self.global_generation);
                 Ok(PacketEvent::Applied)
+            }
+        }
+    }
+
+    /// Blames `site` for the rows each stream of every route `routes`
+    /// accepts loses before its next rows.
+    pub(in crate::data) fn blame(&mut self, site: LossSite, routes: impl Fn(&DeviceRoute) -> bool) {
+        for device in &mut self.devices {
+            if routes(&device.route) {
+                for stream in device.streams.iter_mut().flatten() {
+                    stream.blame(site);
+                }
             }
         }
     }

@@ -326,6 +326,8 @@ fn a_device_that_reconnects_behind_the_proxy_goes_on_from_its_samples_before() {
                     expected: Some(SampleNumber::new(1)),
                     dropped_batches: 0,
                     dropped_samples: 0,
+                    link_samples: 2,
+                    proxy_samples: 0,
                 }),
             },
             _ => Boundary::of(Change::SessionChanged {
@@ -335,6 +337,66 @@ fn a_device_that_reconnects_behind_the_proxy_goes_on_from_its_samples_before() {
         };
         assert_eq!(boundary, Some(expected), "session {session}");
     }
+}
+
+/// The rows a stream is missing after the proxy says it dropped packets of
+/// that stream for this connection count as the proxy's. The proxy's count
+/// is for one stream of one device, and with no count the rows count as
+/// skipped.
+#[test]
+fn rows_missing_after_the_proxys_count_of_dropped_samples_are_the_proxys() {
+    let (stream, proxy) = stream();
+    let root = DeviceRoute::root();
+    let batches = stream.batches(everything());
+    let list = watch_of(&proxy, device(root));
+    reply_update(&proxy, list, &routes_update(&[root]));
+    reply_update(&proxy, list, &metadata_update(1));
+    proxy.send(samples(0, root));
+    proxy.send(Packet::dropped(1, 2).with_route(root));
+    proxy.send(samples(3, root));
+    proxy.send(samples(6, root));
+    proxy.send(Packet::dropped(2, 2).with_route(root));
+    proxy.send(samples(9, root));
+    let wait = Duration::from_secs(5);
+    let mut lost = Vec::new();
+    while lost.len() < 3 {
+        let batch = batches.recv_timeout(wait).expect("a batch");
+        if let Some(loss) = batch.boundary().and_then(|b| b.loss.clone()) {
+            assert_eq!(
+                (loss.samples, loss.dropped_samples, loss.link_samples),
+                (2, 0, 0)
+            );
+            lost.push((loss.proxy_samples, loss.skipped_samples()));
+        }
+    }
+    assert_eq!(lost, [(2, 0), (0, 2), (0, 2)]);
+}
+
+/// The rows a stream is missing after the session's inlet had no room for
+/// packets count as dropped by this connection.
+#[test]
+fn rows_missing_after_the_inlet_overflowed_are_this_connections() {
+    let (stream, _proxy) = stream();
+    let root = DeviceRoute::root();
+    let (_inlet, received) = crate::session::Lane::new(1);
+    let (_taps, taps) = mpsc::unbounded_channel();
+    let store = Arc::new(Mutex::new(Store::new(false)));
+    let mut pump = Pump::new(&stream.root, received, store, taps);
+    for packet in description(root, 1) {
+        pump.parser.push_packet(&packet).expect("a record");
+    }
+    let (sink, batches) = Sink::batches(8, everything());
+    pump.batches.push(sink);
+    let packet = |first| Queued::Item(Received::Packet(samples(first, root)));
+    assert!(pump.take(packet(0)).is_none());
+    assert!(pump.take(Queued::Gap(3)).is_none());
+    assert!(pump.take(packet(4)).is_none());
+    assert!(pump.take(packet(7)).is_none());
+    let lost: Vec<_> = std::iter::from_fn(|| batches.try_recv().ok().flatten())
+        .filter_map(|batch| batch.boundary().and_then(|b| b.loss.clone()))
+        .map(|loss| (loss.samples, loss.dropped_samples, loss.skipped_samples()))
+        .collect();
+    assert_eq!(lost, [(3, 3, 0), (2, 0, 2)]);
 }
 
 /// A disconnect status reaches the pump ahead of the proxy's metadata of
@@ -766,12 +828,48 @@ fn a_batch_lane_carries_each_streams_dropped_batches_onto_its_next_batch() {
         expected: Some(SampleNumber::new(1)),
         dropped_batches,
         dropped_samples: samples,
+        link_samples: 0,
+        proxy_samples: 0,
     };
     assert_eq!(loss(&batch_a), Some(lost(2, 2)));
     assert_eq!(loss(&batch_b), Some(lost(1, 1)));
     assert_eq!(gaps_a + gaps_b, 3, "the gaps count every batch dropped");
     assert_eq!(batch_a.boundary().unwrap().change, None);
     assert_eq!(batch_a.generations(), generations);
+}
+
+/// What a batch a lane dropped said was lost before it, and where, reaches
+/// the next batch the lane queues with the rows of the dropped batch, each
+/// row counted in one place.
+#[test]
+fn a_batch_lane_carries_where_the_rows_before_a_dropped_batch_went() {
+    let root = DeviceRoute::root();
+    let mut parser = described(&[root]);
+    let (mut lane, queue) = BatchLane::new(1);
+    assert!(lane.send(parse(&mut parser, &samples(0, root))));
+    // The proxy dropped two packets, and the lane drops the batch after.
+    parser
+        .push_packet(&Packet::dropped(1, 2).with_route(root))
+        .expect("a count");
+    assert!(lane.send(parse(&mut parser, &samples(3, root))));
+    next_batch(&queue);
+    // The device skipped one row before the batch the lane queues next.
+    assert!(lane.send(parse(&mut parser, &samples(5, root))));
+    let (gaps, batch) = next_batch(&queue);
+    let loss = batch.boundary().and_then(|b| b.loss.clone());
+    assert_eq!(gaps, 1);
+    assert_eq!(
+        loss,
+        Some(Loss {
+            samples: 4,
+            expected: Some(SampleNumber::new(1)),
+            dropped_batches: 1,
+            dropped_samples: 1,
+            link_samples: 0,
+            proxy_samples: 2,
+        })
+    );
+    assert_eq!(loss.map(|loss| loss.skipped_samples()), Some(1));
 }
 
 /// The change of a batch a lane dropped reaches the next batch it
@@ -834,6 +932,8 @@ fn a_batch_lane_that_dropped_a_streams_start_starts_it_with_the_loss() {
             expected: None,
             dropped_batches: 1,
             dropped_samples: 1,
+            link_samples: 0,
+            proxy_samples: 0,
         })
     );
 }

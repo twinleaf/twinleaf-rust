@@ -28,10 +28,14 @@
 //! The connection's queue is the one place samples wait for the hub, and
 //! the one bound on them. It holds 1024 batches, and drops those that come
 //! while it is full, so the proxy's connection never waits on the hub. The
-//! batch after says how many rows of its stream the queue dropped, and the
-//! hub counts them by stream. The hub's thread runs at the priority the
-//! threads that carry packets do, so other work on a busy machine does not
-//! keep it from the queue.
+//! hub's thread runs at the priority the threads that carry packets do, so
+//! other work on a busy machine does not keep it from the queue.
+//!
+//! Each batch says what was lost before it and where, the rows its device
+//! skipped, those lost with its link down, those the proxy dropped for the
+//! hub's connection and those the connection's queue dropped. The hub
+//! counts them by device and stream in its [`Losses`], with each drop of a
+//! device's link, and sends every page the counts each second they grew.
 //!
 //! A run lasts across lost samples, and [`Run::boundaries`] says where they
 //! fell. The hub splits the points it sends there, so the page lifts the pen.
@@ -45,6 +49,7 @@ use crate::captures::{Captures, Outbox, Want};
 use crate::devices::Devices;
 use crate::export::ExportTrace;
 use crate::feed::Feed;
+use crate::loss::Losses;
 use crate::protocol::{self, Frame, Message, MountInfo, Rows, TraceInfo, Window, WindowChunk};
 use crate::pyramid::{self, Level, Point, Pyramid, Slice};
 use crate::wire::{encode, encode_spectra, split_at_breaks, Chunk, Spectrum};
@@ -148,10 +153,9 @@ pub(crate) struct Hub {
     /// The number of the newest change of decimation, so the replay of an
     /// older one is dropped.
     decimation: u64,
-    /// The rows of each stream the connection's queue dropped while the hub
-    /// was behind, and how many of them all the log has said.
-    dropped: HashMap<StreamKey, u64>,
-    dropped_logged: u64,
+    /// What was lost of each device and stream before the hub held it, which
+    /// the watchers of the devices add each drop of a link to.
+    losses: Arc<Losses>,
 }
 
 /// A `memory` message as a page shows it: its bytes, budget, seconds,
@@ -199,6 +203,8 @@ pub(crate) struct Live {
     /// The hub's thread, which alone holds the hub.
     mailbox: flume::Sender<Job>,
     pub(crate) devices: Arc<Devices>,
+    /// What was lost of each device, which the hub's thread sends.
+    losses: Arc<Losses>,
     /// The tree the connection sees, which the page's calls go through.
     pub(crate) tree: DeviceTree,
     /// The captures the pages ask for.
@@ -270,7 +276,14 @@ impl Live {
                 })
                 .collect()
         });
-        crate::devices::watch(&connection, mounts, devices.clone(), runtime);
+        let losses = hub.losses.clone();
+        crate::devices::watch(
+            &connection,
+            mounts,
+            devices.clone(),
+            losses.clone(),
+            runtime,
+        );
         let captures = Captures::new(devices.clone(), &tree, runtime);
         let end = End {
             connection: connection.clone(),
@@ -292,6 +305,7 @@ impl Live {
             id: id.to_string(),
             mailbox,
             devices,
+            losses,
             tree,
             captures,
             next_page: AtomicU64::new(0),
@@ -399,12 +413,15 @@ impl Live {
     }
 
     /// What a page needs to show this hub from scratch, and the receiver of
-    /// everything sent after it. The hub's thread takes both in one job, so
-    /// no point is missed or doubled. The devices' messages each replace the
-    /// last of their kind, so one heard twice does no harm, and they are
-    /// taken after subscribing.
+    /// everything sent after it. `behind` is how many changes the page fell
+    /// behind, when the snapshot comes in their place, and 0 as the page
+    /// connects. The hub's thread takes both in one job, so no point is
+    /// missed or doubled. The messages of the devices and of what was lost
+    /// each replace the last of their kind, so one heard twice does no
+    /// harm, and they are taken after subscribing.
     pub(crate) async fn snapshot(
         &self,
+        behind: u64,
     ) -> Result<(Vec<Frame>, broadcast::Receiver<Arc<Frame>>), Ended> {
         let (hub, seq, rx) = self
             .ask("snapshot", |hub| {
@@ -415,11 +432,37 @@ impl Live {
         let mut frames = vec![Message::Hub {
             id: self.id.clone(),
             seq,
+            behind,
         }
         .frame()];
         frames.extend(hub);
         frames.extend(self.devices.snapshot());
+        frames.extend(self.losses.snapshot());
         Ok((frames, rx))
+    }
+}
+
+impl Live {
+    /// The frames a page is sent for `heard`, what its receiver of changes
+    /// gave it: the change, or, for a page that fell so far behind that the
+    /// channel dropped changes it had not read, a snapshot in their place,
+    /// which says how many they were. `changes` then hears what comes after
+    /// the snapshot. `None` once the hub has ended.
+    pub(crate) async fn frames_for(
+        &self,
+        heard: Result<Arc<Frame>, broadcast::error::RecvError>,
+        changes: &mut broadcast::Receiver<Arc<Frame>>,
+    ) -> Option<Vec<Arc<Frame>>> {
+        match heard {
+            Ok(frame) => Some(vec![frame]),
+            Err(broadcast::error::RecvError::Lagged(behind)) => {
+                log::debug!("A page fell {behind} frames behind and is sent a snapshot");
+                let (snapshot, again) = self.snapshot(behind).await.ok()?;
+                *changes = again;
+                Some(snapshot.into_iter().map(Arc::new).collect())
+            }
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
     }
 }
 
@@ -530,7 +573,7 @@ fn run(mut hub: Hub, samples: &Receiver<SampleBatch>, mail: &flume::Receiver<Job
         if last_memory.elapsed() >= MEMORY_EVERY {
             last_memory = Instant::now();
             timed("memory", || hub.send_memory());
-            hub.log_dropped();
+            hub.losses.send_changed();
         }
     }
 }
@@ -560,6 +603,7 @@ fn gap_times(run: Option<&Run>) -> Vec<f64> {
 
 impl Hub {
     fn new() -> Hub {
+        let feed = Feed::new();
         Hub {
             buffer: {
                 let mut buffer = Buffer::with_budget(RAW_BYTES);
@@ -573,12 +617,11 @@ impl Hub {
             held: None,
             holders: BTreeSet::new(),
             memory_sent: None,
-            feed: Feed::new(),
+            losses: Losses::new(feed.clone()),
+            feed,
             history_seconds: RAW_SECONDS,
             mailbox: None,
             decimation: 0,
-            dropped: HashMap::new(),
-            dropped_logged: 0,
         }
     }
 
@@ -595,13 +638,7 @@ impl Hub {
     }
 
     fn ingest(&mut self, batch: &SampleBatch) {
-        let loss = batch.boundary().and_then(|boundary| boundary.loss.as_ref());
-        if let Some(rows) = loss
-            .map(|loss| loss.dropped_samples)
-            .filter(|&rows| rows > 0)
-        {
-            *self.dropped.entry(batch.stream_key()).or_default() += rows;
-        }
+        self.losses.count(batch);
         if batch.is_empty() {
             return;
         }
@@ -610,17 +647,6 @@ impl Hub {
         // costs more, and gives up its oldest to stay within the room left.
         self.trim_held();
         self.register(batch);
-    }
-
-    /// Logs how many rows the connection's queue dropped since the log last
-    /// said, if any.
-    fn log_dropped(&mut self) {
-        let dropped: u64 = self.dropped.values().sum();
-        if dropped > self.dropped_logged {
-            let rows = dropped - self.dropped_logged;
-            log::warn!("The web page's hub fell behind and dropped {rows} samples");
-            self.dropped_logged = dropped;
-        }
     }
 
     /// Adds a trace for each float column not seen before.
@@ -1381,8 +1407,14 @@ mod tests {
 
     /// A stream of one f32 column at `rate` Hz, as its device describes it.
     fn parser_at(rate: u32) -> PacketParser {
-        let (id, route) = (StreamId::new(1), DeviceRoute::root());
         let mut parser = PacketParser::new(false);
+        describe(&mut parser, rate);
+        parser
+    }
+
+    /// Tells `parser` of the stream, at `rate` Hz, as its device describes it.
+    fn describe(parser: &mut PacketParser, rate: u32) {
+        let (id, route) = (StreamId::new(1), DeviceRoute::root());
         for record in [
             data::Metadata::Device(data::Device {
                 session: SessionId::new(1),
@@ -1414,7 +1446,6 @@ mod tests {
                 .push_packet(&Packet::metadata(record, data::MetadataFlags::UPDATE, route).unwrap())
                 .unwrap();
         }
-        parser
     }
 
     /// Samples `first..first + n` of the stream, each its own number, in
@@ -1643,39 +1674,113 @@ mod tests {
         assert_eq!(lines[1], "1,99");
     }
 
+    /// The simulated device, which streams 5000 rows a second and drops
+    /// none, behind a proxy of the test's own, and a hub over a connection
+    /// to it.
+    struct Fed {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        proxy: twinleaf::proxy::Proxy,
+        live: Live,
+    }
+
+    impl Drop for Fed {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.live.retire();
+            self.proxy.shutdown();
+        }
+    }
+
+    impl Fed {
+        const RATE: f64 = 5000.0;
+
+        fn start() -> Fed {
+            use twinleaf::proxy::{HostOptions, Mount, Proxy};
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let url = twinleaf_tools::tools::simulate::serve(
+                &["--no-drop", "--samplerate", "5000"],
+                stop.clone(),
+            );
+            let root = DeviceRoute::root();
+            let proxy = Proxy::host(HostOptions {
+                port: 0,
+                name: "a test".to_string(),
+                default: Some(Layout {
+                    mounts: vec![Mount {
+                        url,
+                        source: root,
+                        prefix: root,
+                    }],
+                }),
+                ..HostOptions::default()
+            })
+            .unwrap();
+            let connection = Connection::open(&proxy.endpoint()).unwrap();
+            let runtime = tokio::runtime::Handle::current();
+            let live = Live::over(connection, None, &runtime).unwrap();
+            Fed { stop, proxy, live }
+        }
+    }
+
+    /// The next message of type `kind` among `frames`, then `changes`, that
+    /// `wanted` accepts.
+    async fn next_message(
+        frames: Vec<Frame>,
+        changes: &mut broadcast::Receiver<Arc<Frame>>,
+        kind: &str,
+        wanted: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let wait = Duration::from_secs(30);
+        let found = message_within(wait, frames, changes, kind, wanted).await;
+        found.unwrap_or_else(|| panic!("no {kind} message came"))
+    }
+
+    /// The next message of type `kind` among `frames`, then `changes`, that
+    /// `wanted` accepts, or `None` once `wait` has passed.
+    async fn message_within(
+        wait: Duration,
+        frames: Vec<Frame>,
+        changes: &mut broadcast::Receiver<Arc<Frame>>,
+        kind: &str,
+        wanted: impl Fn(&serde_json::Value) -> bool,
+    ) -> Option<serde_json::Value> {
+        let wanted = |frame: &Frame| {
+            let Frame::Text(text) = frame else {
+                return None;
+            };
+            let message: serde_json::Value = serde_json::from_str(text).unwrap();
+            (message["type"] == kind && wanted(&message)).then_some(message)
+        };
+        if let Some(message) = frames.iter().find_map(wanted) {
+            return Some(message);
+        }
+        let found = async {
+            loop {
+                match changes.recv().await {
+                    Ok(frame) => {
+                        if let Some(message) = wanted(&frame) {
+                            return message;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => panic!("the hub ended"),
+                }
+            }
+        };
+        tokio::time::timeout(wait, found).await.ok()
+    }
+
     /// A hub held up for longer than its connection's queue lasts counts
-    /// every row the queue dropped. The simulated device streams 5000 rows a
-    /// second and drops none, and the queue holds 1024 batches, under a
-    /// second of them. So of the rows the stream's time spans, each is in
-    /// the history or counted lost, and the hub's count is what the queue
-    /// dropped.
+    /// every row the queue dropped, and tells the pages. The queue holds
+    /// 1024 batches, under a second of the device's. So of the rows the
+    /// stream's time spans, each is in the history or counted lost, and the
+    /// hub's count, which its `loss` message says, is what the queue
+    /// dropped. The hub is held up again if the device's link was down
+    /// meanwhile, as on a busy machine, and the queue did not fill.
     #[tokio::test]
     async fn a_hub_held_up_counts_every_row_its_queue_dropped() {
-        use std::sync::atomic::AtomicBool;
-        use twinleaf::proxy::{HostOptions, Mount, Proxy};
-        const RATE: f64 = 5000.0;
-        let stop = Arc::new(AtomicBool::new(false));
-        let url = twinleaf_tools::tools::simulate::serve(
-            &["--no-drop", "--samplerate", "5000"],
-            stop.clone(),
-        );
-        let root = DeviceRoute::root();
-        let proxy = Proxy::host(HostOptions {
-            port: 0,
-            name: "a test".to_string(),
-            default: Some(Layout {
-                mounts: vec![Mount {
-                    url,
-                    source: root,
-                    prefix: root,
-                }],
-            }),
-            ..HostOptions::default()
-        })
-        .unwrap();
-        let connection = Connection::open(&proxy.endpoint()).unwrap();
-        let live = Live::over(connection, None, &tokio::runtime::Handle::current()).unwrap();
-        let stream = StreamKey::new(root, StreamId::new(1));
+        let fed = Fed::start();
+        let stream = StreamKey::new(DeviceRoute::root(), StreamId::new(1));
         let held = move |hub: &mut Hub| {
             let run = hub.buffer.run(&stream)?;
             let losses = run.boundaries().filter_map(|(_, _, b)| b.loss.clone());
@@ -1684,24 +1789,122 @@ mod tests {
             });
             let rows = run.retained_rows();
             let span = run.last_timestamp()? - run.first_timestamp()?;
-            let counted = hub.dropped.get(&stream).copied().unwrap_or(0);
+            let counted = hub.losses.of(stream.route, "sine").hub;
             Some((rows.end - rows.start, span, lost, dropped, counted))
         };
         // The stream flows before the hub is held up.
         let started = Instant::now();
-        while live.ask("held", held).await.unwrap().is_none() {
+        while fed.live.ask("held", held).await.unwrap().is_none() {
             assert!(started.elapsed() < Duration::from_secs(30), "no samples");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        live.tell("held up", |_| std::thread::sleep(Duration::from_secs(3)));
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let (rows, span, lost, dropped, counted) = live.ask("held", held).await.unwrap().unwrap();
-        stop.store(true, Ordering::Relaxed);
-        live.retire();
-        proxy.shutdown();
+        let (_, mut changes) = fed.live.snapshot(0).await.unwrap();
+        let dropped = |loss: &serde_json::Value| loss["streams"]["sine"]["hub"].as_u64() > Some(0);
+        let mut told = None;
+        for _ in 0..5 {
+            fed.live
+                .tell("held up", |_| std::thread::sleep(Duration::from_secs(3)));
+            let wait = Duration::from_secs(6);
+            told = message_within(wait, Vec::new(), &mut changes, "loss", dropped).await;
+            if told.is_some() {
+                break;
+            }
+        }
+        let told = told.expect("the queue held 3 s of batches");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (rows, span, lost, dropped, counted) =
+            fed.live.ask("held", held).await.unwrap().unwrap();
         assert!(dropped > 0, "the queue held 3 s of batches");
         assert_eq!(counted, dropped, "the hub counted what its queue dropped");
-        assert_eq!(rows + lost, (span * RATE).round() as u64 + 1);
+        assert_eq!(rows + lost, (span * Fed::RATE).round() as u64 + 1);
+        assert_eq!(told["route"], "/");
+        assert_eq!(
+            told["streams"]["sine"]["hub"], dropped,
+            "the pages were told"
+        );
+    }
+
+    /// A page that fell further behind than the channel of changes holds
+    /// is sent a snapshot in place of the changes it missed, which says how
+    /// many they were, and hears every change after the snapshot.
+    #[tokio::test]
+    async fn a_page_that_fell_behind_is_sent_a_snapshot_that_says_how_far() {
+        let fed = Fed::start();
+        let (_, mut changes) = fed.live.snapshot(0).await.unwrap();
+        let sent = 3000;
+        let flood = move |hub: &mut Hub| {
+            for _ in 0..sent {
+                hub.feed.message(&Message::Clear);
+            }
+        };
+        fed.live.ask("flood", flood).await.unwrap();
+        let heard = changes.recv().await;
+        let Err(broadcast::error::RecvError::Lagged(behind)) = heard else {
+            panic!("the page kept up: {heard:?}");
+        };
+        assert!(behind >= sent - 1024, "{behind}");
+        let frames = fed.live.frames_for(heard, &mut changes).await.unwrap();
+        let Frame::Text(first) = &*frames[0] else {
+            panic!("a snapshot starts with its hub");
+        };
+        let hub: serde_json::Value = serde_json::from_str(first).unwrap();
+        assert_eq!(hub["type"], "hub");
+        assert_eq!(hub["behind"], behind);
+        // The next change is the one after the snapshot's last.
+        fed.live
+            .tell("one more", |hub| hub.feed.message(&Message::Clear));
+        let next = next_message(Vec::new(), &mut changes, "clear", |_| true).await;
+        assert!(next["seq"].as_u64() > hub["seq"].as_u64());
+
+        let kept = changes.recv().await;
+        let one = fed
+            .live
+            .frames_for(kept.clone(), &mut changes)
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 1, "a change the page kept up with goes as it is");
+        assert_eq!(*one[0], *kept.unwrap());
+    }
+
+    /// A device whose link drops is counted once, by the watcher of the
+    /// device, and the hub's thread tells the pages, with how long the link
+    /// has been down so far.
+    #[tokio::test]
+    async fn a_device_whose_link_drops_is_counted_and_the_pages_are_told() {
+        let fed = Fed::start();
+        let (snapshot, mut changes) = fed.live.snapshot(0).await.unwrap();
+        next_message(snapshot, &mut changes, "device", |device| {
+            device["presence"] == "alive"
+        })
+        .await;
+        // On a busy machine the link may have dropped before, and come back.
+        let before = fed.live.losses.drops(DeviceRoute::root());
+        fed.stop.store(true, Ordering::Relaxed);
+        let stopped = Instant::now();
+        let dropped = |loss: &serde_json::Value| loss["link"]["times"].as_u64() > Some(before);
+        let mut told = next_message(Vec::new(), &mut changes, "loss", dropped).await;
+        while stopped.elapsed() < Duration::from_secs(3) {
+            told = next_message(Vec::new(), &mut changes, "loss", dropped).await;
+        }
+        assert_eq!(told["route"], "/");
+        assert_eq!(told["link"]["times"], before + 1);
+        let later = next_message(Vec::new(), &mut changes, "loss", dropped).await;
+        assert_eq!(
+            later["link"]["times"],
+            before + 1,
+            "a link that is down drops once"
+        );
+        assert!(
+            later["link"]["seconds"].as_f64() > told["link"]["seconds"].as_f64(),
+            "the outage grows while the link is down"
+        );
+        let (again, _) = fed.live.snapshot(0).await.unwrap();
+        let held = next_message(again, &mut changes, "loss", |_| true).await;
+        assert_eq!(
+            held["link"]["times"],
+            before + 1,
+            "a snapshot holds the counts"
+        );
     }
 
     #[test]
@@ -1764,6 +1967,66 @@ mod tests {
         hub.flush();
         let next = points(&heard(&mut later), 0);
         assert!(next.first().unwrap().0 > points(&sent, 0).last().unwrap().0);
+    }
+
+    /// The hub counts the rows each batch says were lost before it by where
+    /// they went: skipped with nothing said, the proxy's after its count of
+    /// what it dropped, the hub's after its connection dropped a packet, and
+    /// the link's after the link was lost. The pages are told once, and
+    /// again only when a count grows.
+    #[test]
+    fn the_hub_counts_what_each_batch_says_was_lost_by_where() {
+        use crate::protocol::Lost;
+        let mut hub = Hub::new();
+        let mut rx = hub.feed.subscribe().1;
+        let mut parser = parser();
+        let root = DeviceRoute::root();
+        let mut feed = |parser: &mut PacketParser, first: u32| {
+            for batch in samples(parser, first, 10) {
+                hub.ingest(&batch);
+            }
+            hub.losses.of(root, "field")
+        };
+        let lost = |skipped, link, proxy, hub| Lost {
+            skipped,
+            link,
+            proxy,
+            hub,
+        };
+        assert_eq!(feed(&mut parser, 0), lost(0, 0, 0, 0));
+        assert_eq!(feed(&mut parser, 15), lost(5, 0, 0, 0));
+        parser
+            .push_packet(&Packet::dropped(1, 1).with_route(root))
+            .unwrap();
+        assert_eq!(feed(&mut parser, 32), lost(5, 0, 7, 0));
+        parser.note_dropped_packets();
+        assert_eq!(feed(&mut parser, 50), lost(5, 0, 7, 8));
+        let link = Packet::link(twinleaf::tio::packet::LinkStatus::SensorDisconnected);
+        parser.push_packet(&link.with_route(root)).unwrap();
+        describe(&mut parser, 100);
+        assert_eq!(feed(&mut parser, 63), lost(5, 3, 7, 8));
+        assert_eq!(feed(&mut parser, 73), lost(5, 3, 7, 8));
+
+        let told = |hub: &Hub, rx: &mut broadcast::Receiver<Arc<Frame>>| {
+            hub.losses.send_changed();
+            let sent: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|frame| match &*frame {
+                    Frame::Text(text) => serde_json::from_str(text).ok(),
+                    Frame::Binary(_) => None,
+                })
+                .filter(|message: &serde_json::Value| message["type"] == "loss")
+                .collect();
+            sent
+        };
+        let sent = told(&hub, &mut rx);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]["streams"],
+            serde_json::json!({"field": {"skipped": 5, "link": 3, "proxy": 7, "hub": 8}})
+        );
+        assert!(told(&hub, &mut rx).is_empty(), "nothing more was lost");
+        let in_snapshot = hub.losses.snapshot();
+        assert_eq!(in_snapshot.len(), 1, "a snapshot holds the counts");
     }
 
     #[test]

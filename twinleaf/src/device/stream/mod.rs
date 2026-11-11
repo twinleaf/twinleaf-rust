@@ -276,7 +276,9 @@ impl Pump {
                 self.watches.remove(&error.req_id.value());
                 return;
             }
-            ProxyRx::Link(_) | ProxyRx::Alive | ProxyRx::Unknown(..) => return,
+            ProxyRx::Link(_) | ProxyRx::Alive | ProxyRx::Dropped { .. } | ProxyRx::Unknown(..) => {
+                return
+            }
         };
         let Some((watch, joined)) = self.watches.get_mut(&id) else {
             return;
@@ -298,7 +300,10 @@ impl Pump {
 
     /// Takes one entry of the inlet, a packet, a reply to a watch or the
     /// loss of the socket, or reports the gap the session left. Returns why
-    /// the session ended, at its end. The packets of a route a tap covers
+    /// the session ended, at its end. The proxy's count of the samples it
+    /// dropped for this connection goes to the parser as a packet does, and
+    /// a gap is told to it, so the samples after say where the missing ones
+    /// went. The packets of a route a tap covers
     /// reach the parser, but for the device's own metadata records, as the
     /// parser takes metadata from the proxy's metadata updates alone. Until
     /// the first metadata update of a device, the parser waits for metadata
@@ -310,9 +315,10 @@ impl Pump {
                 self.lose();
                 return None;
             }
-            // The parser marks the gap in the samples.
+            // The parser marks the gap in the samples, as this connection's.
             Queued::Gap(lost) => {
                 log::warn!("the stream's inlet overflowed and {lost} packets were lost");
+                self.parser.note_dropped_packets();
                 return None;
             }
             Queued::Ended(end) => return Some(end),

@@ -52,6 +52,7 @@ The server sends no CORS headers, and hyper's `header_read_timeout` is set.
 | `feed` | the channel of changes, which numbers each one |
 | `hub` | `Live` (one connection to the proxy, its `Hub` of traces, its devices) and how it ends |
 | `devices` | each device's newest identity, RPC table, settings and captures; calls and reads |
+| `loss` | what was lost of each device and stream before the hub's history held it, by where |
 | `captures` | the captures pages ask for: the task that takes each capture RPC's, and each page's outbox |
 | `routes` | the routes, which hub is current, mount order |
 | `discover` | the device picker's scan |
@@ -69,16 +70,19 @@ The page holds one hub's state and comes to hold it one way, from a
 snapshot:
 
 1. **Snapshot**, as a socket opens and whenever a page fell more than 1024
-   changes behind (`Lagged`): `hub {id, seq}`, a `trace` per trace, one
+   changes behind (`Lagged`): `hub {id, seq, behind}`, a `trace` per trace, one
    points frame of all history sent so far, `config`, `memory`, `routes`, then each
    listed device's newest `device`, `table`, `settings`, `captures` and a
-   `capture` per capture RPC the hub has taken. The page drops
-   everything of any hub and builds a new `Session` from it.
+   `capture` per capture RPC the hub has taken, and a `loss` per device
+   that lost anything. The page drops
+   everything of any hub and builds a new `Session` from it. `behind` is
+   how many changes the page fell behind, 0 as a socket opens.
 2. **Changes**, each numbered `seq` one more than the last (`feed.rs`):
    points frames (every 16 ms), one spectra frame per round (every 100 ms),
    `trace` for a new column, device messages, `memory` when what the buffer
    holds or may hold changed (checked each second: `bytes` of `budget`, the
-   `seconds` held of `max_age`, and the bytes per second `rate`), and on a
+   `seconds` held of `max_age`, and the bytes per second `rate`), `loss`
+   when a device lost more (checked each second), and on a
    decimation change `clear`, the history again and `config`.
 3. **Gaps** go back through 1: a change numbered other than the next, or a
    frame naming a trace the session does not have, makes the page close its
@@ -95,6 +99,33 @@ open tab shows as spectra, after each snapshot and when that set changes.
 The hub estimates and sends only the spectra some page names; a page's
 names go when its socket does. It sends `hold {on}` while it holds a plot
 paused, and the three capture messages below.
+
+### What was lost
+
+A sample can be lost in five places between a device and a plot. Each
+has its own count, and the page is told of each apart.
+
+| Where | Counted by | Reaches the page as |
+|---|---|---|
+| The device skipped it, or its link lost it while it stayed up | the parser, from the sample numbers (`Loss::skipped_samples`) | `loss.streams[stream].skipped` |
+| The link to the device was down, or the hub's connection to the proxy was | the proxy's link, which says so in order with the samples, and the device's presence | `loss.link {times, seconds}`, `loss.streams[stream].link` |
+| The proxy dropped it from its queue for the hub's connection (1 MiB of samples) | the proxy's outbox, which tells the client in a `PROXY_RX` packet of kind 4, `Dropped {stream_id, packets}`, ahead of the samples that follow | `loss.streams[stream].proxy` |
+| The hub's connection dropped it: its queue of 1024 batches was full, or its inlet of 32768 packets was | the connection's queue (`Loss::dropped_samples`) | `loss.streams[stream].hub` |
+| The page fell more than 1024 changes behind the hub | the page's socket task | `hub.behind` of the snapshot sent in their place |
+
+`loss {route, link: {times, seconds}, streams: {name: {skipped, link,
+proxy, hub}}}` is one device's counts since the hub started, the newest
+value as a device's other messages are: `streams` by the stream's name,
+each count in rows, `link.times` how often the device's link dropped after
+the hub first heard it, and `link.seconds` how long it was down in all, to
+a tenth, up to now while it is down. The hub's thread sends it at most once
+a second, when it changed. A row is in one count only. The rows lost
+before a stream's next rows are counted where the parser was told they
+went since the stream's last rows: with the link, if it was lost; else as
+the hub's, if its connection had no room for a packet; else as the
+proxy's, if the proxy said it dropped packets of that stream; else as
+skipped. A device that restarts while its link is down sends rows that
+say no count, so `link.times` says what `streams` cannot.
 
 ### Captures
 
@@ -249,7 +280,8 @@ canvas and its WebGL layer.
    (`twinleaf::device::raise_thread_priority`), takes it from that queue. A
    queue that fills drops the batches that come, and the next batch of
    each stream says how many rows went (`Loss::dropped_samples`), which the
-   hub counts by stream. The hub's
+   hub counts by device and stream with what was lost before it
+   (`loss.rs`). The hub's
    thread puts the batch in the `Buffer` of raw rows (10 min of each stream in at
    most 1 GB at first, as `/api/history` sets; past the budget the chunk
    that arrived first goes) and makes a trace of each new float column

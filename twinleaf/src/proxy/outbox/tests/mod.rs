@@ -100,6 +100,13 @@
 //!     asks that the client be let go or stops the proxy leaves the writer
 //!     woken. Source, [`Outbox`], which wakes the client's task whenever it
 //!     has something to write. Rules out a stop that never wakes the writer.
+//! 14. The client is told, model based. Between the urgent queue and the
+//!     stream, a take brings one count for each stream that samples went of
+//!     since the last take, in the order of the streams, which is how many
+//!     of that stream's samples went. Source, the module doc. Rules out a
+//!     count behind the samples that follow the missing ones, one count for
+//!     all streams, and a take that says samples went and tells the client
+//!     nothing.
 //!
 //! # Generator obligations
 //!
@@ -149,7 +156,7 @@ use futures_util::FutureExt;
 use proptest::prelude::*;
 use proptest::strategy::Union;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -306,6 +313,8 @@ enum Key {
     Answer(u32),
     Bytes(Vec<u8>),
     Stopped,
+    /// The count of the samples of a stream that went.
+    Dropped(u8, u32),
 }
 
 /// Returns the key of `packet`.
@@ -316,6 +325,9 @@ fn key(packet: &Packet) -> Key {
             Key::Beat(beat.session().expect("a session").value())
         }
         Payload::ProxyRx(ProxyRx::Link(LinkStatus::Stopped)) => Key::Stopped,
+        Payload::ProxyRx(ProxyRx::Dropped { stream_id, packets }) => {
+            Key::Dropped(stream_id, packets)
+        }
         Payload::ProxyRx(ProxyRx::Reply(reply)) if reply.value.starts_with(ANSWER) => {
             let tag = reply.value[ANSWER.len()..ANSWER.len() + 4].try_into();
             Key::Answer(u32::from_le_bytes(tag.expect("a tag")))
@@ -333,6 +345,7 @@ impl std::fmt::Debug for Key {
             Key::Answer(tag) => write!(f, "answer {tag}"),
             Key::Bytes(bytes) => write!(f, "a part or record of {} bytes", bytes.len()),
             Key::Stopped => write!(f, "Stopped"),
+            Key::Dropped(stream, count) => write!(f, "{count} dropped of stream {stream}"),
         }
     }
 }
@@ -345,6 +358,8 @@ struct Item {
     bytes: usize,
     /// How many packets the model took before it.
     seq: usize,
+    /// The stream a sample is of.
+    stream: Option<u8>,
 }
 
 impl Item {
@@ -354,6 +369,7 @@ impl Item {
             kind,
             bytes: packet.as_bytes().len(),
             seq: 0,
+            stream: packet.ptype().stream_id(),
         }
     }
 
@@ -498,9 +514,11 @@ impl Model {
     }
 
     /// Drops the `dropped` oldest samples on the stream, as a take says they
-    /// went, and checks them against the budget by laws 5 and 6.
-    fn drop_oldest(&mut self, dropped: u64) -> Result<(), String> {
+    /// went, and checks them against the budget by laws 5 and 6. Returns how
+    /// many went of each stream.
+    fn drop_oldest(&mut self, dropped: u64) -> Result<BTreeMap<u8, u32>, String> {
         let mut newest = None;
+        let mut gone_of = BTreeMap::new();
         for _ in 0..dropped {
             let Some(at) = self.stream.iter().position(|i| i.kind == Kind::Sample) else {
                 return Err(format!(
@@ -510,6 +528,9 @@ impl Model {
             let gone = self.stream.remove(at).expect("the sample found");
             self.sample_bytes -= gone.bytes;
             newest = Some(gone.bytes);
+            *gone_of
+                .entry(gone.stream.expect("a sample's stream"))
+                .or_default() += 1;
         }
         if self.sample_bytes > SAMPLE_BUDGET {
             return Err(format!(
@@ -525,10 +546,10 @@ impl Model {
                 ));
             }
         }
-        Ok(())
+        Ok(gone_of)
     }
 
-    /// Checks `taken` against laws 1 to 6, 9 and 10, takes what it brought
+    /// Checks `taken` against laws 1 to 6, 9, 10 and 14, takes what it brought
     /// out of the model, and notes the classes it reached in `classes`.
     fn take(&mut self, taken: &Taken, classes: &mut Classes) -> Result<(), String> {
         let due = self.end.take();
@@ -539,7 +560,7 @@ impl Model {
             ));
         }
         classes.too_slow |= matches!(taken.end, Some(ClientError::TooSlow));
-        self.drop_oldest(taken.dropped)?;
+        let gone_of = self.drop_oldest(taken.dropped)?;
         classes.eviction |= taken.dropped > 0;
 
         let mut packets = taken.packets.iter().map(key).peekable();
@@ -555,6 +576,14 @@ impl Model {
                 ));
             }
             self.release(&item);
+        }
+        for (stream, count) in gone_of {
+            let brought = packets.next();
+            if brought != Some(Key::Dropped(stream, count)) {
+                return Err(format!(
+                    "law 14, the take brought {brought:?} where the count of the {count} samples that went of stream {stream} was due"
+                ));
+            }
         }
 
         let (mut share, mut brought) = (0, 0);

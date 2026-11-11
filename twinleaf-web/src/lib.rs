@@ -27,6 +27,7 @@ mod export;
 mod feed;
 mod guard;
 mod hub;
+mod loss;
 mod protocol;
 mod pyramid;
 mod routes;

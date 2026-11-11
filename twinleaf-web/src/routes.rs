@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
 use twinleaf::proxy::{Layout, Mount};
 use twinleaf::DeviceRoute;
 
@@ -95,7 +95,8 @@ async fn ws(upgrade: WebSocketUpgrade, State(hubs): State<Hubs>) -> Response {
 /// Sends a page the hub's snapshot, then every change the hub sends, until
 /// the page goes or the hub retires. A page that falls so far behind that the
 /// channel drops changes it has not read gets a snapshot again, which
-/// replaces all it holds. What the page sends names the spectra it shows
+/// replaces all it holds and says how many changes it stands for. What the
+/// page sends names the spectra it shows
 /// and the captures it wants, and the captures it asked for go to it as
 /// the hub reads them.
 async fn client(mut socket: WebSocket, live: Arc<Live>) {
@@ -105,7 +106,7 @@ async fn client(mut socket: WebSocket, live: Arc<Live>) {
     if live.is_retired() {
         return;
     }
-    let Ok((snapshot, mut rx)) = live.snapshot().await else {
+    let Ok((snapshot, mut rx)) = live.snapshot(0).await else {
         return;
     };
     if send_all(&mut socket, &snapshot).await.is_err() {
@@ -113,16 +114,12 @@ async fn client(mut socket: WebSocket, live: Arc<Live>) {
     }
     loop {
         tokio::select! {
-            frame = rx.recv() => match frame {
-                Ok(frame) => if send(&mut socket, &frame).await.is_err() { return },
-                Err(broadcast::error::RecvError::Lagged(frames)) => {
-                    log::debug!("A page fell {frames} frames behind and is sent a snapshot");
-                    let Ok((snapshot, again)) = live.snapshot().await else { return };
-                    rx = again;
-                    if send_all(&mut socket, &snapshot).await.is_err() { return }
+            heard = rx.recv() => {
+                let Some(frames) = live.frames_for(heard, &mut rx).await else { return };
+                for frame in frames {
+                    if send(&mut socket, &frame).await.is_err() { return }
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
-            },
+            }
             _ = retired.changed() => return,
             captured = page.captures() => {
                 for frame in captured {
