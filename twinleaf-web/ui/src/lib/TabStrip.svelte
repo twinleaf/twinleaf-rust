@@ -10,9 +10,6 @@
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import IconButton from './IconButton.svelte';
   import CommandItem from './CommandItem.svelte';
-  import RiCopy from '@lucide/svelte/icons/copy';
-  import RiClose from '@lucide/svelte/icons/x';
-  import RiAdd from '@lucide/svelte/icons/plus';
   import { plotIds } from './layout.js';
   import { claim } from './keyrouter.js';
   import { prefs } from './prefs.svelte.js';
@@ -23,6 +20,8 @@
   const commands = getContext('commands');
   /** Runs tab command `id`, made on tab `tab` from one of its buttons, or with no tab from the strip's. */
   const runOn = (id, tab = null) => commands.run(id, { tab, from: 'button' });
+  /** How New layout reads, for the strip's button. */
+  const newRow = commands.row('newTab');
 
   const FLIP_MS = 150;
   let renaming = $state(null);
@@ -95,6 +94,7 @@
         <ContextMenu.Root>
           <ContextMenu.Trigger>
             {#snippet child({ props })}
+              {@const [duplicate, close] = [commands.row('duplicateTab', { tab: t.id }), commands.row('closeTab', { tab: t.id })]}
               <div
                 {...props}
                 class="tab"
@@ -125,8 +125,8 @@
                   <span title={prefs.hints ? 'Double-click to rename' : undefined}>{t.name}</span>
                   <span class="text-[11px] text-muted-foreground">{plotIds(t.layout).length}</span>
                 {/if}
-                <IconButton icon={RiCopy} label="Duplicate {t.name}" class="size-5" tabindex={-1} data-command="duplicateTab" onclick={(e) => (e.stopPropagation(), runOn('duplicateTab', t.id))} />
-                <IconButton icon={RiClose} label="Close {t.name}" class="size-5" tabindex={-1} data-command="closeTab" onclick={(e) => (e.stopPropagation(), runOn('closeTab', t.id))} />
+                <IconButton icon={duplicate.icon} label={duplicate.label} class="size-5" tabindex={-1} data-command="duplicateTab" onclick={(e) => (e.stopPropagation(), runOn('duplicateTab', t.id))} />
+                <IconButton icon={close.icon} label={close.label} class="size-5" tabindex={-1} data-command="closeTab" onclick={(e) => (e.stopPropagation(), runOn('closeTab', t.id))} />
               </div>
             {/snippet}
           </ContextMenu.Trigger>
@@ -140,5 +140,5 @@
       </div>
     {/each}
   </div>
-  <IconButton icon={RiAdd} label="New layout" variant="outline" size="icon-sm" data-command="newTab" onclick={() => runOn('newTab')} />
+  <IconButton icon={newRow.icon} label={newRow.label} variant="outline" size="icon-sm" data-command="newTab" onclick={() => runOn('newTab')} />
 </div>

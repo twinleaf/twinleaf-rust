@@ -14,7 +14,11 @@
 // palette's rows that name a signal. A tab command acts on no plot but on
 // a tab: made on a tab, from its menu, its buttons or its keys, on that
 // tab, here one that is not open; from the tab strip, on the open one.
+// Wherever a command shows, found the same way, it reads as the table
+// says: one label and one icon, a button's name and tip its label; and Zoom
+// to X1–X2 is greyed in every place until its plot has both X cursors.
 import { describe, expect, it } from 'vitest';
+import { mount, unmount } from 'svelte';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
 import { MENUS, axisPopover, closeAll, openMenu } from './harness/menus.js';
@@ -264,4 +268,122 @@ describe('a plot command', () => {
       expect([...reached.get(c.id)].sort(), c.id).toEqual(want.sort());
     }
   }, 600_000);
+
+  it('reads the same wherever it shows: one label and one icon, the table’s, in every menu, popover, button and the palette', async () => {
+    const page = await commandPage();
+    const cmds = page.plots.commands;
+    try {
+      page.ws.selection.only([page.ids[0]]);
+      await settle();
+      /** Each place a command shows, as [command, label, icon or null, where it was found], the label as it reads there. */
+      const shown = [];
+      for (const [name, open] of Object.entries(ORIGINS)) {
+        for (const k of ON_PLOT[name] ? [0, 3] : [0]) {
+          await closeAll();
+          expect(await closePalette(), 'the palette gone').toBe(true);
+          const el = await open(page, page.ids[k]);
+          expect(el, `${name} opens`).toBeTruthy();
+          const where = ON_PLOT[name] ? { on: page.ids[k] } : ON_TAB[name] ? { tab: lastTab().dataset.tab } : {};
+          for (const d of el.querySelectorAll('[data-command]')) {
+            const read = reading(d);
+            if (read) shown.push({ id: d.dataset.command, ...read, at: `${name} of ${k}`, where });
+          }
+        }
+      }
+      await closeAll();
+      await closePalette();
+      expect(shown.length, 'places a command shows').toBeGreaterThan(60);
+      const byId = Map.groupBy(shown, (s) => s.id);
+      for (const [id, places] of byId) {
+        const c = COMMANDS.find((x) => x.id === id);
+        // What the table reads, made where each was found: a submenu's trigger, or a command of no choices, with none; any other with each of its choices.
+        for (const s of places) {
+          const hows = s.sub || !c.choices ? [undefined] : c.choices(cmds.context(id, s.where)).map(([to]) => ({ to }));
+          const reads = hows.map((how) => cmds.row(id, { ...s.where, how })).map((r) => [r.label, iconName(r.icon)]);
+          expect(reads.map(([label]) => label), `${id} in ${s.at}`).toContainEqual(s.label);
+          if (s.icon) expect(reads, `${id} in ${s.at}`).toContainEqual([s.label, s.icon]);
+        }
+        // Every place that shows it with the same words shows the same picture.
+        for (const label of new Set(places.map((s) => s.label))) expect(new Set(places.filter((s) => s.label === label && s.icon).map((s) => s.icon)).size, `${id} as ${label}`).toBeLessThanOrEqual(1);
+        // A command of no choices reads one way everywhere.
+        if (!c.choices) expect([...new Set(places.map((s) => s.label))], `${id}: ${places.map((s) => s.at).join(', ')}`).toHaveLength(1);
+      }
+      // The cursor commands show in a menu and in a popover or the toolbar both.
+      for (const id of ['clearCursors', 'clearXCursors', 'clearYCursors', 'addXCursors', 'addYCursors', 'zoomToCursors']) {
+        expect(new Set(byId.get(id)?.map((s) => s.at.split(' of ')[0])).size, `${id}'s places`).toBeGreaterThanOrEqual(2);
+      }
+    } finally {
+      page.dispose();
+    }
+  }, 300_000);
+
+  it('Zoom to X1–X2 shows greyed in every place without both X cursors, and live with them', async () => {
+    // One plot, the page's width, paused over its samples: room for the readout clear of the cursors' tags, which would hide it.
+    const page = await mountPage([SIGNALS], 'rows', 1, SIGNALS);
+    try {
+      feed(page.hub);
+      await wait(300);
+      await settle();
+      const [id] = plotIds(page.ws.layout);
+      page.views.get(id).show(10, 20, clock.now());
+      page.ws.selection.only([id]);
+      for (const pair of [false, true]) {
+        editCursors(page, id, (c) => ({ ...c, x: { a: 14, b: pair ? 16 : null } }));
+        await wait(200);
+        await settle();
+        const places = [];
+        for (const name of ['the plot menu', 'the readout’s menu', 'the x axis']) {
+          await closeAll();
+          // The pointer away from the plot, where the last menu left it, so the readout shows where it is.
+          await commands.mouse([['move', 2, 2]]);
+          await settle();
+          const el = await ON_PLOT[name](page, id);
+          expect(el, `${name} opens`).toBeTruthy();
+          for (const d of naming(el, 'zoomToCursors')) places.push([name, d.matches('button') ? d.disabled : d.hasAttribute('data-disabled')]);
+        }
+        await closeAll();
+        // The readout's menu and the x axis's popover each have it, greyed without the pair; the plot's menu has none.
+        expect(places, pair ? 'with X1 and X2' : 'with X1 alone').toEqual([['the readout’s menu', !pair], ['the x axis', !pair]]);
+        // The palette lists it for the plot selected while it can be chosen, as it lists Copy table, which it can be either way.
+        page.ws.selection.only([id]);
+        await settle();
+        await pressKey('Control+k');
+        await settle();
+        const listed = (c) => !!document.querySelector(`[data-slot=command-item][data-command="${c}"]`);
+        expect([listed('zoomToCursors'), listed('copyReadout')], 'in the palette').toEqual([pair, true]);
+        expect(await closePalette()).toBe(true);
+      }
+    } finally {
+      page.dispose();
+    }
+  }, 120_000);
 });
+
+/** How a control that names a command shows it, {label, icon, sub}, the icon as its picture's name and `sub` whether it opens a submenu of the command's choices; or null for a control that sets a value of it, as a field or a picker does, or names a signal. */
+function reading(d) {
+  const c = COMMANDS.find((x) => x.id === d.dataset.command);
+  if (!c?.label) return null;
+  const icon = (svg) => [...(svg?.classList ?? [])].find((n) => n.startsWith('lucide-') && n !== 'lucide-icon') ?? null;
+  if (d.matches('[role^=menuitem], [data-slot$=-sub-trigger]')) {
+    const words = d.cloneNode(true);
+    words.querySelectorAll('.menu-value, [data-slot$=-shortcut], svg').forEach((n) => n.remove());
+    return { label: words.textContent.trim(), icon: icon(d.querySelector(':scope > svg.menu-icon')), sub: d.matches('[data-slot$=-sub-trigger]') };
+  }
+  // The palette's rows of a signal name the signal.
+  if (d.matches('[data-slot=command-item]')) return c.needs?.includes('signals') ? null : { label: d.textContent.trim(), icon: null };
+  // A button that shows a picture alone; a button of a value reads the value.
+  if (d.matches('button:not([role=combobox])') && d.querySelector('svg') && !d.textContent.trim()) return { label: d.getAttribute('aria-label'), icon: icon(d.querySelector('svg')) };
+  return null;
+}
+
+/** The name of icon component `Icon`'s picture, as it draws it. */
+const ICONS = new Map();
+function iconName(Icon) {
+  if (!Icon) return null;
+  if (!ICONS.has(Icon)) {
+    const target = document.createElement('div'), app = mount(Icon, { target });
+    ICONS.set(Icon, [...(target.querySelector('svg')?.classList ?? [])].find((n) => n.startsWith('lucide-') && n !== 'lucide-icon') ?? null);
+    unmount(app);
+  }
+  return ICONS.get(Icon);
+}

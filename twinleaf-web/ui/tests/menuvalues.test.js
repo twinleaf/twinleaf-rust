@@ -96,7 +96,7 @@ const CASES = [
     'Zoom to X1–X2': '2.000 s',
     'Clear X cursors': 'X1 14 s',
     'Clear Y cursors': '1 axis',
-    'Clear all cursors': '4 placed',
+    'Clear cursors': '4 placed',
   }],
   [['A', 'B'], 'the add-signal menu', 'A', { 'Remove every signal': '4 signals' }],
   // The Signals list's first signal is aux.triangle.

@@ -515,6 +515,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 /* A square button holding only an icon, as the popover's tools are. */
 .icon-btn { display: grid; place-items: center; width: 24px; height: 24px; flex: none; padding: 0; border: 1px solid transparent; border-radius: var(--radius); background: none; color: var(--muted-foreground); cursor: pointer; }
 .icon-btn:hover { background: var(--secondary); color: var(--foreground); }
+.icon-btn:disabled { opacity: 0.5; cursor: default; background: none; color: var(--muted-foreground); }
 .icon-btn svg { width: 14px; height: 14px; }
 .axis-range .icon-btn { border-color: var(--input); }
 /* The axis's cursors: a label, then adding and clearing them. */

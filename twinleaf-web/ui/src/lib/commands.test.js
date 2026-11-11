@@ -14,10 +14,13 @@
 // the peak the rule says, step through every peak in order and past the
 // view's edge, each as one edit and one view step, each plot of the lead's
 // kind to a peak of its own; with none to go to, they do nothing and their
-// rows say why.
+// rows say why. A command reads the same, by one label and one icon, from
+// every origin; the palette lists what the rule says of the table, and no
+// other; Window sets the views of the plots of the kind it is made on; and
+// Zoom to X1–X2 cannot be chosen until its plot has both X cursors.
 import { afterEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { COMMANDS, HOSTED, PALETTE, PLOTLESS, commandOf, commands } from './commands.js';
+import { COMMANDS, HOSTED, ORIGIN, PALETTE, PLOTLESS, commandOf, commands, listed } from './commands.js';
 import { KEYMAP, actionFor, scopeOf } from './keymap.js';
 import { KINDS } from './constants.js';
 import { SIGNAL, Selection } from './selection.svelte.js';
@@ -41,8 +44,9 @@ describe('the command table', () => {
       // A key is shown and named; a row has an icon to go with its label.
       if (c.keys) expect(c.show?.length && c.what, c.id).toBeTruthy();
       if (c.label) expect(c.icon, c.id).toBeTruthy();
-      // The palette lists it by its label, under a heading the palette has; a submenu marks one of the values it lists.
-      if (c.palette) expect(c.label && PALETTE.includes(c.palette), c.id).toBeTruthy();
+      // The palette lists every command that has a label and needs nothing of where it is made, under a heading the palette has, and no other; a submenu marks one of the values it lists.
+      expect(listed(c), c.id).toBe(!!c.label && !c.needs?.some((n) => ORIGIN.includes(n)));
+      expect(c.palette === undefined ? !listed(c) : listed(c) && PALETTE.includes(c.palette), c.id).toBe(true);
       if (c.choices || c.chosen) expect(c.label && typeof c.choices, c.id).toBe('function');
     }
   });
@@ -145,7 +149,7 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     exportTabs: () => void log.push('exportTabs'),
     importTabs: () => void log.push('importTabs'),
   };
-  return { cmds: commands(svc) };
+  return { cmds: commands(svc), svc };
 }
 
 const runs = [];
@@ -235,21 +239,91 @@ describe('a command', () => {
     const offered = p.cmds.offered().map((c) => c.id);
     expect(offered).not.toContain('addYCursors');
     expect(offered).toContain('splitRight');
-    expect(COMMANDS.filter((c) => c.palette && c.needs?.some((n) => !HOSTED.includes(n))).map((c) => c.id)).toEqual([]);
     const none = page(['time'], [], null, log);
-    expect([...new Set(none.cmds.offered().map((c) => c.id))]).toEqual(COMMANDS.filter((c) => c.palette && c.scope !== 'plot').map((c) => c.id));
+    expect([...new Set(none.cmds.offered().map((c) => c.id))]).toEqual(COMMANDS.filter((c) => listed(c) && c.scope !== 'plot').map((c) => c.id));
     // With none selected, Restore is offered while plots are maximized, as F then restores.
-    expect(page(['time'], [], null, log, ['a']).cmds.offered()).toContainEqual({ id: 'maximize', how: undefined, label: 'Restore', find: 'command maximize Restore', group: 'Plots' });
-    // A command of choices has a row for each, in the words the palette says and matches: a tab to go to, a dock to hide or show, an arrangement.
-    const rows = (id) => none.cmds.offered().filter((c) => c.id === id).map((c) => [c.how.to, c.label, c.find, c.group]);
-    expect(rows('openTab')).toEqual([['T', 'Go to T', 'tab T', 'Tabs'], ['U', 'Go to U', 'tab U', 'Tabs']]);
-    expect(rows('dock')).toEqual([['left', 'Hide the left dock', 'dock left', 'Docks'], ['right', 'Show the right dock', 'dock right', 'Docks']]);
-    expect(rows('arrange')[0]).toEqual(['rows', 'Arrange as Rows', 'arrange Rows', 'Arrange']);
-    // A row made with a choice is that choice's own, with no submenu; a menu words a command its own way, and checks the arrangement the tab is in.
+    expect(page(['time'], [], null, log, ['a']).cmds.offered()).toContainEqual({ id: 'maximize', how: undefined, label: 'Restore', find: 'plots Restore maximize', group: 'Plots' });
+    // A command of choices has a row for each, in its own words, matched with its heading: a tab to go to, a dock to hide or show, an arrangement; a label of text reads the choice after it.
+    const rows = (id, at = none) => at.cmds.offered().filter((c) => c.id === id).map((c) => [c.how.to, c.label, c.find, c.group]);
+    expect(rows('openTab')).toEqual([['T', 'Go to T', 'tabs Go to T openTab', 'Tabs'], ['U', 'Go to U', 'tabs Go to U openTab', 'Tabs']]);
+    expect(rows('dock')).toEqual([['left', 'Hide the left dock', 'docks Hide the left dock dock', 'Docks'], ['right', 'Show the right dock', 'docks Show the right dock dock', 'Docks']]);
+    expect(rows('arrange')[0]).toEqual(['rows', 'Rows', 'arrange Rows arrange', 'Arrange']);
+    expect(rows('setKind', p)).toEqual([['time', 'Kind › Time', 'plots Kind › Time setKind', 'Plots'], ['spectrum', 'Kind › Spectrum', 'plots Kind › Spectrum setKind', 'Plots']]);
+    expect(rows('moveToTab', p)).toEqual([['U', 'Move to tab › U', 'plots Move to tab › U moveToTab', 'Plots']]);
+    // A row made with a choice is that choice's own, with no submenu, and checks the arrangement the tab is in.
     expect(none.cmds.row('arrange', { how: { to: 'rows' } })).toMatchObject({ label: 'Rows', choices: null, value: { label: 'The layout now' } });
     expect(none.cmds.row('arrange', { how: { to: 'grid' } })).toMatchObject({ label: 'Grid', value: null });
     expect(none.cmds.row('exportTabs')).toMatchObject({ label: 'Export every tab…', value: '2 tabs' });
-    expect(none.cmds.offered().find((c) => c.id === 'exportTabs')).toMatchObject({ label: 'Export every tab', find: 'Export every tab', group: 'View' });
+    expect(none.cmds.offered().find((c) => c.id === 'exportTabs')).toMatchObject({ label: 'Export every tab…', group: 'View' });
+  });
+
+  it('reads the same, one label and one icon, from every origin', () => {
+    const ORIGINS = ['menu', 'button', 'key', 'palette', 'toolbar', 'row'];
+    fc.assert(
+      fc.property(setup, fc.option(fc.constantFrom('left', 'right', 'none', 'rows', 'time', 'T', 'U')), ({ kinds, picks, on, last, id }, to) => {
+        const shown = IDS.slice(0, kinds.length);
+        const picked = picks.map((i) => IDS[i]).filter((p) => shown.includes(p));
+        const made = on !== null && shown.includes(IDS[on]) ? IDS[on] : null;
+        const p = page(kinds, picked, last === null ? null : IDS[last], []);
+        // A command of choices is made with one of them, or none; a y axis command on the axis.
+        const c = commandOf(id), choice = c.choices && to !== null ? { to } : {};
+        const how = c.needs?.includes('axis') ? { key: 'shared', ...choice } : c.choices && to !== null ? choice : undefined;
+        const reads = ORIGINS.map((from) => {
+          const r = p.cmds.row(id, { on: made, from, how });
+          return [r.label, r.icon];
+        });
+        for (const r of reads) expect(r, `${id} with ${JSON.stringify(how)}`).toEqual(reads[0]);
+      }),
+    );
+  });
+
+  it('is in the palette as the rule says of the table: each listed command that can act now and be chosen, once for each choice, and no other', () => {
+    fc.assert(
+      fc.property(setup, fc.boolean(), ({ kinds, picks, last }, maximized) => {
+        const shown = IDS.slice(0, kinds.length);
+        const picked = picks.map((i) => IDS[i]).filter((p) => shown.includes(p));
+        const p = page(kinds, picked, last === null ? null : IDS[last], [], maximized ? [shown[0]] : null);
+        // The oracle, from the rule alone: a listed command, on the plots the page gives it, of its kinds.
+        const want = COMMANDS.filter(listed).flatMap((c) => {
+          const ctx = p.cmds.context(c.id, { from: 'palette' });
+          const ids = PLOTLESS.includes(c.scope) ? [] : (picked.length ? picked : c.scope === 'view' ? shown : []).filter((i) => !c.kinds || c.kinds.includes(kinds[IDS.indexOf(i)]));
+          const acts = PLOTLESS.includes(c.scope) || ids.length > 0 || (c.empty && !!c.active?.(ctx));
+          if (!acts || c.disabled?.(ctx)) return [];
+          return (c.choices?.(ctx) ?? [[undefined]]).map(([to]) => `${c.id} ${to}`);
+        });
+        expect(p.cmds.offered().map((o) => `${o.id} ${o.how?.to}`)).toEqual(want);
+      }),
+    );
+  });
+
+  it('Window sets the views of the plots it acts on of the kind of the plot it is made on, from the page of the time plots', () => {
+    fc.assert(
+      fc.property(setup, ({ kinds, picks, on, last }) => {
+        const log = [], shown = IDS.slice(0, kinds.length);
+        const picked = picks.map((i) => IDS[i]).filter((p) => shown.includes(p));
+        const made = on !== null && shown.includes(IDS[on]) ? IDS[on] : null;
+        const p = page(kinds, picked, last === null ? null : IDS[last], log);
+        p.cmds.run('window', { on: made, from: made ? 'button' : 'toolbar', how: { s: 5, typed: true } });
+        const ids = made ? (picked.includes(made) ? picked : [made]) : picked.length ? picked : shown;
+        const kind = made ? kinds[IDS.indexOf(made)] : 'time';
+        expect(log.filter((l) => l.endsWith('.setSpan')).map((l) => l[0]), `made on ${made} with ${picked}`).toEqual(ids.filter((i) => kinds[IDS.indexOf(i)] === kind));
+      }),
+    );
+  });
+
+  it('Zoom to X1–X2 cannot be chosen, and does nothing, until the plot it is made on has X1 and X2', () => {
+    for (const [x, pair] of [[null, false], [{ a: '14 s', b: '—' }, false], [{ a: '—', b: '16 s' }, false], [{ a: '14 s', b: '16 s' }, true]]) {
+      const log = [], p = page(['time', 'time'], ['a', 'b'], 'a', log);
+      const plotOf = p.svc.plotOf;
+      p.svc.plotOf = (id) => {
+        const t = plotOf(id);
+        return { ...t, pv: new Proxy(t.pv, { get: (pv, key) => (key === 'legend' ? { cursors: x && { x, ys: [] } } : pv[key]) }) };
+      };
+      for (const where of [{ on: 'a' }, { from: 'palette' }]) expect(p.cmds.row('zoomToCursors', where).disabled, `${JSON.stringify(x)} ${JSON.stringify(where)}`).toBe(!pair);
+      expect(p.cmds.offered().some((o) => o.id === 'zoomToCursors')).toBe(pair);
+      expect(p.cmds.run('zoomToCursors', { on: 'a', from: 'menu' })).toBe(pair);
+      expect(log.filter((l) => l.endsWith('zoomToCursors'))).toEqual(pair ? ['a.pv.zoomToCursors'] : []);
+    }
   });
 
   it('whose host has not what it needs does not run, has no row, asks nothing and is not in the palette, and every other command is as on a host that has it', async () => {

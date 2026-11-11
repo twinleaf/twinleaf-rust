@@ -8,13 +8,17 @@
 // the list draws only the best matches; and no key but Enter on a valid
 // locked property calls a device. The devices are the stub hub's. A row
 // of a command of the page or a tab, picked, does what it names: the
-// arrangement, the tab or the dock of that row.
+// arrangement, the tab or the dock of that row, the open tab's name to edit,
+// its closing, its layout reset. The rows of commands are what the rule
+// makes of the command table, each in the words the menus use.
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { page as browser } from 'vitest/browser';
-import { clickOn, focusPage, frames, mountPage, pressKey, typeInto, until, wait } from './harness/page.js';
+import { clickOn, editCursors, feed, focusPage, frames, mountPage, pressKey, typeInto, until, wait } from './harness/page.js';
 import { SHOWN } from '../src/lib/palette.js';
+import { COMMANDS, PALETTE, PLOTLESS, listed } from '../src/lib/commands.js';
+import { plotIds } from '../src/lib/layout.js';
 
 const ROUTES = ['/0', '/1'];
 const FILL = Array.from({ length: 300 }, (_, i) => ({ name: `fill.n${i}`, channel: 'diagnostic', access: ['read'], value: i }));
@@ -74,7 +78,7 @@ describe('a command in the command palette', () => {
     try {
       const [first, second] = page.ws.tabs;
       expect(page.ws.arrangement()).toBe('rows');
-      await pick('Arrange as Columns');
+      await pick('Columns');
       expect(page.ws.arrangement(), 'the arrangement named').toBe('columns');
       await pick('Hide the right dock');
       await openPalette();
@@ -85,11 +89,69 @@ describe('a command in the command palette', () => {
       await pick(`Go to ${second.name}`);
       expect(page.ws.activeId, 'the tab named').toBe(second.id);
       await pick(`Go to ${first.name}`);
-      await pick('Duplicate this tab');
+      await pick('Duplicate');
       expect(page.ws.tabs.map((t) => t.name), 'the open tab, copied after it').toEqual([first.name, `${first.name} copy`, second.name]);
-      await pick('New layout tab');
+      await pick('New layout');
       expect(page.ws.tabs.length, 'a tab more').toBe(4);
       expect(page.ws.tab, 'the new tab open, last').toBe(page.ws.tabs.at(-1));
+      // Rename opens the open tab's name for editing, and it stays open once the palette has gone.
+      await pick('Rename');
+      const field = () => document.querySelector(`[data-tab="${page.ws.activeId}"] input`);
+      expect(await until(() => field() && document.activeElement === field(), 2000), 'the open tab’s name, to edit').toBe(true);
+      await frames(10);
+      expect(document.activeElement, 'still editing').toBe(field());
+      await pressKey('Escape');
+      await settle();
+      // Close closes the open tab, which has no plots, so the page does not ask.
+      const open = page.ws.activeId;
+      await pick('Close');
+      expect(page.ws.tabs.map((t) => t.id), 'the open tab closed').not.toContain(open);
+      // Reset to default puts the open tab's default plots back in place of its own.
+      await pick(`Go to ${first.name}`);
+      const had = plotIds(page.ws.layout);
+      await pick('Reset to default');
+      expect(plotIds(page.ws.layout).some((id) => had.includes(id)), 'the default plots').toBe(false);
+    } finally {
+      page.dispose();
+    }
+  }, 120_000);
+
+  it('lists what the rule says of the table: every command with a label that needs nothing of where it is made, that can act now, and no other', async () => {
+    const page = await mountPage([['sine.sine'], ['sine.sine'], ['aux.triangle']], 'rows', 1, ['sine.sine', 'aux.triangle']);
+    try {
+      feed(page.hub);
+      const ids = plotIds(page.ws.layout);
+      page.history.group('Prepare', () => page.ws.setPlot(ids[2], { kind: 'spectrum' }));
+      await wait(300);
+      await settle();
+      const cmds = page.plots.commands;
+      for (const [picked, cursors] of [[[], false], [[ids[0]], false], [[ids[0], ids[2]], true]]) {
+        if (cursors) editCursors(page, ids[0], (c) => ({ ...c, x: { a: 14, b: 16 } }));
+        await wait(200);
+        // The click that gives the page the keys deselects: the selection is made after it.
+        await focusPage();
+        page.ws.selection.only(picked);
+        await settle();
+        await pressKey('Control+k');
+        expect(await until(() => input() && document.activeElement === input(), 2000), 'the palette open').toBe(true);
+        await settle();
+        const rows = [...document.querySelectorAll('[data-slot=command-item][data-command]')].filter((r) => !/^(add|new plot) /.test(r.dataset.value));
+        // The rule applied to the table: each command it lists, under its heading, with a row for each of its choices, while it can act and be chosen.
+        const want = COMMANDS.filter(listed).flatMap((c) => {
+          const ctx = cmds.context(c.id, { from: 'palette' });
+          if (!PLOTLESS.includes(c.scope) && !ctx.plots.length && !(c.empty && c.active?.(ctx))) return [];
+          if (c.disabled?.(ctx)) return [];
+          return (c.choices?.(ctx) ?? [[undefined]]).map(([to]) => [PALETTE.indexOf(c.palette), `${c.palette} ${c.id} ${cmds.row(c.id, { how: to === undefined ? undefined : { to } }).label}`]);
+        }).sort((a, b) => a[0] - b[0]).map(([, row]) => row);
+        const heading = (r) => r.closest('[data-slot=command-group]')?.firstElementChild?.textContent.trim();
+        expect(rows.map((r) => `${heading(r)} ${r.dataset.command} ${r.textContent.trim()}`), `${picked.length} selected`).toEqual(want);
+        // The commands it once left out, now that they need nothing of where they are made.
+        if (picked.length) for (const id of ['resetLayout', 'renameTab', 'closeTab', 'setKind', 'setLayout', 'moveToTab', 'clearXCursors', 'clearYCursors', 'clearSignals']) expect(rows.some((r) => r.dataset.command === id), id).toBe(true);
+        // Copy table and Zoom to X1–X2 while the lead plot has a readout and X1 and X2.
+        for (const id of ['copyReadout', 'zoomToCursors']) expect(rows.some((r) => r.dataset.command === id), `${id} with cursors ${cursors}`).toBe(cursors);
+        await pressKey('Escape');
+        expect(await closed()).toBe(true);
+      }
     } finally {
       page.dispose();
     }

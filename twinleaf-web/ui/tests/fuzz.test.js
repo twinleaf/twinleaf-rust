@@ -93,7 +93,7 @@ const TARGETS = {
   file: () => topButton('File'),
   settings: () => document.querySelector('.top-bar button[aria-label="Display settings"]'),
   window: () => document.querySelector('.top-bar input[aria-label="Time window"]'),
-  eraser: () => document.querySelector('.top-bar button[aria-label="Clear the cursors"]'),
+  eraser: () => document.querySelector('.top-bar button[aria-label="Clear cursors"]'),
   status: () => document.querySelector('.status-bar'),
   menuItem: (i) => nth(all('[role^=menuitem]:not([data-disabled])').filter((m) => !OFF_LIMITS.test(m.textContent.trim())), i),
 };

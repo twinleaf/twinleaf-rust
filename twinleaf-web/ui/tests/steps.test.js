@@ -64,7 +64,7 @@ const COMMANDS = {
   'Shift+Enter on two signals': async () => (await pickSignals(), () => pressKey('Shift+Enter')),
   'Delete on two signals': async () => (await pickSignals(), await pressKey('Enter'), () => pressKey('Delete')),
   // Commands on the cursors, which are edits; every plot has some placed first.
-  'the eraser': (page) => (cursorsEverywhere(page), () => document.querySelector('button[aria-label="Clear the cursors"]').click()),
+  'the eraser': (page) => (cursorsEverywhere(page), () => document.querySelector('button[aria-label="Clear cursors"]').click()),
   'End, which follows live': (page) => (cursorsEverywhere(page), () => pressKey('End')),
   'Clear cursors': (page, id) => (cursorsEverywhere(page), fromMenu(id, 'Clear cursors')),
 };

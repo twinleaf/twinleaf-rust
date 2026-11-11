@@ -59,7 +59,7 @@ async function runFrom(page, on, id, origin, key) {
   if (origin === 'the palette') {
     await pressKey('Control+k');
     await settle();
-    const item = document.querySelector(`[data-slot=command-item][data-value^="command ${id} "]`);
+    const item = document.querySelector(`[data-slot=command-item][data-command="${id}"]`);
     if (!item) return false;
     item.click();
     await settle();

@@ -23,7 +23,10 @@
 // there. A command's keys are in the keymap (keymap.js) from the table
 // alone: no entry there names a command by hand or changes what the table
 // says of its keys. The command palette is handed no actions: the commands
-// it lists are the table's.
+// it lists are the table's. A command reads one way wherever it shows: no
+// entry words itself or draws its icon by where it is made, an entry has
+// only the fields the table lists, and an axis popover's buttons take their
+// words and picture from the table.
 //
 // The key router (keyrouter.js) is the one listener for keys: no other
 // module listens for a key on the window or an element, and a component
@@ -301,6 +304,29 @@ describe('a plot', () => {
       const found = sources(SRC).flatMap((file) => lines(rel(file), (line) => line.includes(made)));
       expect(found.map((at) => at.split(':')[0]), made).toEqual([HOST]);
     }
+  });
+});
+
+describe('a command’s words', () => {
+  const table = fs.readFileSync(path.join(SRC, 'lib/commands.js'), 'utf8');
+  /** The fields an entry of the command table has, as its file lists them. */
+  const FIELDS = table.match(/An entry is \{([^}]*)\}/)[1].replace(/\/\//g, '').split(',').map((f) => f.trim());
+  /** What of a command's look may be a function of where it is made. */
+  const LOOK = ['label', 'icon', 'iconOf', 'active', 'activeIcon'];
+  /** The fields of entry `c` that word it or draw it by where it is made: a function that reads its origin. */
+  const byPlace = (c) => LOOK.filter((f) => typeof c[f] === 'function' && /\bfrom\b/.test(String(c[f])));
+
+  it('are found where an entry words itself by where it is made', () => {
+    expect(byPlace({ label: (ctx) => (ctx.from === 'palette' ? 'Arrange as Rows' : 'Rows'), icon: () => null })).toEqual(['label']);
+    expect(byPlace({ label: (ctx, how) => `Go to ${how.to}`, iconOf: (ctx, how) => how.to })).toEqual([]);
+    expect(FIELDS).toContain('label');
+    expect(FIELDS).toContain('run');
+  });
+  it('are one label and one icon for a command wherever it shows, with no field that words it again', () => {
+    expect(COMMANDS.flatMap((c) => byPlace(c).map((f) => `${c.id}.${f}`))).toEqual([]);
+    expect(COMMANDS.flatMap((c) => Object.keys(c).filter((k) => !FIELDS.includes(k)).map((k) => `${c.id}.${k}`))).toEqual([]);
+    // An axis popover's buttons take their name, tip and picture from the table: the snippet that draws one takes the command and what it adds alone.
+    expect(fs.readFileSync(path.join(SRC, 'lib/PlotCard.svelte'), 'utf8')).toMatch(/\{#snippet tool\(id, how\)\}/);
   });
 });
 

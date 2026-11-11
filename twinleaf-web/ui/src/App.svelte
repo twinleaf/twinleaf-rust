@@ -71,7 +71,6 @@
   import RiSettings from '@lucide/svelte/icons/settings-2';
   import RiPlay from '@lucide/svelte/icons/play';
   import RiPause from '@lucide/svelte/icons/pause';
-  import RiEraser from '@lucide/svelte/icons/eraser';
   import RiAdd from '@lucide/svelte/icons/plus';
   import RiGrid from '@lucide/svelte/icons/layout-grid';
   import RiDownload from '@lucide/svelte/icons/download';
@@ -89,6 +88,8 @@
   // Forward go through, and the plot commands (commands.js), which every
   // menu row, key, button and the palette run: the host's.
   const { cursors, viewHistory, commands } = plots;
+  /** How Clear cursors reads, for the toolbar's button. */
+  const clearRow = commands.row('clearCursors');
   // What a press, a click, a key or an undo does to the plot selection: the Workspace's.
   const selection = ws.selection;
   selection.changed = () => refreshToolbar();
@@ -947,7 +948,7 @@
       </Tip>
       <!-- The time window the plots show, typed or stepped. -->
       <WindowField data-command="window" value={span} onchange={(s, typed) => commands.run('window', { from: 'toolbar', how: { s, typed } })} widest={widestWindow} />
-      <IconButton icon={RiEraser} label="Clear the cursors" data-keeps-selection data-command="clearCursors" onclick={() => commands.run('clearCursors', { from: 'toolbar' })} />
+      <IconButton icon={clearRow.icon} label={clearRow.label} data-keeps-selection data-command="clearCursors" onclick={() => commands.run('clearCursors', { from: 'toolbar' })} />
       <DropdownMenu.Root>
         <Tip text="Arrange this tab's plots">
           {#snippet children(tip)}

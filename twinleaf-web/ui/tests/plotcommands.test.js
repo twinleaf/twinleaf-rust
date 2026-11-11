@@ -193,7 +193,7 @@ const MAXIMIZE = {
   palette: async () => {
     await pressKey('Control+k');
     await settle();
-    const item = document.querySelector('[data-slot=command-item][data-value^="command maximize "]');
+    const item = document.querySelector('[data-slot=command-item][data-command="maximize"]');
     if (item) item.click();
     else await pressKey('Escape');
     // The palette, closed, fades out over the page, and takes every press until it has gone.

@@ -174,15 +174,16 @@ export class PlotHost {
     this.selection.pressOn(id);
   }
 
-  /** Gives each of plots `ids` the fields `fn(plot)` returns, if any, as one step undo names `what`. */
+  /** Gives each of plots `ids` the fields `fn(plot)` returns, if any, as one step undo names `what`, with how many plots it changed when several. */
   editEach(ids, what, fn) {
+    const changed = ids.flatMap((i) => {
+      const plot = this.ws.plots[i], patch = plot && fn(plot);
+      return patch && Object.entries(patch).some(([k, v]) => JSON.stringify(v ?? null) !== JSON.stringify(plot[k] ?? null)) ? [[i, patch]] : [];
+    });
     // A plot's kind is what one is looking at too: switching it is a view step, which Back crosses.
     this.viewHistory.step(() =>
-      this.history.group(ids.length > 1 ? `${what} (${counted(ids.length, 'plot')})` : what, () => {
-        for (const i of ids) {
-          const patch = fn(this.ws.plots[i]);
-          if (patch) this.ws.setPlot(i, patch);
-        }
+      this.history.group(changed.length > 1 ? `${what} (${counted(changed.length, 'plot')})` : what, () => {
+        for (const [i, patch] of changed) this.ws.setPlot(i, patch);
       }),
     );
   }

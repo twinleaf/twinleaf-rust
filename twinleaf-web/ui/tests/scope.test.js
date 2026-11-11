@@ -11,12 +11,15 @@
 // follows live, is an edit: exactly one undo step on however many plots,
 // which undo takes back and redo makes again. A cursor dragged by its line,
 // tag or tab moves on the selected plots of the plot's kind, a Y cursor on
-// those with an axis in its units, and on no other, as one undo step.
+// those with an axis in its units, and on no other, as one undo step. An
+// edit's undo step names how many plots it changed, not how many it was
+// aimed at. A window typed on a time plot sets the windows of the time plots
+// it acts on, and the toolbar's those of the time plots.
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, clearNotices, closeAll, editCursors, feed, leafOf, mountPage, pressKey, rightClick, settle, until, wait, withExamples, withYPair } from './harness/page.js';
+import { centre, clearNotices, clickOn, closeAll, editCursors, feed, leafOf, mountPage, pressKey, rightClick, settle, typeInto, until, wait, withExamples, withYPair } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { withX, withY, xOf, yOf } from '../src/lib/cursors.js';
 import { plotIds } from '../src/lib/layout.js';
@@ -181,7 +184,7 @@ const COMMANDS = {
   'the y popover’s cursor clear': {
     cursors: true,
     prepare: yCursors,
-    act: async (page, id) => (await rightClick(spots(page, id)['a y axis']), await button('Clear this axis')),
+    act: async (page, id) => (await rightClick(spots(page, id)['a y axis']), await button('Clear Y cursors')),
     acted: (page, id) => !page.pv(id).hasYCursors('shared'),
   },
   'a typed frequency range': {
@@ -191,13 +194,13 @@ const COMMANDS = {
   },
   'the x popover’s zoom to X1–X2': {
     prepare: spectraWithCursors,
-    act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await button('Zoom to the X cursors')),
+    act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await button('Zoom to X1–X2')),
     acted: (page, id) => same(page.ws.plots[id].fRange, [3, 7]),
   },
   'the x popover’s cursor clear': {
     cursors: true,
     prepare: spectraWithCursors,
-    act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await button('Clear the X cursors')),
+    act: async (page, id) => (await rightClick(spots(page, id)['the x axis']), await button('Clear X cursors')),
     acted: (page, id) => !page.ws.plots[id].cursors?.f,
   },
   'the readout’s zoom to X1–X2, on spectra': {
@@ -222,10 +225,10 @@ const COMMANDS = {
     act: async (page, id) => (await rightClick(spots(page, id)['the readout']), await choose('Clear Y cursors')),
     acted: (page, id) => !page.pv(id).hasYCursors('shared'),
   },
-  'the readout’s Clear all cursors': {
+  'the readout’s Clear cursors': {
     cursors: true,
     prepare: (page) => (timeCursors(page), yCursors(page)),
-    act: async (page, id) => (await rightClick(spots(page, id)['the readout']), await choose('Clear all cursors')),
+    act: async (page, id) => (await rightClick(spots(page, id)['the readout']), await choose('Clear cursors')),
     acted: (page, id) => !page.ws.plots[id].cursors,
   },
   'Add X cursors from the menu': {
@@ -480,12 +483,12 @@ const ON_AXIS = {
     acted: (pv, key) => !near(pv.yBounds(key), [2, 4]),
   },
   'the popover’s Add Y cursors': {
-    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await button('Add Y cursors on this axis')),
+    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await button('Add Y cursors')),
     acted: (pv, key) => pv.hasYCursors(key),
   },
   'the popover’s cursor clear': {
     prepare: (pv, key, page) => editCursors(page, pv.plotId, (c) => withYPair(c, pv.config().kind, key, 0.1, 0.2)),
-    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await button('Clear this axis')),
+    act: async (page, id, key) => (await rightClick(axisSpot(page, id, key)), await button('Clear Y cursors')),
     acted: (pv, key) => !pv.hasYCursors(key),
   },
   'the popover’s Label': {
@@ -507,12 +510,12 @@ const ON_AXIS = {
   'Add Y cursors, then the cursor clear': {
     act: async (page, id, key, all) => {
       await rightClick(axisSpot(page, id, key));
-      await button('Add Y cursors on this axis');
+      await button('Add Y cursors');
       await closeAll();
       // Escape, once the popover has closed, may deselect: the selection is made again.
       page.ws.selection.only(all);
       await rightClick(axisSpot(page, id, key));
-      await button('Clear this axis');
+      await button('Clear Y cursors');
     },
     acted: () => false,
   },
@@ -578,6 +581,120 @@ describe('a typed frequency range', () => {
   });
 });
 
+/** A button of the open popover by its words. */
+const popoverButton = (text) => [...document.querySelectorAll('[data-slot=popover-content] button')].find((b) => b.textContent.trim() === text || b.getAttribute('aria-label') === text);
+/**
+ * Each edit made on plot 0, set up so plot 0 takes it and the others, by
+ * `bits`, may or may not: `prepare(page, bits)` sets every plot up, `act`
+ * makes it as a person would on plot 0, `to` picking what it sets, and
+ * `what(to)` is the name of its step.
+ */
+const EDITS = {
+  'the density scale': {
+    prepare: (page, bits) => setEach(page, (i) => ({ kind: i && !bits[i][0] ? 'time' : 'spectrum', yScale: bits[i][1] ? 'log' : 'linear' })),
+    act: async (page, ids, to) => (await rightClick(spots(page, ids[0])['a y axis']), await clickOn(popoverButton(to ? 'Log' : 'Linear'))),
+    what: (to) => (to ? 'Log density scale' : 'Linear density scale'),
+  },
+  'the frequency scale': {
+    prepare: (page, bits) => setEach(page, (i) => ({ kind: i && !bits[i][0] ? 'time' : 'spectrum', xScale: bits[i][1] ? 'log' : 'linear' })),
+    act: async (page, ids, to) => (await rightClick(spots(page, ids[0])['the x axis']), await clickOn(popoverButton(to ? 'Log' : 'Linear'))),
+    what: (to) => (to ? 'Log frequency scale' : 'Linear frequency scale'),
+  },
+  'an axis’s side': {
+    prepare: (page, bits) => setEach(page, (i) => ({ mode: i && !bits[i][0] ? 'overlay' : 'independent', axisSides: { 'sine.sine': i && bits[i][1] ? 'right' : 'left' } })),
+    act: async (page, ids) => (await rightClick(axisSpot(page, ids[0], 'sine.sine')), await clickOn(popoverButton('Move this axis to the right'))),
+    what: () => "sine.sine's axis on the right",
+  },
+  'a signal from the add menu': {
+    prepare: (page, bits) => setEach(page, (i) => ({ items: page.ws.plots[plotIds(page.ws.layout)[i]].items.filter((t) => t.key !== 'mag.x' || (i && bits[i][0])) })),
+    act: async (page, ids) => {
+      const add = leafOf(ids[0]).querySelector('button[aria-label="Add a signal"]');
+      await commands.mouse([['move', ...centre(leafOf(ids[0]))], ['move', ...centre(add)], ['down'], ['up']]);
+      await settle();
+      await clickOn([...document.querySelectorAll('.signal-row')].find((r) => r.textContent.trim().startsWith('mag.x')));
+    },
+    what: () => 'Add mag.x',
+  },
+};
+/** Gives each plot `i` the fields `fn(i)`, as one step made before the case. */
+function setEach(page, fn) {
+  page.history.group('Prepare', () => plotIds(page.ws.layout).forEach((id, i) => page.ws.setPlot(id, fn(i))));
+}
+
+describe('an edit made on a plot', () => {
+  it('is one undo step named for how many plots it changed, not how many it was aimed at', async () => {
+    const seen = new Set();
+    await fc.assert(
+      fc.asyncProperty(fc.constantFrom(...Object.keys(EDITS)), fc.array(fc.tuple(fc.boolean(), fc.boolean()), { minLength: 4, maxLength: 4 }), fc.subarray([0, 1, 2, 3]), fc.boolean(), async (name, bits, picks, to) => {
+        const page = await mountPage([[...SIGNALS, 'mag.x'], [...SIGNALS, 'mag.x'], [...SIGNALS, 'mag.x'], [...SIGNALS, 'mag.x']], 'rows', 0, [...SIGNALS, 'mag.x']);
+        try {
+          feed(page.hub);
+          const { prepare, act, what } = EDITS[name];
+          // Plot 0 takes the edit: it is not set as the edit sets it.
+          prepare(page, bits.map((b, i) => (i ? b : [true, !to])));
+          await wait(300);
+          await settle();
+          const ids = plotIds(page.ws.layout);
+          page.ws.selection.only(picks.map((i) => ids[i]));
+          await settle();
+          const before = ids.map((id) => JSON.stringify(page.ws.plots[id])), steps = page.history.undos.length;
+          await act(page, ids, to);
+          await settle();
+          // The oracle: the plots whose settings the edit changed, read off the page.
+          const changed = ids.filter((id, i) => JSON.stringify(page.ws.plots[id]) !== before[i]).length;
+          const label = `${name} on 0 with ${picks} selected, ${JSON.stringify(bits)}`;
+          expect(changed, `${label}: plot 0 changed`).toBeGreaterThan(0);
+          expect(page.history.undos.length - steps, `${label}: undo steps`).toBe(1);
+          expect(page.history.undos.at(-1).label, label).toBe(changed > 1 ? `${what(to)} (${changed} plots)` : what(to));
+          const aimed = picks.includes(0) ? picks.length : 1;
+          if (aimed > changed) seen.add(name);
+        } finally {
+          page.dispose();
+        }
+      }),
+      // Each edit on a selection of four where only plot 0 and one other take it.
+      withExamples(Object.keys(EDITS).map((name) => [name, [[true, false], [true, true], [false, false], [true, false]], [0, 1, 2, 3], true])),
+    );
+    // Each edit was aimed at more plots than it changed at least once.
+    expect([...seen].sort()).toEqual(Object.keys(EDITS).sort());
+  }, 600_000);
+});
+
+describe('the window', () => {
+  it('typed on a time plot sets the windows of the selected time plots it acts on, or its own, and no spectrum’s; from the toolbar, of the time plots selected, or all', async () => {
+    const page = await mountPage(KEYS, 'rows', 0, SIGNALS);
+    try {
+      feed(page.hub);
+      const ids = plotIds(page.ws.layout);
+      await fc.assert(
+        fc.asyncProperty(fc.array(fc.boolean(), { minLength: 4, maxLength: 4 }), fc.subarray([0, 1, 2, 3]), fc.option(fc.nat(3)), fc.constantFrom('7', '9'), async (spectra, picks, k, text) => {
+          await closeAll();
+          // Plot k, where the window is typed, a time plot.
+          setEach(page, (i) => ({ kind: spectra[i] && i !== k ? 'spectrum' : 'time' }));
+          ids.forEach((id) => page.views.get(id).setSpan(3));
+          await wait(150);
+          await settle();
+          const picked = picks.map((i) => ids[i]);
+          page.ws.selection.only(picked);
+          await settle();
+          const before = ids.map((id) => page.views.get(id).window);
+          const field = k === null ? document.querySelector('.top-bar .window-field input') : (await rightClick(spots(page, ids[k])['the x axis']), document.querySelector('[data-slot=popover-content] [data-command=window] input'));
+          expect(field, `the window field ${k === null ? 'of the toolbar' : `of plot ${k}`}`).toBeTruthy();
+          await typeInto(field, text);
+          await pressKey('Enter');
+          await settle();
+          const aimed = k === null ? (picked.length ? picked : ids) : picked.includes(ids[k]) ? picked : [ids[k]];
+          const want = ids.map((id, i) => (aimed.includes(id) && page.ws.plots[id].kind === 'time' ? +text : before[i]));
+          expect(ids.map((id) => page.views.get(id).window), `${text} from ${k ?? 'the toolbar'} with ${picks} selected, spectra ${spectra}`).toEqual(want);
+        }),
+        withExamples([[[false, true, true, false], [0, 1, 2], 0, '7'], [[true, true, false, false], [], null, '9'], [[false, true, false, true], [1, 2, 3], null, '7']]),
+      );
+    } finally {
+      page.dispose();
+    }
+  }, 600_000);
+});
+
 describe('Add Y cursors on an axis, then its clear', () => {
   it('leaves no cursor on any selected plot, the axis of another signal included', async () => {
     const page = await mountPage([SIGNALS, SIGNALS], 'rows', 0, SIGNALS);
@@ -590,13 +707,13 @@ describe('Add Y cursors on an axis, then its clear', () => {
       page.ws.selection.only(ids);
       await settle();
       await rightClick(axisSpot(page, ids[0], 'aux.triangle'));
-      await button('Add Y cursors on this axis');
+      await button('Add Y cursors');
       expect(ids.map((id) => page.pv(id).hasYCursors('aux.triangle'))).toEqual([true, true]);
       await closeAll();
       // Escape, once the popover has closed, may deselect: the selection is made again.
       page.ws.selection.only(ids);
       await rightClick(axisSpot(page, ids[0], 'aux.triangle'));
-      await button('Clear this axis');
+      await button('Clear Y cursors');
       for (const id of ids) for (const x of page.pv(id).yAxes) expect(page.pv(id).hasYCursors(x.key), `${ids.indexOf(id)}:${x.key}`).toBe(false);
     } finally {
       page.dispose();

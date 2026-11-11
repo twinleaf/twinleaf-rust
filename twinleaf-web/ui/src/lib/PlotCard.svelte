@@ -8,18 +8,12 @@
   import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
   import ColorPicker from './ColorPicker.svelte';
-  import RiToLeft from '@lucide/svelte/icons/arrow-left';
-  import RiToRight from '@lucide/svelte/icons/arrow-right';
-  import RiRemoveAxis from '@lucide/svelte/icons/trash-2';
-  import RiFit from '@lucide/svelte/icons/unfold-vertical';
-  import RiFitX from '@lucide/svelte/icons/unfold-horizontal';
   import { counted } from './menus.js';
   import RiShowOnly from '@lucide/svelte/icons/eye';
   import RiHide from '@lucide/svelte/icons/eye-off';
   import RiPalette from '@lucide/svelte/icons/palette';
   import RiMove from '@lucide/svelte/icons/square-arrow-out-up-right';
   import RiTrash from '@lucide/svelte/icons/trash-2';
-  import RiEraser from '@lucide/svelte/icons/eraser';
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import IconButton from './IconButton.svelte';
   import CommandItem from './CommandItem.svelte';
@@ -32,16 +26,10 @@
   import RiDraggable from '@lucide/svelte/icons/grip-vertical';
   import RiBack from '@lucide/svelte/icons/arrow-left';
   import RiForward from '@lucide/svelte/icons/arrow-right';
-  import RiClose from '@lucide/svelte/icons/x';
   import RiPause from '@lucide/svelte/icons/pause';
   import RiPlay from '@lucide/svelte/icons/play';
   import RiAddSignal from '@lucide/svelte/icons/plus';
-  import RiLegend from '@lucide/svelte/icons/list';
-  import RiXCursors from '@lucide/svelte/icons/separator-vertical';
-  import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
-  import RiZoomTo from '@lucide/svelte/icons/zoom-in';
   import RiPeak from '@lucide/svelte/icons/mountain';
-  import CopyImageIcon from '@lucide/svelte/icons/image';
   import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, kindLabel } from './constants.js';
@@ -82,10 +70,12 @@
   const runHere = (id, how) => commands.run(id, { on: plot.id, from: 'button', how });
   /** The peak commands, as the readout's menu, the plot's menu and the x axis's popover offer them. */
   const PEAKS = ['x1ToPeak', 'x2ToPeak', 'peakLeft', 'peakRight'];
-  /** How Maximize reads on this plot, for its button. */
+  /** How the header's commands read on this plot, for their buttons. */
+  const legendRow = $derived(commands.row('legend', { on: plot.id }));
   const maximizeRow = $derived(commands.row('maximize', { on: plot.id }));
   /** How Copy image reads on this plot, for its button in the plot's corner. */
   const copyImageRow = $derived(commands.row('copyImage', { on: plot.id }));
+  const closeRow = $derived(commands.row('close', { on: plot.id }));
 
   /** Each axis setting's buttons, as [value, what the button reads]; its tip names the value in full (commands.js AXIS_SETTINGS). */
   const CHOICES = {
@@ -735,11 +725,12 @@
   </div>
 {/snippet}
 <!-- A button of an axis popover that runs command `id` with `how` and
-     closes the popover: its picture `Icon`, its tip `text` with `keys`, and
-     its name `label`. -->
-{#snippet tool(id, how, Icon, text, label = text, keys = undefined)}
-  <Tip {text} {keys}>
-    {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={label} data-command={id} onclick={() => (runHere(id, how), (axisOpen = xAxisOpen = false))}><Icon /></button>{/snippet}
+     closes the popover: its picture, its name and its tip, with the pointer
+     gesture or the keys that run it too, as the command reads. -->
+{#snippet tool(id, how)}
+  {@const row = commands.row(id, { on: plot.id, how })}
+  <Tip text={row.label} keys={row.gesture ?? row.show ?? undefined}>
+    {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={row.label} data-command={id} disabled={row.disabled} onclick={() => (runHere(id, how), (axisOpen = xAxisOpen = false))}><row.icon /></button>{/snippet}
   </Tip>
 {/snippet}
 <!-- The peak commands' rows, on a plot that shows a signal: each says where its X cursor would go. -->
@@ -927,11 +918,11 @@
     <IconButton icon={RiAddSignal} label="Add a signal" keys={commandOf('addSignals').show} class="add-signal" tabindex={-1} onclick={(e) => openAdd(e.currentTarget, false)} />
     <div class="plot-actions flex shrink-0 items-center">
       <!-- Copy image, shown while the pointer is on the plot. -->
-      {#if copyImageRow.offered}<IconButton icon={CopyImageIcon} label={copyImageRow.label} class="copy-image" tabindex={-1} data-command="copyImage" onclick={() => runHere('copyImage')} />{/if}
+      {#if copyImageRow.offered}<IconButton icon={copyImageRow.icon} label={copyImageRow.label} class="copy-image" tabindex={-1} data-command="copyImage" onclick={() => runHere('copyImage')} />{/if}
       <IconButton
-        icon={RiLegend}
-        label={plot.legend ? 'Hide the legend' : 'Show the legend in the plot'}
-        keys={commandOf('legend').show}
+        icon={legendRow.icon}
+        label={legendRow.label}
+        keys={legendRow.show}
         class={plot.legend ? 'text-primary' : ''}
         aria-pressed={!!plot.legend}
         tabindex={-1}
@@ -951,7 +942,7 @@
       <IconButton icon={RiBack} label="Back to the view before" class="view-step" disabled={!viewHistory.canBack} tabindex={-1} onclick={() => viewHistory.back()} />
       <IconButton icon={RiForward} label="Forward to the view after" class="view-step" disabled={!viewHistory.canForward} tabindex={-1} onclick={() => viewHistory.forward()} />
       <IconButton icon={maximizeRow.icon} label={maximizeRow.label} keys={maximizeRow.show} class="maximize" tabindex={-1} data-command="maximize" onclick={() => runHere('maximize')} />
-      <IconButton icon={RiClose} label="Close plot" keys={commandOf('close').show} tabindex={-1} data-command="close" onclick={() => runHere('close')} />
+      <IconButton icon={closeRow.icon} label={closeRow.label} keys={closeRow.show} tabindex={-1} data-command="close" onclick={() => runHere('close')} />
     </div>
   </div>
 
@@ -980,7 +971,7 @@
           <input aria-label="Lowest frequency shown" type="text" inputmode="decimal" bind:value={fBounds.lo} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
           <span>to</span>
           <input aria-label="Highest frequency shown" type="text" inputmode="decimal" bind:value={fBounds.hi} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
-          {@render tool('fRange', { range: null }, RiFitX, 'Every frequency', 'Show every frequency')}
+          {@render tool('fRange', { range: null })}
         </div>
         {#if fBoundsError}<div class="axis-error">{fBoundsError}</div>{/if}
         <div class="axis-row" role="group" aria-label="Frequency scale">
@@ -990,9 +981,9 @@
       {/if}
       <div class="axis-row" role="group" aria-label="X cursors">
         <span>Cursors</span>
-        {@render tool('addXCursors', undefined, RiXCursors, 'Add X1 and X2', 'Add X cursors')}
-        {@render tool('zoomToCursors', undefined, RiZoomTo, 'Zoom to X1–X2', 'Zoom to the X cursors', ['Ctrl', 'drag'])}
-        {@render tool('clearXCursors', undefined, RiEraser, 'Clear the X cursors')}
+        {@render tool('addXCursors')}
+        {@render tool('zoomToCursors')}
+        {@render tool('clearXCursors')}
       </div>
       {#if plot.items.length}
         <!-- Each peak command's button, its tip saying where its X cursor would go, or why it goes nowhere. -->
@@ -1025,8 +1016,8 @@
         {#if axisKey && plot.mode === 'independent'}
           {@const other = region.side === 'left' ? 'right' : 'left'}
           <span class="axis-tools">
-            {@render tool('axisSide', { key: axisKey, to: other }, other === 'left' ? RiToLeft : RiToRight, `Move this axis to the ${other}`)}
-            {@render tool('axisSide', { key: axisKey, to: 'none' }, RiRemoveAxis, 'Remove this axis; the signal keeps its own scale', 'Remove this axis')}
+            {@render tool('axisSide', { key: axisKey, to: other })}
+            {@render tool('axisSide', { key: axisKey, to: 'none' })}
           </span>
         {/if}
       </div>
@@ -1035,7 +1026,7 @@
         <input aria-label="Lowest value shown" type="text" inputmode="decimal" bind:value={bounds.lo} onkeydown={boundsKey} onblur={applyBounds} />
         <span>to</span>
         <input aria-label="Highest value shown" type="text" inputmode="decimal" bind:value={bounds.hi} onkeydown={boundsKey} onblur={applyBounds} />
-        {@render tool('fitYAxis', region.keys[0], RiFit, 'Fit to the data', 'Fit to the data', ['double-click'])}
+        {@render tool('fitYAxis', region.keys[0])}
       </div>
       {#if plot.kind === 'spectrum'}
         <div class="axis-row" role="group" aria-label="Density scale">
@@ -1046,8 +1037,8 @@
       <!-- This axis's Y cursors, which a pull up off the x axis also draws out. -->
       <div class="axis-row" role="group" aria-label="Y cursors">
         <span>Cursors</span>
-        {@render tool('addYCursors', region.keys[0], RiYCursors, 'Add Y1 and Y2 on this axis', 'Add Y cursors on this axis')}
-        {@render tool('clearYCursors', { key: region.keys[0] }, RiEraser, "Clear this axis's cursors")}
+        {@render tool('addYCursors', region.keys[0])}
+        {@render tool('clearYCursors', { key: region.keys[0] })}
       </div>
       {#if boundsError}<div class="axis-error">{boundsError}</div>{/if}
       <!-- How the axis writes its numbers, its ticks, tags and readout alike, and is labelled. -->
@@ -1183,7 +1174,7 @@
                   <ContextMenu.Separator />
                   <CommandItem id="clearXCursors" on={plot.id} />
                   <CommandItem id="clearYCursors" on={plot.id} />
-                  <CommandItem id="clearCursors" on={plot.id} how="all" />
+                  <CommandItem id="clearCursors" on={plot.id} />
                 </ContextMenu.Content>
               </ContextMenu.Root>
             </div>

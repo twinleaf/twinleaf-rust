@@ -39,7 +39,7 @@ const LIST = [
   ['the gaps between plots', () => [...document.querySelectorAll('.tiles .separator')], false],
   ['the plots: their bodies and headers', () => [...document.querySelectorAll('.tiles .leaf .plot-body, .tiles .leaf .plot-head')], true],
   ['the window field', () => [...document.querySelectorAll('.top-bar .window-field, .top-bar input[aria-label="Time window"]')], true],
-  ['the eraser', () => [...document.querySelectorAll('button[aria-label="Clear the cursors"]')], true],
+  ['the eraser', () => [...document.querySelectorAll('button[aria-label="Clear cursors"]')], true],
   ['File', () => [...document.querySelectorAll('button')].filter((b) => b.textContent.trim() === 'File'), true],
   ['Commands', () => [...document.querySelectorAll('button.search')], true],
   ['the Signals panel: its search, its signals and its list', () => [...document.querySelectorAll('[data-keeps-selection] input[type=search], .palette .chip, .palette')], true],

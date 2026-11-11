@@ -5,8 +5,8 @@
 // the same thing to the same plots.
 //
 // An entry is {id, scope, kinds, needs, place, show, keys, ctrl, shift,
-// keyless, what, label, icon, iconOf, active, activeIcon, when, value,
-// disabled, destructive, choices, chosen, palette, find, empty, check,
+// keyless, what, gesture, label, icon, iconOf, active, activeIcon, when,
+// value, disabled, destructive, choices, chosen, palette, empty, check,
 // run}:
 // - `scope` is 'view', 'plot', 'tab' or 'page': made from the page or the keys with no
 //   plot selected, a 'view' command acts on every plot shown and a 'plot'
@@ -34,24 +34,31 @@
 // - `show`, `keys`, `ctrl`, `shift` and `what` are its keys as keymap.js
 //   takes them; `place` 'page' puts them among the page's keys, 'list'
 //   among the Signals list's and 'tabs' among a layout tab's, not a plot's.
-//   Its row shows its keys, unless it is `keyless`.
+//   Its row shows its keys, unless it is `keyless`. `gesture` is what a
+//   pointer does that runs it too, as ['Ctrl', 'drag'], which its buttons'
+//   tips show in place of keys.
 // - `label`, `icon`, `value`, `disabled` and `destructive` are how its row
-//   reads: `label` is text or a function of the context, and a command with
-//   no label has no row; the icon is what `iconOf(ctx, how)` gives, where
-//   there is one, or `activeIcon` while `active` holds, else `icon`.
-//   `value` is null, text, or {text, icon, warn, title, label}, `label`
-//   what an icon alone says. `when`, where there is one, says whether a
-//   menu has the row at all; its key and its buttons run the command either
-//   way.
+//   reads, and how it reads wherever it shows: a menu's row, a button,
+//   whose tip and name are its label, and the command palette. `label` is
+//   text or a function of the context, and a command with no label shows
+//   nowhere; the icon is what `iconOf(ctx, how)` gives, where there is
+//   one, or `activeIcon` while `active` holds, else `icon`. Neither reads
+//   where the command is made from (`ctx.from`). `value` is null, text, or
+//   {text, icon, warn, title, label}, `label` what an icon alone says.
+//   `when`, where there is one, says whether a menu has the row at all; its
+//   key and its buttons run the command either way. `disabled` greys its
+//   row and its buttons, and keeps it out of the palette.
 // - `choices(ctx, how)`, where there is one, lists the values it sets, as
 //   [value, name]: its row opens a submenu of them, and picking one runs it
 //   with that value as `how.to`. `chosen(ctx, how)` is the value the plot
 //   it is made on has, which the submenu marks; without it the submenu
-//   marks none. A row made with a value, `how.to`, is that choice's own.
-// - `palette` is the heading the command palette lists it under (PALETTE),
-//   and a command without it is not listed there; one of choices is listed
-//   once for each. `find`, text or a function of the context, is what the
-//   palette matches what is typed against, its id and label unless given.
+//   marks none. A row made with a value, `how.to`, is that choice's own:
+//   a label of text reads the choice's name after it (`labelOf`).
+// - The command palette lists every command that has a label and needs
+//   nothing of where it is made (ORIGIN): no axis, no signal. A command on
+//   plots is listed while it has plots to act on, the selected ones; one of
+//   choices once for each. `palette` is the heading it is listed under
+//   (PALETTE), which every listed command has and no other.
 // - `empty` true runs it with no plots to act on too.
 // - `check(ctx)`, where there is one, asks, as a menu opens, what its row
 //   then reads as `how`.
@@ -99,6 +106,9 @@ import RiEraser from '@lucide/svelte/icons/eraser';
 import RiSpan from '@lucide/svelte/icons/ruler-dimension-line';
 import RiPlay from '@lucide/svelte/icons/play';
 import RiFit from '@lucide/svelte/icons/unfold-vertical';
+import RiFitX from '@lucide/svelte/icons/unfold-horizontal';
+import RiToLeft from '@lucide/svelte/icons/arrow-left';
+import RiToRight from '@lucide/svelte/icons/arrow-right';
 import RiPeak from '@lucide/svelte/icons/mountain';
 import RiPeakRight from '@lucide/svelte/icons/chevron-right';
 import RiPeakLeft from '@lucide/svelte/icons/chevron-left';
@@ -242,14 +252,19 @@ function editCursors(ctx, what, targets, fn) {
   ctx.svc.cursors.set(what, new Map(targets.map(([p, axis]) => [p.plotId, fn(p, axis)])));
 }
 
-/** The cursors' readout of the plot `ctx` is made on (PlotView `legend`), or null where it shows none. */
-const readout = (ctx) => ctx.on?.pv?.legend?.cursors ?? null;
+/** The cursors' readout of the lead plot of `ctx`, the one it is made on or else the one clicked last (PlotView `legend`), or null where it shows none. */
+const readout = (ctx) => ctx.lead?.pv?.legend?.cursors ?? null;
+/** Whether the lead plot of `ctx` has X1 and X2 placed, as its readout shows them. */
+function xPair(ctx) {
+  const x = readout(ctx)?.x;
+  return !!x && x.a !== '—' && x.b !== '—';
+}
 
-/** Puts the cursors' readout of the plot `ctx` is made on on the clipboard, as its table shows it; with none, does nothing. */
+/** Puts the cursors' readout of the lead plot of `ctx` on the clipboard, as its table shows it; with none, does nothing. */
 function copyReadout(ctx) {
   const c = readout(ctx);
   if (!c) return false;
-  const { plot, pv } = ctx.on, rows = [];
+  const { plot, pv } = ctx.lead, rows = [];
   if (c.x) {
     rows.push([`X ${c.x.v}`, c.x.a, c.x.b, c.x.d, c.x.rate ? `1/Δt ${c.x.rate}` : '']);
     for (const item of plot.items) {
@@ -283,6 +298,9 @@ const nameIn = (list, v) => list.find((x) => x[0] === v)?.[1] ?? v;
 
 /** Where an independent plot draws a signal's axis, and their names. */
 const SIDES = [['left', 'Left'], ['right', 'Right'], ['none', 'None']];
+/** What moving an axis to each side of SIDES reads as, and its picture. */
+const SIDE_LABELS = { left: 'Move this axis to the left', right: 'Move this axis to the right', none: 'Remove this axis' };
+const SIDE_ICONS = { left: RiToLeft, right: RiToRight, none: RiTrash };
 /** Which side `plot`'s axis of signal `key` is on, of SIDES. */
 function sideOf(plot, key) {
   const s = axisSlots(plot.items.filter((i) => !i.hidden).map((i) => i.key), plot.axisSides);
@@ -592,9 +610,8 @@ export const COMMANDS = [
     run: (ctx, how) => setXAxis(ctx, 'notation', how ?? {}),
   },
   {
-    // Beside the rows that clear some of them, with `how` 'all', its row says all.
     id: 'clearCursors', scope: 'view', palette: 'Plots',
-    icon: RiEraser, label: (ctx, how) => (how === 'all' ? 'Clear all cursors' : 'Clear cursors'),
+    icon: RiEraser, label: 'Clear cursors',
     value: (ctx) => {
       const n = pvs(ctx).reduce((n, p) => n + p.cursorsPlaced(), 0);
       return n ? `${n} placed` : null;
@@ -613,46 +630,45 @@ export const COMMANDS = [
   },
   {
     // A menu has its row on a plot with an X cursor placed.
-    id: 'clearXCursors', scope: 'plot',
-    icon: RiXCursors, label: 'Clear X cursors',
+    id: 'clearXCursors', scope: 'plot', palette: 'Plots',
+    icon: RiEraser, label: 'Clear X cursors',
     when: (ctx) => !!readout(ctx)?.x,
     value: (ctx) => xFirst(pvs(ctx)),
     run: (ctx) => editCursors(ctx, 'Clear X cursors', pvs(ctx).map((p) => [p]), (p) => p.xCursorsCleared()),
   },
   {
     // Made on y axis `how.key` of a plot, on the axis of each plot in its units (`axesLike`); with no `how`, on every y axis of each plot. A menu has its row on a plot with a Y cursor placed.
-    id: 'clearYCursors', scope: 'plot',
-    icon: RiYCursors, label: 'Clear Y cursors',
+    id: 'clearYCursors', scope: 'plot', palette: 'Plots',
+    icon: RiEraser, label: 'Clear Y cursors',
     when: (ctx) => !!readout(ctx)?.ys.length,
     value: (ctx) => counted(pvs(ctx).reduce((n, p) => n + p.yCursorAxes(), 0), 'axis', 'axes'),
     run: (ctx, how) => editCursors(ctx, 'Clear Y cursors', how ? axesLike(ctx.on?.pv, pvs(ctx), how.key) : pvs(ctx).map((p) => [p]), (p, axis) => p.yCursorsCleared(axis)),
   },
   {
-    // The cursors' readout of the plot it is made on, and of no other.
-    id: 'copyReadout', scope: 'plot',
+    // The cursors' readout of its lead plot, the one it is made on, and of no other. It cannot be chosen where that plot shows none.
+    id: 'copyReadout', scope: 'plot', palette: 'Plots',
     icon: RiCopy, label: 'Copy table',
     value: (ctx) => {
       const c = readout(ctx);
-      return c ? counted((c.x ? 1 + ctx.on.plot.items.length : 0) + c.ys.length, 'row') : null;
+      return c ? counted((c.x ? 1 + ctx.lead.plot.items.length : 0) + c.ys.length, 'row') : null;
     },
+    disabled: (ctx) => !readout(ctx),
     run: copyReadout,
   },
   {
-    // To the time or the frequencies between X1 and X2 of the plot it is made on, on the plots a gesture on that plot moves, as one view step (PlotView `zoomToCursors`). A menu has its row while both are placed.
-    id: 'zoomToCursors', scope: 'plot',
+    // To the time or the frequencies between X1 and X2 of its lead plot, the one it is made on, on the plots a gesture on that plot moves, as one view step (PlotView `zoomToCursors`). It cannot be chosen until that plot has both.
+    id: 'zoomToCursors', scope: 'plot', palette: 'Plots', gesture: ['Ctrl', 'drag'],
     icon: RiZoomTo, label: 'Zoom to X1–X2',
-    when: (ctx) => {
-      const x = readout(ctx)?.x;
-      return !!x && x.a !== '—' && x.b !== '—';
-    },
     value: spanValue,
-    run: (ctx) => (ctx.on?.pv ? void ctx.on.pv.zoomToCursors() : false),
+    disabled: (ctx) => !xPair(ctx),
+    run: (ctx) => (ctx.lead?.pv && xPair(ctx) ? void ctx.lead.pv.zoomToCursors() : false),
   },
   // What an axis's popover sets beside its settings. Made on y axis
   // `how.key`, or `how` itself, each acts on the axis of each plot in its
   // units (`axesLike`).
   {
-    id: 'fitYAxis', scope: 'plot', needs: ['axis'],
+    id: 'fitYAxis', scope: 'plot', needs: ['axis'], gesture: ['double-click'],
+    icon: RiFit, label: 'Fit to the data',
     run: (ctx, key) => ctx.svc.viewHistory.step(() => axesLike(ctx.on?.pv, pvs(ctx), key).forEach(([p, axis]) => p.fit([axis]))),
   },
   {
@@ -664,7 +680,7 @@ export const COMMANDS = [
     },
   },
   {
-    // A spectrum's density scale, `how.to` 'log' or 'linear', on the plots with an axis in the units of y axis `how.key`. The edit's name counts every plot it is made on.
+    // A spectrum's density scale, `how.to` 'log' or 'linear', on the plots with an axis in the units of y axis `how.key`.
     id: 'yScale', scope: 'plot', needs: ['axis'],
     run: (ctx, how) => {
       const { key, to } = how ?? {}, has = new Set(axesLike(ctx.on?.pv, pvs(ctx), key).map(([p]) => p.plotId));
@@ -672,19 +688,21 @@ export const COMMANDS = [
     },
   },
   {
-    // The frequency scale of the spectra, `how.to` 'log' or 'linear'. The edit's name counts every plot it is made on.
+    // The frequency scale of the spectra, `how.to` 'log' or 'linear'.
     id: 'xScale', scope: 'plot', needs: ['axis'],
     run: (ctx, how) => ctx.svc.edit(ids(ctx), how?.to === 'log' ? 'Log frequency scale' : 'Linear frequency scale', (plot) => (plot.kind === 'spectrum' ? { xScale: how?.to } : null)),
   },
   {
-    // The frequencies the spectra show, `how.range` as [low, high], or null for every frequency, as one view step.
+    // The frequencies the spectra show, `how.range` as [low, high], or null for every frequency, as one view step. Its button shows every frequency.
     id: 'fRange', scope: 'plot', kinds: ['spectrum'], needs: ['axis'],
+    icon: RiFitX, label: 'Show every frequency',
     run: (ctx, how) => ctx.svc.viewHistory.step(() => ctx.plots.forEach((t) => ctx.svc.ws.setView(t.id, { fRange: how?.range ?? null }))),
   },
   {
-    // Signal `how.key`'s axis on side `how.to` of SIDES, hidden with 'none', on each independent plot that shows the signal. A menu has its row on an independent plot. The edit's name counts every plot it is made on.
+    // Signal `how.key`'s axis on side `how.to` of SIDES, hidden with 'none', on each independent plot that shows the signal. A menu has its row on an independent plot. A row or a button made with a side moves the axis there.
     id: 'axisSide', scope: 'plot', needs: ['axis'],
-    icon: RiAxis, label: 'Axis',
+    icon: RiAxis, iconOf: (ctx, how) => SIDE_ICONS[how?.to],
+    label: (ctx, how) => SIDE_LABELS[how?.to] ?? 'Axis',
     when: (ctx) => ctx.on?.plot.mode === 'independent',
     value: (ctx, how) => common(ctx.plots.filter((t) => sided(t.plot, how?.key)).map((t) => nameIn(SIDES, sideOf(t.plot, how?.key)))),
     choices: () => SIDES,
@@ -696,17 +714,17 @@ export const COMMANDS = [
     },
   },
   {
-    // A window of `how.s` seconds: one typed, with `how.typed`, is a step of its own, the field's arrows and wheel one burst. Made on a plot, it sets the view of every plot it acts on; from the page, of the time plots.
+    // A window of `how.s` seconds: one typed, with `how.typed`, is a step of its own, the field's arrows and wheel one burst. It sets the view of each plot it acts on of the kind of the plot it is made on, from the page of the time plots.
     id: 'window', scope: 'view',
     run: (ctx, how) => {
-      const views = (ctx.on ? ctx.plots : ctx.plots.filter((t) => t.plot.kind === 'time')).map((t) => t.view);
+      const kind = ctx.on?.plot.kind ?? 'time', views = ctx.plots.filter((t) => t.plot.kind === kind).map((t) => t.view);
       const set = () => views.forEach((v) => v.setSpan(how?.s));
       if (how?.typed) ctx.svc.viewHistory.step(set);
       else ctx.svc.viewHistory.burst('window', views, set);
     },
   },
   {
-    id: 'setKind', scope: 'plot',
+    id: 'setKind', scope: 'plot', palette: 'Plots',
     icon: RiKind, label: 'Kind',
     value: (ctx) => common(ctx.plots.map((t) => nameIn(KINDS, t.plot.kind))),
     choices: () => KINDS,
@@ -714,7 +732,7 @@ export const COMMANDS = [
     run: (ctx, how) => (KINDS.some(([kind]) => kind === how?.to) ? ctx.svc.edit(ids(ctx), `Kind ${nameIn(KINDS, how.to)}`, () => ({ kind: how.to })) : false),
   },
   {
-    id: 'setLayout', scope: 'plot',
+    id: 'setLayout', scope: 'plot', palette: 'Plots',
     icon: RiLayout, label: 'Layout',
     value: (ctx) => common(ctx.plots.map((t) => nameIn(MODES, t.plot.mode))),
     choices: () => MODES,
@@ -723,7 +741,7 @@ export const COMMANDS = [
   },
   {
     // To the end of tab `how.to`, as one edit. Its row names the open tab, and cannot be chosen while that is the only one.
-    id: 'moveToTab', scope: 'plot', needs: ['workspace'],
+    id: 'moveToTab', scope: 'plot', palette: 'Plots', needs: ['workspace'],
     icon: RiTab, label: 'Move to tab',
     value: (ctx) => ctx.svc.ws.tab.name || null,
     disabled: (ctx) => !otherTabs(ctx).length,
@@ -735,20 +753,20 @@ export const COMMANDS = [
     },
   },
   {
-    id: 'clearSignals', scope: 'plot',
+    id: 'clearSignals', scope: 'plot', palette: 'Plots',
     icon: RiTrash, label: 'Remove every signal', destructive: true,
     value: (ctx) => counted(ctx.plots.reduce((n, t) => n + t.plot.items.length, 0), 'signal'),
     run: (ctx) => ctx.svc.edit(ids(ctx), 'Remove every signal', () => ({ items: [] })),
   },
   {
-    // Each selected plot gets those of the signals it lacks. A menu has its row unless every selected plot shows them all. Made on a plot, the edit's name counts every plot it is made on; from the page, those that lack a signal.
+    // Each selected plot gets those of the signals it lacks. A menu has its row unless every selected plot shows them all.
     id: 'addToPlots', scope: 'plot', needs: ['signals'], place: 'list', show: ['Enter'], keys: ['Enter'], shift: false, what: 'Add to the selected plots',
     icon: RiAdd, label: 'Add to plot',
     when: (ctx) => !ctx.plots.length || lacking(ctx).length > 0,
     value: (ctx) => (ctx.plots.length ? signalsValue(ctx, lacking(ctx), 'to') : 'No plot selected'),
     disabled: (ctx) => !ctx.plots.length,
     run: (ctx) =>
-      ctx.svc.edit((ctx.on ? ctx.plots : lacking(ctx)).map((t) => t.id), `Add ${signalsNamed(ctx)}`, (plot) => {
+      ctx.svc.edit(ids(ctx), `Add ${signalsNamed(ctx)}`, (plot) => {
         const lacks = ctx.signals.filter((key) => !shows(plot, key));
         return lacks.length ? { items: [...plot.items, ...lacks.map(chip)] } : null;
       }),
@@ -774,45 +792,41 @@ export const COMMANDS = [
   // A layout tab's commands.
   {
     // Opens the tab's name for editing.
-    id: 'renameTab', scope: 'tab', needs: ['workspace'], place: 'tabs', show: ['F2'], keys: ['F2'], what: 'Rename tab', empty: true,
+    id: 'renameTab', scope: 'tab', needs: ['workspace'], palette: 'Tabs', place: 'tabs', show: ['F2'], keys: ['F2'], what: 'Rename tab', empty: true,
     icon: RiRename, label: 'Rename',
     run: (ctx) => void ctx.svc.renameTab(ctx.tab.id),
-  },
-  {
-    // The page asks first when the tab has plots.
-    id: 'closeTab', scope: 'tab', needs: ['workspace'], place: 'tabs', show: ['Delete'], keys: ['Delete'], keyless: true, what: 'close tab', empty: true,
-    icon: RiClose, label: 'Close', destructive: true,
-    value: (ctx) => plotsIn(ctx.tab),
-    run: (ctx) => void ctx.svc.closeTab(ctx.tab),
   },
   {
     // Opens tab `how.to`: the palette's row for each tab.
     id: 'openTab', scope: 'page', needs: ['workspace'], palette: 'Tabs', empty: true,
     icon: RiTab, label: (ctx, how) => `Go to ${nameIn(tabNames(ctx), how?.to)}`,
-    find: (ctx, how) => `tab ${nameIn(tabNames(ctx), how?.to)}`,
     choices: tabNames,
     run: (ctx, how) => void ctx.svc.ws.selectTab(how?.to),
   },
   {
     // An empty tab after the others, which it opens.
     id: 'newTab', scope: 'tab', needs: ['workspace'], palette: 'Tabs', empty: true,
-    icon: RiAdd, label: (ctx) => (ctx.from === 'palette' ? 'New layout tab' : 'New layout'),
-    find: 'New layout tab',
+    icon: RiAdd, label: 'New layout',
     run: (ctx) => ctx.svc.group('New tab', () => ctx.svc.ws.addTab()),
   },
   {
     id: 'duplicateTab', scope: 'tab', needs: ['workspace'], palette: 'Tabs', empty: true,
-    icon: RiDuplicate, label: (ctx) => (ctx.from === 'palette' ? 'Duplicate this tab' : 'Duplicate'),
-    find: 'Duplicate this tab',
+    icon: RiDuplicate, label: 'Duplicate',
     value: (ctx) => plotsIn(ctx.tab),
     run: (ctx) => ctx.svc.group('Duplicate tab', () => ctx.svc.ws.duplicateTab(ctx.tab)),
+  },
+  {
+    // The page asks first when the tab has plots.
+    id: 'closeTab', scope: 'tab', needs: ['workspace'], palette: 'Tabs', place: 'tabs', show: ['Delete'], keys: ['Delete'], keyless: true, what: 'close tab', empty: true,
+    icon: RiClose, label: 'Close', destructive: true,
+    value: (ctx) => plotsIn(ctx.tab),
+    run: (ctx) => void ctx.svc.closeTab(ctx.tab),
   },
   // The page's own commands.
   {
     // Hides dock `how.to`, 'left' or 'right', or shows it while it is hidden: the palette's row for each.
     id: 'dock', scope: 'page', needs: ['workspace'], palette: 'Docks', empty: true,
     icon: RiDock, label: (ctx, how) => `${ctx.svc.dockShown(how?.to) ? 'Hide' : 'Show'} the ${how?.to} dock`,
-    find: (ctx, how) => `dock ${how?.to}`,
     choices: () => DOCKS,
     run: (ctx, how) => void ctx.svc.toggleDock(how?.to),
   },
@@ -820,29 +834,26 @@ export const COMMANDS = [
     // Lays the open tab's plots out as `how.to` of ARRANGEMENTS, as one edit. Its row has that arrangement's picture, and a check while the tab is laid out so.
     id: 'arrange', scope: 'page', needs: ['workspace'], palette: 'Arrange', empty: true,
     icon: RiArrange, iconOf: (ctx, how) => ARRANGE_ICONS[how?.to],
-    label: (ctx, how) => (ctx.from === 'palette' ? `Arrange as ${nameIn(ARRANGEMENTS, how?.to)}` : nameIn(ARRANGEMENTS, how?.to)),
-    find: (ctx, how) => `arrange ${nameIn(ARRANGEMENTS, how?.to)}`,
+    label: (ctx, how) => nameIn(ARRANGEMENTS, how?.to),
     value: (ctx, how) => (how?.to === ctx.svc.ws.arrangement() ? { text: '', icon: RiCheck, label: 'The layout now' } : null),
     choices: () => ARRANGEMENTS,
     run: (ctx, how) => (ARRANGEMENTS.some(([name]) => name === how?.to) ? ctx.svc.group(`Arrange as ${nameIn(ARRANGEMENTS, how.to)}`, () => ctx.svc.ws.arrange(how.to)) : false),
   },
   {
-    id: 'resetLayout', scope: 'page', needs: ['workspace'], empty: true,
+    id: 'resetLayout', scope: 'page', needs: ['workspace'], palette: 'Arrange', empty: true,
     icon: RiReset, label: 'Reset to default',
     run: (ctx) => ctx.svc.group('Reset', () => ctx.svc.ws.reset()),
   },
   {
     // The tabs as a file of layouts, to share.
     id: 'exportTabs', scope: 'page', needs: ['workspace'], palette: 'View', empty: true,
-    icon: RiDownload, label: (ctx) => (ctx.from === 'palette' ? 'Export every tab' : 'Export every tab…'),
-    find: 'Export every tab',
+    icon: RiDownload, label: 'Export every tab…',
     value: (ctx) => counted(ctx.svc.ws.tabs.length, 'tab'),
     run: (ctx) => void ctx.svc.exportTabs(),
   },
   {
     id: 'importTabs', scope: 'page', needs: ['workspace'], palette: 'View', empty: true,
-    icon: RiUpload, label: (ctx) => (ctx.from === 'palette' ? 'Import tabs' : 'Import tabs…'),
-    find: 'Import tabs',
+    icon: RiUpload, label: 'Import tabs…',
     run: (ctx) => void ctx.svc.importTabs(),
   },
 ];
@@ -851,12 +862,26 @@ export const COMMANDS = [
 export const commandOf = (id) => COMMANDS.find((c) => c.id === id);
 /** What `label` field `f` of a command reads in `ctx`. */
 const read = (f, ctx, how) => (typeof f === 'function' ? f(ctx, how) : f);
+/**
+ * What command `c` reads as in `ctx` made with `how`, wherever it shows: its
+ * label, and for a row of one of its choices, `how.to`, of a label of text,
+ * the choice's name after it.
+ */
+function labelOf(c, ctx, how) {
+  const label = read(c.label, ctx, how);
+  if (typeof c.label === 'function' || how?.to === undefined || !c.choices) return label;
+  return `${label} › ${nameIn(c.choices(ctx, how), how.to)}`;
+}
 /** The headings the command palette lists commands under (`palette`), in its order. */
 export const PALETTE = ['Tabs', 'Docks', 'Arrange', 'Plots', 'View'];
 /** The scopes of the commands that act on no plot. */
 export const PLOTLESS = ['tab', 'page'];
 /** What a command may need of where its plots are (`needs`). */
 export const HOSTED = ['workspace', 'live'];
+/** What a command may need of where it is made (`needs`): a command that needs one is not in the palette. */
+export const ORIGIN = ['axis', 'signals'];
+/** Whether the command palette lists command `c`: it shows somewhere, by its label, and needs nothing of where it is made. */
+export const listed = (c) => !!c.label && !c.needs?.some((n) => ORIGIN.includes(n));
 
 /**
  * The commands of a PlotHost (plothost.js) over `svc`, its services:
@@ -908,16 +933,17 @@ export function commands(svc) {
       if (!ctx.plots.length && !c.empty) return true;
       return c.run(ctx, how) !== false;
     },
-    /** How command `id`'s row reads, made at `where` with `how`: {label, icon, value, disabled, destructive, show, choices, chosen, offered}, `choices` null for a row with no submenu, and `offered` whether a menu has the row. */
+    /** How command `id`'s row reads, made at `where` with `how`: {label, icon, value, disabled, destructive, show, gesture, choices, chosen, offered}, `choices` null for a row with no submenu, and `offered` whether a menu has the row. */
     row(id, { how, ...where } = {}) {
       const c = commandOf(id), ctx = context(id, where);
       return {
-        label: read(c.label, ctx, how),
+        label: labelOf(c, ctx, how),
         icon: c.iconOf?.(ctx, how) ?? (c.active?.(ctx, how) ? c.activeIcon : c.icon),
         value: c.value?.(ctx, how) ?? null,
         disabled: !!c.disabled?.(ctx, how),
         destructive: !!c.destructive,
         show: c.keyless ? null : (c.show ?? null),
+        gesture: c.gesture ?? null,
         choices: how?.to === undefined ? (c.choices?.(ctx, how) ?? null) : null,
         chosen: c.chosen?.(ctx, how),
         offered: hosted(c) && (!c.when || !!c.when(ctx, how)),
@@ -930,21 +956,22 @@ export function commands(svc) {
     },
     /**
      * The palette's rows now, in the table's order, as {id, how, label,
-     * find, group}: `how` what the row runs its command with, `find` the
-     * words the palette matches what is typed against, and `group` its
-     * heading. A command the table lists there (`palette`) has a row for
-     * each of its choices, or one: a command on plots while it has plots to
-     * act on now, or runs with none and is on, as Restore is while plots
-     * are maximized; a command of the page or a tab always.
+     * find, group}: `how` what the row runs its command with, `label` what
+     * the command reads as (`labelOf`), `group` its heading, and `find`
+     * the words the palette matches what is typed against: the heading, the
+     * label and the id. A command it lists (`listed`) has a row for each of
+     * its choices, or one, while it can be chosen: a command on plots while
+     * it has plots to act on now, or runs with none and is on, as Restore is
+     * while plots are maximized; a command of the page or a tab always.
      */
     offered() {
-      return COMMANDS.filter((c) => c.palette && hosted(c)).flatMap((c) => {
+      return COMMANDS.filter((c) => listed(c) && hosted(c)).flatMap((c) => {
         const ctx = context(c.id, { from: 'palette' });
         if (!PLOTLESS.includes(c.scope) && !(ctx.plots.length || (c.empty && c.active?.(ctx)))) return [];
         if (c.disabled?.(ctx)) return [];
         return (c.choices?.(ctx) ?? [[undefined]]).map(([to]) => {
-          const how = to === undefined ? undefined : { to }, label = read(c.label, ctx, how);
-          return { id: c.id, how, label, find: c.find ? read(c.find, ctx, how) : `command ${c.id} ${label}`, group: c.palette };
+          const how = to === undefined ? undefined : { to }, label = labelOf(c, ctx, how);
+          return { id: c.id, how, label, find: `${c.palette.toLowerCase()} ${label} ${c.id}`, group: c.palette };
         });
       });
     },
