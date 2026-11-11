@@ -11,6 +11,7 @@ import { page as browser, commands } from 'vitest/browser';
 import { PANELS } from '../src/lib/docks.svelte.js';
 import { SCROLL_REST_MS } from '../src/lib/scrolling.js';
 import { centre, clickOn, glide, mountPage, pickItem, pressKey, rightClick, rested, settle, typeInto, until, wait, watchFrames, withExamples } from './harness/page.js';
+import { lastKey } from '../src/lib/keyrouter.js';
 
 const LIST = '[data-slot=scroll-area-viewport]';
 const BAR = '[data-slot=scroll-area-scrollbar]';
@@ -738,6 +739,70 @@ describe('a drag of the handle beside a dock', () => {
     );
     expect(Object.entries(seen).filter(([, n]) => n < 1).map(([what]) => what), 'not seen').toEqual([]);
   }, 600_000);
+
+  it('ends on Escape with its dock put back on a page mounted again under a drag held, and ends where it is as a narrowing window lays the panes out anew; nothing thrown, and Escape is no drag’s after it', async () => {
+    const errors = [];
+    const onError = (e) => errors.push(String(e.error?.message ?? e.message ?? e.reason));
+    window.addEventListener('error', onError);
+    window.addEventListener('unhandledrejection', onError);
+    const mounted = () => mountPage([['s0.x']], 'columns', 0, signals(3), tableOf({ setting: 3, report: 3, action: 2, other: 2 }));
+    /** Presses the left handle and drags it `by` px out, the button held. */
+    const hold = async (by) => {
+      const [x, y] = centre(handleOf('left'));
+      await commands.mouse([['move', x, y], ['down'], ...glide([x, y], [x + by, y], 4)]);
+      return [x + by, y];
+    };
+    let page = null;
+    try {
+      for (const how of ['mounted again', 'narrowed']) {
+        await browser.viewport(1200, 900);
+        page = await mounted();
+        await atRest();
+        if (how === 'mounted again') {
+          // A drag held as the page goes, as a case that fails under a drag leaves it.
+          await hold(60);
+          page.dispose();
+          await commands.mouse([['up']]);
+          page = await mounted();
+          await atRest();
+        }
+        const said = `the page ${how}`, was = { width: widthOf('left'), hidden: hidden('left'), kept: localStorage.getItem(KEPT[0]) };
+        const at = await hold(80);
+        await settle();
+        expect(Math.abs(widthOf('left') - was.width), `${said}: the drag moved the dock`).toBeGreaterThan(20);
+        if (how === 'narrowed') {
+          // The panes are laid out anew, one above another, under the drag, and again side by side.
+          await browser.viewport(700, 900);
+          await atRest();
+          await browser.viewport(1200, 900);
+          await atRest();
+        }
+        await pressKey('Escape');
+        await commands.mouse([['move', at[0] + 30, at[1]], ['up']]);
+        await atRest();
+        expect(errors, `${said}: nothing thrown`).toEqual([]);
+        expect(hidden('left'), `${said}: hidden`).toBe(was.hidden);
+        // Escape puts back what a drag still under way moved; a narrowed window has ended it.
+        if (how === 'mounted again') {
+          expect(Math.abs(widthOf('left') - was.width), `${said}: px from its width before`).toBeLessThan(1.5);
+          expect(Number(localStorage.getItem(KEPT[0]) ?? 22), `${said}: its width kept`).toBe(Number(was.kept ?? 22));
+        }
+        expect(document.querySelector('[data-pane-resizer][data-active=pointer]'), `${said}: a handle still dragged`).toBe(null);
+        expect(cursors(), `${said}: the page's cursors after it`).not.toEqual(expect.arrayContaining([expect.stringMatching(RESIZE)]));
+        // The drag is over: Escape is no drag's.
+        await pressKey('Escape');
+        expect(lastKey().by, `${said}: Escape after it`).not.toBe('drag');
+        page.dispose();
+        page = null;
+      }
+    } finally {
+      window.removeEventListener('error', onError);
+      window.removeEventListener('unhandledrejection', onError);
+      await commands.mouse([['up']]);
+      page?.dispose();
+      await browser.viewport(1200, 900);
+    }
+  }, 60_000);
 
   it('double-clicked, shows the dock at the width it starts at, hidden or shown', async () => {
     await browser.viewport(1200, 900);

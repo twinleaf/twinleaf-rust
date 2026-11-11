@@ -438,15 +438,16 @@
    * It ends where the pointer is let go, on the page or off it, or where it
    * is as the window loses focus, which then hears no release; Escape ends
    * it where it began. Every end goes through the pane library's release,
-   * which takes its resize cursor off the page.
+   * which takes its resize cursor off the page. A drag lasts no longer than
+   * the pane group it drags in (`$effect.pre` below), and a press that
+   * begins one ends any other of the same handle, so the pane Escape puts
+   * back is always one the group lays out.
    */
   function dockDragging(side, dragging) {
-    if (!dragging) {
-      dragFrom[side]?.ends();
-      dragFrom[side] = null;
-      return;
-    }
-    const pane = dockPanes[side], release = () => window.dispatchEvent(new MouseEvent('mouseup'));
+    dragFrom[side]?.ends();
+    dragFrom[side] = null;
+    if (!dragging) return;
+    const pane = dockPanes[side];
     const from = { width: dockSize[side], pane: pane.getSize() };
     const unclaim = claim('drag', {
       on: {
@@ -464,6 +465,19 @@
     };
     dragFrom[side] = from;
   }
+  /** The pane library's release of a drag of a handle, as the pointer let go. */
+  const release = () => window.dispatchEvent(new MouseEvent('mouseup'));
+  // The pane group lives as long as the page and the window's narrowness
+  // (the `{#key}` about it): before it goes, a drag of its handles ends
+  // where it is, released while its handle still hears it, and ended here
+  // whether or not it did, so no drag outlives the panes it moves.
+  $effect.pre(() => {
+    void narrow.current;
+    return () => {
+      if (dragFrom.left || dragFrom.right) release();
+      for (const side of ['left', 'right']) dockDragging(side, false);
+    };
+  });
   /** Puts dock `side` back to the width it starts at, showing it if hidden. */
   function resetDock(side) {
     keepDockSize(side, DOCK.default);
