@@ -6,7 +6,8 @@
 // another tag or a tick label, every tag is inside the plot area, and each stub is in the
 // axis's gutter beside the plot, short of the tick labels, so the line can
 // be set against a tick. And where the tabs of the Y cursors not yet placed
-// rest: at the foot of each y axis, in plots of every height. And the y
+// rest: at the foot of each y axis, in plots of every height, on an axis as
+// wide as a tab in every frame as the plot is resized. And the y
 // numbers of a stacked plot's lanes, of every height and count: clear of
 // each other and of the next lane's, several or none by the lane's
 // height, never one alone, never back as it changes, the gutter as wide as
@@ -340,6 +341,30 @@ describe('the y numbers of a stacked plot’s lanes', () => {
       withExamples([...shapes.flatMap((s) => [[s, 300, [0, 1, 0]], [s, 150, [0, 1, 0]], [s, 700, [-5, 10, 0]]]), [shapes[2], 100, [0, 1, 0]], [shapes[2], 900, [0, 1, 0]]]),
     );
     // The examples alone reach each outcome, whatever the generated cases.
+    for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(0);
+  }, 600_000);
+
+  it('rest the Y cursors’ tabs only on an axis as wide as a tab, in every frame, as the plot grows and shrinks a pixel at a time', async () => {
+    const count = { tabs: 0, bare: 0 };
+    for (const lanes of [4, 8, 12]) {
+      const { page, pv, leaf } = await stacked(lanes);
+      try {
+        // One frame at each height, up and back down: the frame that first gives a lane room for a tab, and the one that takes it away.
+        const heights = [...Array.from({ length: 301 }, (_, i) => 100 + i), ...Array.from({ length: 301 }, (_, i) => 400 - i)];
+        for (const h of heights) {
+          leaf.style.height = `${h}px`;
+          pv.draw(clock.now());
+          const tabs = pv.pressable.filter((p) => p.part === 'tab' && p.kind === 'y');
+          for (const t of tabs) {
+            const where = `${lanes} lanes in a tile ${h} px high, ${t.key}'s lane ${t.axis.lane.h.toFixed(2)} px high: ${t.text} at ${t.x}, ${t.w} wide`;
+            expect(t.x >= t.axis.x0 && t.x + t.w <= t.axis.x1, `${where}, on its axis from ${t.axis.x0} to ${t.axis.x1}, ${t.axis.x1 - t.axis.x0} px wide`).toBe(true);
+          }
+          count[tabs.length ? 'tabs' : 'bare']++;
+        }
+      } finally {
+        page.dispose();
+      }
+    }
     for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(0);
   }, 600_000);
 

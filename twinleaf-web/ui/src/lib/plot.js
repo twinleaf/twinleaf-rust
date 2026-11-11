@@ -686,21 +686,29 @@ export class PlotView {
     return { left: slots.left.length, right: slots.right.length };
   }
 
-  /** The width of the `slot`th y axis out on `side`, as its labels last needed. */
-  axisWidth(side, slot) {
-    return this.gutter[side][slot] ?? GUTTER.min;
-  }
-
-  /** Plot area and lanes, in CSS px relative to the viewport. Each y axis is as wide as its labels need. */
+  /**
+   * Plot area and lanes, in CSS px relative to the viewport, and what the
+   * frame draws in the gutters by them. `head` is the foot of a floating
+   * header, or -Infinity; `tabs[i]` how many tabs of Y cursors lane i has
+   * room for (`tabRoom`); `widths` each y axis's width by side, from the plot
+   * outward: as wide as its numbers last needed, and as a tab's room at
+   * least while a lane has room for a tab, so the tabs this frame rests
+   * always lie on their axis.
+   */
   geometry(body, cfg, n) {
+    const top = body.y + EDGE.above, height = body.h - EDGE.above - AXIS_BELOW - 22;
+    const count = lanesOf(cfg.mode, n), h = (height - LANE_GAP * (count - 1)) / count;
+    const ys = Array.from({ length: count }, (_, i) => ({ y: top + i * (h + LANE_GAP), h }));
+    const head = this.body.closest('.plot-card.monitor')?.querySelector('.plot-head')?.getBoundingClientRect().bottom ?? -Infinity;
+    const tabs = ys.map((lane) => this.tabRoom(lane, head));
+    const least = tabs.some((room) => room > 0) ? GUTTER.min : GUTTER.bare;
     const counts = this.axisCounts(cfg);
-    const width = (side) => Array.from({ length: counts[side] }, (_, i) => this.axisWidth(side, i)).reduce((a, b) => a + b, 0);
-    const left = Math.max(width('left'), GUTTER.bare), right = Math.max(width('right'), GUTTER.bare);
-    const plot = { x: body.x + left, y: body.y + EDGE.above, w: body.w - left - right, h: body.h - EDGE.above - AXIS_BELOW - 22 };
-    const count = lanesOf(cfg.mode, n);
-    const h = (plot.h - LANE_GAP * (count - 1)) / count;
-    const lanes = count === 1 ? [plot] : Array.from({ length: count }, (_, i) => ({ x: plot.x, y: plot.y + i * (h + LANE_GAP), w: plot.w, h }));
-    return { plot, lanes };
+    const widths = Object.fromEntries(['left', 'right'].map((side) => [side, Array.from({ length: counts[side] }, (_, i) => Math.max(this.gutter[side][i] ?? GUTTER.min, least))]));
+    const width = (side) => Math.max(widths[side].reduce((a, b) => a + b, 0), GUTTER.bare);
+    const left = width('left'), right = width('right');
+    const plot = { x: body.x + left, y: top, w: body.w - left - right, h: height };
+    const lanes = count === 1 ? [plot] : ys.map(({ y }) => ({ x: plot.x, y, w: plot.w, h }));
+    return { plot, lanes, head, tabs, widths };
   }
 
   /**
@@ -1141,8 +1149,8 @@ export class PlotView {
     for (const a of axes) {
       a.slot ??= 0;
       let inner = 0;
-      for (let i = 0; i < a.slot; i++) inner += this.axisWidth(a.side, i);
-      const w = this.axisWidth(a.side, a.slot);
+      for (let i = 0; i < a.slot; i++) inner += geo.widths[a.side][i];
+      const w = geo.widths[a.side][a.slot];
       const outermost = !axes.some((b) => b.side === a.side && b.slot > a.slot);
       if (a.side === 'left') [a.x0, a.x1] = [outermost ? body.x : P.x - inner - w, P.x - inner];
       else [a.x0, a.x1] = [P.x + P.w + inner, outermost ? body.x + body.w : P.x + P.w + inner + w];
@@ -1183,13 +1191,13 @@ export class PlotView {
       });
     }
     // Each axis's grid and numbers, as `laneTicks` picks them by its lane's
-    // height, and the width its gutter needs for what it draws: its numbers,
-    // or, with none, the tabs of the Y cursors resting in a lane with room
-    // for one, or else nothing but the bare edge. Numbers reach past the
-    // plot's top and foot as far as the room it keeps there, and past a lane's
-    // edge between two lanes half way into the gap; none reach above a
-    // floating header's foot, with CLEAR px below it.
-    const head = this.body.closest('.plot-card.monitor')?.querySelector('.plot-head')?.getBoundingClientRect().bottom ?? -Infinity;
+    // height, and the width its numbers need, or with none the bare edge,
+    // for the next frame's geometry, which widens it further for the tabs
+    // of Y cursors in that frame. Numbers reach past the plot's top and foot
+    // as far as the room it keeps there, and past a lane's edge between two
+    // lanes half way into the gap; none reach above a floating header's
+    // foot, with CLEAR px below it.
+    const head = geo.head;
     const need = { left: [], right: [] };
     const reachOf = (lane) => ({
       above: Math.min(lane === geo.lanes[0] ? EDGE.above : LABEL_REACH, lane.y - head - CLEAR),
@@ -1220,7 +1228,7 @@ export class PlotView {
         ctx.fillText(label, ax.side === 'left' ? ax.x1 - GUTTER.gap : ax.x0 + GUTTER.gap, py + 4);
         this.tickLabels.push({ axis: ax.key, x: ax.side === 'left' ? ax.x1 - GUTTER.gap - w : ax.x0 + GUTTER.gap, y: py + 4 - LABEL.up, w, h: LABEL.up + LABEL.down });
       }
-      const want = labels.length ? Math.max(GUTTER.min, Math.ceil(widest + GUTTER.gap + GUTTER.pad)) : this.tabRoom(ax.lane, head) > 0 ? GUTTER.min : GUTTER.bare;
+      const want = labels.length ? Math.max(GUTTER.min, Math.ceil(widest + GUTTER.gap + GUTTER.pad)) : GUTTER.bare;
       need[ax.side][ax.slot] = Math.max(need[ax.side][ax.slot] ?? 0, want);
     });
     for (const side of ['left', 'right'])
@@ -1678,12 +1686,11 @@ export class PlotView {
       const x = (xTabsBeside ? P.x - 2 * TAB.w - 4 : P.x + 2) + i * (TAB.w + 2);
       tabs.push({ part: 'tab', kind: 'x', name, fill: color[name], text: xName[name], x, y: P.y + P.h + AXIS_BELOW + 3, w: TAB.w, h: TAB.h });
     });
-    // The header of a plot too short for one of its own floats over the plot's top, and covers what is under it.
-    const head = this.body.closest('.plot-card.monitor')?.querySelector('.plot-head')?.getBoundingClientRect().bottom ?? -Infinity;
+    // As many as the lane has room for below a floating header, as the frame's geometry decided, which made the axis wide enough for them.
     for (const a of axes) {
       const yc = this.yPair(a.key);
       const resting = ['a', 'b'].filter((name) => !yc || yc[name] === null);
-      const room = this.tabRoom(a.lane, head);
+      const room = this.geo.tabs[this.geo.lanes.indexOf(a.lane)];
       const x = a.side === 'left' ? a.x0 + 2 : a.x1 - TAB.w - 2;
       for (const name of room >= 2 ? resting : resting.slice(0, room)) {
         const up = room >= 2 && name === 'b' ? TAB.h + 2 : 0;
