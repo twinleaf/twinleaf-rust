@@ -755,6 +755,68 @@ export class PlotView {
     this.publishFrame(body, geo.plot);
     if (cfg.kind === 'spectrum') this.drawSpectrum(cfg, traces, geo, body);
     else this.drawTime(cfg, traces, geo, body, perf);
+    this.placeReadout(body, cfg.readoutAt ?? null);
+  }
+
+  /**
+   * Places the cursors' readout, the page's table over the plot
+   * (`.cursor-readout` in the body), clear of every cursor's tag and tab the
+   * plot drew (`pressable`). It sits at `at`, its place as a share of the
+   * body's room across and down, while that covers none of them. Where one
+   * lies under it, it takes the place nearest that covers none: its own
+   * moved along an edge out of the way of what is in it, across the way
+   * those parts move, up or down past an X cursor's and aside past a Y
+   * cursor's; or a corner, or a corner moved so. It stays where it moved to
+   * while that covers none, and comes back once its own place is TAG_HELD
+   * px clear of them all, so a cursor dragged past it moves it once away
+   * and once back. Where no place covers none it is not drawn: the tags
+   * win. With no `at`, as while it is dragged, the page places it alone.
+   * A place it moved to is held from the body's edges on the sides of its
+   * own place, the right one for a place at the right, the bottom one for
+   * a place at the foot, so it stays put there as its size changes with
+   * what it reads. The place is set on the body: `data-readout` 'moved',
+   * with --readout-x and --readout-y the px from those edges and
+   * `data-readout-from` naming them, or 'hidden'.
+   */
+  placeReadout(body, at) {
+    const el = at && this.body.querySelector('.cursor-readout');
+    if (!el) return this.publishReadout(null);
+    const { width: w, height: h } = el.getBoundingClientRect(), I = READOUT_INSET;
+    const right = at.x === 1, foot = at.y === 1;
+    const room = { l: body.x + I, t: body.y + I, r: body.x + body.w - I, b: body.y + body.h - I };
+    const placed = (a) => ({ x: room.l + a.x * Math.max(0, room.r - room.l - w), y: room.t + a.y * Math.max(0, room.b - room.t - h), w, h });
+    const parts = this.pressable.filter((p) => p.part === 'tag' || p.part === 'tab');
+    const clear = (box, by = 0) => !parts.some((p) => overlaps({ x: p.x - by, y: p.y - by, w: p.w + 2 * by, h: p.h + 2 * by }, box));
+    const inRoom = (b) => b.x >= room.l - 0.5 && b.x + w <= room.r + 0.5 && b.y >= room.t - 0.5 && b.y + h <= room.b + 0.5;
+    const home = placed(at), was = this.readoutPlace, same = was?.at === `${at.x},${at.y}`;
+    let to = null;
+    if (!clear(home, same && was.box ? TAG_HELD : 0)) {
+      const kept = same && typeof was.box === 'object' && was.box && { x: right ? body.x + body.w - was.box.ax - w : body.x + was.box.ax, y: foot ? body.y + body.h - was.box.ay - h : body.y + was.box.ay, w, h };
+      if (kept && inRoom(kept) && clear(kept)) to = kept;
+      else {
+        const corners = [home, ...[{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0, y: 1 }, { x: 1, y: 1 }].map(placed)];
+        const ways = corners.flatMap((c) => [c, ...parts.flatMap((p) => (p.kind === 'x' ? [{ ...c, y: p.y + p.h + READOUT_GAP }, { ...c, y: p.y - READOUT_GAP - h }] : [{ ...c, x: p.x + p.w + READOUT_GAP }, { ...c, x: p.x - READOUT_GAP - w }]))]);
+        const d = (b) => Math.hypot(b.x - home.x, b.y - home.y);
+        to = ways.filter((b) => inRoom(b) && clear(b)).reduce((best, b) => (!best || d(b) < d(best) ? b : best), null) ?? 'hidden';
+      }
+    }
+    const box = to && to !== 'hidden' ? { ax: right ? body.x + body.w - to.x - w : to.x - body.x, ay: foot ? body.y + body.h - to.y - h : to.y - body.y, from: `${right ? 'right' : 'left'} ${foot ? 'bottom' : 'top'}` } : to;
+    this.readoutPlace = { at: `${at.x},${at.y}`, box };
+    this.publishReadout(box);
+  }
+
+  /** Sets where `placeReadout` has the readout on the body: `place` {ax, ay, from}, 'hidden', or null for where the page has it. Only a change is written. */
+  publishReadout(place) {
+    const key = place === null || place === 'hidden' ? place : `${place.ax},${place.ay},${place.from}`;
+    if (this.readoutShown === key) return;
+    this.readoutShown = key;
+    if (place === null) delete this.body.dataset.readout;
+    else this.body.dataset.readout = place === 'hidden' ? 'hidden' : 'moved';
+    if (place && place !== 'hidden') {
+      this.body.dataset.readoutFrom = place.from;
+      this.body.style.setProperty('--readout-x', `${place.ax}px`);
+      this.body.style.setProperty('--readout-y', `${place.ay}px`);
+    }
   }
 
   /**
@@ -2291,6 +2353,8 @@ const CURSOR_STUB = 4;
 const SNAP_RING = 5;
 /** How near, in px, the tags of two cursors come before they part to their outer sides, and how much further apart they are before they come back. */
 const TAG_NEAR = 4, TAG_HELD = 6;
+/** The space between the cursors' readout and the plot body's edge, in px, as plot.css keeps it; and the least it leaves beside a cursor's part it moved off. */
+const READOUT_INSET = 4, READOUT_GAP = 2;
 /** Whether boxes `a` and `b`, each {x, y, w, h}, overlap. */
 const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
 /** How far to either side of a cursor's line, in px, a press still lands on it. */

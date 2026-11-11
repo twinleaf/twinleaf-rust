@@ -11,7 +11,10 @@
 // And what follows the pointer, drawn over the rest and let through by a
 // press: the hover's tip covers no cursor's tag or tab, and the pointer's
 // value on a y axis has one place, where it is left out while it would
-// cover a cursor's tag.
+// cover a cursor's tag. The cursors' readout, laid over the plot by the
+// page, covers no cursor's tag or tab in any corner it is given, and a
+// cursor swept under it a pixel at a time, back and forth as a hand moves,
+// moves it once away and once back at most.
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
@@ -163,6 +166,83 @@ describe('a press on a plot', () => {
       for (const [what, n] of Object.entries(count)) expect(n, what).toBeGreaterThan(what === 'covered' || what === 'underAnother' ? -1 : 10);
     } finally {
       await commands.mouse([['up']]);
+      page.dispose();
+    }
+  }, 600_000);
+});
+
+/** Where the page shows the cursors' readout, given its place `at`: the corner of its box on that side, in client px rounded, as its width and height change with what it reads; or 'none' while it is not drawn. */
+function readoutShown(at = { x: 0, y: 0 }) {
+  const el = document.querySelector('.cursor-readout');
+  if (!el || getComputedStyle(el).visibility === 'hidden') return 'none';
+  const r = el.getBoundingClientRect();
+  return [at.x ? r.right : r.left, at.y ? r.bottom : r.top].map(Math.round).join(',');
+}
+
+describe('the cursors’ readout', () => {
+  it('covers no cursor’s tag or tab, wherever the cursors are and whichever corner it is given', async () => {
+    const m = await mounted(), { page, id } = m;
+    const count = { parts: 0, shown: 0, moved: 0, none: 0 };
+    try {
+      await fc.assert(
+        fc.asyncProperty(plotCase, async (c) => {
+          await arrange(m, c);
+          const pv = page.pv(id);
+          // A plot with no cursor placed has no readout.
+          if (!document.querySelector('.cursor-readout')) return;
+          const shown = readoutShown();
+          if (shown === 'none') count.none++;
+          else count.shown++;
+          if (pv.body.dataset.readout === 'moved') count.moved++;
+          for (const part of tagsAndTabs(pv)) {
+            const at = centreOf(part);
+            expect(document.elementFromPoint(...at), `${c.kind} ${c.layout}, the readout at ${JSON.stringify(c.readoutAt)} and ${shown}: what is at the centre of ${nameOf(part)} ${JSON.stringify([part.x, part.y, part.w, part.h])}`).toBe(pv.overlay);
+            count.parts++;
+          }
+        }),
+        { examples: EXAMPLES, numRuns: EXAMPLES.length + Math.ceil(fc.readConfigureGlobal().numRuns / 4) },
+      );
+      // The readout shows in most cases, in its own corner or moved off the cursors' parts.
+      expect(count.parts, 'parts tried').toBeGreaterThan(100);
+      expect(count.moved, 'cases the readout moved in').toBeGreaterThan(2);
+      expect(count.none, 'cases with no readout drawn').toBeLessThan(count.shown);
+    } finally {
+      page.dispose();
+    }
+  }, 600_000);
+
+  it('moves once away from its corner and once back, at most, as a cursor is swept under it', async () => {
+    const m = await mounted(), { page, id } = m;
+    let swept = 0;
+    try {
+      // An X cursor's value along the plot's top, under either top corner; a Y cursor's tags up the left axis, under either left corner.
+      const SWEEPS = [
+        { axis: 'x', readoutAt: CORNERS[0] }, { axis: 'x', readoutAt: CORNERS[1] },
+        { axis: 'y', readoutAt: CORNERS[0] }, { axis: 'y', readoutAt: CORNERS[2] },
+      ];
+      for (const { axis, readoutAt } of SWEEPS) {
+        const still = { a: 0.5, b: 0.6 };
+        const cursors = await arrange(m, { kind: 'time', layout: 'overlay', x: axis === 'x' ? { a: 0, b: null } : still, y: SIGNALS.map(() => (axis === 'y' ? { a: 0, b: 0.5 } : { a: null, b: null })), readoutAt });
+        const pv = page.pv(id), key = pv.yAxes[0].key, [lo, hi] = axis === 'x' ? pv.xd : pv.yBounds(key);
+        // A pixel at a time, as a drag moves it, and back and forth by 3 px as a hand does: 0, 3, 1, 4, 2, 5, ...
+        const STEPS = Math.round(axis === 'x' ? pv.geo.plot.w : pv.yAxes[0].lane.h);
+        const seen = [];
+        for (let i = 0; i <= 2 * STEPS; i++) {
+          const v = lo + ((hi - lo) * Math.min(STEPS, Math.floor(i / 2) + (i % 2 ? 3 : 0))) / STEPS;
+          editCursors(page, id, () => (axis === 'x' ? { ...cursors, x: { ...cursors.x, a: v } } : { ...cursors, y: { time: { ...cursors.y.time, [key]: { ...cursors.y.time[key], a: v } } } }));
+          await settle(2);
+          const shown = readoutShown(readoutAt);
+          if (seen.at(-1) !== shown) seen.push(shown);
+          for (const part of tagsAndTabs(pv)) expect(document.elementFromPoint(...centreOf(part)), `sweeping ${axis} a, the readout at ${JSON.stringify(readoutAt)}, step ${i}: ${nameOf(part)}`).toBe(pv.overlay);
+        }
+        const where = `sweeping ${axis} a, the readout at ${JSON.stringify(readoutAt)}: ${JSON.stringify(seen)}`;
+        expect(seen.length, where).toBeLessThanOrEqual(3);
+        if (seen.length === 3) expect(seen[2], `${where}: back where it was`).toBe(seen[0]);
+        if (seen.length > 1) swept++;
+      }
+      // The sweeps passed under the readout.
+      expect(swept, 'sweeps that moved the readout').toBeGreaterThanOrEqual(3);
+    } finally {
       page.dispose();
     }
   }, 600_000);

@@ -35,12 +35,15 @@ export async function menuPage() {
   return { ...page, ids };
 }
 
-/** A spot of plot `id`'s plot area, in client px. */
+/** A spot of plot `id`'s plot area, in client px, where a press lands on the plot area itself, clear of the readout, the legend and the cursors. */
 export function plotArea(page, id) {
-  const P = page.pv(id)?.geo?.plot;
+  const pv = page.pv(id), P = pv?.geo?.plot;
   expect(P, `plot ${id} drawn`).toBeTruthy();
-  // Its lower right, clear of the readout and the legend in their corners.
-  return [P.x + P.w * 0.75, P.y + P.h * 0.75];
+  // Its lower right first, then across the rest of it.
+  const shares = [[0.75, 0.75], ...[0.5, 0.25, 0.75, 0.9, 0.1].flatMap((y) => [0.5, 0.25, 0.75, 0.9, 0.1].map((x) => [x, y]))];
+  const spot = shares.map(([x, y]) => [P.x + P.w * x, P.y + P.h * y]).find((at) => document.elementFromPoint(...at) === pv.overlay && pv.pressAt(...at)?.part === 'plot');
+  expect(spot, `plot ${id}: a spot of its plot area clear of what lies over it`).toBeTruthy();
+  return spot;
 }
 
 /** Each menu of the page, `open(page, id)` opening it on plot `id` where it is a plot's, and returning it. */

@@ -610,27 +610,19 @@ describe('a cursor dragged on a plot', () => {
     const points = parts.flatMap((p) => (by === 'line' ? [0.3, 0.5, 0.7].map((t) => (axis === 'x' ? [p.x + p.w / 2, p.y + t * p.h] : [p.x + t * p.w, p.y + p.h / 2])) : [[p.x + p.w / 2, p.y + p.h / 2]]));
     return points.find((at) => document.elementFromPoint(...at) === pv.overlay && pv.pressAt(...at)?.kind === axis && pv.pressAt(...at)?.name === name) ?? null;
   }
-  /** The corners of its plot the cursors' readout can be dragged to. */
-  const CORNERS = [{ x: 0, y: 0 }, { x: 1, y: 1 }, { x: 1, y: 0 }, { x: 0, y: 1 }];
   /**
    * Where on plot `id` of `page` a press takes cursor `name` of `axis` by its
-   * `by`, with the notices closed and the plot's readout moved to the first
-   * corner that leaves the part uncovered, the pointer resting over it; null
-   * when no corner does.
+   * `by`, with the notices closed and the pointer resting over it; null when
+   * none does.
    */
   async function uncover(page, id, axis, name, by) {
     const pv = page.pv(id);
     await clearNotices();
-    for (const readoutAt of CORNERS) {
-      page.history.group('Prepare', () => page.ws.setPlot(id, { readoutAt }));
-      if (!(await until(() => pressOn(pv, axis, name, by), 500))) continue;
-      // Over the press, once what shows there has settled, as the readout and the header come and go with the pointer.
-      await commands.mouse([['move', ...pressOn(pv, axis, name, by)]]);
-      await settle(10);
-      const at = pressOn(pv, axis, name, by);
-      if (at) return at;
-    }
-    return null;
+    if (!(await until(() => pressOn(pv, axis, name, by), 500))) return null;
+    // Over the press, once what shows there has settled, as the readout and the header come and go with the pointer.
+    await commands.mouse([['move', ...pressOn(pv, axis, name, by)]]);
+    await settle(10);
+    return pressOn(pv, axis, name, by);
   }
   // Each cursor by each of its parts, every plot selected.
   const EXAMPLES = [

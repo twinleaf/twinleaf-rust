@@ -399,6 +399,11 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
    their menus from the plot's. */
 .readout-layer, .legend-layer { display: contents; }
 .cursor-readout { position: absolute; left: calc(4px + var(--x) * (100% - 8px)); top: calc(4px + var(--y) * (100% - 8px)); transform: translate(calc(var(--x) * -100%), calc(var(--y) * -100%)); z-index: 2; cursor: grab; touch-action: none; max-width: calc(100% - 8px); max-height: calc(100% - 8px); overflow: auto; scrollbar-width: thin; background: color-mix(in oklch, var(--card) 88%, transparent); backdrop-filter: blur(2px); border: 1px solid var(--border); }
+/* Moved off a cursor's tag or tab, or left out where no place is clear of them (plot.js `placeReadout`). */
+.plot-body[data-readout=moved] .cursor-readout { left: var(--readout-x); top: var(--readout-y); transform: none; }
+.plot-body[data-readout=moved][data-readout-from^=right] .cursor-readout { left: auto; right: var(--readout-x); }
+.plot-body[data-readout=moved][data-readout-from$=bottom] .cursor-readout { top: auto; bottom: var(--readout-y); }
+.plot-body[data-readout=hidden] .cursor-readout { visibility: hidden; }
 .cursor-readout table { border-collapse: collapse; font: 10px/16px var(--font-data); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .cursor-readout th, .cursor-readout td { padding: 0 6px; }
 .cursor-readout thead th { font: 500 10px/16px var(--font-ui); color: var(--muted-foreground); text-align: right; border-bottom: 1px solid var(--border); }
