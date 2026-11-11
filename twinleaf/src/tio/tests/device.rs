@@ -4,7 +4,7 @@
 
 use super::WAIT;
 use crate::proto::data as wire;
-use crate::proto::rpc::Method;
+use crate::proto::rpc::{Method, RpcError};
 use crate::proto::sync::Epoch;
 use crate::proto::{ColumnId, DeviceRoute, PacketType, SegmentId, SessionId, StreamId};
 use crate::tio::packet::{Packet, Payload};
@@ -249,9 +249,18 @@ fn serve_device(mut stream: TcpStream, state: &DeviceState, born: usize) {
                 b"dev.name" => Instant::now() + *crate::chan::lock(&state.reply_delay),
                 _ => Instant::now(),
             };
-            if let Some(value) = answer(name, request.args, state.table_hash) {
-                let reply = Packet::rpc_reply(request.id.value(), &value, pkt.route());
-                replies.push((due, reply.unwrap()));
+            let answered = match name {
+                b"fake.capture" => Some(fake_capture(request.args)),
+                _ => answer(name, request.args, state.table_hash).map(Ok),
+            };
+            let id = request.id.value();
+            match answered {
+                Some(Ok(value)) => {
+                    let reply = Packet::rpc_reply(id, &value, pkt.route());
+                    replies.push((due, reply.unwrap()));
+                }
+                Some(Err(error)) => replies.push((due, Packet::rpc_error(id, error, pkt.route()))),
+                None => {}
             }
         }
     }
@@ -286,6 +295,48 @@ pub(crate) fn answer(name: &[u8], args: &[u8], table_hash: u32) -> Option<Vec<u8
             reply
         }
         _ => return None,
+    })
+}
+
+/// The five bytes the fake device's capture holds, in blocks of four.
+const CAPTURED: [u8; 5] = [1, 2, 3, 4, 5];
+
+/// Returns the fake device's answer to `fake.capture`, which its table does
+/// not list, with the selector `args` encode. Its capture is always done.
+/// It refuses block 7 as busy, and any other block past the last as invalid.
+fn fake_capture(args: &[u8]) -> Result<Vec<u8>, RpcError> {
+    use crate::proto::capture::{CaptureMetadata, METADATA_VERSION};
+    let selector = args.try_into().map_err(|_| RpcError::ArgsSize)?;
+    Ok(match i16::from_le_bytes(selector) {
+        -1 => Vec::new(),
+        -2 => vec![2],
+        -3 => {
+            let metadata = CaptureMetadata {
+                version: METADATA_VERSION,
+                data_type: crate::proto::data::DataType::U8,
+                data_size: CAPTURED.len() as u32,
+                block_size: 4,
+                length: CAPTURED.len() as u32,
+                y_calibration: 0.5,
+                x_offset: 0.0,
+                x_stride: 1.0,
+                name: "Fake",
+                units: "V",
+                x_name: "Time",
+                x_units: "s",
+            };
+            let mut reply = vec![0u8; 64];
+            let written = metadata.write(&mut reply).ok_or(RpcError::NoBufs)?;
+            reply.truncate(written);
+            reply
+        }
+        block @ 0..=1 => {
+            let mut bytes = CAPTURED.chunks(4).nth(block as usize).unwrap().to_vec();
+            bytes.resize(4, 0);
+            bytes
+        }
+        7 => return Err(RpcError::Busy),
+        _ => return Err(RpcError::Invalid),
     })
 }
 

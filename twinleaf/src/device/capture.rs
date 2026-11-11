@@ -2,15 +2,20 @@
 //!
 //! A capturing RPC takes an `i16` selector. `-1` triggers a capture, `-2`
 //! reads its [`CaptureStatus`], `-3` reads its [`CaptureMetadata`], and `0`
-//! and up read the data one block at a time. [`read_capture`] runs the whole
-//! sequence.
+//! and up read the data one block at a time. A [`Capture`] takes each of
+//! those steps on its own and waits for none, for a caller that shows how
+//! far a capture is or stops it part way. [`read_capture`] runs the whole
+//! sequence and blocks until it is done.
 
 use super::connection::Device;
 use crate::data::ColumnData;
 use crate::proto::capture as wire;
 use crate::proto::data::DataType;
 use crate::proto::rpc::RpcError;
-use crate::session::rpc::CallError;
+use crate::session::rpc::{CallError, PendingReply, ReplyFuture};
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -99,6 +104,24 @@ impl CaptureMetadata {
     pub fn x_value_f64(&self, index: usize) -> f64 {
         f64::from(self.x_offset) + index as f64 * f64::from(self.x_stride)
     }
+
+    /// Returns how many blocks hold the data, block zero the first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError::ZeroBlocksize`] for blocks of no bytes, and
+    /// [`CaptureError::TooManyBlocks`] for more blocks than the 32768 an
+    /// `i16` selector reaches.
+    pub fn block_count(&self) -> Result<u16, CaptureError> {
+        if self.blocksize == 0 {
+            return Err(CaptureError::ZeroBlocksize);
+        }
+        let blocks = (self.size as usize).div_ceil(usize::from(self.blocksize));
+        match blocks <= i16::MAX as usize + 1 {
+            true => Ok(blocks as u16),
+            false => Err(CaptureError::TooManyBlocks { blocks }),
+        }
+    }
 }
 
 /// A finished capture, with its metadata and every block concatenated and
@@ -112,6 +135,13 @@ pub struct CaptureReadout {
 }
 
 impl CaptureReadout {
+    /// Makes a readout of `data`, a capture's blocks one after another from
+    /// block zero, cut to the `size` its `metadata` gives.
+    pub fn new(metadata: CaptureMetadata, mut data: Vec<u8>) -> CaptureReadout {
+        data.truncate(metadata.size as usize);
+        CaptureReadout { metadata, data }
+    }
+
     /// Decodes every element as a calibrated `f64`.
     ///
     /// # Errors
@@ -195,27 +225,207 @@ pub enum CaptureError {
     UnsupportedDataType(u8),
 }
 
-fn trigger_capture(device: &Device, rpc_name: &str) -> Result<Vec<u8>, CaptureError> {
-    capture_rpc_i16(device, rpc_name, CAPTURE_TRIGGER_INDEX).map_err(Into::into)
-}
-
-fn read_capture_status(device: &Device, rpc_name: &str) -> Result<CaptureStatus, CaptureError> {
-    let reply = capture_rpc_i16(device, rpc_name, CAPTURE_STATUS_INDEX)?;
-    if reply.len() != 1 {
-        return Err(CaptureError::InvalidStatusLength {
-            actual: reply.len(),
-        });
+impl CaptureError {
+    /// Returns whether the device refused a step because a capture is in
+    /// progress on the RPC.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            CaptureError::Rpc(CallError::DeviceError(refused))
+                if matches!(refused.error, RpcError::Busy)
+        )
     }
-    Ok(CaptureStatus::from_raw(reply[0]))
 }
 
-fn read_capture_metadata(device: &Device, rpc_name: &str) -> Result<CaptureMetadata, CaptureError> {
-    let reply = capture_rpc_i16(device, rpc_name, CAPTURE_METADATA_INDEX)?;
-    parse_capture_metadata(&reply)
+/// One capture RPC of a device, whose steps are taken one at a time.
+///
+/// Each step submits one call and returns its [`PendingCapture`], to wait on
+/// or `.await`, so a caller can say how far a capture is, give it up between
+/// two steps, and hold no thread while the device works. A capture runs as
+/// [`read_capture`] runs it. Trigger it, ask its status until it is
+/// [`CaptureStatus::Done`], read its metadata, read
+/// [`CaptureMetadata::block_count`] blocks from block zero, and make a
+/// [`CaptureReadout`] of them. A caller that stops between two steps leaves
+/// the device's capture as it stands, and the next trigger starts another.
+///
+/// # Examples
+///
+/// ```no_run
+/// use twinleaf::device::capture::{Capture, CaptureReadout, CaptureStatus};
+/// use twinleaf::{Connection, DeviceRoute};
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let connection = Connection::connect()?;
+/// let capture = Capture::new(&connection.device(DeviceRoute::root()), "test.capture");
+/// capture.trigger().await?;
+/// while capture.status().await? == CaptureStatus::Capturing {
+///     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+/// }
+/// let metadata = capture.metadata().await?;
+/// let mut data = Vec::new();
+/// for index in 0..metadata.block_count()? {
+///     data.extend(capture.block(index).await?);
+///     println!("{} of {} bytes", data.len(), metadata.size);
+/// }
+/// let readout = CaptureReadout::new(metadata, data);
+/// println!("{:?}", readout.values_f64()?);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct Capture {
+    device: Device,
+    rpc_name: String,
+}
+
+impl Capture {
+    /// Names the capture RPC `rpc_name` of `device`. Nothing is sent.
+    pub fn new(device: &Device, rpc_name: &str) -> Capture {
+        Capture {
+            device: device.clone(),
+            rpc_name: rpc_name.to_string(),
+        }
+    }
+
+    /// Returns the name of the RPC.
+    pub fn rpc_name(&self) -> &str {
+        &self.rpc_name
+    }
+
+    /// Starts a capture.
+    ///
+    /// # Errors
+    ///
+    /// Resolves to [`CaptureError::Rpc`] if the call fails. A device that is
+    /// capturing already refuses, which [`CaptureError::is_busy`] tells.
+    pub fn trigger(&self) -> PendingCapture<()> {
+        self.select(CAPTURE_TRIGGER_INDEX, |_| Ok(()))
+    }
+
+    /// Asks where the capture stands.
+    ///
+    /// # Errors
+    ///
+    /// Resolves to [`CaptureError::Rpc`] if the call fails, and to
+    /// [`CaptureError::InvalidStatusLength`] if the reply is not one byte.
+    pub fn status(&self) -> PendingCapture<CaptureStatus> {
+        self.select(CAPTURE_STATUS_INDEX, |reply| match reply[..] {
+            [status] => Ok(CaptureStatus::from_raw(status)),
+            _ => Err(CaptureError::InvalidStatusLength {
+                actual: reply.len(),
+            }),
+        })
+    }
+
+    /// Reads what the capture holds and how to read it.
+    ///
+    /// # Errors
+    ///
+    /// Resolves to [`CaptureError::Rpc`] if the call fails, and to
+    /// [`CaptureError::InvalidMetadata`] or
+    /// [`CaptureError::UnsupportedMetadataVersion`] if the reply is not
+    /// metadata this build reads.
+    pub fn metadata(&self) -> PendingCapture<CaptureMetadata> {
+        self.select(CAPTURE_METADATA_INDEX, |reply| {
+            parse_capture_metadata(&reply)
+        })
+    }
+
+    /// Reads block `index` of the data, counted from zero.
+    ///
+    /// # Errors
+    ///
+    /// Resolves to [`CaptureError::Rpc`] if the call fails. A device that is
+    /// still capturing refuses, which [`CaptureError::is_busy`] tells. A
+    /// block past the 32768 an `i16` selector reaches resolves to
+    /// [`CaptureError::TooManyBlocks`], and nothing is sent for it.
+    pub fn block(&self, index: u16) -> PendingCapture<Vec<u8>> {
+        match i16::try_from(index) {
+            Ok(selector) => self.select(selector, Ok),
+            Err(_) => PendingCapture {
+                reply: Err(CaptureError::TooManyBlocks {
+                    blocks: usize::from(index) + 1,
+                }),
+                parse: Ok,
+            },
+        }
+    }
+
+    /// Submits the call with `selector`, whose reply `parse` reads.
+    fn select<T>(
+        &self,
+        selector: i16,
+        parse: fn(Vec<u8>) -> Result<T, CaptureError>,
+    ) -> PendingCapture<T> {
+        PendingCapture {
+            reply: Ok(self.device.submit(&self.rpc_name, &selector.to_le_bytes())),
+            parse,
+        }
+    }
+}
+
+/// A step of a [`Capture`] whose reply has not arrived yet.
+///
+/// It resolves once, with what the step read or why it could not. Block on
+/// it with [`wait`](Self::wait) or `.await` it. Dropping it abandons the
+/// reply, and the step still goes ahead.
+#[must_use = "the step is in flight; wait on its reply"]
+#[derive(Debug)]
+pub struct PendingCapture<T> {
+    /// The call's reply, or why no call was sent.
+    reply: Result<PendingReply, CaptureError>,
+    parse: fn(Vec<u8>) -> Result<T, CaptureError>,
+}
+
+impl<T> PendingCapture<T> {
+    /// Blocks until the step resolves and returns what it read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the step's [`CaptureError`], as the method that made it says.
+    pub fn wait(self) -> Result<T, CaptureError> {
+        (self.parse)(self.reply?.wait()?)
+    }
+}
+
+impl<T> IntoFuture for PendingCapture<T> {
+    type Output = Result<T, CaptureError>;
+    type IntoFuture = CaptureFuture<T>;
+
+    fn into_future(self) -> CaptureFuture<T> {
+        CaptureFuture {
+            reply: self.reply.map(IntoFuture::into_future).map_err(Some),
+            parse: self.parse,
+        }
+    }
+}
+
+/// A [`PendingCapture`] being awaited.
+#[derive(Debug)]
+pub struct CaptureFuture<T> {
+    /// The reply being awaited, or why no call was sent, until it is told.
+    reply: Result<ReplyFuture, Option<CaptureError>>,
+    parse: fn(Vec<u8>) -> Result<T, CaptureError>,
+}
+
+impl<T> Future for CaptureFuture<T> {
+    type Output = Result<T, CaptureError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        match &mut this.reply {
+            Ok(reply) => Pin::new(reply).poll(cx).map(|reply| (this.parse)(reply?)),
+            Err(unsent) => {
+                let unsent = unsent.take().expect("a step is polled until it resolves");
+                Poll::Ready(Err(unsent))
+            }
+        }
+    }
 }
 
 /// Triggers a capture on `rpc_name`, waits up to `timeout` for it to finish,
-/// and reads every block. Blocks until done.
+/// and reads every block. Blocks until done. It takes the steps of a
+/// [`Capture`] one after another.
 ///
 /// Polls every 100 ms. A block the device reports busy is retried for up to
 /// `timeout`.
@@ -236,38 +446,22 @@ pub fn read_capture(
     rpc_name: &str,
     timeout: Duration,
 ) -> Result<CaptureReadout, CaptureError> {
-    trigger_capture(device, rpc_name)?;
-    wait_capture_done(device, rpc_name, timeout)?;
+    let capture = Capture::new(device, rpc_name);
+    capture.trigger().wait()?;
+    wait_capture_done(&capture, timeout)?;
 
-    let metadata = read_capture_metadata(device, rpc_name)?;
-    if metadata.blocksize == 0 {
-        return Err(CaptureError::ZeroBlocksize);
+    let metadata = capture.metadata().wait()?;
+    let mut data = Vec::with_capacity(metadata.size as usize);
+    for index in 0..metadata.block_count()? {
+        data.extend(read_capture_block(&capture, index, timeout)?);
     }
-
-    let capture_size = metadata.size as usize;
-    let blocks = capture_size.div_ceil(usize::from(metadata.blocksize));
-    if blocks > i16::MAX as usize + 1 {
-        return Err(CaptureError::TooManyBlocks { blocks });
-    }
-
-    let mut data = Vec::with_capacity(capture_size);
-    for index in 0..blocks {
-        let block = read_capture_block(device, rpc_name, index as i16, timeout)?;
-        data.extend(block);
-    }
-    data.truncate(capture_size);
-
-    Ok(CaptureReadout { metadata, data })
+    Ok(CaptureReadout::new(metadata, data))
 }
 
-fn wait_capture_done(
-    device: &Device,
-    rpc_name: &str,
-    timeout: Duration,
-) -> Result<(), CaptureError> {
+fn wait_capture_done(capture: &Capture, timeout: Duration) -> Result<(), CaptureError> {
     let started = Instant::now();
     loop {
-        let status = read_capture_status(device, rpc_name)?;
+        let status = capture.status().wait()?;
         match status {
             CaptureStatus::Done => return Ok(()),
             CaptureStatus::Idle => return Err(CaptureError::CaptureNotStarted),
@@ -286,30 +480,24 @@ fn wait_capture_done(
 }
 
 fn read_capture_block(
-    device: &Device,
-    rpc_name: &str,
-    index: i16,
+    capture: &Capture,
+    index: u16,
     timeout: Duration,
 ) -> Result<Vec<u8>, CaptureError> {
     let started = Instant::now();
     loop {
-        match capture_rpc_i16(device, rpc_name, index) {
-            Ok(reply) => return Ok(reply),
-            Err(CallError::DeviceError(err))
-                if matches!(err.error, RpcError::Busy) && started.elapsed() < timeout =>
-            {
+        match capture.block(index).wait() {
+            Err(busy) if busy.is_busy() && started.elapsed() < timeout => {
                 std::thread::sleep(CAPTURE_POLL_INTERVAL);
             }
-            Err(CallError::DeviceError(err)) if matches!(err.error, RpcError::Busy) => {
-                return Err(CaptureError::BlockTimeout { index });
+            Err(busy) if busy.is_busy() => {
+                return Err(CaptureError::BlockTimeout {
+                    index: index as i16,
+                });
             }
-            Err(err) => return Err(CaptureError::Rpc(err)),
+            answered => return answered,
         }
     }
-}
-
-fn capture_rpc_i16(device: &Device, rpc_name: &str, arg: i16) -> Result<Vec<u8>, CallError> {
-    device.raw_rpc(rpc_name, &arg.to_le_bytes())
 }
 
 fn parse_capture_metadata(raw: &[u8]) -> Result<CaptureMetadata, CaptureError> {
@@ -351,6 +539,111 @@ fn decode_capture_values(raw: &[u8], meta: &CaptureMetadata) -> Result<Vec<f64>,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::tests::fixtures::{open_through, proxy};
+    use crate::proto::DeviceRoute;
+    use crate::tio::tests::device::FakeDevice;
+
+    /// The capture of a fake device, `fake.capture`, opened through a proxy
+    /// of the test's own, with both.
+    fn fake_capture() -> (FakeDevice, crate::proxy::Proxy, Capture) {
+        let device = FakeDevice::start();
+        let proxy = proxy();
+        let connection = open_through(&proxy, &device.url).unwrap();
+        let capture = Capture::new(&connection.device(DeviceRoute::root()), "fake.capture");
+        (device, proxy, capture)
+    }
+
+    /// Each step reads what its selector serves, waited on or awaited, and
+    /// the blocks in order are the capture, cut to its size.
+    #[test]
+    fn each_step_reads_what_its_selector_serves() {
+        let (device, _proxy, capture) = fake_capture();
+        assert_eq!(capture.rpc_name(), "fake.capture");
+
+        capture.trigger().wait().unwrap();
+        assert_eq!(capture.status().wait().unwrap(), CaptureStatus::Done);
+        let metadata = capture.metadata().wait().unwrap();
+        assert_eq!((metadata.name.as_str(), metadata.length), ("Fake", 5));
+        assert_eq!(metadata.block_count().unwrap(), 2);
+        let blocks = [capture.block(0), capture.block(1)].map(|block| block.wait().unwrap());
+        assert_eq!(blocks, [vec![1, 2, 3, 4], vec![5, 0, 0, 0]]);
+        let readout = CaptureReadout::new(metadata.clone(), blocks.concat());
+        assert_eq!(readout.data, [1, 2, 3, 4, 5]);
+        assert_eq!(readout.values_f64().unwrap(), [0.5, 1.0, 1.5, 2.0, 2.5]);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let awaited = runtime.block_on(async {
+            capture.trigger().await.unwrap();
+            assert_eq!(capture.status().await.unwrap(), CaptureStatus::Done);
+            assert_eq!(capture.block(1).await.unwrap(), [5, 0, 0, 0]);
+            capture.metadata().await.unwrap()
+        });
+        assert_eq!(awaited, metadata);
+        assert_eq!(device.calls("fake.capture"), 9);
+
+        let whole = read_capture(&capture.device, "fake.capture", crate::tio::tests::WAIT);
+        assert_eq!(whole.unwrap(), readout);
+    }
+
+    /// A block the device refuses as busy says so, and a step the device
+    /// refuses otherwise does not. A block no selector reaches is refused
+    /// with nothing sent, waited on or awaited.
+    #[test]
+    fn a_refused_step_says_whether_the_device_is_busy() {
+        let (device, _proxy, capture) = fake_capture();
+
+        let busy = capture.block(7).wait().unwrap_err();
+        assert!(busy.is_busy(), "{busy}");
+        let past = capture.block(2).wait().unwrap_err();
+        assert!(
+            matches!(past, CaptureError::Rpc(_)) && !past.is_busy(),
+            "{past}"
+        );
+        assert_eq!(device.calls("fake.capture"), 2);
+
+        for index in [32768, u16::MAX] {
+            let blocks = usize::from(index) + 1;
+            assert!(matches!(
+                capture.block(index).wait(),
+                Err(CaptureError::TooManyBlocks { blocks: told }) if told == blocks
+            ));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(matches!(
+            runtime.block_on(capture.block(32768).into_future()),
+            Err(CaptureError::TooManyBlocks { blocks: 32769 })
+        ));
+        assert_eq!(device.calls("fake.capture"), 2);
+    }
+
+    /// The blocks of a capture are its size over its block size, rounded
+    /// up, and a capture with blocks of no bytes or more blocks than a
+    /// selector reaches has none to count.
+    #[test]
+    fn the_blocks_are_the_size_over_the_block_size_rounded_up() {
+        let sized = |size: u32, blocksize: u16| CaptureMetadata {
+            size,
+            blocksize,
+            ..metadata(DataType::U8, size, 1.0)
+        };
+        assert_eq!(sized(0, 64).block_count().unwrap(), 0);
+        assert_eq!(sized(64, 64).block_count().unwrap(), 1);
+        assert_eq!(sized(65, 64).block_count().unwrap(), 2);
+        assert_eq!(sized(3000, 256).block_count().unwrap(), 12);
+        assert_eq!(sized(32768, 1).block_count().unwrap(), 32768);
+        assert!(matches!(
+            sized(32769, 1).block_count(),
+            Err(CaptureError::TooManyBlocks { blocks: 32769 })
+        ));
+        assert!(matches!(
+            sized(8, 0).block_count(),
+            Err(CaptureError::ZeroBlocksize)
+        ));
+    }
 
     fn metadata(data_type: DataType, length: u32, y_calibration: f32) -> CaptureMetadata {
         CaptureMetadata {

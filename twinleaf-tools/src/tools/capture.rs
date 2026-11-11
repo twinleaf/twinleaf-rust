@@ -50,18 +50,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+    use twinleaf::device::capture::{Capture, CaptureStatus};
     use twinleaf::device::rpc::RpcMetaFlags;
     use twinleaf::proxy::{HostOptions, Layout, Mount, Proxy};
     use twinleaf::DeviceRoute;
 
-    /// The simulated device lists its captures as captures, and `tio
-    /// capture` reads and prints each, an FID that decays and a phase that
-    /// climbs at the FID's frequency.
-    #[test]
-    fn the_simulated_captures_read_and_print() {
-        let stop = Arc::new(AtomicBool::new(false));
+    /// The simulated device, served from a thread until `stop` is set, and
+    /// a proxy of the test's own that opens it.
+    fn simulated(stop: &Arc<AtomicBool>) -> Proxy {
         let url = crate::tools::simulate::serve(&["--no-drop"], stop.clone());
-        let proxy = Proxy::host(HostOptions {
+        Proxy::host(HostOptions {
             port: 0,
             name: "a test".to_string(),
             default: Some(Layout {
@@ -73,7 +71,60 @@ mod tests {
             }),
             ..HostOptions::default()
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    /// A capture of the simulated device taken a step at a time. It is idle
+    /// until triggered, then capturing, and refuses a second trigger and a
+    /// block as busy until it is done. Its blocks, asked for all at once,
+    /// are the capture its metadata describes, and a block past the last is
+    /// refused, but not as busy.
+    #[test]
+    fn a_capture_is_taken_a_step_at_a_time() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let proxy = simulated(&stop);
+        let connection = Connection::open(&proxy.endpoint()).unwrap();
+        let capture = Capture::new(&connection.device(DeviceRoute::root()), "test.capture");
+
+        assert_eq!(capture.status().wait().unwrap(), CaptureStatus::Idle);
+        capture.trigger().wait().unwrap();
+        assert_eq!(capture.status().wait().unwrap(), CaptureStatus::Capturing);
+        assert!(capture.trigger().wait().unwrap_err().is_busy());
+        assert!(capture.block(0).wait().unwrap_err().is_busy());
+        let give_up = std::time::Instant::now() + Duration::from_secs(5);
+        while capture.status().wait().unwrap() != CaptureStatus::Done {
+            assert!(std::time::Instant::now() < give_up, "the capture is done");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let metadata = capture.metadata().wait().unwrap();
+        assert_eq!(metadata.name, "Test Signal");
+        let blocks = metadata.block_count().unwrap();
+        assert_eq!(u32::from(blocks), metadata.size.div_ceil(256));
+        let asked: Vec<_> = (0..blocks).map(|index| capture.block(index)).collect();
+        let mut data = Vec::new();
+        for block in asked {
+            data.extend(block.wait().unwrap());
+        }
+        let past = capture.block(blocks).wait().unwrap_err();
+        stop.store(true, Ordering::Relaxed);
+        proxy.shutdown();
+
+        assert!(!past.is_busy(), "{past}");
+        let readout = CaptureReadout::new(metadata, data);
+        let values = readout.values_f64().unwrap();
+        assert_eq!(values.len(), readout.metadata.length as usize);
+        assert!((800..=1200).contains(&values.len()));
+        assert!(values.iter().all(|volts| volts.abs() < 2.0));
+    }
+
+    /// The simulated device lists its captures as captures, and `tio
+    /// capture` reads and prints each, an FID that decays and a phase that
+    /// climbs at the FID's frequency.
+    #[test]
+    fn the_simulated_captures_read_and_print() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let proxy = simulated(&stop);
         let connection = Connection::open(&proxy.endpoint()).unwrap();
         let device = connection.device(DeviceRoute::root());
 
