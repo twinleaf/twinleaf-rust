@@ -17,8 +17,10 @@
 // run places, moves and removes them in its gestures; following live takes
 // a plot's time X cursors, and Back or Forward takes those of a plot it
 // shows live and puts back, on one live it shows paused, those it had as
-// the entry's gesture began, Back, or ended, Forward; nothing else changes
-// one, and no plot that follows live has time X cursors. Then examples of what the model
+// it last left that paused view to go live: as the entry's gesture began,
+// Back, or ended, Forward, unless Back or Forward has since made it live
+// from there, which takes the ones it has then. Nothing else changes one,
+// and no plot that follows live has time X cursors. Then examples of what the model
 // leaves out: plots closed, moved to another tab or hidden behind a
 // maximized one, and tabs gone for good.
 import { describe, expect, it } from 'vitest';
@@ -207,8 +209,9 @@ describe('view history, against a model of its rules', () => {
         /**
          * Back or Forward in the model: the plots the gesture of the entry
          * gone past moved, as the entry `by` along shows them. A plot shown
-         * live loses its time X cursors; one live shown paused gets back
-         * those it had then, as the gesture began, Back, or ended, Forward.
+         * live loses its time X cursors, which the entry's other side then
+         * holds when it was paused; one live shown paused gets back those
+         * that side holds, as the gesture began, Back, or ended, Forward.
          */
         const go = (by) => {
           group = null;
@@ -222,6 +225,7 @@ describe('view history, against a model of its rules', () => {
             known.set(id, r);
             const x = (by < 0 ? past.xs.before : past.xs.after).get(id);
             if (JSON.parse(to.get(id)).live) {
+              if (!JSON.parse(from.get(id)).live) (by < 0 ? past.xs.after : past.xs.before).set(id, xOf(cursors.get(id), 'time'));
               if (hasTimeX(cursors.get(id))) count.xTaken++;
               cursors.set(id, withoutX(cursors.get(id), 'time'));
             } else if (JSON.parse(from.get(id)).live && hasTimeX({ x })) {
@@ -538,7 +542,8 @@ describe('a plot closed and brought back by undo', () => {
 // two histories never disagree: the plot's kind is always the edit
 // history's, and always the entry's the model is at; and a plot that
 // follows live never has time X cursors. Following live takes them; Back or
-// Forward that shows a live plot paused puts back those it had then; an undo
+// Forward that shows a live plot paused puts back those it had as it last
+// left that paused view to go live, by any route, and no others; an undo
 // or a redo changes them just as the edit history has them, and one that
 // brings them back to a live plot shows the paused view it left as it went
 // live; nothing else changes them.
@@ -550,7 +555,10 @@ describe('a kind switch, and time X cursors across going live', () => {
    * random ones do: a switch undone and redone, four times; a pan then a
    * switch, gone back across the switch and on past the pan, four times; X
    * cursors placed, live, then Back and Forward, four times; and X cursors
-   * placed, live, then undone, four times, and cleared first, four times.
+   * placed, live, then undone, four times, and cleared first, four times;
+   * X cursors placed, live, Back, then cleared, so Forward and Back again
+   * bring none back; and X cursors placed on a paused plot, Back to live,
+   * then Forward, which brings back those Back took.
    */
   const EXAMPLES = [
     times(4, ['switch', 'undo', 'redo']),
@@ -558,6 +566,8 @@ describe('a kind switch, and time X cursors across going live', () => {
     times(4, ['place', 'follow', 'back', 'forward', 'back']),
     times(4, ['place', 'follow', 'undo', 'redo']),
     times(4, ['place', 'clear', 'follow', 'undo']),
+    ['place', 'follow', 'back', 'clear', 'forward', 'back'],
+    ['pause', 'place', 'back', 'forward'],
   ];
   it('is a step Back and Forward cross, going on through the steps before it, whatever undo and redo do between, and a live plot has no time X cursors', () => {
     const count = { crossed: 0, wentOn: 0, undone: 0, redone: 0, xTaken: 0, xBack: 0, xUndone: 0 };
@@ -617,7 +627,9 @@ describe('a kind switch, and time X cursors across going live', () => {
             // A Back past a step of the view alone, straight after one across a switch.
             else if (can && a === 'back' && crossedLast) count.wentOn++;
             crossedLast = crossed && a === 'back';
-            // Shown live, the plot loses its time X cursors; live shown paused, it gets back those it had then.
+            // Shown live, the plot loses its time X cursors, which the paused view it leaves then holds;
+            // live shown paused, it gets back those that view holds.
+            if (can && to[1] && !from[1]) past.xs[by < 0 ? 'after' : 'before'] = want;
             if (can && to[1] && hasTimeX({ x: want })) (count.xTaken++, (want = { a: null, b: null }));
             else if (can && !to[1] && from[1] && past && hasTimeX({ x: past.xs[by < 0 ? 'before' : 'after'] })) (count.xBack++, (want = past.xs[by < 0 ? 'before' : 'after']));
           } else if (changed(was) && (a === 'undo' || a === 'redo')) count[a === 'undo' ? 'undone' : 'redone']++;

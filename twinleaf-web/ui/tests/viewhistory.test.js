@@ -10,7 +10,8 @@
 // plot's buttons pressable just when the tab has a step to go to. Cursors
 // are edits, which Ctrl+Z undoes, and no plot that follows live has time X
 // cursors: going live takes them; Back or Forward that shows a live plot
-// paused puts back those it had then; an undo or a redo changes them as the
+// paused puts back those it had as it last went live from that view, by
+// any route, Back and Forward among them; an undo or a redo changes them as the
 // edit history has them, and one that brings them back to a live plot shows
 // the paused view it left; a page loaded again follows live with none;
 // nothing else changes them. The window field's arrows and wheel turns in a
@@ -287,7 +288,7 @@ describe('view history on the page', () => {
               if (back && at > 0) at--;
               else if (!back && at < line.length - 1) at++;
               check(g.t);
-              // Back and Forward retrace the views. A plot shown live loses its time X cursors; one live shown paused gets back those it had then.
+              // Back and Forward retrace the views. A plot shown live loses its time X cursors; one live shown paused gets back those it had as it last went live from there.
               const to = JSON.parse(line[at].shows);
               const want = xs.map((x, k) => {
                 if (line[at] === before) return x;
@@ -296,6 +297,8 @@ describe('view history on the page', () => {
                 return JSON.parse(from[k]).live && hasTimeX({ x: then }) ? (count.xBack++, then) : x;
               });
               expect(timeXs(p), `${g.t}: the time X cursors`).toEqual(want);
+              // A paused plot shown live leaves the step's paused side with the cursors it had, for going back there.
+              if (line[at] !== before) xs.forEach((x, k) => JSON.parse(to[k]).live && !JSON.parse(from[k]).live && (past.xs[back ? 'after' : 'before'][k] = x));
               if (back && line[at] !== before) {
                 count.back++;
                 if (/\d/.test(cursors)) count.cursorsKept++;

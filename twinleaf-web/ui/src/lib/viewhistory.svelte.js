@@ -48,10 +48,14 @@
 // edit (CursorEdits `followed`), Back's and Forward's the one their kind
 // change makes. A step holds the time X cursors each plot had (`x`), and
 // Back or Forward that shows a live plot paused again puts back those its
-// view had then. An undo or a redo that brings time X cursors back to a
-// plot that follows live shows the paused view it left as it went live
-// (View `left`), or else pauses it where it is, a step after the one Back
-// is at, as a kind switch it makes is. Otherwise the edit history
+// view had as it last went live from there: a step's paused side takes the
+// cursors a plot has as Back or Forward makes it live from that side. So
+// one Back undoes going live with its cursors, and cursors removed while
+// paused, an edit of their own, stay removed. An undo or a redo that
+// brings time X cursors back to a plot that follows live shows the paused
+// view it left as it went live (View `left`), or else pauses it where it
+// is, a step after the one Back is at, as a kind switch it makes is.
+// Otherwise the edit history
 // (history.svelte.js) is apart: an undo moves no other view, and Back
 // makes no other edit, so it moves no other cursor.
 
@@ -254,15 +258,24 @@ export class ViewHistory {
     return steps[list].findLastIndex((s) => [...s.before.keys()].some((id) => shown.has(id) && this.views.get(id)));
   }
 
-  /** Moves the open tab's step `#next(from)` to `to`, and shows its plots' `side`. */
+  /**
+   * Moves the open tab's step `#next(from)` to `to`, and shows its plots'
+   * `side`. A paused plot it shows live leaves the step's other side with
+   * the time X cursors it has as it goes, so going back there puts back
+   * just what going live took.
+   */
   #go(from, to, side) {
     this.end();
     this.#burst = null;
     const i = this.#next(from);
     if (i < 0) return false;
-    const steps = this.#of(this.ws.activeId), step = steps[from][i];
+    const steps = this.#of(this.ws.activeId), step = steps[from][i], other = step[side === 'before' ? 'after' : 'before'];
     steps[from] = steps[from].toSpliced(i, 1);
     steps[to] = [...steps[to], step];
+    for (const [id, s] of step[side]) {
+      const plot = this.ws.plots[id];
+      if (plot && s.view.live && this.views.get(id)?.live === false && other.has(id)) other.set(id, { ...other.get(id), x: xOf(plot.cursors, 'time') });
+    }
     this.#show(step[side]);
     return true;
   }
