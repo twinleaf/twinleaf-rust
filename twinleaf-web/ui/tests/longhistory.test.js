@@ -23,7 +23,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, frames, HISTORY_HEADROOM, holdHistory, leafOf, mountPage, pressKey, settle, turnWheel, until, wait, withExamples } from './harness/page.js';
+import { centre, frames, HISTORY_HEADROOM, holdHistory, leafOf, mountPage, pressKey, settle, turnWheel, turnWheelToRest, wheelRest, until, wait, withExamples } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { WINDOW_LIMITS, windowText } from '../src/lib/window.js';
@@ -89,8 +89,8 @@ describe('a plot on a hub that holds hours', () => {
     await fc.assert(
       fc.asyncProperty(holding, async (h) => {
         const { oldest, at } = await paused(h);
-        // No frame is drawn between the pause and the wheel.
-        turnWheel(page, id, 400, { n: ALL_THE_WAY });
+        // No frame is drawn between the pause and the wheel; the ease after it draws.
+        await turnWheelToRest(page, id, 400, { n: ALL_THE_WAY });
         const left = view.right - view.span;
         expect(view.right, 'ends at the pause').toBe(at);
         if (h.fill.full) {
@@ -104,7 +104,7 @@ describe('a plot on a hub that holds hours', () => {
         // Drawn, and turned again, it stays.
         const widest = shows();
         await frames();
-        turnWheel(page, id, 400, { n: 3 });
+        await turnWheelToRest(page, id, 400, { n: 3 });
         expect(shows()).toEqual(widest);
         seen[h.fill.full ? 'full' : 'filling']++;
       }),
@@ -118,7 +118,7 @@ describe('a plot on a hub that holds hours', () => {
     await fc.assert(
       fc.asyncProperty(holding, async (h) => {
         const { oldest, now } = await live(h);
-        turnWheel(page, id, 400, { n: ALL_THE_WAY });
+        await turnWheelToRest(page, id, 400, { n: ALL_THE_WAY });
         expect(view.live).toBe(true);
         const [left, right] = view.range(now);
         expect(right).toBe(now - view.delay);
@@ -129,7 +129,7 @@ describe('a plot on a hub that holds hours', () => {
         } else expect(view.span, 'as wide as what the hub holds, or its window').toBeCloseTo(Math.max(10, right - oldest), 6);
         // Paused there, it shows the same.
         view.pause(clock.now());
-        turnWheel(page, id, 400, { n: 3 });
+        await turnWheelToRest(page, id, 400, { n: 3 });
         if (h.fill.full || right - oldest >= 10) expect(view.range(now)).toEqual([left, right]);
       }),
       withExamples(EACH),
@@ -140,7 +140,7 @@ describe('a plot on a hub that holds hours', () => {
     for (const history of HISTORIES) {
       for (const behind of [HISTORY_HEADROOM, HISTORY_HEADROOM + 3]) {
         const { oldest, at } = await paused({ history, fill: { full: true }, behind, now: 100_000 });
-        turnWheel(page, id, 400, { n: ALL_THE_WAY });
+        await turnWheelToRest(page, id, 400, { n: ALL_THE_WAY });
         // The view's time is its delay and the clock's lag behind the hub's newest sample: that much less the headroom is gone.
         const gone = view.delay + behind - HISTORY_HEADROOM;
         expect(view.right - view.span, `${history} s, ${behind} s behind`).toBeCloseTo(oldest, 6);
@@ -156,10 +156,10 @@ describe('a plot on a hub that holds hours', () => {
         await paused(h);
         const first = shows();
         // Three steps: out to the widest view, a turn on the y axis between, and in about `anchor`.
-        turnWheel(page, id, 400, { n: ALL_THE_WAY });
+        await turnWheelToRest(page, id, 400, { n: ALL_THE_WAY });
         const widest = shows();
         turnWheel(page, id, 120, { shift: true });
-        turnWheel(page, id, -400, { n: turns, at: anchor });
+        await turnWheelToRest(page, id, -400, { n: turns, at: anchor });
         const zoomed = shows();
         expect(zoomed.span).toBeLessThan(widest.span);
         press('Back');
@@ -179,9 +179,9 @@ describe('a plot on a hub that holds hours', () => {
     await fc.assert(
       fc.asyncProperty(holding, fc.double({ min: 0.02, max: 0.98, noNaN: true }), async (h, anchor) => {
         await paused(h);
-        turnWheel(page, id, 400, { n: ALL_THE_WAY });
+        await turnWheelToRest(page, id, 400, { n: ALL_THE_WAY });
         const widest = shows();
-        const under = turnWheel(page, id, -400, { n: ALL_THE_WAY, at: anchor });
+        const under = await turnWheelToRest(page, id, -400, { n: ALL_THE_WAY, at: anchor });
         const narrowest = shows();
         expect(narrowest.span).toBe(WINDOW_LIMITS[0]);
         // The moment under the pointer in the widest view is under it in the narrowest.
@@ -189,9 +189,9 @@ describe('a plot on a hub that holds hours', () => {
         expect(Math.abs(narrowest.right - (1 - under) * narrowest.span - moment)).toBeLessThan(WINDOW_LIMITS[0] / 1000);
         // A turn on the y axis between, so the way out and back is a step of its own.
         turnWheel(page, id, 120, { shift: true });
-        turnWheel(page, id, 400, { n: ALL_THE_WAY, at: anchor });
+        await turnWheelToRest(page, id, 400, { n: ALL_THE_WAY, at: anchor });
         expect(shows(), 'the widest view again').toEqual(widest);
-        turnWheel(page, id, -400, { n: ALL_THE_WAY, at: anchor });
+        await turnWheelToRest(page, id, -400, { n: ALL_THE_WAY, at: anchor });
         expect(view.span).toBe(WINDOW_LIMITS[0]);
         // The same two milliseconds, to a thousandth of them.
         expect(Math.abs(view.right - narrowest.right)).toBeLessThan(WINDOW_LIMITS[0] / 1000);
@@ -214,19 +214,21 @@ describe('a plot on a hub that holds hours', () => {
         return hub.asked.slice(from);
       };
       turnWheel(page, id, 400, { n: ALL_THE_WAY });
+      let moving = await wheelRest(page, id);
       const wide = await reads(0);
       // The whole capture once for each signal, and the view with a span
       // either side. A signal's detail is read once a frame at most, so
-      // turns within one frame read it twice however many they are: the
-      // first turn's view at once, and where they ended the frame after.
+      // turns within one frame and the frames their ease moves the view
+      // read it once a frame of it and once after.
       const overview = wide.filter((a) => a.t0 === hub.oldest && a.t1 === hub.at);
       expect(overview.map((a) => a.id).sort(), `${history} s: one overview a signal`).toEqual(traces.map((t) => t.meta.id));
-      expect(wide.length - overview.length, `${history} s: detail reads for turns within one frame`).toBeLessThanOrEqual(2 * traces.length);
+      expect(wide.length - overview.length, `${history} s: detail reads for turns within one frame and their ease`).toBeLessThanOrEqual((moving + 1) * traces.length);
       const from = hub.asked.length;
       turnWheel(page, id, -400, { n: 12, at: 0.4 });
+      moving = await wheelRest(page, id);
       const narrow = await reads(from);
       expect(narrow.length).toBeGreaterThan(0);
-      expect(narrow.length, `${history} s: detail reads for turns within one frame`).toBeLessThanOrEqual(2 * traces.length);
+      expect(narrow.length, `${history} s: detail reads for turns within one frame and their ease`).toBeLessThanOrEqual((moving + 1) * traces.length);
       expect(new Set(narrow.map((a) => `${a.id}|${a.at}`)).size, `${history} s: one read a signal a frame`).toBe(narrow.length);
       for (const a of narrow.slice(-traces.length)) expect(a.t1 - a.t0, 'the view and a span either side').toBeCloseTo(3 * view.span, 6);
       for (const a of hub.asked) {
@@ -260,8 +262,8 @@ describe('a plot on a hub that holds hours', () => {
       flushSync();
       return document.querySelector('.window-button').textContent.trim();
     };
-    const zoomIn = () => {
-      turnWheel(page, id, -400, { n: 4, at: 0.3 });
+    const zoomIn = async () => {
+      await turnWheelToRest(page, id, -400, { n: 4, at: 0.3 });
       expect(view.live, 'a zoom in pauses').toBe(false);
     };
     for (const share of [0.1, 0.5, 1]) {
@@ -272,7 +274,7 @@ describe('a plot on a hub that holds hours', () => {
       expect(await drawn(hub, `${share}: the window set`)).toBeCloseTo(most, 6);
       expect(view.window, 'the window asked for is kept').toBe(WINDOW);
       expect(await reads(), 'the toolbar reads what is shown').toBe(`${windowText(most)} s`);
-      zoomIn();
+      await zoomIn();
       await drawn(hub, `${share}: zoomed in`);
       // A double-click on the plot follows live at the window.
       await commands.mouse([['dblclick', ...centre(leafOf(id).querySelector('.plot-body'))]]);
@@ -280,7 +282,7 @@ describe('a plot on a hub that holds hours', () => {
       expect(await drawn(hub, `${share}: a double-click`)).toBeCloseTo(most, 6);
       expect(view.window).toBe(WINDOW);
       // So does End.
-      zoomIn();
+      await zoomIn();
       leafOf(id).querySelector('.plot-card').focus();
       await pressKey('End');
       expect(await until(() => view.live), 'End follows live').toBe(true);
@@ -290,11 +292,11 @@ describe('a plot on a hub that holds hours', () => {
       press('Forward');
       expect(await drawn(hub, `${share}: Forward`)).toBeCloseTo(most, 6);
       // All the way out, live and then paused, is what is held: the History on a full hub.
-      turnWheel(page, id, 400, { n: ALL_THE_WAY, at: 0.99 });
+      await turnWheelToRest(page, id, 400, { n: ALL_THE_WAY, at: 0.99 });
       expect(view.live).toBe(true);
       expect(await drawn(hub, `${share}: zoomed out, live`)).toBeCloseTo(widest, 6);
       view.pause(clock.now());
-      turnWheel(page, id, 400, { n: ALL_THE_WAY });
+      await turnWheelToRest(page, id, 400, { n: ALL_THE_WAY });
       expect(await drawn(hub, `${share}: zoomed out, paused`)).toBeCloseTo(widest, 6);
       if (share === 1) expect(widest).toBe(history);
     }

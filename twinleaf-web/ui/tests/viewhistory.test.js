@@ -28,7 +28,7 @@ import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
-import { centre, frames, mountPage, pickItem, plotMenu, pressKey, turnWheel, until, wait } from './harness/page.js';
+import { centre, frames, mountPage, pickItem, plotMenu, pressKey, turnWheel, until, wait, wheelRest } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { GONE, IDLE_MS } from '../src/lib/viewhistory.svelte.js';
@@ -84,7 +84,8 @@ async function pickFromMenu(id, label) {
 /**
  * Turns the wheel over plot `id` of page `p` by each of `turns` px, 40 ms of
  * the page's time apart, at fraction `at` across its plot area, the pointer
- * brought there first, with Shift held when `shift`.
+ * brought there first, with Shift held when `shift`, and waits for the zoom
+ * to rest.
  */
 async function wheel(p, id, turns, { at = 0.5, shift = false } = {}) {
   const P = p.pv(id).geo.plot;
@@ -93,6 +94,7 @@ async function wheel(p, id, turns, { at = 0.5, shift = false } = {}) {
     if (i) await wait(40);
     turnWheel(p, id, dy, { at, shift });
   }
+  await wheelRest(p, id);
 }
 
 const gesture = fc.oneof(

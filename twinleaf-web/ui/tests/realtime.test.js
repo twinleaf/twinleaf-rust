@@ -9,7 +9,7 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
-import { centre, feed, leafOf, mountPage, plotMenu, pressKey, turnWheel, wait } from './harness/page.js';
+import { centre, feed, leafOf, mountPage, plotMenu, pressKey, turnWheel, turnWheelToRest, wait } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { IDLE_MS } from '../src/lib/viewhistory.svelte.js';
@@ -51,11 +51,10 @@ describe('real-time smoke: the page on the browser’s clock', () => {
       await wait(100);
       turnWheel(page, id, -120);
       await wait(40);
-      turnWheel(page, id, -120);
+      await turnWheelToRest(page, id, -120);
       const burst = view.span;
       await wait(IDLE_MS + 150);
-      turnWheel(page, id, -120);
-      flushSync();
+      await turnWheelToRest(page, id, -120);
       const later = view.span;
       expect(later).toBeLessThan(burst);
       button(id, 'Back').click();

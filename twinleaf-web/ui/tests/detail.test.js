@@ -9,16 +9,16 @@
 // - each signal is drawn from whichever of what the page holds spans the
 //   most of the view's pixel columns, and of those the one with the most
 //   points across it: the detail window, the overview or the live level;
-// and from the last turn of each zoom, the view is drawn at full detail, as
-// many points across it as the hub's reply to that view holds, within two
-// frames of the time the reply takes.
+// and from the frame each zoom's ease comes to rest, the view is drawn at
+// full detail, as many points across it as the hub's reply to that view
+// holds, within two frames of the time the reply takes.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { frames, holdHistory, mountPage, settle, turnWheel } from './harness/page.js';
+import { easing, frames, holdHistory, mountPage, settle, turnWheel } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const SIGNALS = ['sine.sine', 'aux.triangle'];
-/** The turns of each zoom, one a frame, each a factor of e^0.36. */
+/** The turns of each zoom, one a frame, each 2.4 steps along the wheel's ladder. */
 const TURNS = 15;
 /** The share of the view's span the page asks for either side of it: App.svelte DETAIL_PAD. */
 const PAD = 1;
@@ -86,22 +86,24 @@ describe('a paused plot zoomed on a hub that answers after a delay', () => {
         const fresh = hub.read(x0 - pad, x1 + pad, width).x.filter((x) => x >= x0 && x < x1).length;
         return columns(src) >= Math.round(pv.geo.plot.w) - 1 && across(src) >= fresh - 2;
       });
-    /** Turns the wheel `TURNS` times by `deltaY` at `at` across the plot, a frame each, and gives the frames from the last turn until the view is at full detail. */
+    /** Turns the wheel `TURNS` times by `deltaY` at `at` across the plot, a frame each, and gives the frames from the ease's rest until the view is at full detail. */
     async function zoom(deltaY, at) {
       const from = hub.asked.length;
-      for (let i = 0; i < TURNS; i++) {
+      let moving = 0;
+      for (let i = 0; i < TURNS; i++, moving++) {
         turnWheel(page, id, deltaY, { at });
         await frame();
       }
+      for (; easing(page, id); moving++) await frame();
       let after = 0;
       while (!full() && after < 60) {
         await frame();
         after++;
       }
       const reads = hub.asked.slice(from).filter((a) => !overview(a));
-      // A read a frame a signal at most, and the one the last turn left waiting.
-      expect(reads.length, 'detail reads of one zoom').toBeLessThanOrEqual((TURNS + 1) * traces.length);
-      seen.aborted += reads.filter((a) => a.aborted).length;
+      // A read a frame a signal at most while the view moves, and the one its last move left waiting.
+      expect(reads.length, 'detail reads of one zoom').toBeLessThanOrEqual((moving + 1) * traces.length);
+      seen.aborted += reads.filter((a) => a.aborted && !a.crossed).length;
       for (let i = 0; i < 10; i++) await frame();
       expect(full(), 'and stays at full detail').toBe(true);
       return after;
@@ -116,7 +118,7 @@ describe('a paused plot zoomed on a hub that answers after a delay', () => {
     expect(seen.rival).toBeGreaterThan(0);
     expect(seen.densest.detail).toBeGreaterThan(0);
     expect(seen.densest.live).toBeGreaterThan(0);
-    // A reply nine frames away is overtaken by the turns after it.
+    // A reply nine frames away is overtaken by the moves after it; one within a frame never is before it is due (harness `holdHistory`, `crossed`).
     if (delay > clock.FRAME_MS) expect(seen.aborted).toBeGreaterThan(0);
     else expect(seen.aborted).toBe(0);
   }, 60_000);

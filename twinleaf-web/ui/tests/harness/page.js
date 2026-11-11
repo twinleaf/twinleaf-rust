@@ -482,8 +482,11 @@ export const HISTORY_HEADROOM = 2;
  *   none, and one aborted meanwhile throws as an aborted request does.
  * Returns {now, oldest, asked, read}: `oldest` the oldest time held;
  * `asked` each window read so far, as {id, t0, t1, width, points, at,
- * answered, aborted}, `at` and `answered` the page's time it was asked and
- * answered, null while it is not; and `read(t0, t1, width)` the window a
+ * answered, aborted, crossed}, `at` and `answered` the page's time it was
+ * asked and answered, null while it is not, and `crossed` whether an abort
+ * came once its reply was due: on the virtual clock a frame's timers and
+ * its callbacks run together, so a reply due in a frame lands after that
+ * frame's moves, where a browser lands it before; and `read(t0, t1, width)` the window a
  * read is answered with, as {ratio, x}. The answers are undone by
  * `vi.restoreAllMocks()`.
  */
@@ -522,6 +525,7 @@ export function holdHistory(page, { history, seconds = history + HISTORY_HEADROO
     if (delay > 0) await new Promise((done) => (clock.after(delay, done), signal?.addEventListener('abort', done)));
     if (signal?.aborted) {
       ask.aborted = true;
+      ask.crossed = clock.now() >= ask.at + delay;
       throw signal.reason;
     }
     ask.answered = clock.now();
@@ -536,7 +540,8 @@ export function holdHistory(page, { history, seconds = history + HISTORY_HEADROO
  * fraction `at` across it, on the whole pixel nearest, with Shift held when
  * `shift`, and returns the fraction across that pixel is at. The turns are
  * dispatched one after another with no frame between, so what they zoom to
- * depends on neither the browser's input queue nor the machine's speed.
+ * depends on neither the browser's input queue nor the machine's speed. A
+ * time zoom eases on in the frames after (`wheelRest`).
  */
 export function turnWheel(page, id, deltaY, { n = 1, at = 0.5, shift = false } = {}) {
   const P = page.pv(id).geo.plot, canvas = leafOf(id).querySelector('.plot-body canvas'), x = Math.round(P.x + at * P.w);
@@ -544,4 +549,22 @@ export function turnWheel(page, id, deltaY, { n = 1, at = 0.5, shift = false } =
     canvas.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY, clientX: x, clientY: Math.round(P.y + P.h / 2), shiftKey: shift }));
   }
   return (x - P.x) / P.w;
+}
+
+/** Whether plot `id`'s wheel is easing the time span of a view. */
+export const easing = (page, id) => !!page.pv(id).timeZoom?.eases.size;
+
+/** Steps frames until plot `id`'s wheel has eased its views to rest, and gives the frames that took. */
+export async function wheelRest(page, id) {
+  let n = 0;
+  for (; easing(page, id) && n < 600; n++) await frames(1);
+  flushSync();
+  return n;
+}
+
+/** Turns the wheel as `turnWheel` does, then waits for its zoom to rest (`wheelRest`). */
+export async function turnWheelToRest(page, id, deltaY, opts) {
+  const at = turnWheel(page, id, deltaY, opts);
+  await wheelRest(page, id);
+  return at;
 }

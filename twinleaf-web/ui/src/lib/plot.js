@@ -19,6 +19,7 @@ import { spanText } from './units.js';
 import { WINDOW_LIMITS, windowText } from './window.js';
 import { placedIn, withX, withY, withoutX, withoutY, xOf, yOf } from './cursors.js';
 import * as clock from './clock.js';
+import { aimed, eased, LINE_PX, STILL, turn } from './wheelzoom.js';
 
 /** A CSS colour as [r, g, b, a] in 0..1, resolved by the browser, so theme tokens work. */
 function cssRgba(css) {
@@ -539,6 +540,51 @@ export class PlotView {
     // An end that has reached its last bin is that bin's frequency itself.
     const lower = na === lo ? ext[0] : from(na), upper = nb === hi ? ext[1] : from(nb);
     this.viewHistory.burst('zoom', this.targets(), () => this.onFrequencies?.(lower, upper));
+  }
+
+  /**
+   * Turns the wheel `dy` px, positive out, over the time axis when `axis`,
+   * else over the plot at fraction `at` across it. Each view the gesture
+   * acts on gets a goal span along the ladder the wheel's speed picks, in
+   * the turn's direction from the goal it was easing to, or from the span
+   * it shows when it was at rest or the turn went the other way, within
+   * the spans it can zoom to (wheelzoom.js). Then frame by frame it eases
+   * there: over the time axis a live view about its newest edge, going on
+   * streaming; over the plot about the pointer, which holds that moment,
+   * so zooming in pauses it (`View.zoomTo`). The frames of a run of turns
+   * are one 'zoom' burst, one view step. A view something else moves
+   * meanwhile drops out of the ease.
+   */
+  turnTime(dy, axis, at) {
+    const now = clock.now(), z = (this.timeZoom ??= { wheel: STILL, eases: new Map(), frame: null });
+    const turned = turn(z.wheel, dy, now);
+    Object.assign(z, { wheel: turned.wheel, axis, at, targets: this.targets() });
+    for (const v of z.targets) z.eases.set(v, { ...aimed(z.eases.get(v), v.shown(now), now, turned, v.spans(now)), mark: viewMark(v) });
+    const step = (t) => {
+      z.frame = null;
+      const edge = this.liveEdge();
+      this.viewHistory.burst('zoom', z.targets, () => {
+        for (const [v, e] of z.eases) {
+          if (viewMark(v) !== e.mark) {
+            z.eases.delete(v);
+            continue;
+          }
+          const span = reducedMotion?.matches ? e.goal : eased(e.start, e.goal, t - e.t0);
+          if (span !== v.shown(t)) v.zoomTo(span, z.axis && v.live ? 1 : z.at, t, edge);
+          if (span === e.goal) z.eases.delete(v);
+          else e.mark = viewMark(v);
+        }
+      });
+      if (z.eases.size) z.frame = clock.frame(step);
+    };
+    z.frame ??= clock.frame(step);
+  }
+
+  /** Ends the wheel's ease of time where it has reached. */
+  stopTime() {
+    if (!this.timeZoom) return;
+    clock.cancel(this.timeZoom.frame);
+    this.timeZoom = null;
   }
 
   /** The plot's GPU slot for trace `t`, which holds its window, or, by `variant`, its spectrum drawn in a pair of scales. */
@@ -1824,9 +1870,9 @@ export class PlotView {
     };
     const isTime = () => this.config().kind === 'time';
     // The wheel zooms y over a y axis, or anywhere with Shift, about the
-    // value under the pointer, and zooms x elsewhere: time, over the time
-    // axis about the live edge while live and over the plot about the
-    // pointer; a spectrum's frequencies, about the one under the pointer.
+    // value under the pointer, and zooms x elsewhere: time, eased to a span
+    // that reads well (`turnTime`); a spectrum's frequencies, about the one
+    // under the pointer.
     el.addEventListener('wheel', (e) => {
       e.preventDefault();
       const factor = Math.exp(e.deltaY * 0.0015);
@@ -1846,15 +1892,8 @@ export class PlotView {
             st.range = [v - (v - a) * factor, v + (b - v) * factor];
           }
         });
-      } else if (isTime()) {
-        // Over the time axis a live view zooms about its newest edge and goes
-        // on streaming; over the plot it zooms about the pointer, which holds
-        // that moment, so it pauses.
-        const axis = onAxis(e), vs = this.targets();
-        this.viewHistory.burst('zoom', vs, () => {
-          for (const v of vs) v.zoom(factor, axis && v.live ? 1 : fracX(e.clientX), clock.now(), this.liveEdge());
-        });
-      } else this.zoomFrequencies(factor, Math.min(1, Math.max(0, fracX(e.clientX))));
+      } else if (isTime()) this.turnTime(e.deltaMode === 1 ? e.deltaY * LINE_PX : e.deltaY, onAxis(e), fracX(e.clientX));
+      else this.zoomFrequencies(factor, Math.min(1, Math.max(0, fracX(e.clientX))));
     }, { passive: false });
     // The band under the plot holds the x axis.
     const onAxis = (e) => !!this.pressAt(e.clientX, e.clientY, ['xaxis']);
@@ -1872,6 +1911,7 @@ export class PlotView {
     // its press to its release, is one view step for what it moves of the
     // views, and one edit for a cursor it places, moves or removes.
     el.addEventListener('pointerdown', (e) => {
+      this.stopTime();
       this.onFocus?.();
       if (e.button !== 0) return;
       el.setPointerCapture(e.pointerId);
@@ -2007,6 +2047,7 @@ export class PlotView {
      * and has not written stays where the tab has it.
      */
     this.letGo = () => {
+      this.stopTime();
       this.zoomBand = null;
       this.seeking = false;
       if (!drag) return;
@@ -2118,6 +2159,9 @@ export function sameView(a, b) {
   return a.spectra.size === b.spectra.size && [...a.spectra].every(([t, sp]) => b.spectra.get(t) === sp);
 }
 
+/** What a view's span and edge are set to, as a string: two are equal while nothing has moved the view. */
+const viewMark = (v) => (v.live ? `live ${v.span}` : `${v.span} ${v.right}`);
+
 /**
  * What one plot shows: a time plot's x range, live, trailing the newest
  * samples by `delay`, or paused at `right`; the plot's y ranges; and the
@@ -2226,11 +2270,24 @@ export class View {
    * its window stays as asked.
    */
   zoom(factor, anchor, perf, edge = LIVE_EDGE) {
+    this.zoomTo(this.shown(perf) * factor, anchor, perf, edge);
+  }
+
+  /**
+   * [narrowest, widest], the spans a zoom takes the view to at page time
+   * `perf`: as wide as what the view can show, and live no wider than the
+   * decimation keeps.
+   */
+  spans(perf) {
     const limits = this.limits(perf), held = limits ? limits[1] - limits[0] : WINDOW_LIMITS[1];
-    const widest = this.live ? Math.min(this.liveSeconds(), held) : held;
-    const shown = this.shown(perf);
-    const span = Math.min(widest, Math.max(WINDOW_LIMITS[0], shown * factor));
-    if (this.live && factor < 1 && anchor < edge) this.pause(perf);
+    return [WINDOW_LIMITS[0], this.live ? Math.min(this.liveSeconds(), held) : held];
+  }
+
+  /** Zooms to show `asked` seconds, within `spans`, about the point at fraction `anchor` across the plot, as `zoom`. */
+  zoomTo(asked, anchor, perf, edge = LIVE_EDGE) {
+    const [narrowest, widest] = this.spans(perf), shown = this.shown(perf);
+    const span = Math.min(widest, Math.max(narrowest, asked));
+    if (this.live && asked < shown && anchor < edge) this.pause(perf);
     if (!this.live) {
       // It stays within what has arrived: zooming out past the newest
       // sample widens it into the past instead.

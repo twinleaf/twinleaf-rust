@@ -349,8 +349,9 @@ describe('a paused plot', () => {
       await focusPage();
       await pressKey('Space');
       const [id] = plotIds(page.ws.layout), body = leafOf(id).querySelector('.plot-body'), [x, y] = centre(body);
-      // Two zooms at once: the second's read waits its turn.
+      // Two zooms at once, eased over the frames after: the second frame's read waits its turn.
       for (const deltaY of [120, -120]) body.querySelector('canvas').dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY, clientX: x, clientY: y }));
+      await frames(2);
     } finally {
       page.dispose();
     }
