@@ -318,6 +318,15 @@ describe('the export dialog', { timeout: 120_000 }, () => {
     await choose('Axis unit', '-12');
     await drawn(c);
     expect(c.plot(c.id).yFormat, 'the copy’s axis in pT').toEqual({ shared: { unit: -12 } });
+    // The pane's signal row and axis, and the figure's legend, name pT; the page's plot and Signals list nT.
+    if (control('Legend shown').getAttribute('aria-pressed') !== 'true') await press('Legend shown');
+    await drawn(c);
+    const unitsIn = (root) => [...root.querySelectorAll('[data-unit-of]')].map((el) => el.textContent.trim());
+    expect(new Set(unitsIn(dialog().querySelector('.stage-box'))), 'the figure’s legend').toEqual(new Set(['pT']));
+    expect(unitsIn(dialog()).filter((t) => t !== 'pT'), 'the dialog names pT alone').toEqual([]);
+    expect(unitsIn(dialog()).length, 'the pane and the figure').toBeGreaterThanOrEqual(3);
+    expect(unitsIn(leafOf(id)), 'the page’s plot').toEqual(['nT']);
+    expect([...document.querySelectorAll('.sig-units')].map((el) => el.textContent.trim()).sort(), 'the Signals list').toEqual(['V', 'V', 'nT']);
     expect(pv().legend.cursors ?? null, 'no cursors here').toBe(null);
     const ticks = pv().tickLabels.filter((l) => l.axis === 'shared').map((l) => Number(l.text.replace('−', '-')));
     expect(Math.max(...ticks.map(Math.abs)), 'its ticks in pT').toBeGreaterThan(100);

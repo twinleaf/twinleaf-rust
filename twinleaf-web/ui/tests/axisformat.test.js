@@ -8,6 +8,8 @@
 // The label runs up the axis's outer edge, in room the gutter makes for it,
 // clear of its numbers.
 import { describe, expect, it } from 'vitest';
+import fc from 'fast-check';
+import { unitChoices } from '../src/lib/units.js';
 import { commands, page as browser } from 'vitest/browser';
 import { centre, click, closeAll, editCursors, feed, leafOf, mountPage, pressKey, rightClick, settle, typeInto, wait, withYPair } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
@@ -384,6 +386,18 @@ describe('a y axis’s label', () => {
         page.dispose();
       }
     }
+    // Two plots of the same signal, the first in fT, the second on Auto, beside the Signals list.
+    const two = await plotPage('overlay', 'time', { legend: true }, null, { ...NT, plots: 2 });
+    try {
+      two.page.plots.commands.run('yUnit', { on: two.ids[0], how: { key: 'shared', to: -15 } });
+      two.page.plots.commands.run('yLabel', { on: two.ids[0], how: { key: 'shared', to: 'units' } });
+      for (const p of two.pvs) await drawn(p);
+      await wait(300);
+      await settle(6);
+      await browser.screenshot({ path: `${SHOTS}/fT-beside-auto.png` });
+    } finally {
+      two.page.dispose();
+    }
   }, 120_000);
 });
 
@@ -579,6 +593,52 @@ describe('a y axis’s unit', () => {
       }
     }
   }, 120_000);
+});
+
+describe('the unit a plot shows a signal in', () => {
+  /** Two signals in nT, so an overlay's shared axis is in one unit. */
+  const TWO_NT = { signals: ['mag.x', 'mag.y'], units: { 'mag.x': 'nT', 'mag.y': 'nT' }, amplitude: 0.005, plots: 2 };
+  /** What names signal units in `root`, as [key, text]: every element marked with the signal it names the unit of. */
+  const named = (root) => [...root.querySelectorAll('[data-unit-of]')].map((el) => [el.dataset.unitOf, el.textContent.trim()]);
+  const cases = fc.tuple(fc.constantFrom(...MODES), fc.constantFrom('time', 'spectrum'), fc.nat(5));
+
+  it('is named by everything within the plot that names it: the unit its axis fixes there, and on Auto or elsewhere the reported unit', async () => {
+    const seen = new Set();
+    await fc.assert(
+      fc.asyncProperty(cases, async ([mode, kind, pick]) => {
+        const { page, ids, pvs } = await plotPage(mode, kind, { legend: true }, null, TWO_NT);
+        try {
+          const [fixedOn, other] = ids, spectrum = kind === 'spectrum', per = spectrum ? '/√Hz' : '';
+          const axis = mode === 'overlay' ? 'shared' : 'mag.x', choice = unitChoices(`nT${per}`)[pick];
+          page.plots.commands.run('yUnit', { on: fixedOn, how: { key: axis, to: choice.e } });
+          page.plots.commands.run('yLabel', { on: fixedOn, how: { key: axis, to: 'units' } });
+          for (const p of pvs) await drawn(p);
+          const where = `${mode} ${kind} in ${choice.text}`;
+          // On the plot fixed: mag.x, and in an overlay mag.y too, in the unit chosen; the rest in nT.
+          const want = (key) => (key === 'mag.x' || mode === 'overlay' ? choice.text : `nT${per}`);
+          const inPlot = named(leafOf(fixedOn));
+          expect(new Set(inPlot.map(([k]) => k)), `${where}: the chips and the legend name each signal's unit`).toEqual(new Set(['mag.x', 'mag.y']));
+          for (const [key, text] of inPlot) expect(text, `${where}: ${key} in its plot`).toBe(want(key));
+          // The axis's label, and its popover's heading where the axis is one signal's.
+          expect(pvs[0].labelBoxes.find((b) => b.axis === axis)?.text, `${where}: the axis label`).toBe(choice.text);
+          await rightClick(axisSpot(pvs[0], axis));
+          const pop = document.querySelector('[data-slot=popover-content]');
+          for (const [key, text] of named(pop)) expect(text, `${where}: the popover's heading for ${key}`).toBe(want(key));
+          if (mode !== 'overlay') expect(named(pop).length, `${where}: a heading with a unit`).toBe(1);
+          await closeAll();
+          // The other plot of the same signals, on Auto, and the Signals list name the reported unit.
+          for (const [key, text] of named(leafOf(other))) expect(text, `${where}: ${key} on the plot on Auto`).toBe(`nT${per}`);
+          const list = [...document.querySelectorAll('.sig-units')].map((el) => el.textContent.trim());
+          expect(list, `${where}: the Signals list`).toEqual(['nT', 'nT']);
+          seen.add(`${mode}:${kind}`);
+        } finally {
+          page.dispose();
+        }
+      }),
+      { examples: MODES.flatMap((m) => ['time', 'spectrum'].map((k, i) => [[m, k, i * 3]])), numRuns: 8 },
+    );
+    expect(seen.size, 'every layout and kind').toBe(6);
+  }, 300_000);
 });
 
 describe('an axis’s settings', () => {

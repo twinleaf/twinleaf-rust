@@ -462,8 +462,24 @@ export const Y_AUTO = {
   legend: { time: { digits: 5, notation: 'fig' }, spectrum: { digits: 4, notation: 'exp' } },
   floor: { spectrum: { digits: 3, notation: 'exp' } },
 };
-/** The units of a y axis of `traces`, as `PlotView.axisUnits` names them: its signals' units, each once and in order, a spectrum's per √Hz. */
-const unitsOf = (traces, spectrum) => [...new Set(traces.map((t) => (spectrum ? `${t.meta.units}/√Hz` : t.meta.units)))].sort().join(' ');
+/** The units of a y axis whose signals are in `units`, as `PlotView.axisUnits` names them: each once and in order, a spectrum's per √Hz. */
+const unitsOf = (units, spectrum) => [...new Set(units.map((u) => (spectrum ? `${u}/√Hz` : u)))].sort().join(' ');
+
+/**
+ * The unit signal `key` is shown in on a plot of settings `cfg`, {kind,
+ * mode, keys, yFormat}, `keys` the signals it draws, where `unitOf(k)`
+ * is each signal's reported unit: the unit its y axis fixes (units.js
+ * `fixedUnit`), or else its reported unit, a spectrum's per √Hz; '' for a
+ * signal with none. Everything within a plot that names a signal's unit
+ * names this one.
+ */
+export function shownUnit(cfg, key, unitOf) {
+  const u = unitOf(key);
+  if (!u) return '';
+  const spectrum = cfg.kind === 'spectrum', overlay = cfg.mode === 'overlay';
+  const fixed = fixedUnit(axisFormat(cfg.yFormat?.[overlay ? 'shared' : key]), unitsOf((overlay ? cfg.keys : [key]).map(unitOf), spectrum));
+  return fixed ? fixed.text : spectrum ? `${u}/√Hz` : u;
+}
 /** How a spectrum's x axis writes a frequency on Auto: a cursor's place, and the distance between two. */
 export const F_AUTO = { at: { digits: 4, notation: 'fig' }, span: { digits: 4, notation: 'si' } };
 
@@ -778,9 +794,8 @@ export class PlotView {
     for (const [key, ts, i, side, slot] of axes) {
       const f = axisFormat(cfg.yFormat?.[key]), lane = ys[i];
       if (f.label === 'off' || !ts.length || !lane) continue;
-      // A signal's units as the axis writes its numbers: in the unit it fixes, where it fixes one.
-      const fixed = fixedUnit(f, unitsOf(ts, spectrum));
-      const unitOf = (t) => (!t.meta.units ? '' : fixed ? fixed.text : spectrum ? `${t.meta.units}/√Hz` : t.meta.units);
+      // A signal's units as the plot shows them (`shownUnit`).
+      const unitOf = (t) => shownUnit(cfg, t.key, (k) => traces.find((x) => x.key === k)?.meta.units ?? '');
       const units = [...new Set(ts.map(unitOf).filter(Boolean))];
       const named = units.length > 1 ? ts.map((t) => (unitOf(t) ? `${t.key} (${unitOf(t)})` : t.key)).join(', ') : `${ts.map((t) => t.key).join(', ')}${units.length ? ` (${units[0]})` : ''}`;
       const y0 = Math.max(lane.y, head + CLEAR) + CLEAR, y1 = lane.y + lane.h - Math.min(2, tabs[i]) * (TAB.h + CLEAR) - CLEAR;
@@ -1258,7 +1273,7 @@ export class PlotView {
     // in the units of its signals.
     for (const a of axes) {
       a.format = axisFormat(cfg.yFormat?.[a.key]);
-      a.units = unitsOf(a.plans.map((p) => p.t), spectrum);
+      a.units = unitsOf(a.plans.map((p) => p.t.meta.units), spectrum);
       a.slot ??= 0;
       let inner = 0;
       for (let i = 0; i < a.slot; i++) inner += geo.widths[a.side][i];
@@ -2141,7 +2156,7 @@ export class PlotView {
   axisUnits(key) {
     const a = this.yAxes.find((a) => a.key === key);
     if (!a) return null;
-    return unitsOf(a.plans.map((p) => p.t), this.config().kind === 'spectrum');
+    return unitsOf(a.plans.map((p) => p.t.meta.units), this.config().kind === 'spectrum');
   }
 
   /** The form y axis `key` writes a value in at `place` of Y_AUTO, as its settings say, in the units it shows (units.js `formOf`). */

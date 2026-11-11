@@ -30,7 +30,7 @@
   import RiPlay from '@lucide/svelte/icons/play';
   import RiAddSignal from '@lucide/svelte/icons/plus';
   import RiPeak from '@lucide/svelte/icons/mountain';
-  import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
+  import { PlotView, axisSlots, colorOf, monitorOf, shownUnit } from './plot.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, kindLabel } from './constants.js';
   import { stepIn } from './keymap.js';
@@ -194,7 +194,7 @@
     boundsShown = { ...bounds };
     sampleAt = b ? middle(b) : null;
   }
-  // The unit the axis fixes, which the heading names; the fields follow it as it changes with the popover open.
+  // The fields follow the axis's unit as it changes with the popover open.
   const fixedText = $derived(axisOpen ? (plot.yFormat, fixedHere()?.text) : null);
   $effect(() => {
     fixedText;
@@ -512,8 +512,8 @@
   const toggleHidden = (key) => onEdit(`${plot.items.find((i) => i.key === key)?.hidden ? 'Show' : 'Hide'} ${key}`, { items: plot.items.map((i) => (i.key === key ? { ...i, hidden: !i.hidden } : i)) });
   // Whether a spectrum draws the signal's noise floor line, which its chip's eye turns on and off.
   const toggleFloor = (key) => onEdit(`${plot.items.find((i) => i.key === key)?.floorHidden ? 'Show' : 'Hide'} ${key}'s noise floor`, { items: plot.items.map((i) => (i.key === key ? { ...i, floorHidden: !i.floorHidden } : i)) });
-  /** The units of what the plot shows of signal `key`: a spectrum's are per √Hz. */
-  const unitsShown = (key) => unitsOf(key) && (plot.kind === 'spectrum' ? `${unitsOf(key)}/√Hz` : unitsOf(key));
+  /** The unit this plot shows signal `key` in (plot.js `shownUnit`), which every place in it that names the signal's unit names. */
+  const unitsShown = (key) => shownUnit({ kind: plot.kind, mode: plot.mode, keys: drawnItems().map((i) => i.key), yFormat: plot.yFormat }, key, unitsOf);
   const showOnly = (key) => onEdit(`Show only ${key}`, { items: plot.items.map((i) => ({ ...i, hidden: i.key !== key })) });
   const showAll = () => onEdit('Show every signal', { items: plot.items.map((i) => ({ ...i, hidden: false })) });
   /** Whether `e` happened on the header itself or the empty part of its chips. */
@@ -818,7 +818,7 @@
               <div id="chip-{item.id}" data-key={item.key} class:hidden-signal={item.hidden} class="trace-chip" class:ghost={item[SHADOW]} data-menu-for={signalsOpen && menuChip === item.key ? '' : undefined} class:unscaled={axisless(item.key)} role="option" aria-selected={zoneFocused && i === active} style="--c:{colorFor(item.key)}" title={axisless(item.key) ? 'No axis of its own: drag it beside the plot\'s left or right edge to give it one' : r?.info}>
                 <Swatch key={item.key} />
                 <span class="name">{item.key}</span>
-                {#if unitsShown(item.key)}<span class="units">{unitsShown(item.key)}</span>{/if}
+                {#if unitsShown(item.key)}<span class="units" data-unit-of={item.key}>{unitsShown(item.key)}</span>{/if}
                 {#if plot.kind === 'spectrum'}
                   <!-- A spectrum's chip shows its white noise floor, always,
                        the hover's values being in the legend and the tip; its
@@ -1012,7 +1012,7 @@
   <Popover.Root bind:open={axisOpen}>
     <Popover.Content customAnchor={axisAnchor} side="right" align="start" class="axis-pop w-auto gap-0 p-1.5">
       <div class="axis-head">
-        {#if axisKey}<i style="--c: {colorFor(axisKey)}"></i>{axisKey}{#if unitsOf(axisKey)}<span class="units">{fixedText ?? unitsOf(axisKey)}</span>{/if}{:else}Y axis{/if}
+        {#if axisKey}<i style="--c: {colorFor(axisKey)}"></i>{axisKey}{#if unitsShown(axisKey)}<span class="units" data-unit-of={axisKey}>{unitsShown(axisKey)}</span>{/if}{:else}Y axis{/if}
         {#if axisKey && plot.mode === 'independent'}
           {@const other = region.side === 'left' ? 'right' : 'left'}
           <span class="axis-tools">
@@ -1087,7 +1087,7 @@
                       {#each plot.items as item (item.id)}
                         <div class="row" role="listitem" data-key={item.key} style="--c:{colorFor(item.key)}" title={item.key}>
                           <!-- A bare plot's legend names its signals, by the name given them where there is one, as a picture of it holds no values. -->
-                          <Swatch key={item.key} /><span class="name">{item.label || item.key}</span>{#if !host.bare}<span class="val">{legend.rows[item.key]?.value ?? ''}</span>{/if}<span class="units">{unitsShown(item.key)}</span>
+                          <Swatch key={item.key} /><span class="name">{item.label || item.key}</span>{#if !host.bare}<span class="val">{legend.rows[item.key]?.value ?? ''}</span>{/if}<span class="units" data-unit-of={item.key}>{unitsShown(item.key)}</span>
                           {#if !host.bare}
                             <Tip text="Remove from this plot" keys={['Delete']}>
                               {#snippet children(tip)}<button {...tip} class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>{/snippet}

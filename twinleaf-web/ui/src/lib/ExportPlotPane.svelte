@@ -15,7 +15,7 @@
   import * as clock from './clock.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
   import ColorPicker from './ColorPicker.svelte';
-  import { colorOf } from './plot.js';
+  import { colorOf, shownUnit } from './plot.js';
   import { MODES } from './constants.js';
   import { AXIS_SETTINGS } from './commands.js';
   import { axisFormat, fromUnit, inUnit, unitChoices } from './units.js';
@@ -38,6 +38,8 @@
   const axis = $derived(pickedKey && axisOf(pickedKey));
   const axisSignals = $derived(plot.items.filter((i) => axisOf(i.key) === axis));
   const unitsOf = (key) => session.trace(key)?.meta.units ?? '';
+  /** The unit the copy's plot shows signal `key` in (plot.js `shownUnit`), as the plot's own chips and legend name it. */
+  const unitShown = (key) => shownUnit({ kind: plot.kind, mode: plot.mode, keys: plot.items.filter((i) => !i.hidden).map((i) => i.key), yFormat: plot.yFormat }, key, unitsOf);
   const set = $derived(axisFormat(plot.yFormat?.[axis]));
   /** Each value of axis setting `field` as a <select> holds it, and back. */
   const optionOf = (v) => (v === null ? 'auto' : String(v));
@@ -190,11 +192,11 @@
         </Popover.Content>
       </Popover.Root>
       <input type="text" value={item.label || item.key} aria-label="Name of {item.key}" onchange={(e) => rename(item.key, e.currentTarget.value)} />
-      <button class="axis" aria-pressed={item.key === pickedKey} aria-label="Axis of {item.key}" onclick={() => (picked = item.key)}>{unitsOf(item.key) || '—'}</button>
+      <button class="axis" aria-pressed={item.key === pickedKey} aria-label="Axis of {item.key}" onclick={() => (picked = item.key)} data-unit-of={item.key}>{unitShown(item.key) || '—'}</button>
     </div>
   {/each}
   {#if axis}
-    <div class="axis-of">{axisSignals.length > 1 ? `Axis of ${axisSignals.length} signals` : 'Axis'}{unitsOf(pickedKey) ? ` · ${unitsOf(pickedKey)}` : ''}</div>
+    <div class="axis-of">{axisSignals.length > 1 ? `Axis of ${axisSignals.length} signals` : 'Axis'}{#if unitShown(pickedKey)} · <span data-unit-of={pickedKey}>{unitShown(pickedKey)}</span>{/if}</div>
     <div class="r">
       <span>Range</span>
       <select aria-label="Range" value={range.how} onchange={(e) => setRange(e.currentTarget.value)}>
