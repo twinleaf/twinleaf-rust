@@ -37,6 +37,20 @@ export function keyPressed() {
   keyboardLast = true;
 }
 
+/** What watches Shift, each told whether it is held as it goes down or up. */
+const shiftWatchers = new Set();
+
+/** Tells what watches Shift that it is `held`, as the key router does as Shift goes down or up. */
+export function shiftHeard(held) {
+  for (const fn of [...shiftWatchers]) fn(held);
+}
+
+/** Has `fn(held)` told each time Shift goes down or up, until the function it returns is called. */
+export function watchShift(fn) {
+  shiftWatchers.add(fn);
+  return () => shiftWatchers.delete(fn);
+}
+
 /**
  * Whether key event `e`, pressed on `at`, belongs to where it was pressed,
  * rather than to the plots the keys act on. A key pressed on no element

@@ -52,8 +52,11 @@
 //
 // A claimant with a `place` is offered the keys of that place in keymap.js,
 // and runs the action a key names there; one without is offered every key.
+//
+// Shift going down or up is told, before anything else, to what watches it
+// (keys.js `watchShift`), as a cursor drag that snaps while it is held.
 import { actionFor } from './keymap.js';
-import { keepsKey, keyPressed } from './keys.js';
+import { keepsKey, keyPressed, shiftHeard } from './keys.js';
 import { runShownKey } from './menus.js';
 
 /** What a claimant answers to hand a key to the page: the element never hears it, and the claimants after the element take it as pressed on no element. */
@@ -150,6 +153,7 @@ function after(e, at) {
 /** A key on its way down: the claimants before the element. */
 function down(e) {
   keyPressed();
+  if (e.key === 'Shift' && !e.repeat) shiftHeard(true);
   last = { key: e.key, by: null, page: false };
   const hit = offer(BEFORE, e, e.target);
   if (!hit) return;
@@ -165,6 +169,7 @@ function down(e) {
  * button focused by a click presses nothing.
  */
 function up(e) {
+  if (e.key === 'Shift') shiftHeard(false);
   if (e.key === ' ' && !keepsKey(e)) e.preventDefault();
 }
 

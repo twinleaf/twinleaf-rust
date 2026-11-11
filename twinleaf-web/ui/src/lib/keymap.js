@@ -110,6 +110,7 @@ export const KEYMAP = [
       { show: ['Drag'], on: 'X1 X2 tab, x axis', what: 'X cursor' },
       { show: ['Drag'], on: 'Y1 Y2 tab, y axis', what: 'Y cursor' },
       { show: ['Drag'], on: 'line or tag', what: 'Move' },
+      { show: ['Shift'], on: 'during a drag', what: 'Snap to a tick, the other cursor or the data' },
       { show: ['Drag'], on: 'off its lane', what: 'Remove' },
       { show: ['Right-click'], on: 'readout', what: 'Copy, clear' },
     ],

@@ -327,18 +327,22 @@
   // or the plot takes it for a move or a pan. A menu opened anywhere on the
   // plot, by the right button or the keys, selects it first as a press on
   // its controls does, so the menu acts on what is selected.
-  let pressedAt = null;
+  // A click is a Shift+click by Shift as it was at the press: Shift pressed
+  // during a press snaps a dragged cursor, and its release selects as a
+  // plain click does.
+  let pressedAt = null, pressedShift = false;
   /** The plot's header and controls, a press on which selects the plot first: its grip and its header start the same move. */
   const CONTROLS = '.plot-head, button, [role=button], [role=combobox], input';
   function pressed(e) {
     pressedAt = [e.clientX, e.clientY];
+    pressedShift = e.shiftKey;
     if (e.button === 0 && !e.shiftKey && e.target.closest?.(CONTROLS)) onPress?.();
     else onFocus();
   }
   function clicked(e) {
     if (!pressedAt || Math.hypot(e.clientX - pressedAt[0], e.clientY - pressedAt[1]) >= DRAG_START) return;
     if (e.target.closest('button, input, [role=menuitem]')) return;
-    onSelect?.(e.shiftKey, e.detail);
+    onSelect?.(pressedShift, e.detail);
   }
 
   let body = $state();

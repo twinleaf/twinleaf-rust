@@ -20,6 +20,8 @@ import { WINDOW_LIMITS, windowText } from './window.js';
 import { placedIn, withX, withY, withoutX, withoutY, xOf, yOf } from './cursors.js';
 import * as clock from './clock.js';
 import { aimed, eased, LINE_PX, STILL, turn } from './wheelzoom.js';
+import { pickSnap, SNAP_PX, snapCandidates, STAND } from './snap.js';
+import { watchShift } from './keys.js';
 
 /** A CSS colour as [r, g, b, a] in 0..1, resolved by the browser, so theme tokens work. */
 function cssRgba(css) {
@@ -550,12 +552,16 @@ export class PlotView {
      *   while it is out of view; 'tab', where it rests while not placed,
      *   with `alpha`, how plainly it shows. A line and a tag of a cursor in
      *   view hold `at`, where the cursor is along its axis, in client px.
-     * - what follows the pointer, drawn over the rest, each with `through`,
-     *   as a press goes through it to what is under: 'pointer', the
-     *   pointer's value on a y axis, with that axis's `key`; 'tip', the
-     *   hover's tip.
+     * - what a press goes through to what is under, each with `through`:
+     *   'snap', the mark on what a cursor dragged with Shift snapped to, a
+     *   ring centred at (`cx`, `cy`) or else an outline of its box, with
+     *   `name` and `fill` its cursor's, drawn over the cursors' lines and
+     *   under their tags; and what follows the pointer, drawn over the
+     *   rest: 'pointer', the pointer's value on a y axis, with that axis's
+     *   `key`; 'tip', the hover's tip.
      */
     this.pressable = [];
+    this.snapped = null; // what the cursor being dragged with Shift snapped to, see `snapAt`, with the cursor's `kind`, `name` and y `axisKey`
     this.tagsParted = {}; // the pairs of tags that are on their outer sides, by pair, see `parted`
     this.tagsPlaced = [];
     this.tickLabels = []; // the box of each tick label, {x, y, w, h} in client px, as last drawn, and a y label's axis, its range key
@@ -857,6 +863,8 @@ export class PlotView {
       });
     }
     const xd = plans.length ? [f0, f1] : null;
+    // What this frame draws: the frequencies, and each signal's spectrum.
+    this.drawn = { x0: f0, x1: f1, plans };
     this.fExtent = plans.length ? [fmin, fmax] : null;
     this.drawOverlay(cfg, geo, body, plans, ranges, xd, true, traces);
   }
@@ -1000,6 +1008,8 @@ export class PlotView {
     const xticks = logX ? sx.ticks(6) : spectrum ? sx.ticks(Math.max(2, P.w / 90)) : time.ticks(xd[0], xd[1], Math.max(2, P.w / 120));
     const fewDecades = logX && Math.log10(xd[1] / xd[0]) < 2;
     const labelled = (f) => decade(f) || (fewDecades && [2, 5].includes(Math.round(f / 10 ** Math.floor(Math.log10(f) + 1e-9))));
+    // The ticks an X cursor dragged with Shift snaps to: each one the grid has a line at.
+    this.xTicks = xticks;
     ctx.fillStyle = T.axisText;
     ctx.textAlign = 'center';
     this.tickLabels = [];
@@ -1100,6 +1110,8 @@ export class PlotView {
       const { grid, labels, count } = laneTicks(sy, ax.lane, logY ? decade : undefined);
       // Numbers take the precision of the ticks they label, so no two read the same.
       const fmt = logY ? (v) => v.toExponential(0) : sy.tickFormat(count);
+      // The ticks a Y cursor dragged with Shift snaps to: where the axis draws its grid, or else its numbers.
+      ax.ticks = i === 0 || cfg.mode === 'stacked' ? grid : labels;
       if (i === 0 || cfg.mode === 'stacked')
         for (const tv of grid) {
           const py = Math.round(sy(tv)) + 0.5;
@@ -1432,9 +1444,10 @@ export class PlotView {
 
   /**
    * Lays out the cursors as parts of `pressable`, after the regions under
-   * them, and draws them from it in its order: every line, then every tag,
-   * then the tabs, so a tag lies over any line and what lies over another
-   * takes the press there.
+   * them, and draws them from it in its order: every line, then the mark on
+   * what a cursor dragged with Shift snapped to, then every tag, then the
+   * tabs, so a tag lies over any line and what lies over another takes the
+   * press there.
    *
    * X1 and X2 are lines through every lane, named just above the x axis,
    * their place at the top of the plot beside the line, and where the tags
@@ -1587,9 +1600,26 @@ export class PlotView {
         tabs.push({ part: 'tab', kind: 'y', name, key: a.key, axis: a, fill: color[name], text: yName[name], x, y: a.lane.y + a.lane.h - 2 - TAB.h - up, w: TAB.w, h: TAB.h });
       }
     }
-    this.pressable.push(...lines, ...tags, ...tabs);
+    // While a cursor dragged with Shift is snapped, a mark on what it snapped
+    // to: a ring on the signal's point; an outline about the tick's number
+    // or the other cursor's name; or, for a tick with no number or 0, a ring
+    // on the cursor's line at the pointer.
+    const snaps = [], s = this.snapped, hov = this.hover;
+    if (s) {
+      const axis = s.kind === 'x' ? s.point && axes.find((a) => a.plans.some((p) => p.t.key === s.key)) : axes.find((a) => a.key === s.axisKey);
+      const along = s.kind === 'x' ? this.pxOf(s.v) : axis && this.axisScale(axis)(s.v);
+      const mark = { part: 'snap', through: true, name: s.name, fill: color[s.name] };
+      const ring = (cx, cy) => ({ ...mark, cx, cy, x: cx - SNAP_RING, y: cy - SNAP_RING, w: 2 * SNAP_RING, h: 2 * SNAP_RING });
+      const about = (b) => ({ ...mark, x: b.x - 2, y: b.y - 2, w: b.w + 4, h: b.h + 4 });
+      const label = s.from === 'tick' && this.tickLabels.find((b) => (s.kind === 'x' ? b.axis === undefined && Math.abs(b.x + b.w / 2 - along) < 1 : b.axis === s.axisKey && Math.abs(b.y + b.h / 2 - along) < 2));
+      const named = s.from === 'cursor' && tags.find((t) => t.kind === s.kind && t.name !== s.name && t.key === s.axisKey && !t.edge && t.text === (s.kind === 'x' ? xName : yName)[t.name]);
+      const pt = s.point && axis && [this.pxOf(s.point.x), this.axisScale(axis)(s.point.y)];
+      const it = pt ? ring(...pt) : label ? about(label) : named ? about(named) : hov ? ring(...(s.kind === 'x' ? [along, hov.y] : [hov.x, along])) : null;
+      if (it && [it.x, it.y].every(Number.isFinite)) snaps.push(it);
+    }
+    this.pressable.push(...lines, ...snaps, ...tags, ...tabs);
     // A tab shows while the pointer is on it, plainly, or on its axis; or on another tab or edge tag of its y axis.
-    const hov = this.hover, on = hov ? this.pressAt(hov.x, hov.y) : null;
+    const on = hov ? this.pressAt(hov.x, hov.y) : null;
     const overXAxis = !!hov && hov.y > P.y + P.h && hov.x >= body.x && hov.x <= body.x + body.w;
     const overAxis = hov ? this.yAxisAt(hov.x, hov.y) : null;
     for (const t of tabs) {
@@ -1605,6 +1635,14 @@ export class PlotView {
           ctx.lineTo(x1, y1);
         }
         ctx.stroke();
+      } else if (p.part === 'snap') {
+        ctx.strokeStyle = p.fill;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        if (p.cx === undefined) ctx.rect(p.x + 0.5, p.y + 0.5, p.w - 1, p.h - 1);
+        else ctx.arc(p.cx, p.cy, SNAP_RING, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.lineWidth = 1;
       } else if (p.text && (p.alpha ?? 1) > 0) {
         ctx.globalAlpha = p.alpha ?? 1;
         ctx.fillStyle = p.fill;
@@ -1800,6 +1838,43 @@ export class PlotView {
     for (const [p, axis] of this.cursorTargets(key)) this.cursors.draft(p.plotId, withY(this.cursors.get(p.plotId), kind, axis, name, value));
   }
 
+  /**
+   * The signals of `plans`, as this frame draws them, for snap.js: a time
+   * plot's points from what it draws them from, a spectrum's bins, each
+   * with what its features stand out by.
+   */
+  snapSignals(plans) {
+    if (this.spectrum)
+      return plans.map(({ t, s }) => ({ key: t.key, n: s.f.length, x: (i) => s.f[i], y: (i) => s.a[i], stand: STAND.spectrumDb / 20, troughs: false, level: Math.log10 }));
+    return plans.map(({ t, src, a0, a1 }) => {
+      const range = this.yAxes.find((a) => a.plans.some((p) => p.t === t))?.range ?? [0, 0];
+      return { key: t.key, n: Math.max(0, a1 - a0), x: (i) => src.xAt(a0 + i), y: (i) => src.yAt(a0 + i), stand: STAND.timeShare * (range[1] - range[0]) };
+    });
+  }
+
+  /**
+   * What a cursor dragged with Shift held snaps to, from what the plot last
+   * drew (snap.js), when without Shift it would be at client px `at` along
+   * its axis: X cursor `name`, or with `key` Y cursor `name` of that y axis.
+   * As {v, from, key, point} with `v` where the cursor goes, or null to
+   * follow the pointer.
+   */
+  snapAt(name, at, key) {
+    const P = this.geo?.plot, xd = this.xd, plans = this.drawn?.plans;
+    if (!P || !xd || !plans) return null;
+    const other = name === 'a' ? 'b' : 'a';
+    if (key === undefined) {
+      const near = [this.dataAt(at - SNAP_PX), this.dataAt(at + SNAP_PX)];
+      const candidates = snapCandidates({ axis: 'x', view: xd, ticks: this.xTicks, other: this.markers()[other], signals: this.snapSignals(plans), near });
+      return pickSnap(candidates, at, (v) => this.pxOf(v));
+    }
+    const axis = this.yAxes.find((a) => a.key === key);
+    if (!axis) return null;
+    const sy = this.axisScale(axis), { a, b } = this.markers();
+    const candidates = snapCandidates({ axis: 'y', view: [sy.invert(axis.lane.y + axis.lane.h), sy.invert(axis.lane.y)], ticks: axis.ticks, other: this.yPair(key)[other], signals: this.snapSignals(axis.plans), xs: [a, b], xView: xd });
+    return pickSnap(candidates, at, sy);
+  }
+
   /** The data x under clientX, and back. */
   dataAt(clientX) {
     const P = this.geo?.plot, xd = this.xd;
@@ -1984,7 +2059,9 @@ export class PlotView {
       const targets = band ? this.axisTargets(band, e.clientY) : this.yTargets(e.clientY);
       // How far from the cursor the pointer holds it, along the cursor's axis.
       const grab = cursor?.at === undefined ? 0 : (cursor.kind === 'x' ? e.clientX : e.clientY) - cursor.at;
-      drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: 0, mode, targets, band, cursor: cursor?.name, key: cursor?.key, grab };
+      drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: 0, mode, targets, band, cursor: cursor?.name, key: cursor?.key, grab, shift: false };
+      unwatchShift?.();
+      unwatchShift = watchShift(onShift);
       // A time cursor holds a moment the live view would scroll away, so
       // dragging one pauses every plot it moves on.
       if (mode === 'xcursor' && isTime()) for (const [p] of this.cursorTargets()) p.view.pause(clock.now());
@@ -2015,6 +2092,25 @@ export class PlotView {
         else drag.mode = 'none';
       } else drag.started = true;
       return true;
+    };
+    // A dragged cursor's place: where the pointer holds it, or, while Shift
+    // is held, what it snaps to near there (`snapAt`), noted as `snapped`
+    // for the mark drawn on it. Shift is read from the pointer as it moves,
+    // and as it goes down or up mid-drag, which places the cursor at once.
+    // Shift held at the press selects the plot and starts no drag, so
+    // snapping begins with Shift pressed once a drag is under way.
+    const placeCursor = () => {
+      const x = drag.mode === 'xcursor', at = (x ? drag.x : drag.y) - drag.grab;
+      const snap = drag.shift ? this.snapAt(drag.cursor, at, x ? undefined : drag.key) : null;
+      this.snapped = snap && { ...snap, kind: x ? 'x' : 'y', name: drag.cursor, axisKey: drag.key };
+      if (x) this.draftX(drag.cursor, snap ? snap.v : this.dataAt(at));
+      else this.draftY(drag.key, drag.cursor, snap ? snap.v : this.yValueAt(drag.key, at));
+    };
+    let unwatchShift = null;
+    const onShift = (held) => {
+      if (!drag?.moved || (drag.mode !== 'xcursor' && drag.mode !== 'ycursor')) return;
+      drag.shift = held;
+      placeCursor();
     };
     // Offsets the y ranges of `keys` by dy pixels of the lane at clientY.
     const offsetY = (keys, dy, clientY) => {
@@ -2060,10 +2156,9 @@ export class PlotView {
         if (!this.zoomBand && isTime()) for (const v of this.targets()) v.pause(clock.now());
         const P0 = this.geo.plot;
         this.zoomBand = [drag.x0, Math.min(P0.x + P0.w, Math.max(P0.x, e.clientX))];
-      } else if (drag.mode === 'xcursor') {
-        this.draftX(drag.cursor, this.dataAt(e.clientX - drag.grab));
-      } else if (drag.mode === 'ycursor') {
-        this.draftY(drag.key, drag.cursor, this.yValueAt(drag.key, e.clientY - drag.grab));
+      } else if (drag.mode === 'xcursor' || drag.mode === 'ycursor') {
+        drag.shift = e.shiftKey;
+        placeCursor();
       } else if (drag.mode === 'seek') {
         // The window moves with the pointer, at the scale of the whole
         // history, and stays within it.
@@ -2109,6 +2204,9 @@ export class PlotView {
       this.stopTime();
       this.zoomBand = null;
       this.seeking = false;
+      this.snapped = null;
+      unwatchShift?.();
+      unwatchShift = null;
       if (!drag) return;
       drag = null;
       this.cursors.cancel();
@@ -2176,6 +2274,8 @@ const SEEK_BAR = 4, SEEK_MIN = 2;
  * from the plot beside it and further below it.
  */
 const CURSOR_STUB = 4;
+/** The radius, in px, of the ring on what a cursor dragged with Shift snapped to. */
+const SNAP_RING = 5;
 /** How near, in px, the tags of two cursors come before they part to their outer sides, and how much further apart they are before they come back. */
 const TAG_NEAR = 4, TAG_HELD = 6;
 /** Whether boxes `a` and `b`, each {x, y, w, h}, overlap. */
