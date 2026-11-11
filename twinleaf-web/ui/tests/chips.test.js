@@ -8,12 +8,15 @@
 // order, dim exactly while its chip is out of view as a person would say it,
 // one lit while the row shows any chip, as it scrolls, resizes and its chips
 // and their values change; a click on a dim one brings its chip into view.
-// Under a row that fits, none.
+// Under a row that fits, none. The header's + follows the row's last chip at
+// the chips' spacing, or holds the row's end while it runs past it, still
+// as the pointer comes and goes, and opens the add-signal menu under it.
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { commands } from 'vitest/browser';
-import { centre, clickOn, drag, dropped, feed, frames, leafOf, mountPage, settle, until, wait, withExamples } from './harness/page.js';
+import { centre, clickOn, closeAll, drag, dropped, feed, frames, leafOf, mountPage, pressKey, settle, until, wait, withExamples } from './harness/page.js';
+import { openMenu } from './harness/menus.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
@@ -83,8 +86,8 @@ describe('chip rows', () => {
   }, 600_000);
 });
 
-/** Each signal's name as long as `signal`, and two values, for the examples. */
-const L = Array(14).fill(6), Y = [0.5, -0.25];
+/** Each signal's name as long as `signal`, or one letter long, and two values, for the examples. */
+const L = Array(14).fill(6), S = Array(14).fill(1), Y = [0.5, -0.25];
 /** Whether `chip` is wholly within the box its row shows, or, wider than the row, filling it. */
 const wholly = (chip, row) => {
   const c = chip.getBoundingClientRect(), r = row.getBoundingClientRect();
@@ -97,7 +100,9 @@ const wholly = (chip, row) => {
  * as much of the row as any chip does.
  */
 function inView(chips, row) {
-  const b = row.getBoundingClientRect(), fade = parseFloat(getComputedStyle(row).getPropertyValue('--fade'));
+  // The row shows chips but for the room it keeps at its right end for the +.
+  const box = row.getBoundingClientRect(), add = parseFloat(row.style.getPropertyValue('--add')) || 0;
+  const b = { left: box.left, right: box.right - add, width: box.width - add }, fade = parseFloat(getComputedStyle(row).getPropertyValue('--fade'));
   const l = b.left + (row.classList.contains('more-left') ? fade : 0), r = b.right - (row.classList.contains('more-right') ? fade : 0);
   const span = (c, a, z) => Math.max(0, Math.min(c.right, z) - Math.max(c.left, a));
   const boxes = chips.map((c) => c.getBoundingClientRect()), held = boxes.map((c) => span(c, b.left, b.right)), most = Math.max(0, ...held);
@@ -110,6 +115,43 @@ function sample(hub, t, y) {
   session.tick(perf);
 }
 
+/** Whether client boxes `a` and `b` overlap by more than half a px. */
+const overlaps = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+/**
+ * Checks where the + of header `head` lies by its row of chips `row`, which
+ * runs past an edge while `over`: within the chips' gap after the last chip,
+ * or the text an empty row shows, while the row fits, and at the row's right
+ * end while it does not; on no chip, dash or action of the header.
+ */
+function checkPlus(row, head, over, where) {
+  const plus = head.querySelector('.add-signal').getBoundingClientRect(), r = row.getBoundingClientRect(), gap = parseFloat(getComputedStyle(row).columnGap);
+  const items = [...row.children].filter((el) => el.matches('.trace-chip, .trace-empty')).map((el) => el.getBoundingClientRect());
+  // The room the row keeps at its right end for the +, where chips scrolled under it are masked out.
+  const add = parseFloat(row.style.getPropertyValue('--add')) || 0, shows = r.right - add;
+  const said = `${where}: the + at ${plus.left}..${plus.right}, the row at ${r.left}..${r.right}, showing chips to ${shows}`;
+  if (over) expect(plus.left >= shows - 0.5 && plus.right <= r.right + 0.5, `${said}, at the end of a row that runs past it, clear of its fade`).toBe(true);
+  else {
+    expect(items.length, `${where}: a chip or the empty row's text before the +`).toBeGreaterThan(0);
+    const d = plus.left - items.at(-1).right;
+    expect(d >= -0.5 && d <= gap + 0.5, `${said}, ${d} px after the last of the row's ${items.length}, within its gap of ${gap} px`).toBe(true);
+  }
+  // On nothing else: the chips as the row shows them, the dashes, the actions.
+  const clip = (c, by) => ({ left: Math.max(c.left, by.left), right: Math.min(c.right, by.right), top: c.top, bottom: c.bottom });
+  const shown = items.map((c) => clip(c, { left: r.left, right: shows })).filter((c) => c.right > c.left);
+  const strip = head.querySelector('.chip-dashes')?.getBoundingClientRect();
+  const dashes = [...head.querySelectorAll('.chip-dash')].map((d) => clip(d.getBoundingClientRect(), strip)).filter((d) => d.right > d.left);
+  const actions = [...head.querySelectorAll('.plot-actions button')].map((b) => b.getBoundingClientRect()).filter((b) => b.width > 0);
+  for (const [what, boxes] of [['a chip', shown], ['a dash', dashes], ['an action', actions]]) for (const b of boxes) expect(overlaps(plus, b), `${said}, on ${what} at ${b.left}..${b.right}`).toBe(false);
+  // In the header, before its actions, where the header holds what it has; narrower, it clips them all.
+  const h = head.getBoundingClientRect(), first = Math.min(h.right, ...actions.map((b) => b.left));
+  const inner = h.right - parseFloat(getComputedStyle(head).paddingRight);
+  if (Math.max(...actions.map((b) => b.right), plus.right) <= inner + 0.5) {
+    expect(plus.left >= h.left && plus.right <= first + 0.5, `${said}, in the header at ${h.left}..${h.right} before its actions from ${first}`).toBe(true);
+    // The actions keep to the header's right end, the room between them and the + free.
+    if (actions.length) expect(Math.abs(Math.max(...actions.map((b) => b.right)) - inner), `${where}: the actions at the header's right end, ${inner}`).toBeLessThan(1);
+  }
+}
+
 /**
  * Checks plot `id`'s row of chips against the dashes under it, and gives
  * how its row stands: whether it runs past an edge, and its dashes.
@@ -117,11 +159,12 @@ function sample(hub, t, y) {
 function checkDashes(id, where) {
   const leaf = document.querySelector(`.leaf[data-plot="${id}"]`), row = leaf.querySelector('.trace-zone'), head = leaf.querySelector('.plot-head');
   const chips = [...row.querySelectorAll(':scope > .trace-chip')], strip = head.querySelector('.chip-dashes');
-  const over = row.scrollWidth > row.clientWidth + 1;
+  const past = row.scrollWidth > row.clientWidth + 1, over = past && chips.length > 0;
   // The header is as high with the strip as without it.
   expect(head.getBoundingClientRect().height, `${where}: the header's height`).toBe(28);
+  checkPlus(row, head, past, where);
   if (!over) {
-    expect(strip, `${where}: no dashes under a row that fits`).toBe(null);
+    expect(strip, `${where}: no dashes under a row that fits, or that has no chips`).toBe(null);
     return { over, dashes: [] };
   }
   expect(strip, `${where}: dashes under a row that runs past an edge`).not.toBe(null);
@@ -144,17 +187,21 @@ function checkDashes(id, where) {
 }
 
 describe('the dashes under a row of chips', () => {
-  it('are there only while the row runs past an edge, one per signal in its colour, dim while its chip is out of view, one lit, and a click on a dim one brings its chip into view', async () => {
-    const count = { fits: 0, over: 0, out: 0, crowded: 0, revealed: 0, unlit: 0, edge: 0 };
+  it('are there only while the row runs past an edge, one per signal in its colour, dim while its chip is out of view, one lit, and a click on a dim one brings its chip into view; the + follows the last chip, or holds the row’s end', async () => {
+    const count = { fits: 0, over: 0, out: 0, crowded: 0, revealed: 0, unlit: 0, edge: 0, empty: 0, free: 0 };
     const change = fc.constantFrom('none', 'add', 'remove', 'reverse', 'narrow', 'hide', 'values', 'legend', 'widen', 'wheel');
     // How far along the row is scrolled: a fraction of the way, or chip `chip`'s left edge put `at` px from the row's.
     const scroll = fc.oneof(fc.double({ min: 0, max: 1, noNaN: true }), fc.record({ chip: fc.nat(), at: fc.integer({ min: -80, max: 80 }) }));
     const values = fc.array(fc.oneof(fc.double({ min: -1e6, max: 1e6, noNaN: true }), fc.double({ min: -1e-3, max: 1e-3, noNaN: true })), { minLength: 2, maxLength: 2 });
     const names = fc.array(fc.integer({ min: 1, max: 22 }), { minLength: 14, maxLength: 14 });
+    // Where in the header's free room, past the +, a signal is dropped and a right-click made: a fraction of
+    // the way across it; and where the signal comes from, the Signals list or the next plot.
+    const free = fc.record({ at: fc.double({ min: 0, max: 1, noNaN: true }), from: fc.constantFrom('list', 'plot') });
     await fc.assert(
-      fc.asyncProperty(fc.integer({ min: 1, max: 14 }), fc.integer({ min: 1, max: 4 }), fc.option(fc.integer({ min: 150, max: 900 })), names, scroll, fc.nat(), change, values, async (n, columns, width, lengths, scrolled, pick, then, [y0, y1]) => {
+      fc.asyncProperty(fc.integer({ min: 0, max: 14 }), fc.integer({ min: 1, max: 4 }), fc.option(fc.integer({ min: 150, max: 900 })), names, scroll, fc.nat(), change, values, free, async (n, columns, width, lengths, scrolled, pick, then, [y0, y1], room) => {
         const signals = lengths.map((len, i) => `dev.${'signalnamewithmanyparts'.slice(0, len)}${i}`);
-        const keys = [signals.slice(0, n), ...Array.from({ length: columns - 1 }, () => [])];
+        // The next plot, where there is one, holds the last signal.
+        const keys = [signals.slice(0, n), ...Array.from({ length: columns - 1 }, (_, k) => (k === 0 && n < 14 ? [signals[13]] : []))];
         const page = await mountPage(keys, 'columns', 0, signals);
         try {
           feed(page.hub);
@@ -166,7 +213,7 @@ describe('the dashes under a row of chips', () => {
           await settle();
           const row = leafOf(id).querySelector('.trace-zone');
           if (typeof scrolled === 'number') row.scrollLeft = scrolled * (row.scrollWidth - row.clientWidth);
-          else {
+          else if (n) {
             const c = row.querySelectorAll(':scope > .trace-chip')[scrolled.chip % n];
             row.scrollLeft += c.getBoundingClientRect().left - row.getBoundingClientRect().left - scrolled.at;
           }
@@ -174,6 +221,7 @@ describe('the dashes under a row of chips', () => {
           const where = `${n} signals of names ${JSON.stringify(lengths.slice(0, n))} long, a plot ${width ? `${width} px` : columns === 1 ? 'the page' : `a ${columns}th of the page`} wide, scrolled ${JSON.stringify(scrolled)}`;
           let seen = checkDashes(id, where);
           count[seen.over ? 'over' : 'fits']++;
+          if (!n) count.empty++;
           if (seen.over) {
             count.out += seen.dashes.some((d) => d.classList.contains('out')) ? 1 : 0;
             count.crowded += seen.strip.classList.contains('crowded') ? 1 : 0;
@@ -198,18 +246,18 @@ describe('the dashes under a row of chips', () => {
               ),
             );
           else if (then === 'narrow') leafOf(id).querySelector('.plot-card').style.flex = '0 0 55%';
-          else if (then === 'widen') row.querySelectorAll(':scope > .trace-chip .val')[pick % n].style.width = '30ch';
+          else if (then === 'widen' && n) row.querySelectorAll(':scope > .trace-chip .val')[pick % n].style.width = '30ch';
           else if (then === 'wheel') row.dispatchEvent(new WheelEvent('wheel', { deltaY: 40 + (pick % 120), bubbles: true, cancelable: true }));
           sample(page.hub, 21, y1);
           flushSync();
           await wait(200);
           await frames(4);
           seen = checkDashes(id, `${where}, after '${then}'`);
-          if (then === 'hide' && seen.over) {
+          if (then === 'hide' && seen.over && items.length) {
             const k = pick % items.length;
             expect(getComputedStyle(seen.dashes[k]).opacity, `${where}: the hidden signal's dash looks as its chip does`).toBe(getComputedStyle(seen.chips[k]).opacity);
           }
-          if (seen.over) {
+          if (seen.over && seen.chips.length) {
             // A dash that shows, dim if any is: a click on it brings its chip wholly into view, and lights it.
             const shown = seen.dashes.filter((d) => d.getBoundingClientRect().right <= seen.strip.getBoundingClientRect().right - 1);
             const dim = shown.filter((d) => d.classList.contains('out')), from = dim.length ? dim : shown;
@@ -229,6 +277,66 @@ describe('the dashes under a row of chips', () => {
             expect(dash.classList.contains('out'), `${where}: dash ${i} after a click on it`).toBe(false);
             checkDashes(id, `${where}, after '${then}' and a click on dash ${i}`);
           }
+          // The + and the chips stay where they are as the pointer comes onto the header, Copy image
+          // showing there, and leaves it.
+          const head = leafOf(id).querySelector('.plot-head'), plus = head.querySelector('.add-signal');
+          const boxes = () => JSON.stringify([plus, ...row.children].map((el) => ((b) => [b.left, b.top, b.width])(el.getBoundingClientRect())));
+          await commands.mouse([['move', 1, 1]]);
+          await until(() => getComputedStyle(head.querySelector('.copy-image') ?? head).opacity !== '1' || !head.querySelector('.copy-image'));
+          const away = boxes();
+          await commands.mouse([['move', ...centre(head)]]);
+          await until(() => getComputedStyle(head).opacity === '1' && getComputedStyle(head.querySelector('.copy-image') ?? head).opacity === '1');
+          expect(boxes(), `${where}: the + and the chips with the pointer on the header`).toBe(away);
+          await commands.mouse([['move', 1, 1]]);
+          await frames();
+          expect(boxes(), `${where}: the + and the chips with the pointer gone again`).toBe(away);
+          checkDashes(id, `${where}, after '${then}', the pointer gone`);
+          // A press on the + opens the add-signal menu under it, and A does from the plot.
+          await commands.mouse([['move', ...centre(head)]]);
+          await until(() => getComputedStyle(head).opacity === '1');
+          await clickOn(plus);
+          expect(await until(() => openMenu()?.querySelector('.add-filter')), `${where}: the add-signal menu from the +`).toBe(true);
+          const m = openMenu().getBoundingClientRect(), p = plus.getBoundingClientRect();
+          expect(m.top >= p.bottom - 1 && m.top <= p.bottom + 12 && m.left < p.right && m.right > p.left, `${where}: the menu at ${JSON.stringify(m)} under the + at ${JSON.stringify(p)}`).toBe(true);
+          await closeAll();
+          leafOf(id).querySelector('.plot-card').focus();
+          await pressKey('a');
+          expect(await until(() => openMenu()?.querySelector('.add-filter')), `${where}: the add-signal menu from A`).toBe(true);
+          const q = openMenu().getBoundingClientRect();
+          expect(Math.abs(q.left - m.left) < 1 && Math.abs(q.top - m.top) < 1, `${where}: the menu from A at ${JSON.stringify(q)}, where the +'s is`).toBe(true);
+          await closeAll();
+          // The header's free room past the +, short of the actions and the header's gap before them, is
+          // the row's: a right-click there opens the add-signal menu, a press-drag picks the plot up, and
+          // a signal dropped there lands last, the shadow of it last in the row while it is held there.
+          const p2 = plus.getBoundingClientRect(), actions = head.querySelector('.plot-actions').getBoundingClientRect();
+          const end = actions.left - parseFloat(getComputedStyle(head).columnGap), h = head.getBoundingClientRect();
+          const source = room.from === 'plot' && columns > 1 && n < 14 ? leafOf(plotIds(page.ws.layout)[1]).querySelector('.trace-chip') : document.querySelector(`.palette .chip[data-key="${signals[13]}"]`);
+          if (end - p2.right > 8 && n < 14 && source) {
+            count.free++;
+            const at = [p2.right + 2 + room.at * (end - p2.right - 4), h.top + h.height / 2];
+            await commands.mouse([['move', ...at], ['down', 'right'], ['up', 'right']]);
+            await settle();
+            expect(await until(() => openMenu()?.querySelector('.add-filter')), `${where}: the add-signal menu from a right-click at ${at[0]} in the free room ${p2.right}..${end}`).toBe(true);
+            await closeAll();
+            await commands.mouse([['move', ...at], ['down'], ['move', at[0] + 20, at[1] + 40], ['move', at[0] + 40, at[1] + 80]]);
+            await frames(4);
+            expect(document.querySelector('.move-ghost'), `${where}: the plot picked up by a press-drag at ${at[0]}`).not.toBe(null);
+            await pressKey('Escape');
+            await commands.mouse([['up']]);
+            await settle();
+            source.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            const from = centre(source), key = source.dataset.key;
+            const path = [['move', ...from], ['down'], ['move', from[0] + 8, from[1] + 8]];
+            for (let k = 1; k <= 8; k++) path.push(['move', from[0] + ((at[0] - from[0]) * k) / 8, from[1] + ((at[1] - from[1]) * k) / 8]);
+            await commands.mouse([...path, ['wait', 150]]);
+            await frames(4);
+            const kids = [...row.querySelectorAll(':scope > .trace-chip')];
+            expect(kids.at(-1)?.classList.contains('ghost'), `${where}: the shadow of ${key}, held at ${at[0]}, last in the row of ${kids.map((c) => c.dataset.key)}`).toBe(true);
+            await commands.mouse([['up']]);
+            await dropped();
+            await settle();
+            expect(page.ws.plots[id].items.at(-1)?.key, `${where}: ${key} from the ${room.from === 'plot' && columns > 1 ? 'next plot' : 'Signals list'}, dropped at ${at[0]}`).toBe(key);
+          }
         } finally {
           page.dispose();
         }
@@ -247,7 +355,21 @@ describe('the dashes under a row of chips', () => {
         [14, 4, null, L, 0.3, 2, 'hide', Y],
         [4, 1, 500, L, { chip: 2, at: 8 }, 0, 'none', Y],
         [4, 1, 600, L, { chip: 1, at: -100 }, 1, 'widen', Y],
-      ]),
+        // The + after the last of two chips that fit, before and after the legend takes their values; at
+        // the end of a row of twelve that runs past it; after an empty row's text, before and after a
+        // signal comes.
+        [2, 1, null, S, 0, 0, 'legend', Y],
+        [12, 2, null, L, 0.5, 0, 'none', Y],
+        [0, 1, null, L, 0, 0, 'add', Y],
+        // One signal taken away from a narrow plot, half the page or 150 px wide, whose empty row's text
+        // then runs past its end: no dashes.
+        [1, 2, null, S, 0, 0, 'remove', Y],
+        [1, 1, 150, S, 0, 0, 'remove', Y],
+        // Two chips that fit once the legend takes their values, with room past the +, a signal dropped
+        // in the middle of it from the Signals list, and from the next plot.
+        [2, 1, null, S, 0, 0, 'legend', Y, { at: 0.5, from: 'list' }],
+        [2, 2, null, S, 0, 0, 'legend', Y, { at: 0.5, from: 'plot' }],
+      ].map((e) => [...e.slice(0, 8), e[8] ?? { at: 0.5, from: 'list' }])),
     );
     for (const [what, k] of Object.entries(count)) expect(k, what).toBeGreaterThan(0);
   }, 600_000);

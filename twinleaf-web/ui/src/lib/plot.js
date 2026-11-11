@@ -226,10 +226,10 @@ export const monitorOf = (size, mode, n) =>
   size.width < MONITOR.width || size.height < MONITOR.height || size.height / lanesOf(mode, n) < MONITOR.lane;
 // The fraction across a live plot past which zooming in stays live, at the
 // least: the newest stretch, where a zoom is to resize the window, not to
-// hold a moment. A plot with a header reaches further, to below its + button.
+// hold a moment. A plot with a header reaches further, to below its actions.
 const LIVE_EDGE = 0.85;
-/** How far left of the header's + button, in px, that stretch begins. */
-const LIVE_EDGE_BUFFER = 32;
+/** How far left of the header's actions, in px, that stretch begins. */
+const LIVE_EDGE_BUFFER = 62;
 /**
  * How often the hover's numbers read again while the pointer holds still,
  * in ms. A live plot scrolls under a still pointer, and numbers that changed
@@ -1892,16 +1892,16 @@ export class PlotView {
 
   /**
    * The fraction across the plot past which zooming in leaves a live view
-   * live: from a little left of the header's + button, so the header's
+   * live: from a little left of the header's actions, so the header's
    * buttons mark the newest stretch with room to spare, though never more
    * than its newer half; or LIVE_EDGE
    * where the plot shows no header.
    */
   liveEdge() {
     const P = this.geo?.plot;
-    const add = this.body.closest('.plot-card')?.querySelector('.add-signal')?.getBoundingClientRect();
-    if (!P || !add?.width) return LIVE_EDGE;
-    return Math.min(LIVE_EDGE, Math.max(0.5, (add.left - LIVE_EDGE_BUFFER - P.x) / P.w));
+    const actions = this.body.closest('.plot-card')?.querySelector('.plot-head > .plot-actions')?.getBoundingClientRect();
+    if (!P || !actions?.width) return LIVE_EDGE;
+    return Math.min(LIVE_EDGE, Math.max(0.5, (actions.left - LIVE_EDGE_BUFFER - P.x) / P.w));
   }
 
   /** Whether (x, y) is on the plot's lanes, where a Ctrl+drag marks a range of x to zoom to. */

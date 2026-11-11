@@ -315,41 +315,64 @@
 
   /**
    * The row of chips as last measured, for the dashes under it while it runs
-   * past an edge: whether it does, where the strip of dashes lies in the
-   * header (its content box, `left` and `width` in px), and the ids of the
-   * chips out of view, as `outOfView` decides.
+   * past an edge and for its +: whether it does, where the strip of dashes
+   * lies in the header (its content box, `left` and `width` in px), the ids
+   * of the chips out of view, as `outOfView` decides, and where in the
+   * header the + lies (`plus`, its left in px).
    */
-  let chipRow = $state.raw({ over: false, left: 0, width: 0, out: new Set() });
+  let chipRow = $state.raw({ over: false, left: 0, width: 0, out: new Set(), plus: 0 });
   /** A dash under the row of chips, in px: its full width, its least, and the gap between two. */
   const DASH = { w: 14, min: 4, gap: 3 };
   /** How wide the fade at an edge of the row of chips is, in px, while the row runs past that edge: its `--fade`. */
   const FADE = 24;
 
+  /** The + of the header that row `node` is in. */
+  const plusOf = (node) => node?.parentElement?.querySelector(':scope > .add-signal') ?? null;
+
+  /**
+   * The part of row `node`'s client box that shows chips: all of it but the
+   * room it keeps at its right end for the + (`--add`).
+   */
+  function rowView(node) {
+    const b = node.getBoundingClientRect(), add = parseFloat(node.style.getPropertyValue('--add')) || 0;
+    return { left: b.left, right: b.right - add, top: b.top, bottom: b.bottom, width: b.width - add };
+  }
+
   /**
    * Marks a row of chips that runs past either edge, for the fade there, and
    * turns the wheel into a sideways scroll over it. The row is one line high
-   * however many signals it holds. While it runs past an edge, `chipRow`
+   * however many signals it holds, and spans the header's free room, so a
+   * drop, a right-click or a press there is the row's. It keeps room at its
+   * right end for the + (`--add`: the +'s width and the chips' gap), and the
+   * + lies after its last chip, or the text an empty row shows, at the
+   * chips' gap, or in that room while the row runs past its end. `chipRow`
    * follows it as it scrolls, resizes and its chips change.
    */
   function overflowEdges(node) {
     node.style.setProperty('--fade', `${FADE}px`);
+    const head = node.parentElement;
     const mark = () => {
+      const plus = plusOf(node), style = getComputedStyle(node), gap = parseFloat(style.columnGap) || 0;
+      const add = `${gap + (plus?.offsetWidth ?? 0)}px`;
+      if (node.style.getPropertyValue('--add') !== add) node.style.setProperty('--add', add);
       const left = node.scrollLeft > 1, right = node.scrollLeft + node.clientWidth < node.scrollWidth - 1;
       node.classList.toggle('more-left', left);
       node.classList.toggle('more-right', right);
-      const over = node.scrollWidth > node.clientWidth + 1, pad = parseFloat(getComputedStyle(node).paddingLeft) || 0;
+      const over = node.scrollWidth > node.clientWidth + 1, padL = parseFloat(style.paddingLeft) || 0, padR = parseFloat(style.paddingRight) || 0;
       const chips = over ? [...node.querySelectorAll(':scope > .trace-chip')].map((c) => [c.id, c.getBoundingClientRect()]) : [];
-      const out = outOfView(chips, node.getBoundingClientRect(), { left: left ? FADE : 0, right: right ? FADE : 0 });
-      chipRow = { over, left: node.offsetLeft + pad, width: node.clientWidth - 2 * pad, out };
+      const out = outOfView(chips, rowView(node), { left: left ? FADE : 0, right: right ? FADE : 0 });
+      const b = node.getBoundingClientRect(), last = [...node.querySelectorAll(':scope > .trace-chip, :scope > .trace-empty')].at(-1)?.getBoundingClientRect();
+      const at = Math.min(last ? last.right + gap : b.left + padL, b.right - padL - (plus?.offsetWidth ?? 0));
+      chipRow = { over, left: node.offsetLeft + padL, width: node.clientWidth - padL - padR, out, plus: at - head.getBoundingClientRect().left };
     };
     const wheel = (e) => {
       if (node.scrollWidth <= node.clientWidth || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
       e.preventDefault();
       node.scrollLeft += e.deltaY;
     };
-    // The row's own size, its header's, and each chip's, as a value or a name changes its width.
+    // The row's own size, its header's, the +'s, and each chip's, as a value or a name changes its width.
     const sizing = new ResizeObserver(mark);
-    const watch = () => [node, node.parentElement, ...node.children].forEach((el) => el && sizing.observe(el));
+    const watch = () => [node, head, plusOf(node), ...node.children].forEach((el) => el && sizing.observe(el));
     watch();
     const chips = new MutationObserver(() => (watch(), mark()));
     chips.observe(node, { childList: true });
@@ -387,7 +410,7 @@
   function reveal(id) {
     const c = document.getElementById(`chip-${id}`);
     if (!c || !zone) return;
-    const r = c.getBoundingClientRect(), box = zone.getBoundingClientRect();
+    const r = c.getBoundingClientRect(), box = rowView(zone);
     const clear = Math.max(0, Math.min(FADE, (box.width - r.width) / 2));
     if (r.width >= box.width) zone.scrollLeft += r.left - box.left;
     else if (r.left < box.left + clear) zone.scrollLeft -= box.left + clear - r.left;
@@ -554,13 +577,12 @@
   }
   let zoneFocused = $state(false);
   let addFromKeys = false;
-  /** Opens the add-a-signal menu under the plot's signals. */
   /**
-   * Opens the add-signal menu under `below`, the signals' row by default, as
+   * Opens the add-signal menu under `below`, the header's + by default, as
    * a right-click on the row does. From the keys, closing it gives focus back
    * to the plot.
    */
-  function openAdd(below = zone, fromKeys = true) {
+  function openAdd(below = plusOf(zone) ?? zone, fromKeys = true) {
     const r = below.getBoundingClientRect();
     addFromKeys = fromKeys;
     zone.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.left + 4, clientY: r.bottom }));
@@ -839,13 +861,13 @@
           </div>
         {/snippet}
       </ContextMenu.Trigger>
-      <!-- While the row runs past an edge: a dash per signal under it, in its
+      <!-- While a row of signals runs past an edge: a dash per signal under it, in its
            colour and in its order, dim while its chip is out of view, as many
            as there are signals. The dashes share the row's width, down to a
            least width each, past which the strip fades at its end. A click
            brings the dash's chip into view. It lies over the header's foot,
            so it takes no room. -->
-      {#if chipRow.over}
+      {#if chipRow.over && zoneItems.length}
         {@const crowded = zoneItems.length * (DASH.min + DASH.gap) - DASH.gap > chipRow.width}
         <div class="chip-dashes" class:crowded role="group" aria-label="Signals in this plot, in view or not" style="left:{chipRow.left}px;width:{chipRow.width}px;gap:{DASH.gap}px">
           {#each zoneItems as item (item.id)}
@@ -915,7 +937,8 @@
         {/if}
       </ContextMenu.Content>
     </ContextMenu.Root>
-    <IconButton icon={RiAddSignal} label="Add a signal" keys={commandOf('addSignals').show} class="add-signal" tabindex={-1} onclick={(e) => openAdd(e.currentTarget, false)} />
+    <!-- After the row's last chip, as the row places it. -->
+    <IconButton icon={RiAddSignal} label="Add a signal" keys={commandOf('addSignals').show} class="add-signal" tabindex={-1} style="left:{chipRow.plus}px" onclick={(e) => openAdd(e.currentTarget, false)} />
     <div class="plot-actions flex shrink-0 items-center">
       <!-- Copy image, shown while the pointer is on the plot. -->
       {#if copyImageRow.offered}<IconButton icon={copyImageRow.icon} label={copyImageRow.label} class="copy-image" tabindex={-1} data-command="copyImage" onclick={() => runHere('copyImage')} />{/if}
