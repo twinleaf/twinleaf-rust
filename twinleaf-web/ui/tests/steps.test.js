@@ -130,9 +130,9 @@ async function lift(from, to) {
 const PX = 1.5;
 /** Presses at `from`, moves to `to` by way of the point between, and lets go. */
 const pull = (from, to) => commands.mouse([['move', ...from], ['down'], ['move', (from[0] + to[0]) / 2, (from[1] + to[1]) / 2], ['move', ...to], ['up']]);
-/** Waits until plot `id`'s body holds still on the page: a page just mounted, or a plot given its first cursor, is still laying itself out. */
-async function still(id) {
-  const at = () => JSON.stringify(leafOf(id).querySelector('.plot-body').getBoundingClientRect());
+/** Waits until plot `id`'s body, or its `part`, holds still on the page: a page just mounted, or a plot given its first cursor or its legend, is still laying itself out. */
+async function still(id, part = '.plot-body') {
+  const at = () => JSON.stringify(leafOf(id).querySelector(part).getBoundingClientRect());
   for (let was = ''; was !== at(); await frames(15)) was = at();
   await settle();
 }
@@ -181,10 +181,17 @@ const DRAGS = {
     await dropped();
   },
   async tab(page, a) {
-    const tabs = [...document.querySelectorAll('[role=tablist] [data-tab]')];
+    const order = () => [...document.querySelectorAll('[role=tablist] [data-tab]')].map((t) => t.dataset.tab).join(' ');
+    const tabs = [...document.querySelectorAll('[role=tablist] [data-tab]')], was = order();
     const from = tabs[a % tabs.length], onto = tabs[(a + 1) % tabs.length];
     const [bx, by] = centre(onto), r = onto.getBoundingClientRect(), start = centre(from.querySelector('span'));
-    await drag(start, [bx + (r.width / 3) * Math.sign(bx - start[0]), by], [[bx, by]], 500);
+    // The drag library places a tab by its middle, which keeps its distance
+    // from the pointer: that middle goes a third of the way past `onto`'s,
+    // within the strip, and the tab is let go once the strip has made room.
+    const grip = start[0] - centre(from)[0], to = [bx + (r.width / 3) * Math.sign(bx - start[0]) + grip, by];
+    await commands.mouse([['move', ...start], ['down'], ['move', start[0] + 8, start[1] + 8], ...glide(start, [bx + grip, by]), ...glide([bx + grip, by], to)]);
+    await until(() => order() !== was, 2000);
+    await commands.mouse([['up']]);
     await dropped();
   },
   async legend(page, a, b) {
@@ -192,6 +199,9 @@ const DRAGS = {
     page.history.group('Legend', () => page.ws.setPlot(id, { legend: true }));
     const legend = () => leafOf(id).querySelector('.pinned-legend');
     if (!(await until(legend, 2000))) return;
+    // Pressed where it rests once the pointer is over its plot: the plot is still laying itself out, and the pointer coming over it moves the legend.
+    await commands.mouse([['move', ...centre(leafOf(id))]]);
+    await still(id, '.pinned-legend');
     const [x, y] = centre(legend());
     await commands.mouse([['move', x, y], ['down'], ['move', x - 20 * (b % 4), y + 15], ['move', x - 40 * (b % 4), y + 30 * (b % 3)], ['up']]);
     return 1;
