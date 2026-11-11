@@ -11,6 +11,14 @@
 // so two plots with the same cursors read the same. Each kind keeps its
 // own, so a plot switched to the other kind and back finds them.
 //
+// A plot whose view follows live has no `x`, whatever its kind: time X
+// cursors mark moments, which a live plot scrolls away. Placing one pauses
+// the plot; going live, by any route, takes them away, by an edit made with
+// it where a person went live; Back, or an undo, into the paused view brings
+// back the pause and the cursors it had (viewhistory.svelte.js keeps this);
+// and a tab read from storage or a file, whose views start live, has none
+// (tabs.js). Y cursors and a spectrum's `f` stay as they are.
+//
 // The values are never changed in place: each change here gives a new one.
 // CursorEdits is the one writer of a plot's `cursors`: every change is an
 // edit, one undo step, however many plots it changes. A drag shows what it
@@ -50,6 +58,10 @@ export const withY = (cursors, kind, key, name, value) =>
   tidy({ ...cursors, y: { ...cursors?.y, [kind]: { ...cursors?.y?.[kind], [key]: { ...yOf(cursors, kind, key), [name]: value } } } });
 /** `cursors` without X1 and X2 of a plot of `kind`. */
 export const withoutX = (cursors, kind) => tidy({ ...cursors, [xField(kind)]: undefined });
+/** `cursors` with X1 and X2 of a plot of `kind` as `pair`, {a, b}. */
+export const withXPair = (cursors, kind, pair) => tidy({ ...cursors, [xField(kind)]: pair });
+/** Whether `cursors` hold a time X cursor: one of a time plot's, or kept by a spectrum for when it is one again. */
+export const hasTimeX = (cursors) => some(xOf(cursors, 'time'));
 /** `cursors` without the Y cursors of y axis `key` of a plot of `kind`, or with no key, of its every y axis. */
 export function withoutY(cursors, kind, key) {
   const { [key]: _, ...rest } = cursors?.y?.[kind] ?? {};

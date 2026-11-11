@@ -44,14 +44,16 @@ describe('a plot’s cursors, as its tab keeps them', () => {
     }));
   });
 
-  it('are saved with the tab, and come back with it', () => {
-    const p = { ...newPlot('time', 'overlay', ['sine.sine']), cursors: { x: { a: 5, b: 6 }, y: { time: { shared: { a: 1, b: null } } } } };
-    const tab = makeTab('A', { plots: { [p.id]: p, q: { ...newPlot('time', 'overlay', []), id: 'q', cursors: { x: 'broken' } } }, layout: presets.rows([p.id, 'q']) });
+  it('are saved with the tab, and come back with it, but for the time X cursors, as its views start live', () => {
+    const p = { ...newPlot('time', 'overlay', ['sine.sine']), cursors: { x: { a: 5, b: 6 }, f: { a: 3, b: null }, y: { time: { shared: { a: 1, b: null } } } } };
+    const tab = makeTab('A', { plots: { [p.id]: p, q: { ...newPlot('time', 'overlay', []), id: 'q', cursors: { x: 'broken' } }, r: { ...newPlot('spectrum', 'overlay', []), id: 'r', cursors: { x: { a: 1, b: 2 } } } }, layout: presets.rows([p.id, 'q', 'r']) });
     const map = new Map(), storage = { getItem: (k) => map.get(k) ?? null, setItem: (k, v) => map.set(k, v) };
     saveTabs(storage, [tab], tab.id);
     const back = loadTabs(storage).tabs[0];
-    expect(back.plots[p.id].cursors).toEqual(p.cursors);
+    expect(back.plots[p.id].cursors).toEqual({ f: p.cursors.f, y: p.cursors.y });
     expect('cursors' in back.plots.q).toBe(false);
+    // A spectrum's time X cursors, kept for when it is a time plot again, go too.
+    expect('cursors' in back.plots.r).toBe(false);
   });
 });
 

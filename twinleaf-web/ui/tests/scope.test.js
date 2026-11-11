@@ -556,7 +556,7 @@ describe('Add Y cursors on an axis, then its clear', () => {
 });
 
 describe('cursors placed on a plot', () => {
-  it('are saved with its tab, and are on the plot when the page is loaded again', async () => {
+  it('are saved with its tab, and are on the plot when the page is loaded again, but for its time X cursors, as the page loads live', async () => {
     const first = await mountPage([SIGNALS, SIGNALS], 'rows', 0, SIGNALS);
     let saved, placed;
     try {
@@ -580,8 +580,8 @@ describe('cursors placed on a plot', () => {
       feed(again.hub);
       await settle();
       const [a, b] = plotIds(again.ws.layout);
-      expect(again.ws.plots[a].cursors).toEqual(placed);
-      expect([again.pv(a).cursorsPlaced(), again.pv(b).cursorsPlaced()], 'drawn on the plot that had them').toEqual([4, 0]);
+      expect(again.ws.plots[a].cursors).toEqual({ y: placed.y });
+      expect([again.pv(a).cursorsPlaced(), again.pv(b).cursorsPlaced()], 'drawn on the plot that had them').toEqual([2, 0]);
     } finally {
       again.dispose();
     }

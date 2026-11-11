@@ -2231,6 +2231,11 @@ const viewMark = (v) => (v.live ? `live ${v.span}` : `${v.span} ${v.right}`);
  * are edits, kept in its tab (cursors.js). It reads the time from
  * the hub, so it outlives any one hub's session, and it outlives the plot's
  * component, so a remount keeps all of them.
+ *
+ * A view that follows live has no time X cursors on its plot: they mark
+ * moments, which scroll away (viewhistory.svelte.js holds the rule). Going
+ * live, it keeps the paused view it leaves as `left`, which an undo that
+ * brings those cursors back shows again.
  */
 export class View {
   live = true;
@@ -2247,6 +2252,8 @@ export class View {
   held = () => ({ oldest: null, dropped: false, history: null });
   yByKind = new Map(); // plot kind, a spectrum's by y scale -> range key -> {range, auto}: PlotView's `y`
   spectra = new Map(); // Trace -> the spectrum a spectrum plot shows of it, held while paused: PlotView's `spectrumOf`
+  /** The paused view, as `state` gives it, that the view left when it last went live, or null while it never has. */
+  left = null;
   listeners = new Set();
 
   constructor(hub) {
@@ -2432,6 +2439,7 @@ export class View {
    * goes back to its window.
    */
   follow(restore = false) {
+    if (!this.live) this.left = this.state();
     this.live = true;
     this.span = restore ? this.window : Math.min(this.liveSeconds(), this.span);
     this.pausedAt = this.pausedHistory = null;
@@ -2463,6 +2471,7 @@ export class View {
    */
   restore(s, perf) {
     const newest = this.hub.now(perf) - this.delay;
+    if (s.live && !this.live) this.left = this.state();
     Object.assign(this, { live: s.live, window: s.window, span: s.span });
     if (s.live) this.pausedAt = this.pausedHistory = null;
     else [this.right, this.pausedAt, this.pausedHistory] = [Math.min(s.right, newest), Math.min(s.pausedAt ?? s.right, newest), s.pausedHistory ?? null];

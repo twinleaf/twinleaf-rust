@@ -17,7 +17,7 @@
 // Outside tools read that key and shape, so `tabFromJson` is the one place
 // that reads it, and a change to it changes the key.
 
-import { cursorsFromJson } from './cursors.js';
+import { cursorsFromJson, withoutX } from './cursors.js';
 import { fromJson, plotIds, presets } from './layout.js';
 
 export const SAVE_KEY = 'tl-plot-tabs-v2';
@@ -69,7 +69,8 @@ export function remapIds(t) {
 /**
  * The tab saved or imported JSON describes, or null if it does not hold
  * together: a name, plots with items, and a layout over those plots. A
- * plot's cursors are read as far as they hold together. Its items get
+ * plot's cursors are read as far as they hold together, but for its time X
+ * cursors: its view starts live, which has none (cursors.js). Its items get
  * fresh ids, as one shared with another plot or the signal list
  * confuses the drag library.
  */
@@ -78,7 +79,7 @@ export function tabFromJson(t) {
   const plots = {};
   for (const [id, p] of Object.entries(t.plots)) {
     if (!p || !Array.isArray(p.items)) return null;
-    const { cursors: _, ...rest } = p, cursors = cursorsFromJson(p.cursors);
+    const { cursors: _, ...rest } = p, cursors = withoutX(cursorsFromJson(p.cursors), 'time');
     plots[id] = { ...PLOT_DEFAULTS, ...rest, id, items: p.items.filter((i) => i && typeof i.key === 'string').map((i) => chip(i.key)), ...(cursors && { cursors }) };
   }
   const layout = t.layout ? fromJson(t.layout) : null;

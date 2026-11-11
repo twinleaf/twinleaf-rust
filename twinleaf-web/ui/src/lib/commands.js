@@ -105,11 +105,8 @@ function editCursors(ctx, what, targets, fn) {
   ctx.svc.cursors.set(what, new Map(targets.map(([p, axis]) => [p.plotId, fn(p, axis)])));
 }
 
-/** Has the plots of `ctx` follow the newest samples again, as one view step, back at their windows with `restore`; their time X cursors go, as one edit. */
-function follow(ctx, restore) {
-  ctx.svc.viewHistory.step(() => ctx.plots.forEach((t) => t.view.follow(restore)));
-  ctx.svc.cursors.followed(ids(ctx));
-}
+/** Has the plots of `ctx` follow the newest samples again, back at their windows with `restore` (ViewHistory `follow`). */
+const follow = (ctx, restore) => ctx.svc.viewHistory.follow(ids(ctx), restore);
 
 /** Opens the picker of keymap.js plot action `id` on the lead plot, and says whether it has one. */
 const picker = (id) => (ctx) => ctx.svc.picker(ctx.lead.id, id);
@@ -216,17 +213,18 @@ export const COMMANDS = [
     run: (ctx) => ctx.svc.openExport(ctx.plots),
   },
   {
-    // A pair in view on each plot, the time plots paused, as they hold the moment it marks.
+    // A pair in view on each plot, the time plots paused, as they hold the moment it marks: one view step that holds the cursors it placed.
     id: 'addXCursors', scope: 'plot',
     icon: RiXCursors, label: 'Add X cursors',
     value: (ctx) => {
       const d = xSpan(pvs(ctx));
       return d ? { text: d, icon: RiSpan } : null;
     },
-    run: (ctx) => {
-      ctx.svc.viewHistory.step(() => pvs(ctx).forEach((p) => p.config().kind === 'time' && p.view.pause(clock.now())));
-      editCursors(ctx, 'Add X cursors', pvs(ctx).map((p) => [p]), (p) => p.xCursorsAdded());
-    },
+    run: (ctx) =>
+      ctx.svc.viewHistory.step(() => {
+        pvs(ctx).forEach((p) => p.config().kind === 'time' && p.view.pause(clock.now()));
+        editCursors(ctx, 'Add X cursors', pvs(ctx).map((p) => [p]), (p) => p.xCursorsAdded());
+      }),
   },
   {
     // On the axis of each plot in the units of y axis `how` of the plot it is made on.

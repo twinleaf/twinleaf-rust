@@ -41,6 +41,7 @@
 // | the docks keep their widths, but for a menu's command, which can hide one  |
 // | at most one popup layer is open, and no tooltip shows over one but for a   |
 // | control inside it                                                          |
+// | no plot that follows live has time X cursors                               |
 // | nothing threw, no promise was left rejected, Svelte reported nothing       |
 //
 // At most one popup layer (menu, popover, dialog or select) is open, and no
@@ -53,6 +54,7 @@ import fc from 'fast-check';
 import { centre, dropped, emptySpots, feed, focusPage, frames, glide, headerSpot, holding, leafOf, mountPage, pressKey, quietApi, rested, showing, until, withExamples } from './harness/page.js';
 import { GUTTER, plotIds, rects, restrict } from '../src/lib/layout.js';
 import { STEP } from '../src/lib/moves.js';
+import { hasTimeX } from '../src/lib/cursors.js';
 
 const KEYS = [['sine.sine', 'sine.cosine'], ['aux.triangle'], ['sine.cosine'], ['aux.sawtooth']];
 const SIGNALS = ['vector.x', 'vector.y'];
@@ -300,6 +302,8 @@ function check(page, { steps, widths }, s) {
   expect(showing().sort(), `the plots showing, after ${at}`).toEqual([...shown].sort());
   expect(misplaced(ws), `tiles away from the layout, after ${at}`).toEqual([]);
   oneLayer(page, null, s);
+  const liveWithX = ws.tabs.flatMap((t) => Object.entries(t.plots)).filter(([id, p]) => page.views.get(id)?.live && hasTimeX(p.cursors));
+  expect(liveWithX.map(([id]) => id), `plots that follow live with time X cursors, after ${at}`).toEqual([]);
   if (!movesDocks(s)) expect(dockWidths(), `dock widths, after ${at}`).toEqual(widths);
   // Undo then redo gives back the tabs; after a step that made one, what the step left of the selection too.
   // A quick is two presses: its second may deselect after its first made the step, as a chip's Remove then Layout.

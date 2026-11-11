@@ -97,7 +97,9 @@
   const { hub, ws, history, registry, views } = getContext('page');
   setContext('history', history);
   views.onChange = viewChanged;
-  const viewHistory = new ViewHistory(ws, views, { notice: (text) => toast.warning(text), edit: (label, fn) => history.group(label, fn) });
+  // The plots' cursors, which are edits: placing, moving or removing any is one undo step (cursors.js).
+  const cursors = new CursorEdits(ws, history);
+  const viewHistory = new ViewHistory(ws, views, { notice: (text) => toast.warning(text), edit: (label, fn) => history.group(label, fn), cursors });
   // What a press, a click, a key or an undo does to the plot selection: the Workspace's.
   const selection = ws.selection;
   selection.changed = () => refreshToolbar();
@@ -106,8 +108,6 @@
     ws.activeId;
     untrack(refreshToolbar);
   });
-  // The plots' cursors, which are edits: placing, moving or removing any is one undo step (cursors.js).
-  const cursors = new CursorEdits(ws, history);
   const drags = new Drags(ws, refreshToolbar, history);
   setContext('selection', selection);
   // What the panels write to devices and run on them, and its notices
@@ -685,14 +685,13 @@
   }
   /**
    * The toolbar's Live button: pauses every time plot of the tab while all
-   * follow live, or has them all follow live, as one view step, their time
-   * X cursors, which live would scroll away, removed as one edit. Space does
-   * the same for the selected plots alone.
+   * follow live, as one view step, or has them all follow live (ViewHistory
+   * `follow`). Space does the same for the selected plots alone.
    */
   function toggleLive() {
-    const ids = ws.timeIds(), perf = clock.now(), pausing = live;
-    viewHistory.step(() => ids.forEach((id) => (pausing ? views.of(id).pause(perf) : views.of(id).follow(false))));
-    if (!pausing) cursors.followed(ids);
+    const ids = ws.timeIds(), perf = clock.now();
+    if (live) viewHistory.step(() => ids.forEach((id) => views.of(id).pause(perf)));
+    else viewHistory.follow(ids, false);
     refreshToolbar();
   }
   function setDelay(ms) {

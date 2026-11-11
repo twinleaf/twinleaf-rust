@@ -5,7 +5,8 @@
 // it showed before and after: its View `state` (live or paused and where,
 // its span and window, the y ranges it holds and the spectra a
 // paused spectrum holds), its view fields (tabs.js VIEW_FIELDS, as a
-// spectrum's frequencies) and its kind, time or spectrum. Back shows the before of every plot of the
+// spectrum's frequencies) and its kind, time or spectrum, with the time X
+// cursors it had (`x`), which no step counts as a move. Back shows the before of every plot of the
 // step still in the tab, so the plots one gesture moved go back together;
 // Forward shows the after.
 //
@@ -39,14 +40,27 @@
 // is a step here, after the one Back is at, in place of those Forward had.
 // So the newest step always ends at the kind the plot has.
 //
-// Otherwise the edit history (history.svelte.js) is apart: an undo never
-// moves a view, and Back makes no other edit, so it never moves a cursor.
+// The other thing the two hold together is a plot's time X cursors, which
+// a view that follows live never has (cursors.js): they mark moments, which
+// scroll away. A view goes live through here alone: by `follow`, which
+// every Follow live, Pause and Live of the page runs, and by Back and
+// Forward. Each takes the time X cursors of the plots it makes live, by an
+// edit (CursorEdits `followed`), Back's and Forward's the one their kind
+// change makes. A step holds the time X cursors each plot had (`x`), and
+// Back or Forward that shows a live plot paused again puts back those its
+// view had then. An undo or a redo that brings time X cursors back to a
+// plot that follows live shows the paused view it left as it went live
+// (View `left`), or else pauses it where it is, a step after the one Back
+// is at, as a kind switch it makes is. Otherwise the edit history
+// (history.svelte.js) is apart: an undo moves no other view, and Back
+// makes no other edit, so it moves no other cursor.
 
 import { SvelteMap } from 'svelte/reactivity';
 import { sameView } from './plot.js';
 import { VIEW_FIELDS } from './tabs.js';
 import { KINDS } from './constants.js';
 import { counted } from './menus.js';
+import { hasTimeX, withXPair, xOf } from './cursors.js';
 import * as clock from './clock.js';
 
 /** How long, in ms, wheel turns or keys rest before the next is a step of its own. */
@@ -79,10 +93,11 @@ export class ViewHistory {
    * `ws` is the page's Workspace and `views` its Views, each View knowing
    * the oldest time its plot can show; `notice(text)` tells the person;
    * `now()` is the page time, in ms; `edit(label, fn)` runs `fn` as one
-   * edit named `label`, History's `group`.
+   * edit named `label`, History's `group`; `cursors` is the page's
+   * CursorEdits, which writes the time X cursors views going live take.
    */
-  constructor(ws, views, { notice = () => {}, now = clock.now, edit = (label, fn) => fn() } = {}) {
-    Object.assign(this, { ws, views, notice, now, edit });
+  constructor(ws, views, { notice = () => {}, now = clock.now, edit = (label, fn) => fn(), cursors } = {}) {
+    Object.assign(this, { ws, views, notice, now, edit, cursors });
   }
 
   /** Whether Back would change what the open tab shows. */
@@ -154,6 +169,21 @@ export class ViewHistory {
     if (moved.length) this.#push(h.tab, { before: only(h.before, moved), after: only(after, moved) });
   }
 
+  /**
+   * Has the views of plots `ids` follow the newest samples again, as one
+   * step, each back at its window with `restore`, else on at the span it
+   * shows (View `follow`), their time X cursors taken as one edit: the one
+   * way the page goes live, but Back and Forward.
+   */
+  follow(ids, restore) {
+    this.step(() =>
+      this.edit('Follow live', () => {
+        for (const id of ids) this.views.of(id).follow(restore);
+        this.cursors.followed(ids);
+      }),
+    );
+  }
+
   /** Shows what the newest step that moves a plot shown in the open tab moved, as it was before; says whether there was one. */
   back() {
     return this.#go('backs', 'forwards', 'before');
@@ -176,18 +206,32 @@ export class ViewHistory {
 
   /**
    * Runs `fn`, an undo or a redo of the edit history, and returns what it
-   * returns. Each plot whose kind it changed has a step for that, in its
-   * tab, which Back crosses as it does the command's.
+   * returns. A plot it gives time X cursors while its view follows live
+   * shows the paused view it left as it went live, or pauses where it is,
+   * with the notice when the hub has dropped where that starts. Each plot
+   * whose kind it changed, or whose view it paused, has a step for that, in
+   * its tab, which Back crosses as it does the command's.
    */
   edited(fn) {
     this.end();
     this.#burst = null;
     const before = this.ws.tabs.map((t) => [t.id, this.#read(Object.keys(t.plots))]);
     const out = fn();
+    let lost = false;
+    for (const t of this.ws.tabs) {
+      for (const [id, plot] of Object.entries(t.plots)) {
+        const v = this.views.get(id);
+        if (!v?.live || !hasTimeX(plot.cursors)) continue;
+        if (v.left) v.restore(v.left, this.now());
+        else v.pause(this.now());
+        lost = (plot.kind === 'time' && v.startHeld(this.now())) || lost;
+      }
+    }
+    if (lost) this.notice(GONE);
     for (const [tab, was] of before) {
       const plots = this.ws.tabs.find((t) => t.id === tab)?.plots ?? {}, after = this.#read(Object.keys(plots));
-      const switched = [...was.keys()].filter((id) => after.has(id) && after.get(id).kind !== was.get(id).kind);
-      if (switched.length) this.#push(tab, { before: only(was, switched), after: only(after, switched) });
+      const changed = [...was.keys()].filter((id) => after.has(id) && !same(after.get(id), was.get(id)));
+      if (changed.length) this.#push(tab, { before: only(was, changed), after: only(after, changed) });
     }
     return out;
   }
@@ -223,15 +267,26 @@ export class ViewHistory {
     return true;
   }
 
-  /** Shows `states`, by plot id, of the plots in the open tab, each as the kind it was, with the notice when the hub dropped where one starts. */
+  /**
+   * Shows `states`, by plot id, of the plots in the open tab, each as the
+   * kind it was, with the notice when the hub dropped where one starts. A
+   * plot shown live loses its time X cursors, and one live shown paused
+   * gets back those it had then.
+   */
   #show(states) {
     const here = [...states].filter(([id]) => this.ws.plots[id] && this.views.get(id));
-    // The plots it shows as the other kind are switched by one edit, named as the command's is.
+    // One edit switches the plots it shows as the other kind, named as the
+    // command's is, and sets the time X cursors of those it makes live or pauses.
     const switched = here.filter(([id, s]) => s.kind !== this.ws.plots[id].kind);
-    if (switched.length) {
-      const name = KINDS.find(([kind]) => kind === switched[0][1].kind)?.[1] ?? switched[0][1].kind;
-      this.edit(switched.length > 1 ? `Kind ${name} (${counted(switched.length, 'plot')})` : `Kind ${name}`, () => {
+    const followed = here.filter(([id, s]) => s.view.live && hasTimeX(this.ws.plots[id].cursors)).map(([id]) => id);
+    const paused = here.filter(([id, s]) => !s.view.live && this.views.get(id).live && (s.x.a !== null || s.x.b !== null));
+    if (switched.length || followed.length || paused.length) {
+      const name = switched.length && (KINDS.find(([kind]) => kind === switched[0][1].kind)?.[1] ?? switched[0][1].kind);
+      const label = !switched.length ? (followed.length ? 'Follow live' : 'Pause') : switched.length > 1 ? `Kind ${name} (${counted(switched.length, 'plot')})` : `Kind ${name}`;
+      this.edit(label, () => {
         for (const [id, s] of switched) this.ws.setPlot(id, { kind: s.kind });
+        if (followed.length) this.cursors.followed(followed);
+        if (paused.length) this.cursors.set(label, new Map(paused.map(([id, s]) => [id, withXPair(this.ws.plots[id].cursors, 'time', s.x)])));
       });
     }
     let lost = false;
@@ -276,12 +331,12 @@ export class ViewHistory {
     return [...this.views.map].filter(([, v]) => targets.includes(v)).map(([id]) => id).sort();
   }
 
-  /** What plots `ids` that have a view show, by id: {view, fields, kind}, its View state, its view fields and its kind. */
+  /** What plots `ids` that have a view show, by id: {view, fields, kind, x}, its View state, its view fields, its kind and its time X cursors. */
   #read(ids) {
     const out = new Map();
     for (const id of ids) {
       const v = this.views.get(id), plot = this.ws.tabs.find((t) => t.plots[id])?.plots[id];
-      if (v && plot) out.set(id, { view: v.state(), fields: Object.fromEntries([...VIEW_FIELDS].map((f) => [f, plot[f] ?? null])), kind: plot.kind });
+      if (v && plot) out.set(id, { view: v.state(), fields: Object.fromEntries([...VIEW_FIELDS].map((f) => [f, plot[f] ?? null])), kind: plot.kind, x: xOf(plot.cursors, 'time') });
     }
     return out;
   }

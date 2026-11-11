@@ -14,8 +14,11 @@
 // Back shows the tab's entry before, Forward the one after; a paused time
 // plot whose start the hub has since dropped starts at the oldest time it
 // holds, never past the newest samples. Cursors are edits, in the tab: the
-// run places, moves and removes them between the gestures, and no Back or
-// Forward changes one. Then examples of what the model
+// run places, moves and removes them in its gestures; following live takes
+// a plot's time X cursors, and Back or Forward takes those of a plot it
+// shows live and puts back, on one live it shows paused, those it had as
+// the entry's gesture began, Back, or ended, Forward; nothing else changes
+// one, and no plot that follows live has time X cursors. Then examples of what the model
 // leaves out: plots closed, moved to another tab or hidden behind a
 // maximized one, and tabs gone for good.
 import { describe, expect, it } from 'vitest';
@@ -27,7 +30,7 @@ import { History } from './history.svelte.js';
 import { Favorites } from './favorites.svelte.js';
 import { presets } from './layout.js';
 import { makeTab, newPlot } from './tabs.js';
-import { withX, withY, withoutX } from './cursors.js';
+import { CursorEdits, hasTimeX, withX, withXPair, withY, withoutX, xOf } from './cursors.js';
 
 /** How far back the hub holds, in seconds; it started at device time START. */
 const HELD_S = 120, START = 1000;
@@ -52,7 +55,8 @@ function setup() {
   // What the hub holds of every plot's signals: each view reads the oldest time its plot can show from it.
   views.held = () => ({ oldest: oldest(), dropped: dropped() !== null, history: null });
   for (const id of ws.allPlotIds()) views.of(id);
-  const vh = new ViewHistory(ws, views, { now: () => t.ms, notice: (text) => t.notices.push(text) });
+  const history = new History(ws, new Favorites(null)), cursors = new CursorEdits(ws, history);
+  const vh = new ViewHistory(ws, views, { now: () => t.ms, notice: (text) => t.notices.push(text), edit: (label, fn) => history.group(label, fn), cursors });
   // Each signal's newest spectrum estimate, a new one as time passes.
   const estimate = new Map();
   const spectrumOf = (key) => {
@@ -75,8 +79,11 @@ function setup() {
       if (p.kind === 'spectrum' && (v.live || !v.spectra.has(p.items[0].key))) v.spectra.set(p.items[0].key, spectrumOf(p.items[0].key));
     }
   };
-  return { ws, views, vh, hub, t, dropped, frame };
+  return { ws, views, vh, hub, t, dropped, frame, history, cursors };
 }
+
+/** Whether no plot of any tab whose view follows live has time X cursors. */
+const noLiveX = (ws, views) => ws.tabs.every((tab) => Object.entries(tab.plots).every(([id, p]) => !views.get(id)?.live || !hasTimeX(p.cursors)));
 
 /** What plot `p`'s view `v` shows, read from the view itself, in one string; spectra by `ids` of them. */
 function showing(p, v, ids) {
@@ -135,10 +142,10 @@ describe('view history, against a model of its rules', () => {
   it('makes one entry of each drag, command and burst of a tab, and Back and Forward show the tab as it was at the entry before and after', () => {
     // A run is quick, so there are always enough for each rule to be reached; the examples come on top of the random runs.
     const numRuns = Math.max(100, fc.readConfigureGlobal().numRuns);
-    const count = { entries: 0, joined: 0, cameBack: 0, keptForward: 0, rested: 0, otherKind: 0, oneStopped: 0, several: 0, shown: 0, startup: 0, gone: 0, spectra: 0, frequencies: 0, yRanges: 0, cursorsKept: 0 };
+    const count = { entries: 0, joined: 0, cameBack: 0, keptForward: 0, rested: 0, otherKind: 0, oneStopped: 0, several: 0, shown: 0, startup: 0, gone: 0, spectra: 0, frequencies: 0, yRanges: 0, cursorsKept: 0, xTaken: 0, xBack: 0 };
     fc.assert(
       fc.property(fc.array(action, { minLength: 10, maxLength: 40 }), (actions) => {
-        const { ws, views, vh, hub, t, dropped, frame } = setup();
+        const { ws, views, vh, hub, t, dropped, frame, cursors: edits } = setup();
         const spectrumIds = new Map();
         const ids = (s) => (spectrumIds.has(s) || spectrumIds.set(s, spectrumIds.size), spectrumIds.get(s));
         const tabIds = () => Object.keys(ws.plots);
@@ -149,26 +156,39 @@ describe('view history, against a model of its rules', () => {
         // The model: each tab's entries, each what the tab showed after its gesture and the plots that gesture moved, and which it shows.
         const model = new Map(ws.tabs.map((tab) => [tab.id, { line: [{ shows: new Map(Object.keys(tab.plots).map((id) => [id, show(id)])), moved: [] }], at: 0 }]));
         const known = new Map(ws.allPlotIds().map((id) => [id, show(id)]));
-        // The cursors each plot has, as the run's cursor edits left them: nothing else changes them.
+        // The cursors each plot has, as the run's cursor edits, following
+        // live, and Back and Forward across a pause left them: nothing else
+        // changes them.
         const cursors = new Map();
         const editCursors = (id, change) => {
-          ws.setPlot(id, { cursors: change(ws.plots[id].cursors) });
+          edits.set('Edit', new Map([[id, change(ws.plots[id].cursors)]]));
           cursors.set(id, ws.plots[id].cursors);
         };
-        let group = null; // the burst open to more: {tab, kind, targets, last, at, base, forwards}
-        /** A group's entry, as the tab shows now: none, Forward as it was, when it shows what it did as the group began. */
+        /** Following live, as every Follow live, Pause and Live of the page does: the time X cursors go. */
+        const follow = (ids) => {
+          vh.follow(ids, true);
+          for (const id of ids) cursors.set(id, withoutX(cursors.get(id), 'time'));
+        };
+        /** The time X cursors of the open tab's plots, by id. */
+        const tabXs = () => new Map(tabIds().map((id) => [id, xOf(ws.plots[id].cursors, 'time')]));
+        let group = null; // the burst open to more: {tab, kind, targets, last, at, base, xs, forwards}
+        /**
+         * A group's entry, as the tab shows now: none, Forward as it was, when
+         * it shows what it did as the group began. It holds the time X cursors
+         * of the plots it moved as the group began and as it ended.
+         */
         const settle = (g) => {
           const m = model.get(g.tab), now = tabShows(), none = same(now, g.base);
           if (none && g.made && g.forwards.length) count.keptForward++;
           g.made ||= !none;
           const moved = [...now.keys()].filter((id) => now.get(id) !== g.base.get(id));
-          m.line = none ? [...m.line.slice(0, g.at + 1), ...g.forwards] : [...m.line.slice(0, g.at + 1), { shows: now, moved }];
+          m.line = none ? [...m.line.slice(0, g.at + 1), ...g.forwards] : [...m.line.slice(0, g.at + 1), { shows: now, moved, xs: { before: g.xs, after: tabXs() } }];
           m.at = none ? g.at : g.at + 1;
           for (const [id, s] of now) known.set(id, s);
         };
         const begin = (kind, targets) => {
           const m = model.get(ws.activeId);
-          return { tab: ws.activeId, kind, targets, last: t.ms, at: m.at, base: tabShows(), forwards: m.line.slice(m.at + 1) };
+          return { tab: ws.activeId, kind, targets, last: t.ms, at: m.at, base: tabShows(), xs: tabXs(), forwards: m.line.slice(m.at + 1) };
         };
         /** What showing entry `s` of plot `id` shows: a paused time plot whose start the hub dropped starts at the oldest it holds, no wider than what is held, never past the newest samples. */
         const restored = (id, s) => {
@@ -184,10 +204,15 @@ describe('view history, against a model of its rules', () => {
           }
           return [JSON.stringify({ ...v, span, right, pausedAt }), moved];
         };
-        /** Back or Forward in the model: the plots the gesture of the entry gone past moved, as the entry `by` along shows them. */
+        /**
+         * Back or Forward in the model: the plots the gesture of the entry
+         * gone past moved, as the entry `by` along shows them. A plot shown
+         * live loses its time X cursors; one live shown paused gets back
+         * those it had then, as the gesture began, Back, or ended, Forward.
+         */
         const go = (by) => {
           group = null;
-          const m = model.get(ws.activeId), from = m.line[m.at].shows, changed = m.line[by < 0 ? m.at : m.at + 1].moved;
+          const m = model.get(ws.activeId), from = m.line[m.at].shows, past = m.line[by < 0 ? m.at : m.at + 1], changed = past.moved;
           m.at += by;
           const to = m.line[m.at].shows;
           let moved = false;
@@ -195,6 +220,14 @@ describe('view history, against a model of its rules', () => {
             const [r, lost] = restored(id, to.get(id));
             moved ||= lost;
             known.set(id, r);
+            const x = (by < 0 ? past.xs.before : past.xs.after).get(id);
+            if (JSON.parse(to.get(id)).live) {
+              if (hasTimeX(cursors.get(id))) count.xTaken++;
+              cursors.set(id, withoutX(cursors.get(id), 'time'));
+            } else if (JSON.parse(from.get(id)).live && hasTimeX({ x })) {
+              cursors.set(id, withXPair(cursors.get(id), 'time', x));
+              count.xBack++;
+            }
           }
           const differs = (field) => changed.some((id) => JSON.stringify(JSON.parse(to.get(id))[field]) !== JSON.stringify(JSON.parse(from.get(id))[field]));
           if (changed.length > 1) count.several++;
@@ -225,9 +258,7 @@ describe('view history, against a model of its rules', () => {
         };
         const command = (id, what) => {
           const v = views.get(id), st = yOf(id);
-          // Following live removes the time X cursors, as the page does: an edit beside the view's step.
-          if (what === 'follow') (v.follow(true), editCursors(id, (c) => withoutX(c, 'time')));
-          else if (what === 'pause') v.pause(t.ms);
+          if (what === 'pause') v.pause(t.ms);
           else if (what === 'addX') {
             v.pause(t.ms);
             const [x0, x1] = v.range(hub.now(t.ms));
@@ -247,7 +278,7 @@ describe('view history, against a model of its rules', () => {
             // A drag or a command: one group, whatever it passes through.
             group = null;
             const g = begin(null, targets);
-            if (a.t === 'command') vh.step(() => targets.forEach((id) => command(id, a.what)));
+            if (a.t === 'command') vh.step(() => (a.what === 'follow' ? follow(targets) : targets.forEach((id) => command(id, a.what))));
             else {
               vh.begin();
               for (const p of a.moves) {
@@ -311,6 +342,7 @@ describe('view history, against a model of its rules', () => {
           // Every plot shows what the model says, in every tab, and Back and Forward can be pressed just when there is an entry to go to.
           for (const [id, s] of known) expect(show(id), `${a.t}: ${id}`).toBe(s);
           for (const tab of ws.tabs) for (const [id, plot] of Object.entries(tab.plots)) expect(plot.cursors, `${a.t}: the cursors of ${id}`).toEqual(cursors.get(id));
+          expect(noLiveX(ws, views), `${a.t}: a plot that follows live has time X cursors`).toBe(true);
           const m = model.get(ws.activeId);
           expect(vh.canBack, `${a.t}: can go back`).toBe(m.at > 0);
           expect(vh.canForward, `${a.t}: can go forward`).toBe(m.at < m.line.length - 1);
@@ -364,9 +396,9 @@ describe('view history', () => {
   });
 
   it('can go back only to steps that change what shows, and leaves those of closed plots where they are', () => {
-    const { ws, views, vh, t, ids } = page();
+    const { ws, views, vh, t, ids, history } = page();
     vh.step(() => views.get(ids[0]).pause(t.ms));
-    ws.closePlot(ids[0]);
+    history.group('Close', () => ws.closePlot(ids[0]));
     expect(vh.canBack).toBe(false);
     expect(vh.back()).toBe(false);
     expect(vh.canForward).toBe(false);
@@ -393,7 +425,7 @@ describe('view history', () => {
   });
 
   it('holds a spectrum’s frequencies, y ranges and the spectrum it held paused, and never moves a spectrum for what the hub dropped', () => {
-    const { ws, views, vh, t, b, frame } = page();
+    const { ws, views, vh, t, b, frame, history } = page();
     ws.selectTab(ws.tabs[1].id);
     frame();
     const v = views.get(b[0]), key = ws.plots[b[0]].items[0].key;
@@ -403,7 +435,7 @@ describe('view history', () => {
     vh.step(() => v.follow());
     frame();
     expect(v.spectra.get(key)).not.toBe(held);
-    ws.setPlot(b[0], { cursors: { f: { a: 3, b: 4 } } });
+    history.group('Cursors', () => ws.setPlot(b[0], { cursors: { f: { a: 3, b: 4 } } }));
     vh.step(() => (ws.setView(b[0], { fRange: [2, 20] }), v.yByKind.set('spectrum:log', new Map([['shared', { range: [0, 9], auto: false }]]))));
     t.ms += (HELD_S + 60) * 1000;
     vh.back();
@@ -428,21 +460,20 @@ describe('view history', () => {
   });
 
   it('leaves the steps of a plot moved to another tab in the tab they were made in, which goes back past them', () => {
-    const { ws, views, vh, t, ids } = page(), a = views.get(ids[0]);
+    const { ws, views, vh, t, ids, history } = page(), a = views.get(ids[0]);
     vh.step(() => a.pause(t.ms));
-    ws.movePlotToTab(ids[0], ws.tabs[1].id);
+    history.group('Move', () => ws.movePlotToTab(ids[0], ws.tabs[1].id));
     expect(vh.canBack).toBe(false);
     ws.selectTab(ws.tabs[1].id);
     expect(vh.canBack).toBe(false);
-    ws.movePlotToTab(ids[0], ws.tabs[0].id);
+    history.group('Move', () => ws.movePlotToTab(ids[0], ws.tabs[0].id));
     ws.selectTab(ws.tabs[0].id);
     expect(vh.back()).toBe(true);
     expect(a.live).toBe(true);
   });
 
   it('lets go of a tab’s steps once neither the tabs nor an undo or a redo hold the tab', () => {
-    const { ws, views, vh, t, ids } = page();
-    const history = new History(ws, new Favorites(null));
+    const { ws, views, vh, t, ids, history } = page();
     vh.step(() => views.get(ids[0]).pause(t.ms));
     const a = ws.activeId;
     history.group('Close tab', () => ws.closeTab(ws.tabs[0]));
@@ -458,9 +489,9 @@ describe('view history', () => {
 describe('a plot closed and brought back by undo', () => {
   /** The page as `setup` makes it, with its edit history, which keeps the views of the plots it holds as the page does. */
   const page = () => {
-    const p = setup(), history = new History(p.ws, new Favorites(null));
-    const edit = (fn) => (fn(), p.views.prune(history.held().plots));
-    return { ...p, history, edit, ids: Object.keys(p.ws.plots) };
+    const p = setup();
+    const edit = (fn) => (fn(), p.views.prune(p.history.held().plots));
+    return { ...p, edit, ids: Object.keys(p.ws.plots) };
   };
 
   it('shows its view as it was, and Back goes on through its steps', () => {
@@ -498,58 +529,103 @@ describe('a plot closed and brought back by undo', () => {
 });
 
 // A kind switch is an edit, which Ctrl+Z undoes, and a view step, which Back
-// crosses: random runs of switches, pans, another edit, Back, Forward, undo
-// and redo on one plot. The model is the list of what the plot showed, its
-// kind and its view, after each change of either, however made: by the
-// command, by an undo or by a redo. Back shows the entry before and Forward
-// the one after, and the two histories never disagree: the plot's kind is
-// always the edit history's, and always the entry's the model is at.
-describe('a kind switch', () => {
-  const act = fc.constantFrom('switch', 'switch', 'pan', 'legend', 'back', 'back', 'forward', 'undo', 'undo', 'redo');
+// crosses: random runs of switches, pans, another edit, X cursors placed and
+// cleared, pauses, following live, Back, Forward, undo and redo on one plot.
+// The model is the list of what the plot showed, its kind and its view,
+// after each change of either, however made: by the command, by an undo or
+// by a redo, each with the time X cursors the plot had as it began and as
+// it ended. Back shows the entry before and Forward the one after, and the
+// two histories never disagree: the plot's kind is always the edit
+// history's, and always the entry's the model is at; and a plot that
+// follows live never has time X cursors. Following live takes them; Back or
+// Forward that shows a live plot paused puts back those it had then; an undo
+// or a redo changes them just as the edit history has them, and one that
+// brings them back to a live plot shows the paused view it left as it went
+// live; nothing else changes them.
+describe('a kind switch, and time X cursors across going live', () => {
+  const act = fc.constantFrom('switch', 'switch', 'pan', 'legend', 'place', 'place', 'clear', 'pause', 'follow', 'follow', 'back', 'back', 'forward', 'undo', 'undo', 'redo');
   const times = (n, acts) => Array.from({ length: n }, () => acts).flat();
   /**
    * Runs that reach every count the test asks of its cases, whatever the
-   * random ones do: a switch undone and redone, four times; and a pan then a
-   * switch, gone back across the switch and on past the pan, four times.
+   * random ones do: a switch undone and redone, four times; a pan then a
+   * switch, gone back across the switch and on past the pan, four times; X
+   * cursors placed, live, then Back and Forward, four times; and X cursors
+   * placed, live, then undone, four times, and cleared first, four times.
    */
-  const EXAMPLES = [times(4, ['switch', 'undo', 'redo']), times(4, ['pan', 'switch', 'back', 'back'])];
-  it('is a step Back and Forward cross, going on through the steps before it, whatever undo and redo do between', () => {
-    const count = { crossed: 0, wentOn: 0, undone: 0, redone: 0 };
+  const EXAMPLES = [
+    times(4, ['switch', 'undo', 'redo']),
+    times(4, ['pan', 'switch', 'back', 'back']),
+    times(4, ['place', 'follow', 'back', 'forward', 'back']),
+    times(4, ['place', 'follow', 'undo', 'redo']),
+    times(4, ['place', 'clear', 'follow', 'undo']),
+  ];
+  it('is a step Back and Forward cross, going on through the steps before it, whatever undo and redo do between, and a live plot has no time X cursors', () => {
+    const count = { crossed: 0, wentOn: 0, undone: 0, redone: 0, xTaken: 0, xBack: 0, xUndone: 0 };
     fc.assert(
       fc.property(fc.array(act, { minLength: 4, maxLength: 24 }), (acts) => {
-        const { ws, views, hub, t } = setup(), id = Object.keys(ws.plots)[0], v = views.get(id);
-        const history = new History(ws, new Favorites(null));
-        const vh = new ViewHistory(ws, views, { now: () => t.ms, edit: (label, fn) => history.group(label, fn) });
+        const { ws, views, hub, t, history, cursors, vh } = setup(), id = Object.keys(ws.plots)[0], v = views.get(id);
         const seen = () => JSON.stringify([ws.plots[id].kind, v.live, v.live ? null : v.right, v.span]);
-        const line = [seen()];
-        let at = 0;
-        /** A change of what the plot shows is an entry after the one it is at, in place of those Forward had. */
-        const changed = () => {
-          if (seen() === line[at]) return false;
-          line.splice(at + 1, Infinity, seen());
+        const x = () => xOf(ws.plots[id].cursors, 'time');
+        const line = [{ shows: seen(), xs: null }];
+        let at = 0, placed = 0;
+        // The time X cursors the plot should have, and the paused view it left when it last went live.
+        let want = x(), left = null;
+        /** A change of what the plot shows is an entry after the one it is at, in place of those Forward had, with the time X cursors as the change began (`was`) and ended. */
+        const changed = (was) => {
+          if (seen() === line[at].shows) return false;
+          line.splice(at + 1, Infinity, { shows: seen(), xs: { before: was, after: x() } });
           at++;
           return true;
         };
         let crossedLast = false;
         const run = (a) => {
           t.ms += 1000;
+          const was = x(), before = seen(), wasLive = v.live;
           if (a === 'switch') vh.step(() => history.group('Kind', () => ws.setPlot(id, { kind: ws.plots[id].kind === 'time' ? 'spectrum' : 'time' })));
           else if (a === 'pan') vh.step(() => v.pan(-0.1, t.ms));
           else if (a === 'legend') history.group('Legend', () => ws.setPlot(id, { legend: !ws.plots[id].legend }));
-          else if (a === 'undo' || a === 'redo') vh.edited(() => history[a]());
+          else if (a === 'place') {
+            // As Add X cursors: a time plot pauses, as one step with the edit.
+            const kind = ws.plots[id].kind;
+            vh.step(() => {
+              if (kind === 'time') v.pause(t.ms);
+              cursors.set('Add X cursors', new Map([[id, withX(ws.plots[id].cursors, kind, 'a', ++placed)]]));
+            });
+            if (kind === 'time') want = { ...want, a: placed };
+          } else if (a === 'clear') (cursors.clear([id]), (want = { a: null, b: null }));
+          else if (a === 'pause') vh.step(() => v.pause(t.ms));
+          else if (a === 'follow') (vh.follow([id], true), (want = { a: null, b: null }));
+          else if (a === 'undo' || a === 'redo') {
+            const e = a === 'undo' ? history.undos.at(-1) : history.redos.at(-1);
+            vh.edited(() => history[a]());
+            // An undo or a redo changes the cursors as the edit history has them, and no further.
+            if (e) want = xOf(e[a === 'undo' ? 'before' : 'after'].tabs[0].plots[id]?.cursors, 'time');
+            if (wasLive && hasTimeX({ x: want })) {
+              expect(v.live, `${a}: cursors back on a live plot pause it`).toBe(false);
+              if (left) expect(seen().slice(seen().indexOf(',')), `${a}: the paused view it left`).toBe(left.slice(left.indexOf(',')));
+              count.xUndone++;
+            }
+          }
           if (a === 'back' || a === 'forward') {
             const by = a === 'back' ? -1 : 1, can = at + by >= 0 && at + by < line.length;
-            const was = JSON.parse(line[at])[0];
+            const from = JSON.parse(line[at].shows), past = line[by < 0 ? at : at + 1];
             expect(vh[a](), a).toBe(can);
             if (can) at += by;
-            const crossed = can && JSON.parse(line[at])[0] !== was;
+            const to = JSON.parse(line[at].shows);
+            const crossed = can && to[0] !== from[0];
             if (crossed) count.crossed++;
             // A Back past a step of the view alone, straight after one across a switch.
             else if (can && a === 'back' && crossedLast) count.wentOn++;
             crossedLast = crossed && a === 'back';
-          } else if (changed() && (a === 'undo' || a === 'redo')) count[a === 'undo' ? 'undone' : 'redone']++;
-          expect(seen(), `${a}: what the plot shows`).toBe(line[at]);
+            // Shown live, the plot loses its time X cursors; live shown paused, it gets back those it had then.
+            if (can && to[1] && hasTimeX({ x: want })) (count.xTaken++, (want = { a: null, b: null }));
+            else if (can && !to[1] && from[1] && past && hasTimeX({ x: past.xs[by < 0 ? 'before' : 'after'] })) (count.xBack++, (want = past.xs[by < 0 ? 'before' : 'after']));
+          } else if (changed(was) && (a === 'undo' || a === 'redo')) count[a === 'undo' ? 'undone' : 'redone']++;
+          if (!wasLive && v.live) left = before;
+          expect(seen(), `${a}: what the plot shows`).toBe(line[at].shows);
           expect([vh.canBack, vh.canForward], `${a}: Back and Forward`).toEqual([at > 0, at < line.length - 1]);
+          expect(x(), `${a}: the time X cursors`).toEqual(want);
+          expect(noLiveX(ws, views), `${a}: a live plot with time X cursors`).toBe(true);
           // Never past the newest samples, whatever was restored.
           if (!v.live) expect(v.right).toBeLessThanOrEqual(hub.now(t.ms));
         };
