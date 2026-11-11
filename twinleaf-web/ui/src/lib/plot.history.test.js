@@ -382,6 +382,23 @@ describe('what a view shows, live or paused, on a hub at any fill', () => {
     fc.record({ t: fc.constant('back'), k: fc.nat(), wide: fc.boolean(), live: fc.boolean() }),
     fc.record({ t: fc.constant('time'), share: fc.double({ min: 0, max: 0.6, noNaN: true }) }),
   );
+  /** Sets view `v`, on a hub of History `h`, the way `a` says: `pass` lets time go by, and `kept` holds the states the view was in. */
+  const set = (v, a, h, pass, kept) => {
+    if (a.t === 'follow') v.follow(a.restore);
+    else if (a.t === 'pause') v.pause(0);
+    else if (a.t === 'window') v.setSpan(a.share * h);
+    else if (a.t === 'zoom') v.zoom(a.factor, a.anchor, 0);
+    else if (a.t === 'pan') v.pan(a.by, 0);
+    else if (a.t === 'show') v.show(v.hub.at + a.from * h, v.hub.at + (a.from + a.length) * h, 0);
+    else if (a.t === 'time') pass(a.share * h);
+    else {
+      const at = v.hub.at - v.delay;
+      const wide = a.live ? { ...kept[0], live: true, window: 5 * h, span: 5 * h } : { ...kept[0], live: false, span: 2 * h, right: at, pausedAt: at, pausedHistory: h };
+      // As the view history puts a view back.
+      v.restore(a.wide ? wide : kept[a.k % kept.length], 0);
+      v.startHeld(0);
+    }
+  };
   const within = (v, h) => {
     const at = v.hub.at, tol = 16 * step(at), [left, right] = v.range(at);
     expect(left, 'starts no earlier than the oldest held').toBeGreaterThanOrEqual(v.hubHolds.oldest - tol);
@@ -396,21 +413,8 @@ describe('what a view shows, live or paused, on a hub at any fill', () => {
         const { v, pass } = hubAt(h, now, share), kept = [v.state()];
         within(v, h);
         for (const a of ways) {
-          if (a.t === 'follow') v.follow(a.restore);
-          else if (a.t === 'pause') v.pause(0);
-          else if (a.t === 'window') v.setSpan(a.share * h);
-          else if (a.t === 'zoom') v.zoom(a.factor, a.anchor, 0);
-          else if (a.t === 'pan') v.pan(a.by, 0);
-          else if (a.t === 'show') v.show(v.hub.at + a.from * h, v.hub.at + (a.from + a.length) * h, 0);
-          else if (a.t === 'time') pass(a.share * h);
-          else {
-            const at = v.hub.at - v.delay;
-            const wide = a.live ? { ...kept[0], live: true, window: 5 * h, span: 5 * h } : { ...kept[0], live: false, span: 2 * h, right: at, pausedAt: at, pausedHistory: h };
-            // As the view history puts a view back.
-            v.restore(a.wide ? wide : kept[a.k % kept.length], 0);
-            v.startHeld(0);
-            seen.back++;
-          }
+          set(v, a, h, pass, kept);
+          if (a.t === 'back') seen.back++;
           if (a.t === 'follow') seen.follow++;
           kept.push(v.state());
           within(v, h);
@@ -424,6 +428,30 @@ describe('what a view shows, live or paused, on a hub at any fill', () => {
         if (share === 1) expect(Math.abs(right - left - Math.min(v.pausedHistory ?? h, h))).toBeLessThanOrEqual(16 * step(v.hub.at));
       }),
       { numRuns: 400 },
+    );
+    for (const k of Object.keys(seen)) expect(seen[k], k).toBeGreaterThan(0);
+  });
+
+  it('paused, ends no later than the moment it paused, whichever way it is set, on a hub that has said what it holds or has not yet', () => {
+    const seen = { said: 0, unsaid: 0 };
+    /** A view on a hub that has said nothing of what it holds, as before its first report, and `pass(seconds)`. */
+    const unsaid = (now) => {
+      const v = viewOn(now, { oldest: null, dropped: false, history: null });
+      return { v, pass: (seconds) => (v.hub.at += seconds) };
+    };
+    fc.assert(
+      fc.property(history, deviceTime, fc.option(fill, { nil: null }), fc.array(way, { maxLength: 16 }), (h, now, share, ways) => {
+        const { v, pass } = share === null ? unsaid(now) : hubAt(h, now, share), kept = [v.state()];
+        for (const a of ways) {
+          set(v, a, h, pass, kept);
+          kept.push(v.state());
+          if (v.live) continue;
+          expect(v.right, JSON.stringify(a)).toBeLessThanOrEqual(v.pausedAt);
+          seen[share === null ? 'unsaid' : 'said']++;
+        }
+      }),
+      // Paused before the hub has said, time gone by, then a pan later: it stays at its pause.
+      { numRuns: 400, examples: [[60, 100_000, null, [{ t: 'pause' }, { t: 'time', share: 0.5 }, { t: 'pan', by: 1 }]]] },
     );
     for (const k of Object.keys(seen)) expect(seen[k], k).toBeGreaterThan(0);
   });

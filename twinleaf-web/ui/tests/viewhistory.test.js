@@ -342,7 +342,9 @@ describe('view history on the page', () => {
         { t: 'addXFollow', at: 0, how: 'toolbar' }, { t: 'undo' }, { t: 'reload' }, { t: 'addX', at: 1 }, { t: 'back', at: 1 },
       ], 0, 0, 0],
       // A press held still on an X cursor's line, after a drag moved it there: it moves no cursor.
-      [[{ t: 'wheel', at: 0, turns: [-120] }, { t: 'wheel', at: 0, turns: [-120] }, { t: 'back', at: 0 }, { t: 'drag', at: 0, dx: 69, rest: false }, { t: 'forward', at: 0 }, { t: 'drag', at: 0, dx: 0, rest: false }], 2147483627, 0, 0]]),
+      [[{ t: 'wheel', at: 0, turns: [-120] }, { t: 'wheel', at: 0, turns: [-120] }, { t: 'back', at: 0 }, { t: 'drag', at: 0, dx: 69, rest: false }, { t: 'forward', at: 0 }, { t: 'drag', at: 0, dx: 0, rest: false }], 2147483627, 0, 0],
+      // Paused plots zoomed out before the hub has said what it holds, which end no later than their pause, and the page loaded again: they load paused as they were.
+      [[{ t: 'addXFollow', at: 0, how: 'dblclick' }, { t: 'wheel', at: 0, turns: [120, -120, 120] }, { t: 'addX', at: 0 }, { t: 'drag', at: 0, dx: 0, rest: false }, { t: 'reload' }], 0, 0, 0]]),
     );
     // A replay of one failure runs that case alone.
     if (fc.readConfigureGlobal().path !== undefined) return;

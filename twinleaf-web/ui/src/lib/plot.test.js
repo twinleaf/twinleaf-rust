@@ -344,13 +344,13 @@ describe('A live view panned', () => {
 });
 
 describe('A paused view panned later', () => {
-  it('stops at the newest samples, whatever its plot has drawn', () => {
+  it('stops at the moment it paused, however far the newest samples have gone on, whatever its plot has drawn or its hub has said it holds', () => {
     let now = 1000;
     const v = new View({ now: () => now });
     v.pause(0);
     now = 1001;
     v.pan(0.5, 0);
-    expect(v.right).toBe(1001 - v.delay);
+    expect(v.right).toBe(1000 - v.delay);
   });
 });
 

@@ -2590,13 +2590,17 @@ export class View {
   }
 
   /**
-   * Keeps a paused view within its limits, the history its plot captured:
-   * every way of setting a paused view's span or its right edge ends here.
-   * A live view is kept within its own as it is read.
+   * Keeps a paused view within its limits, the history its plot captured,
+   * and, while nothing says what that is, ending no later than the moment
+   * it paused, where its limits end: every way of setting a paused view's
+   * span or its right edge ends here. A live view is kept within its own
+   * as it is read.
    */
   keepWithin() {
-    const limits = this.live ? null : this.limits();
+    if (this.live) return;
+    const limits = this.limits();
     if (limits) [this.span, this.right] = this.#within(limits);
+    else if (this.pausedAt !== null) this.right = Math.min(this.right, this.pausedAt);
   }
 
   /** [span, right], the paused view's span and right edge kept within `limits`. */
