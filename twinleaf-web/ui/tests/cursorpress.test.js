@@ -15,7 +15,8 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
-import { editCursors, feed, frames, leafOf, mountPage, settle, wait } from './harness/page.js';
+import { flushSync } from 'svelte';
+import { OPEN, editCursors, feed, frames, leafOf, mountPage, settle, until, wait } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { xOf, yOf } from '../src/lib/cursors.js';
@@ -165,6 +166,34 @@ describe('a press on a plot', () => {
       page.dispose();
     }
   }, 600_000);
+});
+
+describe('a press in the first frame after the plot moved or changed size', () => {
+  it('lands on what the plot shows where it is now, not on what it drew where it was', async () => {
+    const page = await mountPage([[SIGNALS[0]], [SIGNALS[1]], [SIGNALS[2]], []], 'grid', 0, SIGNALS);
+    try {
+      feed(page.hub);
+      await settle(6);
+      const id = plotIds(page.ws.layout)[0], pv = page.pv(id);
+      // The middle of its x axis, which the plot area covers once the plot fills the tab.
+      const at = centreOf(pv.pressable.find((p) => p.part === 'xaxis'));
+      expect(pv.pressAt(...at)?.part, 'the x axis before').toBe('xaxis');
+      const before = JSON.stringify(leafOf(id).getBoundingClientRect());
+      // Maximized, with no frame of the page's between it and the press.
+      page.ws.maximize([id]);
+      flushSync();
+      expect(JSON.stringify(leafOf(id).getBoundingClientRect()), 'the plot fills the tab').not.toBe(before);
+      expect(document.elementFromPoint(...at), 'the plot is under the pointer').toBe(pv.overlay);
+      expect(pv.pressAt(...at)?.part, 'a press lands on the plot area').toBe('plot');
+      // A right-click there opens the plot's menu, not the x axis's popover.
+      await commands.mouse([['move', ...at], ['down', 'right'], ['up', 'right']]);
+      expect(await until(() => document.querySelector(OPEN)), 'a menu opened').toBe(true);
+      expect(document.querySelector('[data-slot=context-menu-content]'), "the plot's menu").not.toBe(null);
+      expect(document.querySelector('[data-slot=popover-content]'), "the axis's popover").toBe(null);
+    } finally {
+      page.dispose();
+    }
+  });
 });
 
 /** Whether boxes `a` and `b`, each {x, y, w, h}, overlap. */

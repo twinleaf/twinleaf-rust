@@ -247,8 +247,6 @@ describe('maximized plots', () => {
           document.activeElement?.blur();
           await pressKey('f');
           flushSync();
-          // A press on a plot is read against what it last drew: the plots draw at their maximized size first, as after each step.
-          await frames();
           expect([...page.ws.maximized].sort()).toEqual(max.map((i) => ids[i]).sort());
           for (const s of steps) {
             await clearNotices();

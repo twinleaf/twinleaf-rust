@@ -562,6 +562,7 @@ export class PlotView {
      */
     this.pressable = [];
     this.snapped = null; // what the cursor being dragged with Shift snapped to, see `snapAt`, with the cursor's `kind`, `name` and y `axisKey`
+    this.drawnOn = null; // where the plot's body was as it last drew, {x, y, w, h} in client px
     this.tagsParted = {}; // the pairs of tags that are on their outer sides, by pair, see `parted`
     this.tagsPlaced = [];
     this.tickLabels = []; // the box of each tick label, {x, y, w, h} in client px, as last drawn, and a y label's axis, its range key
@@ -745,6 +746,7 @@ export class PlotView {
     this.sizeOverlay(r);
     if (!visible) return;
     const body = { x: r.left, y: r.top, w: r.width, h: r.height };
+    this.drawnOn = body;
     this.renderer.fill(body, theme().bgRgba);
     const cfg = this.config();
     const traces = this.traces();
@@ -1698,8 +1700,13 @@ export class PlotView {
    * there that a press does not go through, which lies over the others, or
    * null where there is none. With
    * `parts`, only those parts count, as for what lies under a cursor.
+   * Where the plot's body is not where it last drew, as in the frame after
+   * a layout change, the plot draws first, so the press is read against
+   * where everything is now.
    */
   pressAt(x, y, parts = null) {
+    const d = this.drawnOn, r = d && this.body.getBoundingClientRect();
+    if (d && (r.left !== d.x || r.top !== d.y || r.width !== d.w || r.height !== d.h)) this.draw(clock.now());
     return this.pressable.findLast((p) => !p.through && (!parts || parts.includes(p.part)) && x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h) ?? null;
   }
 
@@ -1896,8 +1903,7 @@ export class PlotView {
   regionAt(x, y) {
     const band = this.yAxisAt(x, y);
     if (band) return { kind: 'y', keys: this.axisTargets(band, y), side: band.side };
-    const P = this.geo?.plot;
-    if (P && y > P.y + P.h && x >= P.x && x <= P.x + P.w) return { kind: 'x' };
+    if (this.pressAt(x, y, ['xaxis'])) return { kind: 'x' };
     return { kind: 'plot', keys: this.yTargets(y) };
   }
 
