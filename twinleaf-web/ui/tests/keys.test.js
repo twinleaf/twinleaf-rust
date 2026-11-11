@@ -2,8 +2,9 @@
 // router's order (keyrouter.js ORDER), from every place on the page a key
 // can be pressed, found on the page.
 // - Escape belongs first to a drag or a resize under way, which it cancels;
-//   then to an open menu, popover or dialog, which closes, or to a field,
-//   which keeps it; then it leaves a maximized view, the selection kept;
+//   then to an open menu, popover or dialog, which closes, or to a field
+//   something is typed in, which keeps it to put back what it showed, focus
+//   kept; then it leaves a maximized view, the selection kept;
 //   then it deselects; then it goes out a level. That is its order wherever
 //   focus is: a list in the page, a plot's signals or the Signals list,
 //   keeps the other keys pressed in it and not Escape, and no part of the
@@ -164,6 +165,8 @@ describe('Escape', () => {
         [null, 'rows', 14, 'press', 'tip'],
         [[2], 'none', 17, 'keys', 'none'],
         [null, 'plots', 21, 'press', 'none'],
+        // Focus in the edit bar's field, a property row picked, nothing typed: out a level.
+        [null, 'rows', 2147483636, 'keys', 'none'],
       ]),
     );
     // Each owner in Escape's order was met, from several places.
@@ -202,6 +205,48 @@ describe('Escape', () => {
       }
     }
   }, 60_000);
+
+  it('in a field something is typed in puts back what the field showed, focus kept, and is the field’s; the next goes out a level: in every field on the page', async () => {
+    /** The page with a property row picked, so the edit bar shows its field. */
+    const mounted = async () => {
+      const page = await mountPage(KEYS, 'columns', 1, [...KEYS.flat(), ...SIGNALS], RPCS);
+      feed(page.hub);
+      await focusPage();
+      await clickOn(document.querySelector('.dock-panel tr[id^=prop-] td:last-child'));
+      await settle();
+      return page;
+    };
+    const fieldsOf = () => places().filter((el) => el.matches('input:not([type=checkbox]):not([type=radio]), textarea'));
+    let page = await mounted();
+    const names = fieldsOf().map(named);
+    page.dispose();
+    expect(names.some((n) => n.includes('New value of')), `the edit bar's field among ${names}`).toBe(true);
+    const steps = {};
+    for (const [i, name] of names.entries()) {
+      page = await mounted();
+      try {
+        const field = fieldsOf()[i];
+        field.focus();
+        await settle();
+        const was = field.value, parent = tree.parent(cursorOf(field));
+        await pressKey('x');
+        await settle();
+        const typed = field.value !== was;
+        const at = [];
+        for (let press = 0; press < 2; press++) {
+          await pressKey('Escape');
+          flushSync();
+          await frames();
+          at.push({ by: lastKey().by, shows: field.value === was ? 'as it was' : field.value, focus: document.activeElement === field ? 'the field' : cursorOf(document.activeElement) === parent ? 'the level above' : named(document.activeElement) });
+        }
+        steps[name] = { typed, at };
+      } finally {
+        page.dispose();
+      }
+    }
+    const want = { typed: true, at: [{ by: null, shows: 'as it was', focus: 'the field' }, { by: 'navigation', shows: 'as it was', focus: 'the level above' }] };
+    expect(steps).toEqual(Object.fromEntries(names.map((n) => [n, want])));
+  }, 120_000);
 
   it('has its owners in that order in the router, and none before the element but a drag and an open menu', () => {
     const at = (id) => ORDER.findIndex((o) => o.id === id);

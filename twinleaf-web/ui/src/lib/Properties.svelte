@@ -164,12 +164,14 @@
   let draft = $state('');
   let editor = $state(null);
   let lastEdit = null;
+  /** What the field shows for the rows it edits, before anything is typed: the value every device of every row agrees on. */
+  const filled = () => (bar?.kind === 'values' ? show(bar.shared) : bar?.kind === 'one' ? show(shared(editing[0])) : '');
   $effect(() => {
-    // New rows fill the field with the value every device of every row agrees on.
+    // New rows fill the field.
     const names = editing.map((r) => r.name).join('\n');
     if (names === lastEdit) return;
     lastEdit = names;
-    draft = untrack(() => (bar?.kind === 'values' ? show(bar.shared) : bar?.kind === 'one' ? show(shared(editing[0])) : ''));
+    draft = untrack(filled);
   });
   /** Writes `text` to every row of the bar, on the devices a write of each reaches. */
   const writeBar = (text) => writes.write(bar.rows.map((r) => ({ name: r.name, devices: writersOf(r, devices) })), text, switching);
@@ -253,16 +255,19 @@
       },
     }),
   );
-  /** Enter in the edit bar's field writes what is typed, and Escape puts the shared value back. */
+  /**
+   * Enter in the edit bar's field writes what is typed. Escape, once
+   * something is typed, puts the field back as it was filled and keeps the
+   * key; with nothing typed it leaves the key to the page, which goes out a
+   * level (keyrouter.js).
+   */
   function editorKey(e) {
     if (e.key === 'Enter' && bar && draft.trim() !== '') {
       e.preventDefault();
       writeBar(draft.trim());
-    } else if (e.key === 'Escape') {
+    } else if (e.key === 'Escape' && draft !== filled()) {
       e.preventDefault();
-      lastEdit = null; // puts the shared value back
-      draft = '';
-      tableEl?.focus();
+      draft = filled();
     }
   }
 </script>

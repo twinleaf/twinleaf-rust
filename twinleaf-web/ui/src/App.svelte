@@ -340,6 +340,12 @@
   const checked = $derived([...hub.session.devices.values()].sort(byRoute).filter((d) => !unchecked.has(d.route)));
   /** The words every property row shown has in its name: one filter for every panel of properties. */
   let propertyFilter = $state('');
+  /** Escape in the filter's field clears what is typed, before it does anything else. */
+  function filterKey(e) {
+    if (e.key !== 'Escape' || !propertyFilter) return;
+    propertyFilter = '';
+    e.preventDefault();
+  }
   /** Whether dock `side` has a panel of properties, open or folded, and so holds the filter's field, in its top row. */
   const holdsFilter = (side) => docks[side].some((p) => PANELS[p.id].channels);
   // The property rows the page shows, in page order, which a Shift pick runs
@@ -891,7 +897,7 @@
 
 {#snippet dockTop(side)}
   {#if holdsFilter(side)}
-    <Input class="h-7 min-w-0 flex-1 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows />
+    <Input class="h-7 min-w-0 flex-1 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows onkeydown={filterKey} />
   {/if}
 {/snippet}
 
