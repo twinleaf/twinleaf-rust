@@ -59,6 +59,18 @@ export function plotArea(page, id, under = false) {
   return spot;
 }
 
+/**
+ * A spot of plot `id`'s plot area as `plotArea` finds it with the pointer
+ * resting on the plot, as it rests when a person presses there: a
+ * monitor's header then shows over the top of its plot, taking the presses
+ * there, and its legend moves down out from under it.
+ */
+export async function plotSpot(page, id, under = false) {
+  await commands.mouse([['move', ...centre(leafOf(id).querySelector('.plot-body'))]]);
+  await settle();
+  return plotArea(page, id, under);
+}
+
 /** Right-clicks plot `id`'s axis `which` ('x', or 'y' for its first y axis), which opens its popover, and returns it. */
 export async function axisPopover(page, id, which) {
   const pv = page.pv(id), P = pv.geo.plot, band = pv.axisBands[0];
@@ -71,7 +83,7 @@ export async function axisPopover(page, id, which) {
 
 /** Each menu of the page, `open(page, id)` opening it on plot `id` where it is a plot's, and returning it. */
 export const MENUS = {
-  'the plot menu': async (page, id) => (await rightClick(plotArea(page, id)), openMenu()),
+  'the plot menu': async (page, id) => (await rightClick(await plotSpot(page, id)), openMenu()),
   'a chip’s menu': async (page, id) => (await rightClick(centre(leafOf(id).querySelector('.trace-chip .name'))), openMenu()),
   'a legend row’s menu': async (page) => (await rightClick(centre(leafOf(page.ids[0]).querySelector('.pinned-legend .row'))), openMenu()),
   'the readout’s menu': async (page) => (await rightClick(centre(leafOf(page.ids[0]).querySelector('.cursor-readout'))), openMenu()),
