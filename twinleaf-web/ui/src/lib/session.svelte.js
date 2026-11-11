@@ -64,6 +64,27 @@ export function dropping(memory, maxAge, budget) {
 }
 
 /**
+ * What a plot paused keeps at the rate and limits of the hub's `memory`,
+ * once the live history holds all it may: {steady, need, keeps}, or null
+ * while nothing streams or no budget is set. `steady` is the bytes of the
+ * time limit at the rate, `need` those of the live history and a full
+ * paused one beside it, and `keeps` the seconds from the pause that the
+ * paused history keeps the whole time limit before it loses its oldest:
+ * all of `maxAge` when `need` fits the budget, and then it loses none.
+ *
+ * The paused history shares the live history's rows, and costs the rows
+ * the live history drops since the pause, `rate` bytes a second, in the
+ * room the live history leaves of the budget, its oldest going first
+ * (twinleaf-web/src/hub.rs `trim_held`). When memory comes first the live
+ * history fills the budget and leaves no room, so `keeps` is 0.
+ */
+export function pausing({ rate, maxAge, budget }) {
+  if (!(rate > 0) || !(budget > 0)) return null;
+  const steady = rate * maxAge;
+  return { steady, need: 2 * steady, keeps: Math.min(maxAge, Math.max(0, (budget - steady) / rate)) };
+}
+
+/**
  * One line of points, in device seconds, kept for `keep` seconds before the
  * newest. Points have absolute indices that never change, so a GPU ring
  * buffer can find the ones it has not uploaded.

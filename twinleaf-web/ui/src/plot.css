@@ -256,8 +256,9 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .set-control .set-value { min-width: 3.5rem; text-align: right; }
 /* The raw history's settings (HistorySettings.svelte): its two limits, then
    apart from them a footer: a waterline of the memory held with a tick
-   where the span of time would fill it, and under it a caption naming the
-   limit that comes first. */
+   where the span of time would fill it and a band a full paused history
+   takes, and under it a caption naming the limit that comes first and a
+   line saying what a paused plot keeps. */
 .history-set { display: flex; flex-direction: column; gap: var(--space-3); font-size: 12px; line-height: var(--line); }
 /* The stepper matches the select above it: height, border and corners. */
 .stepper { display: flex; align-items: center; height: var(--row); border: 1px solid var(--input); border-radius: min(var(--radius-md), 10px); overflow: hidden; }
@@ -272,6 +273,14 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .waterline { position: relative; height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--muted-foreground) 25%, transparent); overflow: hidden; }
 .waterline .fill { height: 100%; background: var(--primary); transition: width 0.3s; }
 .waterline .tick { position: absolute; top: 0; bottom: 0; width: 3px; margin-left: -1.5px; background: var(--foreground); opacity: 0.8; }
+/* The band a full paused history takes, hatched from the tick to a thin
+   edge where it ends; past the bar's end, no edge, and an arrow after the
+   bar. */
+.water-bar { display: flex; align-items: center; gap: 2px; }
+.water-bar .waterline { flex: 1; }
+.waterline .paused { position: absolute; top: 0; bottom: 0; border-right: 1px solid var(--foreground); background: repeating-linear-gradient(-45deg, color-mix(in srgb, var(--foreground) 55%, transparent) 0 1.5px, transparent 1.5px 4px); }
+.waterline .paused.past { border-right: 0; }
+.water-bar .past-end { flex: none; width: 12px; height: 12px; margin-right: -4px; color: var(--foreground); }
 /* The caption's lines, one sentence each, set close as one paragraph. */
 .water-notes { color: var(--muted-foreground); font-size: 11px; line-height: var(--line); font-variant-numeric: tabular-nums; }
 .water-caption { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { dropping, Session, Trace } from './session.svelte.js';
+import { dropping, pausing, Session, Trace } from './session.svelte.js';
+import { pausedKeeps } from './words.js';
+import { HISTORY_SPANS } from './constants.js';
 import { Hub } from './hub.svelte.js';
 import { decodeFrame, holdMessage, signalKey, spectraMessage } from './protocol.js';
 
@@ -379,5 +381,60 @@ describe('what a lower History setting drops', () => {
         expect(lower.paused).toBeGreaterThanOrEqual(higher.paused - 1e-6);
       }),
     );
+  });
+});
+
+describe('what a paused plot keeps', () => {
+  /** The hub's rate and limits, and what paused plots hold now, as the hub may say them. */
+  const hub = fc.record({
+    rate: fc.double({ min: 1, max: 1e8, noNaN: true }),
+    maxAge: fc.constantFrom(...HISTORY_SPANS),
+    budget: fc.double({ min: 1e6, max: 32e9, noNaN: true }),
+    held: fc.option(fc.record({ seconds: fc.double({ min: 0, max: 86400, noNaN: true }), bytes: fc.double({ min: 0, max: 32e9, noNaN: true }) }), { nil: null }),
+  });
+  const close = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(b));
+
+  it('keeps the whole time limit for no less than no time and no more than the limit, and for ever when the live and the paused history both fit', () => {
+    fc.assert(
+      fc.property(hub, (memory) => {
+        const { steady, need, keeps } = pausing(memory);
+        expect(steady).toBe(memory.rate * memory.maxAge);
+        expect(need).toBe(2 * steady);
+        expect(keeps).toBeGreaterThanOrEqual(0);
+        expect(keeps).toBeLessThanOrEqual(memory.maxAge);
+        if (need <= memory.budget) expect(keeps).toBe(memory.maxAge);
+        // Memory first: the live history leaves no room.
+        if (steady >= memory.budget) expect(keeps).toBe(0);
+        // Short of all of it, the paused history's cost at `keeps` is the room the live history leaves.
+        if (keeps > 0 && keeps < memory.maxAge) expect(close(steady + memory.rate * keeps, memory.budget)).toBe(true);
+        // What paused plots hold now does not change it.
+        expect(pausing({ ...memory, held: null })).toEqual(pausing(memory));
+      }),
+    );
+  });
+
+  it('keeps it for less, or as long, within a smaller budget', () => {
+    fc.assert(
+      fc.property(hub, fc.double({ min: 0, max: 1, noNaN: true }), (memory, share) => {
+        const smaller = pausing({ ...memory, budget: Math.max(1, memory.budget * share) });
+        expect(smaller.keeps).toBeLessThanOrEqual(pausing(memory).keeps);
+      }),
+    );
+  });
+
+  it('says nothing while no stream adds data, or with no budget', () => {
+    expect(pausing({ rate: 0, maxAge: 3600, budget: 1e9 })).toBeNull();
+    expect(pausing({ rate: 1600, maxAge: 3600, budget: 0 })).toBeNull();
+  });
+
+  it('is, at 760 MB an hour within 1 GB, the hour for 240/760 of an hour, and 1.52 GB for all of it', () => {
+    const memory = { rate: 760e6 / 3600, maxAge: 3600, budget: 1e9, held: null };
+    const pause = pausing(memory);
+    expect(close(pause.steady, 760e6)).toBe(true);
+    expect(close(pause.need, 1.52e9)).toBe(true);
+    expect(close(pause.keeps, (240 / 760) * 3600)).toBe(true);
+    expect(pausedKeeps(pause, memory.maxAge)).toBe('A paused plot keeps its full 60 min for ~19 min, then loses its oldest. All of it needs ~1.5 GB');
+    expect(pausedKeeps(pausing({ ...memory, budget: 2e9 }), memory.maxAge)).toBe('A paused plot keeps its full 60 min');
+    expect(pausedKeeps(pausing({ ...memory, budget: 5e8 }), memory.maxAge)).toBe('A paused plot loses its oldest at once. Its full 60 min needs ~1.5 GB');
   });
 });

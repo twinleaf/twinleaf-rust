@@ -6,7 +6,12 @@
   //
   // The waterline is the memory held of the budget, and its tick is where
   // the span of time would fill it. A tick inside the bar means time comes
-  // first, and the water stops there; none means memory does.
+  // first, and the water stops there; none means memory does. While time
+  // comes first, a hatched band runs on from the tick to where the live
+  // history and a full paused one beside it would fill it, twice as far
+  // (session.svelte.js `pausing`); past the bar's end it runs to the end,
+  // and an arrow after the bar says it goes on. A line under the caption
+  // says, in time, what a paused plot keeps.
   //
   // A lower limit that drops history the hub holds asks first, in place of
   // the waterline: what it drops of the live history and of what paused
@@ -18,12 +23,13 @@
   // one that drops nothing, is set at once.
   import * as Select from '$lib/components/ui/select/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
+  import RiArrow from '@lucide/svelte/icons/chevron-right';
   import RiInfo from '@lucide/svelte/icons/info';
   import RiMinus from '@lucide/svelte/icons/minus';
   import RiPlus from '@lucide/svelte/icons/plus';
   import Tip from './Tip.svelte';
   import { api } from './protocol.js';
-  import { dropping } from './session.svelte.js';
+  import { dropping, pausing } from './session.svelte.js';
   import { escapeFirst } from './overlay.svelte.js';
   import { HISTORY_BUDGETS, HISTORY_SPANS } from './constants.js';
   import { bytesEstimate, bytesText, spanText } from './units.js';
@@ -54,6 +60,10 @@
 
   /** The limit that comes first at the current rate, whose value shows bright: `time`, `memory` or none. */
   const binding = $derived(tick >= 1 ? 'memory' : tick > 0 ? 'time' : null);
+  /** What a paused plot keeps at the current rate and limits, or null while nothing streams. */
+  const pause = $derived(pausing(memory));
+  /** Where the paused band ends, as a share of the budget, past 1 when the budget holds less; 0 while memory comes first. */
+  const band = $derived(binding === 'time' && pause ? pause.need / memory.budget : 0);
 
   /** The lower setting the question asks about, {maxAge, budget, limit}, `limit` the one lowered, `time` or `memory`; null while none is asked. */
   let asking = $state(null);
@@ -126,9 +136,21 @@
     </div>
   {:else}
     <div class="water">
-      <div class="waterline" role="meter" aria-label="Memory held" aria-valuenow={memory.bytes} aria-valuemin={0} aria-valuemax={memory.budget}>
-        <div class="fill" style="width: {held * 100}%"></div>
-        {#if tick > 0 && tick < 1}<div class="tick" style="left: {tick * 100}%"></div>{/if}
+      <div class="water-bar">
+        <div
+          class="waterline"
+          role="meter"
+          aria-label="Memory held"
+          aria-valuenow={memory.bytes}
+          aria-valuemin={0}
+          aria-valuemax={memory.budget}
+          aria-valuetext={words.waterText(memory.bytes, memory.budget, pause, binding === 'time')}
+        >
+          <div class="fill" style="width: {held * 100}%"></div>
+          {#if band}<div class="paused" class:past={band > 1} style="left: {tick * 100}%; width: {(Math.min(1, band) - tick) * 100}%"></div>{/if}
+          {#if tick > 0 && tick < 1}<div class="tick" style="left: {tick * 100}%"></div>{/if}
+        </div>
+        {#if band > 1}<RiArrow class="past-end" aria-hidden="true" />{/if}
       </div>
       <div class="water-notes">
         <div class="water-caption">
@@ -143,6 +165,7 @@
             {#snippet children(tip)}<button {...tip} class="info" aria-label={info}><RiInfo /></button>{/snippet}
           </Tip>
         </div>
+        {#if pause && binding}<div class="paused-keeps">{words.pausedKeeps(pause, memory.maxAge)}</div>{/if}
         {#if memory.held}
           <!-- What holding the paused plots' capture costs: what the history would have dropped since. -->
           <div>Paused plots hold {bytesEstimate(memory.held.bytes)} more</div>

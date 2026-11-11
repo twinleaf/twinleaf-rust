@@ -9,11 +9,12 @@
 // outcome (writes.svelte.js): {level, text, detail}, `detail` the lines
 // under the text.
 //
-// And the question lowering a History limit asks before it drops history
-// the hub holds.
+// And the History popover's: the question lowering a limit asks before it
+// drops history the hub holds, what a paused plot keeps, and what its
+// waterline reads as to a screen reader.
 
 import { switchOf } from './properties.js';
-import { spanText } from './units.js';
+import { bytesEstimate, bytesText, spanText } from './units.js';
 
 /** `items` joined as a sentence lists them: "a", "a and b", "a, b and c", the rest past `most` counted. */
 export function list(items, most = 3) {
@@ -201,4 +202,29 @@ export function lowerAsk({ live, paused }, keep) {
   if (live > 0) lines.push(`This drops the oldest ${spanText(live)} now held`);
   if (paused > 0) lines.push(`Paused plots lose the oldest ${spanText(paused)} they show`);
   return { lines, drop: `Drop ${spanText(Math.max(live, paused))}`, keep: `Keep ${keep}` };
+}
+
+/**
+ * What a plot paused keeps under a time limit of `maxAge` seconds, by
+ * session.svelte.js `pausing`: its full span, for how long before it loses
+ * its oldest, and what keeping it all needs.
+ */
+export function pausedKeeps({ need, keeps }, maxAge) {
+  const span = spanText(maxAge);
+  if (keeps >= maxAge) return `A paused plot keeps its full ${span}`;
+  if (keeps >= 1) return `A paused plot keeps its full ${span} for ~${spanText(keeps)}, then loses its oldest. All of it needs ${bytesEstimate(need)}`;
+  return `A paused plot loses its oldest at once. Its full ${span} needs ${bytesEstimate(need)}`;
+}
+
+/**
+ * The History waterline as a screen reader reads it: the memory held of
+ * the budget, then, while the time limit comes first, its two marks, the
+ * live history at the time limit and that with a full paused plot beside
+ * it (session.svelte.js `pausing`), the second past the limit when it is.
+ */
+export function waterText(bytes, budget, pause, timeFirst) {
+  const held = `${bytesText(bytes)} of ${bytesText(budget)}`;
+  if (!pause || !timeFirst) return held;
+  const past = pause.need > budget ? ', past the limit' : '';
+  return `${held}. The time limit fills ${bytesEstimate(pause.steady)}, and ${bytesEstimate(pause.need)} with a paused plot${past}`;
 }
