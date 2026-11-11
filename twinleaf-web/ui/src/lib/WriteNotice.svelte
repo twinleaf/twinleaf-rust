@@ -3,9 +3,9 @@
   // happened, a line for each thing it left out, and Revert while it is
   // offered. The pointer on it keeps it open, and a press on it keeps the
   // selection, so Revert leaves the rows picked. After a Ctrl+Z that took
-  // nothing back, it says to use Revert, and Revert is marked a moment. It
-  // is drawn as the page's
-  // other notices are, at its level.
+  // nothing back, it says why: to use Revert, which is marked a moment, or
+  // that the old value was not known. It is drawn as the page's other
+  // notices are, at its level.
   import RiCheck from '@lucide/svelte/icons/circle-check';
   import RiWarn from '@lucide/svelte/icons/triangle-exclamation-point';
   import RiError from '@lucide/svelte/icons/octagon-x';
@@ -26,7 +26,7 @@
       <div class="write-notice-text">{notice.text}</div>
       {#each notice.detail as line, i (i)}<div class="write-notice-detail">{line}</div>{/each}
       {#if off}<div class="write-notice-detail">{words.revertOff(off.label, off.why)}</div>{/if}
-      {#if writes.useRevert}<div class="write-notice-detail write-notice-undo">{writes.useRevert}</div>{/if}
+      {#if writes.undoHeld}<div class="write-notice-detail write-notice-undo">{writes.undoHeld}</div>{/if}
     </div>
     {#if writes.canRevert}<button class="write-notice-revert" class:pointed={writes.pointed} onclick={() => writes.revert()}>{words.REVERT}</button>{/if}
   </div>

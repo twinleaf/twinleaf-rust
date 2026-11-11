@@ -39,6 +39,10 @@ const devicesOf = (results, state) => new Set(results.filter((r) => !state || r.
 export const REVERT = 'Revert';
 /** What Ctrl+Z says right after a write, while its Revert is offered, as it takes back no edit made before the write. */
 export const USE_REVERT = 'Nothing undone: press Revert to undo the write';
+/** What Ctrl+Z says right after a write that offers no Revert, as it takes back no edit made before the write. */
+export const UNDO_UNKNOWN = "Nothing undone: the old value isn't known";
+/** What Ctrl+Z says right after a device action, as it takes back no edit made before the action. */
+export const UNDO_ACTION = "Nothing undone: a device action can't be undone";
 
 /**
  * What each device made of a call, as lines: the devices that refused,

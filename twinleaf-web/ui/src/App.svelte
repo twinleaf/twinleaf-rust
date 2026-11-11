@@ -852,7 +852,7 @@
   /**
    * Takes the last edit back, or with `redo` does it again. A plot's kind it
    * changes is a view step, as the command's is. Right after a device write
-   * it may take nothing back, and the write's notice says to use Revert
+   * or action it may take nothing back, and a notice says why
    * (writes.svelte.js `undo`).
    */
   function undo(redo) {

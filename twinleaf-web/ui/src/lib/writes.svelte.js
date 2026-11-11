@@ -15,9 +15,10 @@
 // write or Revert starts, and when a device written disconnects or
 // reconnects, or the hub does. A run of actions reports with a notice of
 // its own, with no Revert. Nothing here is an undo step: Ctrl+Z never
-// writes to a device. Nor does it take back, while a write's Revert is
-// offered, an edit made before that write: the write's notice says to use
-// Revert, which it marks (`undo`). What the notices say is words.js's.
+// writes to a device. Nor does it take back an edit made before the last
+// write or run of actions while its notice shows, or before a write while
+// its Revert is offered: it says why instead (`undo`). What the notices say
+// is words.js's.
 
 import { SvelteMap } from 'svelte/reactivity';
 import { sameShown } from './properties.js';
@@ -173,12 +174,23 @@ export class DeviceWrites {
   /** The cells of the hub's session, or null before any. */
   #cells = $state.raw(null);
   /**
-   * What Revert puts back: {session, rows, toggle, entries, edits, held},
-   * each entry {device, connections, name, old, wrote}, `edits` the steps
-   * undo could take back as the write started, and `held` whether a Ctrl+Z
-   * took nothing back since.
+   * What Revert puts back, and Ctrl+Z holds for while it is offered:
+   * {session, rows, toggle, entries, why, edits, held}, each entry
+   * {device, connections, name, old, wrote}, `why` revert; `edits` and
+   * `held` as `#done` has them.
    */
   #offer = $state.raw(null);
+  /**
+   * The last write that took on a device with no Revert, as no old value
+   * was known, or run of actions that ran on one, as Ctrl+Z holds for it:
+   * {why, edits, held, until}. `why` is unknown or action; `edits` the
+   * steps undo could take back as it started; `held` whether a Ctrl+Z took
+   * nothing back for it since; `until` the page time a run's hold ends,
+   * NOTICE_MS after it reports. A write's goes with its notice. A run
+   * leaves the Revert offered before it, which holds once the run's hold
+   * has ended.
+   */
+  #done = $state.raw(null);
   /** Whether Revert is marked, for POINT_MS after a Ctrl+Z that took nothing back. */
   pointed = $state(false);
   #pointing = null;
@@ -199,7 +211,10 @@ export class DeviceWrites {
     this.present = present;
     this.checked = checked;
     this.edits = edits;
-    this.#notice = new TimedNotice(present, () => (this.#offer = null));
+    this.#notice = new TimedNotice(present, () => {
+      this.#offer = null;
+      if (this.#done?.why === 'unknown') this.#done = null;
+    });
   }
 
   /**
@@ -258,9 +273,10 @@ export class DeviceWrites {
     );
   }
 
-  /** Starts a write or Revert: the one before it loses its Revert and its claim on the notice. */
+  /** Starts a write or Revert: the one before it loses its Revert and its claim on the notice, and what Ctrl+Z held for goes. */
   #begin() {
     this.#offer = null;
+    this.#done = null;
     return ++this.#latest;
   }
 
@@ -284,13 +300,20 @@ export class DeviceWrites {
     const olds = unique(entries.map((e) => asText(e.old)));
     const was = edits.length === 1 && entries.length === ok.length && olds.length === 1 ? entries[0].old : undefined;
     const rows = edits.map((e) => e.name);
-    this.#offer = entries.length && session === this.hub.session ? { session, rows, toggle, entries, edits: steps, held: false } : null;
+    const current = session === this.hub.session;
+    this.#offer = entries.length && current ? { session, rows, toggle, entries, why: 'revert', edits: steps, held: false } : null;
     const revert = !!this.#offer;
+    this.#done = ok.length && current && !revert ? { why: 'unknown', edits: steps, held: false, until: Infinity } : null;
     this.#notice.show({ ...words.wrote({ rows, toggle, value: text, results, was, unknownOld, revert }), revert }, revert ? REVERT_MS : NOTICE_MS);
   }
 
-  /** What the notice says of Ctrl+Z, while Revert can be pressed and a Ctrl+Z took nothing back since the write: to use Revert. Else null. */
-  get useRevert() {
+  /**
+   * What the write's notice says of Ctrl+Z once one took nothing back
+   * since the write: to use Revert, while it can be pressed, or that the
+   * old value was not known. Else null.
+   */
+  get undoHeld() {
+    if (this.#done?.held) return this.#done.why === 'unknown' ? words.UNDO_UNKNOWN : null;
     return this.canRevert && this.#offer.held ? words.USE_REVERT : null;
   }
 
@@ -350,46 +373,57 @@ export class DeviceWrites {
    * Runs actions `names` in order, each on the devices `devicesOf(name)`
    * gives, stopping at the first that does not run on every device, and
    * reports what ran with a notice of its own. It asks nothing and offers
-   * no Revert.
+   * no Revert. One that ran on any device is what Ctrl+Z holds for next.
    */
   async run(names, devicesOf) {
-    const cells = this.#now(), done = [], reached = new Set();
+    const cells = this.#now(), done = [], reached = new Set(), steps = this.edits();
+    let failed = null;
     for (const name of names) {
       const to = devicesOf(name);
       if (!to.length) continue;
       for (const d of to) reached.add(d.route);
       const results = (await cells.call(this.hub, name, '', to, false)).map((r) => ({ ...r, label: words.device(to.find((d) => d.route === r.route)) }));
-      if (results.every((r) => r.state === 'ok')) {
-        done.push(name);
-        continue;
+      if (!results.every((r) => r.state === 'ok')) {
+        failed = { name, results };
+        break;
       }
-      const n = words.ran({ names, done, failed: { name, results }, devices: reached.size });
-      return this.present.report(n.level, n.text, n.detail);
+      done.push(name);
     }
-    if (!done.length) return;
-    const n = words.ran({ names, done, devices: reached.size });
+    if (!done.length && !failed) return;
+    if (done.length || failed.results.some((r) => r.state === 'ok')) this.#done = { why: 'action', edits: steps, held: false, until: clock.now() + NOTICE_MS };
+    const n = words.ran({ names, done, failed, devices: reached.size });
     this.present.report(n.level, n.text, n.detail);
   }
 
   /**
    * Ctrl+Z, whose `take()` takes back the last edit, `step` (or none), and
-   * returns its label. While the last write's Revert is offered, Ctrl+Z
-   * takes back no edit made before that write: when `step` is none or one
-   * undo could take back as the write started, nothing is taken back, the
-   * write's notice says to use Revert (`useRevert`) until a Ctrl+Z takes
-   * something back, Revert is marked for POINT_MS, and it returns {held:
-   * true}. Otherwise it returns {label},
-   * what `take()` returned. A step made after the write, or brought back
-   * by redo since, is taken back as ever, and so is any once Revert has
-   * gone.
+   * returns its label. Right after a write or a run of actions, Ctrl+Z
+   * takes back no edit made before it: when `step` is none or one undo
+   * could take back as it started, nothing is taken back, and it returns
+   * {held: true}. A run's hold, for NOTICE_MS after it reports, comes
+   * first, with a notice of its own saying an action cannot be undone; so
+   * does the hold of a write with no Revert, while its notice shows, which
+   * says the old value was not known. Else it holds while a write's Revert
+   * is offered, a run since or not, and the write's notice says to use
+   * Revert, which is marked for POINT_MS. The write's notice says so
+   * (`undoHeld`) until a Ctrl+Z holds for something else or takes
+   * something back. Otherwise it returns {label}, what `take()` returned.
+   * A step made after the write or run, or brought back by redo since, is
+   * taken back as ever, and so is any once every hold has ended.
    */
   undo(step, take) {
-    const holds = this.canRevert && (!step || this.#offer.edits.includes(step));
-    if (this.#offer && this.#offer.held !== holds) this.#offer = { ...this.#offer, held: holds };
-    if (!holds) return { label: take() };
-    this.pointed = true;
-    clock.cancel(this.#pointing);
-    this.#pointing = clock.after(POINT_MS, () => (this.pointed = false));
+    const fits = (h) => !step || h.edits.includes(step);
+    const d = this.#done, o = this.canRevert ? this.#offer : null;
+    const by = d && clock.now() < d.until && fits(d) ? d : o && fits(o) ? o : null;
+    if (d && d.held !== (by === d)) this.#done = { ...d, held: by === d };
+    if (this.#offer && this.#offer.held !== (!!by && by === o)) this.#offer = { ...this.#offer, held: !!by && by === o };
+    if (!by) return { label: take() };
+    if (by.why === 'action') this.present.report('warning', words.UNDO_ACTION, []);
+    if (by.why === 'revert') {
+      this.pointed = true;
+      clock.cancel(this.#pointing);
+      this.#pointing = clock.after(POINT_MS, () => (this.pointed = false));
+    }
     return { held: true };
   }
 
