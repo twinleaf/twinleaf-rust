@@ -107,6 +107,7 @@ export class PlotHost {
       newPlot: (keys) => this.#page.newPlot(keys),
       copy: (plots) => this.#page.copy(plots),
       copyCheck: (plots) => this.#page.copyCheck(plots),
+      copyImage: (id) => this.#page.copyImage(id),
       openExport: (plots) => this.#page.openExport(plots),
       picker: (id, action) => !!this.pickers.get(id)?.(action),
       renameTab: (id) => this.#page.renameTab(id),
@@ -121,7 +122,7 @@ export class PlotHost {
   /**
    * Has the page serve this host's plots: `page` is what the commands that
    * need a workspace run through, {split(ids, dir, fromKeys), close(ids,
-   * fromKeys), newPlot(keys), copy(plots), copyCheck(plots),
+   * fromKeys), newPlot(keys), copy(plots), copyCheck(plots), copyImage(id),
    * openExport(plots), renameTab(id), closeTab(tab), dockShown(side),
    * toggleDock(side), exportTabs(), importTabs()}, with `viewChanged(id)`,
    * told as plot `id`'s view moves, and `place`, as the top of this file

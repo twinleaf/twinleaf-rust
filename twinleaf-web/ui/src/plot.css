@@ -294,6 +294,9 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 
 /* The plot area is see-through: the WebGL layer behind draws it. */
 .plot-body { position: relative; flex: 1; min-height: 60px; background: transparent; }
+/* Copy image, first of the header's actions, shown while the pointer is on the plot: hidden, it keeps its room and takes no press. */
+.plot-actions > .copy-image { opacity: 0; pointer-events: none; transition: opacity 0.1s; }
+.plot-card:hover .plot-actions > .copy-image { opacity: 1; pointer-events: auto; }
 /* The plot takes focus for its context menu. The card's border shows focus and
    selection, so the browser's ring, clipped to a bar under the header, is off. */
 .plot-body:focus, .plot-body:focus-visible { outline: none; }
@@ -327,14 +330,14 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .trace-chip .name { max-width: 18ch; overflow: hidden; text-overflow: ellipsis; }
 /* A narrow plot gives its header to its signals: the kind shortens, then
    Back and Forward go, which a wider plot of the tab has, as they go
-   through the tab's steps; then the kind and the grip, the empty header
-   still picking the plot up. The kind's trigger stays in the page at no
-   width, for K to open it. */
+   through the tab's steps, and Copy image, which its menu has; then the
+   kind and the grip, the empty header still picking the plot up. The
+   kind's trigger stays in the page at no width, for K to open it. */
 .plot-card { container: plot / inline-size; }
 @container plot (width < 480px) {
 	.plot-head [data-slot=select-trigger] { flex-shrink: 1; min-width: 0; }
 	.plot-head .trace-zone { min-width: 64px; }
-	.plot-head .view-step { display: none; }
+	.plot-head .view-step, .plot-head .copy-image { display: none; }
 }
 @container plot (width < 280px) {
 	.plot-head .grip, .plot-head .maximize { display: none; }

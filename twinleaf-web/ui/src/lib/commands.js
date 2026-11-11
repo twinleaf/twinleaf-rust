@@ -91,6 +91,7 @@ import RiClose from '@lucide/svelte/icons/x';
 import RiLegend from '@lucide/svelte/icons/list';
 import RiCopy from '@lucide/svelte/icons/clipboard-copy';
 import RiExport from '@lucide/svelte/icons/file-down';
+import RiImage from '@lucide/svelte/icons/image';
 import RiXCursors from '@lucide/svelte/icons/separator-vertical';
 import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
 import RiEraser from '@lucide/svelte/icons/eraser';
@@ -476,8 +477,15 @@ export const COMMANDS = [
     run: (ctx) => (ctx.from === 'key' && String(globalThis.getSelection?.() ?? '') ? false : void ctx.svc.copy(ctx.plots).catch((error) => ctx.svc.toast.error(`Could not copy: ${error.message}`))),
   },
   {
+    // The picture of the plot it is made on, as the page shows it, with its legend: a PNG on the clipboard.
+    id: 'copyImage', scope: 'plot', palette: 'Plots', needs: ['workspace'],
+    icon: RiImage, label: 'Copy image',
+    run: (ctx) => void ctx.svc.copyImage(ctx.lead.id).catch((error) => ctx.svc.toast.error(`Could not copy the image: ${error.message}`)),
+  },
+  {
+    // Its data or its images, in the export dialog.
     id: 'exportData', scope: 'view', palette: 'Plots', needs: ['workspace'], empty: true,
-    icon: RiExport, label: 'Export data…',
+    icon: RiExport, label: 'Export…',
     value: (ctx) => (ctx.on ? plotsValue(ctx) : ctx.svc.selection.plots.size ? `${ctx.plots.length} selected` : counted(ctx.plots.length, 'plot')),
     run: (ctx) => ctx.svc.openExport(ctx.plots),
   },
@@ -833,9 +841,9 @@ export const HOSTED = ['workspace', 'live'];
  * `viewHistory`, `cursors`, `toast`, `edit(ids, what, fn)`, `group(what,
  * fn)`, which runs `fn` as one edit named `what`, `split(ids, dir,
  * fromKeys)`, `close(ids, fromKeys)`, `newPlot(keys)`, `copy(plots)`,
- * `copyCheck(plots)`, `openExport(plots)`, `picker(id, action)`,
- * `renameTab(id)`, `closeTab(tab)`, `dockShown(side)`, `toggleDock(side)`,
- * `exportTabs()` and `importTabs()`.
+ * `copyCheck(plots)`, `copyImage(id)`, `openExport(plots)`, `picker(id,
+ * action)`, `renameTab(id)`, `closeTab(tab)`, `dockShown(side)`,
+ * `toggleDock(side)`, `exportTabs()` and `importTabs()`.
  *
  * Where a command is made is {on, signal, signals, tab, from}: `on` the
  * plot it is made on, or null for the page; `signal` the signal whose row

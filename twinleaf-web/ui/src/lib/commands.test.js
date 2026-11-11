@@ -135,6 +135,7 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     newPlot: record('newPlot'),
     copy: record('copy'),
     copyCheck: record('copyCheck'),
+    copyImage: record('copyImage'),
     openExport: record('openExport'),
     picker: record('picker'),
     renameTab: (id) => void log.push(`renameTab ${id}`),

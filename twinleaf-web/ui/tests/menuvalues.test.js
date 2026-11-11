@@ -61,7 +61,7 @@ const CASES = [
   [['A', 'B', 'C'], 'the plot menu', 'A', {
     // 2 signals × 1,000 rows on A and on B, and C's 50 bins.
     'Copy data': '4,050 rows',
-    'Export data': '3 plots',
+    'Export…': '3 plots',
     // A's pair only, 2 s apart.
     'Add X cursors': '2.000 s',
     // A's shared axis, in V, and B's axis of sine.sine, in V; C's is in V/√Hz.
@@ -74,7 +74,7 @@ const CASES = [
   }],
   [[], 'the plot menu', 'B', {
     'Copy data': '2,000 rows',
-    'Export data': null,
+    'Export…': null,
     'Add X cursors': null,
     'Add Y cursors': 'sine.sine',
     'Clear cursors': null,
@@ -99,8 +99,8 @@ const CASES = [
   [['B'], 'the Signals list’s menu', null, { 'Add to plot': null }],
   [['B', 'D'], 'the Signals list’s menu', null, { 'Add to plot': '2 plots' }],
   [[], 'a tab’s menu', null, { Duplicate: '4 plots', Close: '4 plots' }],
-  [[], 'the File dropdown', null, { 'Export every tab': '2 tabs', 'Export data': '4 plots' }],
-  [['A', 'C'], 'the File dropdown', null, { 'Export data': '2 selected' }],
+  [[], 'the File dropdown', null, { 'Export every tab': '2 tabs', 'Export…': '4 plots' }],
+  [['A', 'C'], 'the File dropdown', null, { 'Export…': '2 selected' }],
   [[], 'the Layout dropdown', null, { 'Arrange this tab': '4 plots', Rows: '✓', Columns: null, Grid: null, Quadrants: null, 'One large': null }],
   // Devices is the first of the left dock's two panels; the right dock holds six.
   [[], 'a dock panel’s menu', null, { 'Move up': '1 of 2', 'Move down': '1 of 2', 'Move to the right dock': '6 panels' }],

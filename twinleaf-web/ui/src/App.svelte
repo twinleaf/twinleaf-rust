@@ -162,6 +162,7 @@
     newPlot: (keys) => newPlotWith(keys),
     copy: (targets) => copyData(targets),
     copyCheck: (targets) => copyCheck(targets),
+    copyImage: (id) => copyImage(id),
     openExport: (targets) => openExport(targets),
     renameTab: (id) => tabStrip.startRename(id),
     closeTab: (t) => closeTab(t),
@@ -675,19 +676,22 @@
   }
   let paletteOpen = $state(false);
   let keysOpen = $state(false);
-  // The export the dialog offers, or null: plots' signals, the time they
-  // show and the time the history holds of them.
+  // The export the dialog offers, or null: the plots it exports.
   let exporting = $state(null);
-  /** Offers to export the signals of `targets`, plots as commands.js gives them. */
+  /** Offers to export `targets`, plots as commands.js gives them: those that show a signal the hub has. */
   function openExport(targets) {
-    const session = hub.session, now = hub.now(clock.now());
-    const plots = targets.filter((t) => t.plot.items.length);
-    const traces = [...new Map(plots.flatMap(({ plot }) => plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean)).map((t) => [t.key, t])).values()];
-    if (!traces.length) return toast.warning('Nothing to export: the plots show no signals');
-    const ranges = plots.filter((t) => t.plot.kind === 'time').map((t) => t.view.range(now));
-    const shown = ranges.length ? [Math.min(...ranges.map((r) => r[0])), Math.max(...ranges.map((r) => r[1]))] : null;
-    const oldest = Math.min(...traces.map((t) => session.memory?.oldest?.[t.meta.id] ?? Infinity));
-    exporting = { hub: session.id, traces, shown, whole: [isFinite(oldest) ? oldest : -Infinity, now] };
+    const session = hub.session;
+    const ids = targets.filter((t) => t.plot.items.some((i) => session.byKey.get(i.key))).map((t) => t.id);
+    if (!ids.length) return toast.warning('Nothing to export: the plots show no signals');
+    exporting = { ids };
+  }
+
+  /** Puts plot `id`'s picture, as the page shows it, on the clipboard as a PNG. */
+  async function copyImage(id) {
+    const picture = plots.picture(id);
+    const blob = await new Promise((done) => picture.toBlob(done, 'image/png'));
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    toast.success('Image copied');
   }
 
   /**

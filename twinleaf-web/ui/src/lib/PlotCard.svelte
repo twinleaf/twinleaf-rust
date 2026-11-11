@@ -40,6 +40,7 @@
   import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
   import RiZoomTo from '@lucide/svelte/icons/zoom-in';
   import RiPeak from '@lucide/svelte/icons/mountain';
+  import CopyImageIcon from '@lucide/svelte/icons/image';
   import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, kindLabel } from './constants.js';
@@ -82,6 +83,8 @@
   const PEAKS = ['x1ToPeak', 'x2ToPeak', 'peakLeft', 'peakRight'];
   /** How Maximize reads on this plot, for its button. */
   const maximizeRow = $derived(commands.row('maximize', { on: plot.id }));
+  /** How Copy image reads on this plot, for its button in the plot's corner. */
+  const copyImageRow = $derived(commands.row('copyImage', { on: plot.id }));
 
   /** Each axis setting's buttons, as [value, what the button reads]; its tip names the value in full (commands.js AXIS_SETTINGS). */
   const CHOICES = {
@@ -873,6 +876,8 @@
     </ContextMenu.Root>
     <IconButton icon={RiAddSignal} label="Add a signal" keys={commandOf('addSignals').show} class="add-signal" tabindex={-1} onclick={(e) => openAdd(e.currentTarget, false)} />
     <div class="plot-actions flex shrink-0 items-center">
+      <!-- Copy image, shown while the pointer is on the plot. -->
+      {#if copyImageRow.offered}<IconButton icon={CopyImageIcon} label={copyImageRow.label} class="copy-image" tabindex={-1} data-command="copyImage" onclick={() => runHere('copyImage')} />{/if}
       <IconButton
         icon={RiLegend}
         label={plot.legend ? 'Hide the legend' : 'Show the legend in the plot'}
@@ -1131,6 +1136,7 @@
       {#if plot.items.length && place}
         <ContextMenu.Label>Data</ContextMenu.Label>
         <CommandItem id="copyData" on={plot.id} how={copyCheck} />
+        <CommandItem id="copyImage" on={plot.id} />
         <CommandItem id="exportData" on={plot.id} />
       {/if}
       <ContextMenu.Label>Cursors</ContextMenu.Label>
