@@ -15,8 +15,8 @@
 import { describe, expect, it } from 'vitest';
 import { commands } from 'vitest/browser';
 import fc from 'fast-check';
-import { MENUS, closeAll, openMenu } from './harness/menus.js';
-import { centre, click, clickOn, editCursors, feed, focusPage, leafOf, mountPage, pressKey, rightClick, settle, until, wait, withExamples, withYPair } from './harness/page.js';
+import { MENUS, axisPopover, closeAll, openMenu } from './harness/menus.js';
+import { centre, click, clickOn, editCursors, feed, focusPage, leafOf, mountPage, pressKey, rightClick, settle, typeInto, until, wait, withExamples, withYPair } from './harness/page.js';
 import { COMMANDS } from '../src/lib/commands.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
@@ -25,8 +25,9 @@ const SIGNALS = ['sine.sine', 'aux.triangle'];
 
 /**
  * Four plots in rows, each of both signals with its legend and cursors
- * placed, the last a spectrum, another tab, and a signal in the Signals
- * list that no plot shows: every origin of every command shows on it.
+ * placed, the first independent, with an axis a signal, and the last a
+ * spectrum, another tab, and a signal in the Signals list that no plot
+ * shows: every origin of every command shows on its first or its last plot.
  */
 async function commandPage() {
   const page = await mountPage([SIGNALS, SIGNALS, SIGNALS, SIGNALS], 'rows', 1, [...SIGNALS, 'mag.x']);
@@ -36,14 +37,14 @@ async function commandPage() {
   session.apply({ kind: 'spectra', spectra: [...session.traces.values()].map((t) => ({ id: t.meta.id, f, a: f.map((v) => ([2, 5, 20].includes(v) ? 1 : 0.1)), floor: 0.02 })) }, perf);
   session.tick(perf);
   const ids = plotIds(page.ws.layout);
-  page.history.group('Prepare', () => ids.forEach((id, i) => page.ws.setPlot(id, { legend: true, ...(i === 3 && { kind: 'spectrum' }) })));
+  page.history.group('Prepare', () => ids.forEach((id, i) => page.ws.setPlot(id, { legend: true, ...(i === 0 && { mode: 'independent' }), ...(i === 3 && { kind: 'spectrum' }) })));
   await wait(300);
   await settle();
   for (const id of ids) {
     const kind = page.ws.plots[id].kind;
     // A time plot paused over the samples, as its X cursors mark moments of them, so they have peaks in view.
     if (kind === 'time') page.views.get(id).show(10, 20, clock.now());
-    editCursors(page, id, (c) => withYPair({ ...c, ...(kind === 'time' ? { x: { a: 14, b: 16 } } : { f: { a: 3, b: 7 } }) }, kind, 'shared', 0.1, 0.5));
+    editCursors(page, id, (c) => withYPair({ ...c, ...(kind === 'time' ? { x: { a: 14, b: 16 } } : { f: { a: 3, b: 7 } }) }, kind, page.pv(id).yAxes[0].key, 0.1, 0.5));
   }
   // The legend and the readout show what a frame drew a few times a second.
   await wait(200);
@@ -55,15 +56,6 @@ async function commandPage() {
 const naming = (el, id) => [...(el?.querySelectorAll(`[data-command="${id}"]`) ?? [])];
 /** Brings the pointer over plot `id`, so its header shows its buttons. */
 const hover = (id) => commands.mouse([['move', ...centre(leafOf(id))]]);
-/** Right-clicks plot `id`'s axis `which` ('x', or 'y' for its first y axis), which opens its popover. */
-async function axisPopover(page, id, which) {
-  const pv = page.pv(id), P = pv.geo.plot, band = pv.axisBands[0];
-  // The y axis low down, clear of the readout in the plot's top left corner.
-  await rightClick(which === 'x' ? [P.x + P.w / 2, P.y + P.h + 8] : [(band.x0 + band.x1) / 2, P.y + P.h * 0.9]);
-  const open = () => document.querySelector('[data-slot=popover-content][data-state=open]');
-  await until(open, 2000);
-  return open();
-}
 
 /**
  * The origins made on plot `id`: each opens what holds its control and
@@ -79,6 +71,8 @@ const ON_PLOT = {
     return openMenu();
   },
   'the readout’s menu': async (page, id) => (await rightClick(centre(leafOf(id).querySelector('.cursor-readout'))), openMenu()),
+  'a chip’s menu': (page, id) => MENUS['a chip’s menu'](page, id),
+  'the add-signal menu': (page, id) => MENUS['the add-signal menu'](page, id),
   'the header': async (page, id) => (await hover(id), leafOf(id).querySelector('.plot-head')),
   'the x axis': (page, id) => axisPopover(page, id, 'x'),
   'the y axis': (page, id) => axisPopover(page, id, 'y'),
@@ -118,6 +112,35 @@ function keyOf(c) {
   return c.show?.includes('Ctrl') ? c.show.map((k) => (k === 'Ctrl' ? 'Control' : k.toLowerCase())).join('+') : null;
 }
 
+/** A list of values a control opens: a row's submenu, or a dropdown's list. */
+const VALUES = '[data-slot$=-menu-sub-content], [data-slot=select-content]';
+/** What a field with no value of its own takes: a window, a frequency, or the low end of a range, of which a field takes one. */
+const TYPED = ['5', '0.001'];
+/**
+ * Makes the gesture of `control`, which names a command, until `ran()`: a
+ * click; on a control that opens a list of values, a click then on the
+ * first value there that is not the one chosen; in a field, or in the
+ * first field of a group of them, a value typed and Enter.
+ */
+async function make(control, ran) {
+  control.scrollIntoView({ block: 'nearest' });
+  const field = control.matches('input') ? control : control.querySelector('input');
+  if (field) {
+    for (const text of TYPED) {
+      if (ran()) return;
+      await typeInto(field, text);
+      await pressKey('Enter');
+      await settle();
+    }
+    return;
+  }
+  const open = [...document.querySelectorAll(VALUES)];
+  await click(centre(control));
+  const list = [...document.querySelectorAll(VALUES)].find((l) => !open.includes(l));
+  const value = list?.querySelector('[role=menuitemradio][aria-checked=false], [role=menuitem], [role=option][aria-selected=false]');
+  if (value) await click(centre(value));
+}
+
 /** Has every command record what it is run on into `calls`, in place of running; returns what puts them back. */
 function record(calls) {
   const runs = COMMANDS.map((c) => [c, c.run]);
@@ -131,21 +154,26 @@ describe('a plot command', () => {
     const calls = [], restore = record(calls);
     // Which origin offers which command, found on the page.
     const offers = new Map(COMMANDS.map((c) => [c.id, []]));
+    // The plots, of the first and the last, on which an origin of each command was first found.
+    const foundOn = new Map(COMMANDS.map((c) => [c.id, new Set([0])]));
     const reached = new Map(COMMANDS.map((c) => [c.id, new Set()]));
     try {
       const named = new Set();
       // One plot selected, so a signal's menu has both of its rows, each on a signal.
       page.ws.selection.only([page.ids[0]]);
       await settle();
+      // An origin made on a plot is opened on the first plot and on the last, the spectrum, as some controls are a time plot's or a spectrum's alone.
       for (const [name, open] of [...Object.entries(ON_PLOT), ...Object.entries(ON_PAGE)]) {
-        // An origin that opens by command is opened for each.
-        for (const c of open.length > 2 ? COMMANDS : [null]) {
-          await closeAll();
-          expect(await closePalette(), 'the palette gone').toBe(true);
-          const el = await open(page, page.ids[0], c?.id);
-          expect(el, `${name} opens`).toBeTruthy();
-          for (const row of el.querySelectorAll('[data-command]')) named.add(row.dataset.command);
-          for (const x of c ? [c] : COMMANDS) if (naming(el, x.id).length) offers.get(x.id).push(name);
+        for (const k of ON_PLOT[name] ? [0, 3] : [0]) {
+          // An origin that opens by command is opened for each.
+          for (const c of open.length > 2 ? COMMANDS : [null]) {
+            await closeAll();
+            expect(await closePalette(), 'the palette gone').toBe(true);
+            const el = await open(page, page.ids[k], c?.id);
+            expect(el, `${name} opens`).toBeTruthy();
+            for (const row of el.querySelectorAll('[data-command]')) named.add(row.dataset.command);
+            for (const x of c ? [c] : COMMANDS) if (naming(el, x.id).length && !offers.get(x.id).includes(name)) (offers.get(x.id).push(name), foundOn.get(x.id).add(k));
+          }
         }
       }
       await closeAll();
@@ -185,14 +213,13 @@ describe('a plot command', () => {
               const control = naming(el, id)[0];
               // A control the plot shows only for some plots, as a time axis's pause, is not this plot's; nor is a signal's row the menu has only for some selections.
               if (!control) return false;
-              control.scrollIntoView({ block: 'nearest' });
-              await click(centre(control));
+              await make(control, () => calls.length > 0);
             });
           }
           const key = keyOf(c);
           // A key of the Signals list is pressed there, on a signal a click picked.
           if (key) await check('its key', fromPage, async () => (c.place === 'list' && (await clickOn(listSignals()[0])), pressKey(key)));
-          if (c.label && !c.needs?.some((n) => n === 'axis' || n === 'signals')) {
+          if (c.palette) {
             await check('the palette', fromPage, async () => {
               await pressKey('Control+k');
               await settle();
@@ -209,16 +236,17 @@ describe('a plot command', () => {
             });
           }
         }),
-        // A command the palette does not offer, then one whose first origin is a plot's header; each command on a plot in a selection of two; then random cases.
-        withExamples([['splitRight', [], 0], ['pause', [3], 0], ...COMMANDS.map((c) => [c.id, [0, 3], 0])]),
+        // A command the palette does not offer, then one whose first origin is a plot's header; each command on each plot an origin of it was found on, in a selection of the two; then random cases.
+        withExamples([['splitRight', [], 0], ['pause', [3], 0], ...COMMANDS.flatMap((c) => [...foundOn.get(c.id)].map((k) => [c.id, [0, 3], k]))]),
       );
     } finally {
       restore();
       page.dispose();
     }
-    // Each command is reached, and from every origin that offers it.
+    // Each command is reached from somewhere, and from every origin that offers it.
     for (const c of COMMANDS) {
-      const want = [...offers.get(c.id), ...(keyOf(c) ? ['its key'] : []), ...(c.label && !c.needs?.some((n) => n === 'axis' || n === 'signals') ? ['the palette'] : [])];
+      const want = [...offers.get(c.id), ...(keyOf(c) ? ['its key'] : []), ...(c.palette ? ['the palette'] : [])];
+      expect(want.length, `${c.id} has an origin on the page`).toBeGreaterThan(0);
       expect([...reached.get(c.id)].sort(), c.id).toEqual(want.sort());
     }
   }, 600_000);

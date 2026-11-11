@@ -174,14 +174,6 @@
     viewChanged,
     place: {
       startMove: (id, e) => drags.startMove(id, e),
-      otherTabs: () => ws.tabs.filter((t) => t.id !== ws.activeId),
-      tabName: () => ws.tab.name,
-      moveToTab(id, tabId) {
-        const ids = plots.targets(id);
-        history.group(`Move ${plotsText(ids.length)} to ${ws.tabs.find((t) => t.id === tabId)?.name ?? 'a tab'}`, () => {
-          for (const i of ids) ws.movePlotToTab(i, tabId);
-        });
-      },
       otherPlots: (id) =>
         plotIds(ws.layout)
           .filter((p) => p !== id)
@@ -668,12 +660,6 @@
     };
   });
 
-  /** Sets the window of the views the toolbar acts on: a window typed is a step of its own, the field's arrows and wheel one burst. */
-  function setSpan(v, typed) {
-    const vs = chosen(), set = () => vs.forEach((vw) => vw.setSpan(v));
-    if (typed) viewHistory.step(set);
-    else viewHistory.burst('window', vs, set);
-  }
   /**
    * The toolbar's Live button: pauses every time plot of the tab while all
    * follow live, as one view step, or has them all follow live back at
@@ -960,7 +946,7 @@
         {/snippet}
       </Tip>
       <!-- The time window the plots show, typed or stepped. -->
-      <WindowField value={span} onchange={setSpan} widest={widestWindow} />
+      <WindowField data-command="window" value={span} onchange={(s, typed) => commands.run('window', { from: 'toolbar', how: { s, typed } })} widest={widestWindow} />
       <IconButton icon={RiEraser} label="Clear the cursors" data-keeps-selection data-command="clearCursors" onclick={() => commands.run('clearCursors', { from: 'toolbar' })} />
       <DropdownMenu.Root>
         <Tip text="Arrange this tab's plots">

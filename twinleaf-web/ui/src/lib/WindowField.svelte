@@ -17,9 +17,10 @@
   /**
    * `value` is the window shown, in seconds, and `widest()` the widest the
    * views can show now. `onchange(s, typed)` sets a window: `typed` for one
-   * typed, else a step of the arrows or the wheel.
+   * typed, else a step of the arrows or the wheel. Any other attribute is
+   * the field's own, as the command it runs (`data-command`).
    */
-  let { value, onchange, widest } = $props();
+  let { value, onchange, widest, ...own } = $props();
 
   let box = $state();
   // What the field holds while it is typed in, or null; why what was set from it was refused, or null, and the widest then.
@@ -75,7 +76,7 @@
   }
 </script>
 
-<label class="window-field" class:invalid={!!refused} bind:this={box} onwheel={wheel} data-keeps-selection>
+<label class="window-field" class:invalid={!!refused} bind:this={box} onwheel={wheel} data-keeps-selection {...own}>
   <input
     type="text"
     autocomplete="off"

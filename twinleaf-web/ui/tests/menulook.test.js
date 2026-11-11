@@ -5,7 +5,9 @@
 // column wide, or while the hints show its shortcut in the value's place;
 // and one right edge for the shortcuts, the values and the arrows.
 import { describe, expect, it } from 'vitest';
-import { MENUS, closeAll, menuPage } from './harness/menus.js';
+import { page as browser } from 'vitest/browser';
+import { MENUS, axisPopover, closeAll, menuPage, openMenu, row } from './harness/menus.js';
+import { centre, click, pressKey, settle, until, wait } from './harness/page.js';
 import { prefs } from '../src/lib/prefs.svelte.js';
 
 /** Whether `el` shows: it and every element it is in are displayed. */
@@ -95,4 +97,66 @@ describe('every menu', () => {
       page.dispose();
     }
   }, 120_000);
+});
+
+/** Where VITE_TL_SHOTS names a folder, each menu, popover and box of the page is saved there as a picture, to compare by eye and pixel for pixel. */
+const SHOTS = import.meta.env.VITE_TL_SHOTS;
+describe.skipIf(!SHOTS)('every menu, popover and box', () => {
+  it('is saved as a picture', async () => {
+    const page = await menuPage();
+    /** Saves the page as `name`, and `el`, once nothing in it is still fading in, as `name`.el, which is what holds still from run to run. */
+    const shot = async (name, el) => {
+      const path = `${SHOTS}/${name.replace(/[^\w-]+/g, '-')}`;
+      await until(() => !el.getAnimations({ subtree: true }).some((a) => a.playState === 'running'), 2000);
+      await browser.screenshot({ path: `${path}.png` });
+      await browser.screenshot({ element: el, path: `${path}.el.png` });
+    };
+    try {
+      // The third plot a spectrum, so an axis of each kind has its popover.
+      page.history.group('Prepare', () => page.ws.setPlot(page.ids[2], { kind: 'spectrum' }));
+      await wait(300);
+      await settle();
+      for (const hints of [true, false]) {
+        prefs.setHints(hints);
+        for (const [name, open] of Object.entries(MENUS)) {
+          await closeAll();
+          const menu = await open(page, page.ids[0]);
+          expect(menu, `${name} opens`).toBeTruthy();
+          await shot(`${name}${hints ? '' : ' unhinted'}`, menu);
+        }
+      }
+      prefs.setHints(true);
+      for (const sub of ['X cursors to peaks', 'Layout']) {
+        await closeAll();
+        await MENUS['the plot menu'](page, page.ids[0]);
+        await click(centre(row(sub)));
+        await shot(`the ${sub} submenu`, openMenu(true));
+      }
+      for (const [i, which] of [[0, 'x'], [0, 'y'], [1, 'y'], [2, 'x'], [2, 'y']]) {
+        await closeAll();
+        const popover = await axisPopover(page, page.ids[i], which);
+        expect(popover, `plot ${i}'s ${which} axis popover opens`).toBeTruthy();
+        await shot(`the ${which} axis popover of plot ${i}`, popover);
+      }
+      await closeAll();
+      await pressKey('Control+k');
+      await settle();
+      const list = document.querySelector('[data-slot=command-list]'), box = list.closest('[role=dialog]');
+      await shot('the Commands box', box);
+      for (let at = 1; list.scrollTop + list.clientHeight < list.scrollHeight - 1; at++) {
+        list.scrollTop += list.clientHeight;
+        await settle();
+        await shot(`the Commands box, page ${at}`, box);
+      }
+      await pressKey('Escape');
+      await until(() => !document.querySelector('[data-slot=dialog-overlay]'), 2000);
+      await pressKey('?');
+      await settle();
+      await shot('the keys sheet', document.querySelector('[role=dialog]'));
+      await pressKey('Escape');
+    } finally {
+      prefs.setHints(true);
+      page.dispose();
+    }
+  }, 240_000);
 });

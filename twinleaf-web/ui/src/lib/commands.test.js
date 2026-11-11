@@ -17,7 +17,7 @@
 // rows say why.
 import { afterEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { COMMANDS, HOSTED, commandOf, commands } from './commands.js';
+import { COMMANDS, HOSTED, PALETTE, commandOf, commands } from './commands.js';
 import { KEYMAP, actionFor, scopeOf } from './keymap.js';
 import { KINDS } from './constants.js';
 import { SIGNAL, Selection } from './selection.svelte.js';
@@ -39,8 +39,9 @@ describe('the command table', () => {
       // A key is shown and named; a row has an icon to go with its label.
       if (c.keys) expect(c.show?.length && c.what, c.id).toBeTruthy();
       if (c.label) expect(c.icon, c.id).toBeTruthy();
-      // A command reached by no key, no row and no palette is reached by nothing.
-      expect(!!(c.keys || c.label), c.id).toBe(true);
+      // The palette lists it by its label, under a heading the palette has; a submenu marks one of the values it lists.
+      if (c.palette) expect(c.label && PALETTE.includes(c.palette), c.id).toBeTruthy();
+      if (c.choices || c.chosen) expect(c.label && typeof c.choices, c.id).toBe('function');
     }
   });
 
@@ -82,8 +83,10 @@ function plotOf(id, kind, log, live = true, items = ['s']) {
  * Commands over plots of `kinds` (one per id), each showing signals `items`, 's' unless given,
  * with `picked` selected, `last` clicked last and `signals` picked in the
  * Signals list: every service records what it is asked into `log`,
- * and the workspace holds only which plots are maximized, which a command
- * changes by `maximize` and `restoreLayout` alone.
+ * and the workspace holds no plot to read: only which plots are maximized,
+ * which a command changes by `maximize` and `restoreLayout` alone, its tabs
+ * by name, T open and U beside it, and `setView` and `movePlotToTab`, which
+ * record the plot each is asked to change.
  */
 function page(kinds, picked, last, log, maximized = null, signals = ['s'], items = ['s'], lacks = []) {
   const shown = IDS.slice(0, kinds.length);
@@ -94,6 +97,11 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     maximized,
     maximize: (ids) => ((view.maximized = ids), void log.push(`maximize ${ids}`)),
     restoreLayout: () => ((view.maximized = null), void log.push('restoreLayout')),
+    tabs: [{ id: 'T', name: 'T' }, { id: 'U', name: 'U' }],
+    tab: { id: 'T', name: 'T' },
+    activeId: 'T',
+    setView: (id) => void log.push(`setView ${id}`),
+    movePlotToTab: (id, tab) => void log.push(`movePlotToTab ${id} ${tab}`),
   };
   const ws = new Proxy(view, {
     get: (t, key) => (key in t ? t[key] : expect.unreachable(`a command read ws.${String(key)}`)),
@@ -111,8 +119,9 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     selection,
     viewHistory: { step: (fn) => fn(), burst: (kind, views, fn) => fn(), follow: record('follow') },
     cursors: { set: (what, byId) => log.push(`cursors ${what} ${[...byId.keys()]}`), clear: record('clear'), lastX: () => 'a' },
-    toast: { error: record('toast') },
+    toast: { error: record('toast'), success: record('toast') },
     edit: record('edit'),
+    group: (what, fn) => (log.push(`group ${what}`), fn()),
     split: record('split'),
     close: record('close'),
     newPlot: record('newPlot'),
@@ -204,12 +213,13 @@ describe('a command', () => {
     expect(p.cmds.row('exportData', { on: 'c' }).value).toBe(null);
     expect(p.cmds.row('maximize', { on: 'a' }).label).toBe('Maximize');
     expect(p.cmds.row('copyData', { on: 'a', how: { state: 'too-many', rows: 200000, reason: 'More' } })).toMatchObject({ disabled: true, value: { text: '200,000 rows', warn: true } });
-    // The palette offers no command that needs an axis, and none with no plots to act on.
+    // The palette offers the commands the table lists there, so none that needs an axis, and none with no plots to act on.
     const offered = p.cmds.offered().map((c) => c.id);
     expect(offered).not.toContain('addYCursors');
     expect(offered).toContain('splitRight');
+    expect(COMMANDS.filter((c) => c.palette && c.needs?.some((n) => !HOSTED.includes(n))).map((c) => c.id)).toEqual([]);
     const none = page(['time'], [], null, log);
-    expect(none.cmds.offered().map((c) => c.id)).toEqual(COMMANDS.filter((c) => c.label && c.scope === 'view' && !c.needs?.includes('axis')).map((c) => c.id));
+    expect(none.cmds.offered().map((c) => c.id)).toEqual(COMMANDS.filter((c) => c.palette && c.scope === 'view').map((c) => c.id));
     // With none selected, Restore is offered while plots are maximized, as F then restores.
     expect(page(['time'], [], null, log, ['a']).cmds.offered()).toContainEqual({ id: 'maximize', label: 'Restore' });
   });

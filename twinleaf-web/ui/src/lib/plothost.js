@@ -11,7 +11,7 @@
 //   the windows of the hub's history a paused plot reads (`readWindows`),
 //   which the host asks for as each view moves;
 // - the settings document: `plot(id)`, the settings of plot `id`, of a
-//   Workspace of its own (`ws`), edited through `edit`, `each` and
+//   Workspace of its own (`ws`), edited through the commands, `edit` and
 //   `setView`, each edit a step of `history`;
 // - the view: `view(id)`, plot `id`'s View, and `viewHistory`, the steps
 //   Back and Forward go through;
@@ -26,9 +26,9 @@
 //   the one way to a plot's pixels;
 // - the selection: `selected`, `select`, `point` and `press`;
 // - `place`, what a page that lays its plots out in tabs adds, or null:
-//   {startMove(id, e), otherTabs(), tabName(), moveToTab(id, tabId),
-//   otherPlots(id), moveSignal(id, key, to), traceDragStart(),
-//   landSignal(id, item, items)}. The page gives it, with what its
+//   {startMove(id, e), otherPlots(id), moveSignal(id, key, to),
+//   traceDragStart(), landSignal(id, item, items)}. The page gives it,
+//   with what its
 //   commands need of a page, through `serve`; a host never served has no
 //   workspace (commands.js `needs`), and its commands that need one do not
 //   run and have no rows.
@@ -95,6 +95,7 @@ export class PlotHost {
       cursors: this.cursors,
       toast,
       edit: (ids, what, fn) => this.editEach(ids, what, fn),
+      group: (what, fn) => history.group(what, fn),
       split: (ids, dir, fromKeys) => this.#page.split(ids, dir, fromKeys),
       close: (ids, fromKeys) => this.#page.close(ids, fromKeys),
       newPlot: (keys) => this.#page.newPlot(keys),
@@ -169,11 +170,6 @@ export class PlotHost {
         }
       }),
     );
-  }
-
-  /** `editEach` on the plots a command made on plot `id` acts on. */
-  each(id, what, fn) {
-    this.editEach(this.targets(id), what, fn);
   }
 
   /** Gives plot `id` the fields of `patch`, as one step undo names `what`. */

@@ -3,7 +3,7 @@
 // another tab and properties.
 import { expect } from 'vitest';
 import { commands } from 'vitest/browser';
-import { centre, click, editCursors, feed, leafOf, mountPage, rightClick, settle, wait, withYPair } from './page.js';
+import { centre, click, editCursors, feed, leafOf, mountPage, rightClick, settle, until, wait, withYPair } from './page.js';
 import { plotIds } from '../../src/lib/layout.js';
 
 export { OPEN, click, closeAll, leafOf, rightClick, settle } from './page.js';
@@ -55,6 +55,16 @@ export function plotArea(page, id, under = false) {
   const over = document.elementFromPoint(P.x + P.w * 0.75, P.y + P.h * 0.75);
   expect(spot, `plot ${id}: a spot of its plot area clear of what lies over it, as ${over?.dataset.slot ?? over?.className} does its lower right`).toBeTruthy();
   return spot;
+}
+
+/** Right-clicks plot `id`'s axis `which` ('x', or 'y' for its first y axis), which opens its popover, and returns it. */
+export async function axisPopover(page, id, which) {
+  const pv = page.pv(id), P = pv.geo.plot, band = pv.axisBands[0];
+  // The y axis low down, clear of the readout in the plot's top left corner.
+  await rightClick(which === 'x' ? [P.x + P.w / 2, P.y + P.h + 8] : [(band.x0 + band.x1) / 2, P.y + P.h * 0.9]);
+  const open = () => document.querySelector('[data-slot=popover-content][data-state=open]');
+  await until(open, 2000);
+  return open();
 }
 
 /** Each menu of the page, `open(page, id)` opening it on plot `id` where it is a plot's, and returning it. */

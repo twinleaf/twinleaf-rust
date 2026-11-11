@@ -6,7 +6,7 @@
   // lane per signal.
   //
   // As in a menu bar, ← → move from one open dropdown to the other.
-  import { onDestroy, tick } from 'svelte';
+  import { getContext, onDestroy, tick } from 'svelte';
   import { claim } from './keyrouter.js';
   import * as clock from './clock.js';
   import * as Select from '$lib/components/ui/select/index.js';
@@ -23,9 +23,13 @@
    * `plot` is the plot whose `kind` and `mode` these show. `open` is the kind
    * dropdown's, which the parent's K key opens, and `onOpenChange` hears
    * both dropdowns, so the parent can take focus back once neither is open.
-   * `onKind(kind)` and `onMode(mode)` set them.
+   * A choice runs the plot's Kind or Layout command (commands.js), made on
+   * this plot.
    */
-  let { plot, open = $bindable(false), onOpenChange, onKind, onMode } = $props();
+  let { plot, open = $bindable(false), onOpenChange } = $props();
+  const commands = getContext('commands');
+  /** Runs command `id`, made on this plot from its dropdown, with the value chosen. */
+  const choose = (id) => (to) => commands.run(id, { on: plot.id, from: 'button', how: { to } });
 
   const ICONS = { time: RiTime, spectrum: RiSpectrum, overlay: RiOverlay, independent: RiIndependent, stacked: RiStacked };
   const nameOf = (list, value) => list.find(([v]) => v === value)?.[1] ?? value;
@@ -66,22 +70,22 @@
   {/each}
 {/snippet}
 
-<Select.Root type="single" value={plot.kind} onValueChange={onKind} bind:open onOpenChange={changed}>
+<Select.Root type="single" value={plot.kind} onValueChange={choose('setKind')} bind:open onOpenChange={changed}>
   <Tip text="Kind: {nameOf(KINDS, plot.kind)}" keys={commandOf('kind').show}>
     {#snippet children(tip)}
       {@const Icon = ICONS[plot.kind]}
-      <Select.Trigger {...tip} bind:ref={kindTrigger} size="sm" class="kind-select" tabindex={-1} aria-label="Plot kind: {nameOf(KINDS, plot.kind)}">
+      <Select.Trigger {...tip} bind:ref={kindTrigger} size="sm" class="kind-select" tabindex={-1} data-command="setKind" aria-label="Plot kind: {nameOf(KINDS, plot.kind)}">
         <Icon />
       </Select.Trigger>
     {/snippet}
   </Tip>
   <Select.Content>{@render items(KINDS)}</Select.Content>
 </Select.Root>
-<Select.Root type="single" value={plot.mode} onValueChange={onMode} bind:open={layoutOpen} onOpenChange={changed}>
+<Select.Root type="single" value={plot.mode} onValueChange={choose('setLayout')} bind:open={layoutOpen} onOpenChange={changed}>
   <Tip text="Layout: {nameOf(MODES, plot.mode)}">
     {#snippet children(tip)}
       {@const Icon = ICONS[plot.mode]}
-      <Select.Trigger {...tip} bind:ref={layoutTrigger} size="sm" class="kind-select" tabindex={-1} aria-label="Plot layout: {nameOf(MODES, plot.mode)}">
+      <Select.Trigger {...tip} bind:ref={layoutTrigger} size="sm" class="kind-select" tabindex={-1} data-command="setLayout" aria-label="Plot layout: {nameOf(MODES, plot.mode)}">
         <Icon />
       </Select.Trigger>
     {/snippet}

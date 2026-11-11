@@ -13,23 +13,17 @@
   import RiRemoveAxis from '@lucide/svelte/icons/trash-2';
   import RiFit from '@lucide/svelte/icons/unfold-vertical';
   import RiFitX from '@lucide/svelte/icons/unfold-horizontal';
-  import { common, counted } from './menus.js';
-  import RiSpan from '@lucide/svelte/icons/ruler-dimension-line';
+  import { counted } from './menus.js';
   import RiShowOnly from '@lucide/svelte/icons/eye';
   import RiHide from '@lucide/svelte/icons/eye-off';
   import RiPalette from '@lucide/svelte/icons/palette';
-  import RiAxis from '@lucide/svelte/icons/arrow-right-left';
   import RiMove from '@lucide/svelte/icons/square-arrow-out-up-right';
   import RiTrash from '@lucide/svelte/icons/trash-2';
-  import RiCopy from '@lucide/svelte/icons/clipboard-copy';
   import RiEraser from '@lucide/svelte/icons/eraser';
-  import RiTab from '@lucide/svelte/icons/app-window';
-  import RiKind from '@lucide/svelte/icons/chart-line';
-  import RiLayout from '@lucide/svelte/icons/layers';
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import IconButton from './IconButton.svelte';
   import CommandItem from './CommandItem.svelte';
-  import { AXIS_SETTINGS, axesLike, commandOf, cursorPeers, xSpan } from './commands.js';
+  import { AXIS_SETTINGS, commandOf, cursorPeers } from './commands.js';
   import { DIGITS, axisFormat } from './units.js';
   import KindPicker from './KindPicker.svelte';
   import { claim } from './keyrouter.js';
@@ -46,13 +40,10 @@
   import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
   import RiZoomTo from '@lucide/svelte/icons/zoom-in';
   import RiPeak from '@lucide/svelte/icons/mountain';
-  import { PlotView, axisSlots, colorOf, cursorText, monitorOf } from './plot.js';
+  import { PlotView, axisSlots, colorOf, monitorOf } from './plot.js';
   import Swatch from './Swatch.svelte';
-  import { DRAG_START, KINDS, MODES, kindLabel } from './constants.js';
-  import { writeTables } from './copy.js';
-  import { toast } from './toast.svelte.js';
+  import { DRAG_START, kindLabel } from './constants.js';
   import { stepIn } from './keymap.js';
-  import { chip } from './tabs.js';
   import WindowField from './WindowField.svelte';
   import * as clock from './clock.js';
 
@@ -71,14 +62,8 @@
   setContext('colors', colors);
   /** The plot's View, and whether it is selected. */
   const view = $derived(host.view(plot.id)), selected = $derived(host.selected(plot.id));
-  /** The plots a command or a gesture here acts on, by id; their views; and their settings. */
-  const targetIds = () => host.targets(plot.id);
-  const targets = () => targetIds().map((id) => host.view(id));
-  const targetPlots = () => targetIds().map((id) => host.plot(id));
-  /** Edits: `fn(plot)`'s fields on each plot a command here acts on, `patch` on this plot, and what a view shows on those of its kind. */
-  const onEach = (what, fn) => host.each(plot.id, what, fn);
+  /** An edit of this plot alone: its fields `patch`, as one step named `what`. */
   const onEdit = (what, patch) => host.edit(plot.id, what, patch);
-  const onView = (patch) => host.setView(plot.id, patch);
   /** The selection: focus or a press that lands here, a press on the plot's controls, and a click. */
   const onFocus = () => host.point(plot.id);
   const onPress = () => host.press(plot.id);
@@ -86,9 +71,8 @@
   /** What a page that lays its plots out in tabs adds (PlotHost `place`), or null: moving the plot and its signals among the page's plots and tabs. */
   // svelte-ignore state_referenced_locally
   const place = host.place;
-  const otherTabs = $derived(place?.otherTabs() ?? []), tabName = $derived(place?.tabName() ?? ''), otherPlots = $derived(place?.otherPlots(plot.id) ?? []);
+  const otherPlots = $derived(place?.otherPlots(plot.id) ?? []);
   const onStartMove = (e) => place?.startMove(plot.id, e);
-  const onMoveToTab = (tabId) => place?.moveToTab(plot.id, tabId);
   const onTraceDragStart = () => place?.traceDragStart();
   const onLandSignal = (item, items) => place?.landSignal(plot.id, item, items);
   const onMoveSignal = (key, to) => place?.moveSignal(plot.id, key, to);
@@ -99,65 +83,12 @@
   /** How Maximize reads on this plot, for its button. */
   const maximizeRow = $derived(commands.row('maximize', { on: plot.id }));
 
-  /** Runs `fn(pv)` on the PlotView of each plot a command here acts on. */
-  const eachPv = (fn) => {
-    const ids = targetIds();
-    for (const p of registry) if (ids.includes(p.plotId)) fn(p);
-  };
-  /** Runs `fn`, a command here that moves the views, as one view step, however many plots it moves. */
-  const asStep = (fn) => viewHistory.step(fn);
-  /**
-   * Gives each plot a cursor command here acts on the cursors `fn(pv)`
-   * returns for it, as one edit named `what`: `each` runs over those
-   * plots, `eachPv` by default, or `eachAxis` of an axis.
-   */
-  const editCursors = (what, fn, each = eachPv) => {
-    const byId = new Map();
-    each((p, axis) => byId.set(p.plotId, fn(p, axis)));
-    cursors.set(what, byId);
-  };
-  const clearXCursors = () => editCursors('Clear X cursors', (p) => p.xCursorsCleared());
-  /** Removes the Y cursors of the axis of each plot that matches this plot's y axis `key`, or with no key, of every axis of each plot. */
-  const clearYCursors = (key) => editCursors('Clear Y cursors', (p, axis) => p.yCursorsCleared(axis), key === undefined ? eachPv : (fn) => eachAxis(key, fn));
-  /**
-   * Runs `fn(pv, axis)` for a command made on this plot's y axis `key`, on
-   * the PlotView of each plot the command acts on, `axis` the key of that
-   * plot's y axis in the same units as this one (commands.js `axesLike`).
-   */
-  const eachAxis = (key, fn) => axesLike(pv, targetPvs(), key).forEach(([p, axis]) => fn(p, axis));
-  /** Sets y scale `scale` on each plot a command on this plot's y axis `key` acts on: those with an axis in its units. */
-  function setYScale(key, scale) {
-    const ids = new Set();
-    eachAxis(key, (p) => ids.add(p.plotId));
-    onEach(scale === 'log' ? 'Log density scale' : 'Linear density scale', (p) => (ids.has(p.id) ? { yScale: scale } : null));
-  }
   /** Each axis setting's buttons, as [value, what the button reads]; its tip names the value in full (commands.js AXIS_SETTINGS). */
   const CHOICES = {
     label: [['off', 'Off'], ['units', 'Units'], ['name', 'Name']],
     digits: [[null, 'Auto'], ...DIGITS.map((d) => [d, String(d)])],
     notation: [['auto', 'Auto'], ['plain', 'Plain'], ['exp', 'Exp']],
   };
-  // What the menus' rows say of the plots their commands act on (menus.js):
-  // a count over them, a setting they share, or how many they are where a
-  // row names plots. Each is read as its menu opens.
-  /** The PlotViews of the plots a command here acts on. */
-  const targetPvs = () => {
-    const ids = targetIds();
-    return [...registry].filter((p) => ids.includes(p.plotId));
-  };
-  /** The first X cursor placed on the plots a command here acts on that have one, named to tell it from its pair, or from the view's width. */
-  function xFirst() {
-    return common(targetPvs().flatMap((p) => {
-      const { a, b } = p.markers(), at = a ?? b;
-      if (at === null) return [];
-      const between = a !== null && b !== null ? Math.abs(b - a) : p.xd ? p.xd[1] - p.xd[0] : 0;
-      return [`${a !== null ? 'X1' : 'X2'} ${cursorText(p.xKind()).at(at, between)}`];
-    }));
-  }
-  /** The name list `list` (KINDS, MODES) gives value `v`. */
-  const nameIn = (list, v) => list.find((x) => x[0] === v)?.[1] ?? v;
-  /** Sets `field` to `value` on each plot a command here acts on of this plot's kind, as a frequency axis's scale; `what` names the step. */
-  const setEach = (what, field, value) => onEach(what, (p) => (p.kind === plot.kind ? { [field]: value } : null));
 
   const session = $derived(hub.session);
   /** The signal `key`'s colour, units and rate, once the hub has its trace. */
@@ -168,18 +99,8 @@
   const unitsOf = (key) => session.trace(key)?.meta.units ?? '';
   /** An independent plot's axes, {left, right}, each the signal keys from the plot outward. */
   const slots = $derived(plot.mode === 'independent' ? axisSlots(drawnItems().map((i) => i.key), plot.axisSides) : null);
-  /** Which side plot `p`'s axis of signal `key` is on, as a menu names it: Left, Right or None. */
-  const sideOf = (p, key) => {
-    const s = axisSlots(p.items.filter((i) => !i.hidden).map((i) => i.key), p.axisSides);
-    return s.left.includes(key) ? 'Left' : s.right.includes(key) ? 'Right' : 'None';
-  };
   /** Whether signal `key` has no axis of its own on an independent plot. */
   const axisless = (key) => !!slots && !slots.left.includes(key) && !slots.right.includes(key);
-  /** Puts signal `key`'s axis on `side`, 'left' or 'right', or hides it with 'none', on each independent plot a command here acts on that shows it. */
-  function setSide(key, side) {
-    const shows = (p) => p.mode === 'independent' && p.items.some((i) => i.key === key);
-    onEach(side === 'none' ? `Hide ${key}'s axis` : `${key}'s axis on the ${side}`, (p) => (shows(p) ? { axisSides: { ...p.axisSides, [key]: side } } : null));
-  }
 
   // A right-click shows what it was on: the time axis's window, or the
   // plot's own items, in a menu; a y axis's settings, which take typing, in
@@ -225,8 +146,8 @@
     // A wheel over a plot zooms it with the menu still open: the count
     // follows once the views of every plot a copy would hold rest, keeping
     // the last one shown meanwhile.
-    const offs = targets().map((v) =>
-      v.onChange(() => {
+    const offs = commands.context('copyData', { on: plot.id }).plots.map(({ view }) =>
+      view.onChange(() => {
         clock.cancel(timer);
         timer = clock.after(RECOUNT_MS, ask);
       }),
@@ -260,25 +181,6 @@
     boundsShown = { ...bounds };
     axisOpen = true;
   }
-  /** Puts the cursors' readout on the clipboard, as the table shows it. */
-  function copyReadout() {
-    const c = legend.cursors;
-    if (!c) return;
-    const rows = [];
-    if (c.x) {
-      rows.push([`X ${c.x.v}`, c.x.a, c.x.b, c.x.d, c.x.rate ? `1/Δt ${c.x.rate}` : '']);
-      for (const item of plot.items) {
-        const r = legend.rows[item.key];
-        rows.push([item.key, r?.a ?? '—', r?.b ?? '—', r?.d ?? '—', '']);
-      }
-    }
-    for (const y of c.ys) rows.push([`Y ${y.name}`, y.a, y.b, y.d, y.ratio]);
-    const blocks = [{ title: `Cursors · ${plot.items.map((i) => i.key).join(', ')}`, header: ['', '1', '2', 'Δ = 2 − 1', ''], rows }];
-    writeTables(blocks).then(
-      () => toast.success('Copied the cursor readout'),
-      (error) => toast.error(`Could not copy: ${error.message}`),
-    );
-  }
   /**
    * What the popovers' fields showed as they opened, or last set: bounds
    * left as shown set nothing, so a field that loses focus as its popover
@@ -295,8 +197,7 @@
     else if (plot.kind === 'spectrum' && plot.yScale !== 'linear' && lo <= 0) boundsError = 'A log axis starts above zero';
     else {
       boundsError = '';
-      // A log axis takes no bound at or below zero, and is left as it is.
-      asStep(() => eachAxis(region.keys[0], (p, axis) => !(p.logY && lo <= 0) && p.setYBounds([axis], lo, hi)));
+      runHere('yRange', { key: region.keys[0], lo, hi });
       boundsShown = { ...bounds };
       return true;
     }
@@ -314,7 +215,7 @@
     else if (plot.xScale !== 'linear' && lo <= 0) fBoundsError = 'A log axis starts above zero';
     else {
       fBoundsError = '';
-      onView({ fRange: [lo, hi] });
+      runHere('fRange', { range: [lo, hi] });
       fBoundsShown = { ...fBounds };
       return true;
     }
@@ -324,9 +225,6 @@
   function boundsKey(e) {
     if (e.key === 'Enter' && applyBounds()) axisOpen = false;
   }
-
-  /** Runs `fn(view)` on the view of each plot a command here acts on, as one view step. */
-  const forTargets = (fn) => viewHistory.step(() => targets().forEach(fn));
 
   // The signals menu: every signal the plot does not show, filtered by a
   // substring of its name, and kept open so several can be added at once.
@@ -340,9 +238,7 @@
     return session.signals.filter((t) => !has.has(t.key) && t.key.toLowerCase().includes(f));
   });
   /** Adds signal `key` to each plot a command here acts on that does not show it. */
-  function addSignal(key) {
-    onEach(`Add ${key}`, (p) => (p.items.some((i) => i.key === key) ? null : { items: [...p.items, chip(key)] }));
-  }
+  const addSignal = (key) => commands.run('addToPlots', { on: plot.id, signals: [key], from: 'menu' });
   function filterKey(e) {
     // Escape and Tab go on to the menu, which closes; every other key stays here.
     if (e.key === 'Escape' || e.key === 'Tab') return;
@@ -473,12 +369,6 @@
   let windowSpan = $state(10);
   /** The widest window the plot's view can show now. */
   const widestWindow = () => view.spans(clock.now())[1];
-  /** Sets the window of the plots a command here acts on: a window typed is a step of its own, the field's arrows and wheel one burst. */
-  function setWindow(s, typed) {
-    const set = () => forTargets((v) => v.setSpan(s));
-    if (typed) viewHistory.step(set);
-    else viewHistory.burst('window', targets(), set);
-  }
 
   onMount(() => {
     // The window read is what the view can show of it, which grows as a hub fills.
@@ -489,8 +379,9 @@
       overlay,
       hub,
       view,
-      targets,
-      cursorTargets: (key) => cursorPeers(pv, targetPvs(), key),
+      // What a gesture on the plot moves: the views, and for a cursor the PlotViews, of the plots a command here acts on.
+      targets: () => host.targets(plot.id).map((id) => host.view(id)),
+      cursorTargets: (key) => cursorPeers(pv, host.targets(plot.id).map((id) => host.pv(id)).filter(Boolean), key),
       cursors,
       colors,
       onFollow: () => runHere('follow'),
@@ -498,8 +389,8 @@
       plotId: plot.id,
       renderer,
       onFocus,
-      onFrequencies: (lo, hi) => onView({ fRange: [lo, hi] }),
-      onFitY: (key) => asStep(() => eachAxis(key, (p, axis) => p.fit([axis]))),
+      onFrequencies: (lo, hi) => host.setView(plot.id, { fRange: [lo, hi] }),
+      onFitY: (key) => runHere('fitYAxis', key),
       viewHistory,
       config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null, yFormat: plot.yFormat ?? null, xFormat: plot.xFormat ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
     });
@@ -645,10 +536,9 @@
     zone.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.left + 4, clientY: r.bottom }));
   }
   let addInput = $state(null);
-  /** Removes every signal and keeps the menu open on its filter, as adding one does, to add others. */
-  function removeAll(e) {
+  /** Keeps the add-signal menu open on its filter once every signal is removed, as adding one does, to add others. */
+  function keepAdding(e) {
     e.preventDefault();
-    onEach('Remove every signal', () => ({ items: [] }));
     tick().then(() => addInput?.focus());
   }
   /** Gives focus back to the plot when a menu opened from the keys closes. */
@@ -769,8 +659,6 @@
 
 <!-- A row's value in its trailing column, when it has one. -->
 {#snippet value(text)}{#if text}<span class="menu-value">{text}</span>{/if}{/snippet}
-<!-- The distance between X1 and X2, after a ruler, when a pair is placed. -->
-{#snippet span()}{@const d = xSpan(targetPvs())}{#if d}<span class="menu-value"><RiSpan />{d}</span>{/if}{/snippet}
 <!-- An axis setting's row of an axis popover, as command `id` reads, made
      with `how`: a button for each value, pressed at `current`, this plot's. -->
 {#snippet axisSetting(id, field, how, current)}
@@ -784,13 +672,28 @@
     </div>
   </div>
 {/snippet}
+<!-- A scale's two buttons in an axis popover, which run command `id` with
+     `how`; the one of a log scale is pressed while `log`. -->
+{#snippet scale(id, how, log)}
+  <div class="seg">
+    <button class:on={log} aria-pressed={log} data-command={id} onclick={() => runHere(id, { ...how, to: 'log' })}>Log</button>
+    <button class:on={!log} aria-pressed={!log} data-command={id} onclick={() => runHere(id, { ...how, to: 'linear' })}>Linear</button>
+  </div>
+{/snippet}
+<!-- A button of an axis popover that runs command `id` with `how` and
+     closes the popover: its picture `Icon`, its tip `text` with `keys`, and
+     its name `label`. -->
+{#snippet tool(id, how, Icon, text, label = text, keys = undefined)}
+  <Tip {text} {keys}>
+    {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={label} data-command={id} onclick={() => (runHere(id, how), (axisOpen = xAxisOpen = false))}><Icon /></button>{/snippet}
+  </Tip>
+{/snippet}
 <!-- The peak commands' rows, on a plot that shows a signal: each says where its X cursor would go. -->
 {#snippet peakItems()}{#if plot.items.length}{#each PEAKS as id}<CommandItem {id} on={plot.id} />{/each}{/if}{/snippet}
 <!-- A signal's own menu, on its chip and on its row of the legend: what
      it shows, how it looks, where it goes. `close` closes the menu it is in. -->
 {#snippet signalMenu(key, close)}
   {@const item = plot.items.find((i) => i.key === key)}
-  {@const side = slots ? (slots.left.includes(key) ? 'left' : slots.right.includes(key) ? 'right' : 'none') : null}
   {@const hides = plot.items.filter((i) => i.key !== key && !i.hidden).length}
   <!-- Two rows: this signal alone or every signal, whichever it is not showing; and this signal hidden or shown. -->
   {#if !hides && !item?.hidden && plot.items.some((i) => i.hidden)}
@@ -804,18 +707,7 @@
     <ContextMenu.SubTrigger><RiPalette class="menu-icon" />Colour<span class="menu-value"><i style="--c: {colorFor(key)}"></i>{#if colors.picked[key] === undefined}Auto{/if}</span></ContextMenu.SubTrigger>
     <ContextMenu.SubContent class="p-1.5"><ColorPicker {key} ondone={close} /></ContextMenu.SubContent>
   </ContextMenu.Sub>
-  {#if side}
-    <ContextMenu.Sub>
-      <ContextMenu.SubTrigger><RiAxis class="menu-icon" />Axis{@render value(common(targetPlots().filter((p) => p.mode === 'independent' && p.items.some((i) => i.key === key)).map((p) => sideOf(p, key))))}</ContextMenu.SubTrigger>
-      <ContextMenu.SubContent>
-        <ContextMenu.RadioGroup value={side} onValueChange={(v) => setSide(key, v)}>
-          <ContextMenu.RadioItem value="left">Left</ContextMenu.RadioItem>
-          <ContextMenu.RadioItem value="right">Right</ContextMenu.RadioItem>
-          <ContextMenu.RadioItem value="none">None</ContextMenu.RadioItem>
-        </ContextMenu.RadioGroup>
-      </ContextMenu.SubContent>
-    </ContextMenu.Sub>
-  {/if}
+  <CommandItem id="axisSide" on={plot.id} how={{ key }} />
   {#if place}
   <ContextMenu.Sub>
     <ContextMenu.SubTrigger><RiMove class="menu-icon" />Move to{@render value(counted(otherPlots.length, 'plot'))}</ContextMenu.SubTrigger>
@@ -852,7 +744,7 @@
     tabindex="-1"
   >
     <IconButton icon={RiDraggable} label="Drag onto a plot's edge to dock, its middle to swap, or a tab to move" class="grip cursor-grab touch-none text-muted-foreground" tabindex={-1} data-focus-skip onpointerdown={(e) => !e.shiftKey && onStartMove(e)} />
-    <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} onKind={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, () => ({ kind: v }))} onMode={(v) => onEach(`Layout ${nameIn(MODES, v)}`, () => ({ mode: v }))} />
+    <KindPicker {plot} bind:open={kindOpen} onOpenChange={kindClosed} />
     <!-- The plot's signals, each with its value at the hover, or its newest
          while live, unless the legend shows the values. Right-clicking them
          adds or removes signals. -->
@@ -958,6 +850,7 @@
               role="option"
               aria-selected={i === addActive}
               tabindex="-1"
+              data-command="addToPlots"
               onpointermove={() => (addActive = i)}
               onpointerdown={(e) => e.preventDefault()}
               onclick={() => addSignal(t.key)}
@@ -972,7 +865,7 @@
         </ScrollArea>
         {#if plot.items.length}
           <ContextMenu.Separator />
-          <ContextMenu.Item variant="destructive" onSelect={removeAll}><RiTrash class="menu-icon" />Remove every signal{@render value(counted(targetPlots().reduce((n, p) => n + p.items.length, 0), 'signal'))}</ContextMenu.Item>
+          <CommandItem id="clearSignals" on={plot.id} onran={keepAdding} />
         {/if}
         {/if}
       </ContextMenu.Content>
@@ -1023,25 +916,20 @@
       {#if plot.kind === 'time'}
         <div class="axis-row">
           <span>Window</span>
-          <WindowField value={windowSpan} onchange={setWindow} widest={widestWindow} />
+          <WindowField data-command="window" value={windowSpan} onchange={(s, typed) => runHere('window', { s, typed })} widest={widestWindow} />
         </div>
       {:else}
         <!-- The range as a phrase, low to high, in Hz, with the fit to every bin beside it. -->
-        <div class="axis-range" role="group" aria-label="Frequency range">
+        <div class="axis-range" role="group" aria-label="Frequency range" data-command="fRange">
           <input aria-label="Lowest frequency shown" type="text" inputmode="decimal" bind:value={fBounds.lo} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
           <span>to</span>
           <input aria-label="Highest frequency shown" type="text" inputmode="decimal" bind:value={fBounds.hi} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
-          <Tip text="Every frequency">
-            {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Show every frequency" onclick={() => (onView({ fRange: null }), (xAxisOpen = false))}><RiFitX /></button>{/snippet}
-          </Tip>
+          {@render tool('fRange', { range: null }, RiFitX, 'Every frequency', 'Show every frequency')}
         </div>
         {#if fBoundsError}<div class="axis-error">{fBoundsError}</div>{/if}
         <div class="axis-row" role="group" aria-label="Frequency scale">
           <span>Scale</span>
-          <div class="seg">
-            <button class:on={plot.xScale !== 'linear'} aria-pressed={plot.xScale !== 'linear'} onclick={() => setEach('Log frequency scale', 'xScale', 'log')}>Log</button>
-            <button class:on={plot.xScale === 'linear'} aria-pressed={plot.xScale === 'linear'} onclick={() => setEach('Linear frequency scale', 'xScale', 'linear')}>Linear</button>
-          </div>
+          {@render scale('xScale', {}, plot.xScale !== 'linear')}
         </div>
         {@const set = axisFormat(plot.xFormat)}
         {@render axisSetting('xDigits', 'digits', {}, set.digits)}
@@ -1049,15 +937,9 @@
       {/if}
       <div class="axis-row" role="group" aria-label="X cursors">
         <span>Cursors</span>
-        <Tip text="Add X1 and X2">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add X cursors" data-command="addXCursors" onclick={() => (runHere('addXCursors'), (xAxisOpen = false))}><RiXCursors /></button>{/snippet}
-        </Tip>
-        <Tip text="Zoom to X1–X2" keys={['Ctrl', 'drag']}>
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Zoom to the X cursors" onclick={() => (pv?.zoomToCursors(), (xAxisOpen = false))}><RiZoomTo /></button>{/snippet}
-        </Tip>
-        <Tip text="Clear the X cursors">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear the X cursors" onclick={() => (clearXCursors(), (xAxisOpen = false))}><RiEraser /></button>{/snippet}
-        </Tip>
+        {@render tool('addXCursors', undefined, RiXCursors, 'Add X1 and X2', 'Add X cursors')}
+        {@render tool('zoomToCursors', undefined, RiZoomTo, 'Zoom to X1–X2', 'Zoom to the X cursors', ['Ctrl', 'drag'])}
+        {@render tool('clearXCursors', undefined, RiEraser, 'Clear the X cursors')}
       </div>
       {#if plot.items.length}
         <!-- Each peak command's button, its tip saying where its X cursor would go, or why it goes nowhere. -->
@@ -1083,31 +965,22 @@
         {#if axisKey && plot.mode === 'independent'}
           {@const other = region.side === 'left' ? 'right' : 'left'}
           <span class="axis-tools">
-            <Tip text="Move this axis to the {other}">
-              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Move this axis to the {other}" onclick={() => (setSide(axisKey, other), (axisOpen = false))}>{#if other === 'left'}<RiToLeft />{:else}<RiToRight />{/if}</button>{/snippet}
-            </Tip>
-            <Tip text="Remove this axis; the signal keeps its own scale">
-              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Remove this axis" onclick={() => (setSide(axisKey, 'none'), (axisOpen = false))}><RiRemoveAxis /></button>{/snippet}
-            </Tip>
+            {@render tool('axisSide', { key: axisKey, to: other }, other === 'left' ? RiToLeft : RiToRight, `Move this axis to the ${other}`)}
+            {@render tool('axisSide', { key: axisKey, to: 'none' }, RiRemoveAxis, 'Remove this axis; the signal keeps its own scale', 'Remove this axis')}
           </span>
         {/if}
       </div>
       <!-- The range as a phrase, low to high, with the fit beside it. -->
-      <div class="axis-range" role="group" aria-label="Y axis range">
+      <div class="axis-range" role="group" aria-label="Y axis range" data-command="yRange">
         <input aria-label="Lowest value shown" type="text" inputmode="decimal" bind:value={bounds.lo} onkeydown={boundsKey} onblur={applyBounds} />
         <span>to</span>
         <input aria-label="Highest value shown" type="text" inputmode="decimal" bind:value={bounds.hi} onkeydown={boundsKey} onblur={applyBounds} />
-        <Tip text="Fit to the data" keys={['double-click']}>
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Fit to the data" onclick={() => (asStep(() => eachAxis(region.keys[0], (p, axis) => p.fit([axis]))), (axisOpen = false))}><RiFit /></button>{/snippet}
-        </Tip>
+        {@render tool('fitYAxis', region.keys[0], RiFit, 'Fit to the data', 'Fit to the data', ['double-click'])}
       </div>
       {#if plot.kind === 'spectrum'}
         <div class="axis-row" role="group" aria-label="Density scale">
           <span>Scale</span>
-          <div class="seg">
-            <button class:on={plot.yScale !== 'linear'} aria-pressed={plot.yScale !== 'linear'} onclick={() => setYScale(region.keys[0], 'log')}>Log</button>
-            <button class:on={plot.yScale === 'linear'} aria-pressed={plot.yScale === 'linear'} onclick={() => setYScale(region.keys[0], 'linear')}>Linear</button>
-          </div>
+          {@render scale('yScale', { key: region.keys[0] }, plot.yScale !== 'linear')}
         </div>
       {/if}
       <!-- How the axis is labelled and writes its numbers, its ticks, tags and readout alike. -->
@@ -1118,12 +991,8 @@
       <!-- This axis's Y cursors, which a pull up off the x axis also draws out. -->
       <div class="axis-row" role="group" aria-label="Y cursors">
         <span>Cursors</span>
-        <Tip text="Add Y1 and Y2 on this axis">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Add Y cursors on this axis" data-command="addYCursors" onclick={() => (runHere('addYCursors', region.keys[0]), (axisOpen = false))}><RiYCursors /></button>{/snippet}
-        </Tip>
-        <Tip text="Clear this axis's cursors">
-          {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear this axis's cursors" onclick={() => (clearYCursors(region.keys[0]), (axisOpen = false))}><RiEraser /></button>{/snippet}
-        </Tip>
+        {@render tool('addYCursors', region.keys[0], RiYCursors, 'Add Y1 and Y2 on this axis', 'Add Y cursors on this axis')}
+        {@render tool('clearYCursors', { key: region.keys[0] }, RiEraser, "Clear this axis's cursors")}
       </div>
       {#if boundsError}<div class="axis-error">{boundsError}</div>{/if}
       {#if axisKey}
@@ -1228,13 +1097,13 @@
                   {/snippet}
                 </ContextMenu.Trigger>
                 <ContextMenu.Content class="menu-icons">
-                  <ContextMenu.Item onSelect={copyReadout}><RiCopy class="menu-icon" />Copy table{@render value(counted((c.x ? 1 + plot.items.length : 0) + c.ys.length, 'row'))}</ContextMenu.Item>
-                  {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2{@render span()}</ContextMenu.Item>{/if}
+                  <CommandItem id="copyReadout" on={plot.id} />
+                  <CommandItem id="zoomToCursors" on={plot.id} />
                   {@render peakItems()}
                   <ContextMenu.Separator />
-                  {#if c.x}<ContextMenu.Item onSelect={clearXCursors}><RiXCursors class="menu-icon" />Clear X cursors{@render value(xFirst())}</ContextMenu.Item>{/if}
-                  {#if c.ys.length}<ContextMenu.Item onSelect={() => clearYCursors()}><RiYCursors class="menu-icon" />Clear Y cursors{@render value(counted(targetPvs().reduce((n, p) => n + p.yCursorAxes(), 0), 'axis', 'axes'))}</ContextMenu.Item>{/if}
-                  <ContextMenu.Item data-command="clearCursors" onSelect={() => commands.run('clearCursors', { on: plot.id })}><RiEraser class="menu-icon" />Clear all cursors{@render value(commands.row('clearCursors', { on: plot.id }).value)}</ContextMenu.Item>
+                  <CommandItem id="clearXCursors" on={plot.id} />
+                  <CommandItem id="clearYCursors" on={plot.id} />
+                  <CommandItem id="clearCursors" on={plot.id} how="all" />
                 </ContextMenu.Content>
               </ContextMenu.Root>
             </div>
@@ -1273,34 +1142,15 @@
       <CommandItem id="addYCursors" on={plot.id} how={region.keys?.[0]} />
       <CommandItem id="clearCursors" on={plot.id} />
       <ContextMenu.Label>Show</ContextMenu.Label>
-      <ContextMenu.Sub>
-        <ContextMenu.SubTrigger><RiKind class="menu-icon" />Kind{@render value(common(targetPlots().map((p) => nameIn(KINDS, p.kind))))}</ContextMenu.SubTrigger>
-        <ContextMenu.SubContent>
-          <ContextMenu.RadioGroup value={plot.kind} onValueChange={(v) => onEach(`Kind ${nameIn(KINDS, v)}`, () => ({ kind: v }))}>
-            {#each KINDS as [kind, kl]}<ContextMenu.RadioItem value={kind}>{kl}</ContextMenu.RadioItem>{/each}
-          </ContextMenu.RadioGroup>
-        </ContextMenu.SubContent>
-      </ContextMenu.Sub>
-      <ContextMenu.Sub>
-        <ContextMenu.SubTrigger><RiLayout class="menu-icon" />Layout{@render value(common(targetPlots().map((p) => nameIn(MODES, p.mode))))}</ContextMenu.SubTrigger>
-        <ContextMenu.SubContent>
-          <ContextMenu.RadioGroup value={plot.mode} onValueChange={(v) => onEach(`Layout ${nameIn(MODES, v)}`, () => ({ mode: v }))}>
-            {#each MODES as [mode, ml]}<ContextMenu.RadioItem value={mode}>{ml}</ContextMenu.RadioItem>{/each}
-          </ContextMenu.RadioGroup>
-        </ContextMenu.SubContent>
-      </ContextMenu.Sub>
+      <CommandItem id="setKind" on={plot.id} />
+      <CommandItem id="setLayout" on={plot.id} />
       <!-- Where the plot is among the page's plots and tabs, on a page that lays them out. -->
       {#if place}
       <ContextMenu.Label>Arrange</ContextMenu.Label>
       <CommandItem id="splitRight" on={plot.id} />
       <CommandItem id="splitDown" on={plot.id} />
       <CommandItem id="maximize" on={plot.id} />
-      <ContextMenu.Sub>
-        <ContextMenu.SubTrigger disabled={!otherTabs.length}><RiTab class="menu-icon" />Move to tab{@render value(tabName)}</ContextMenu.SubTrigger>
-        <ContextMenu.SubContent>
-          {#each otherTabs as t (t.id)}<ContextMenu.Item onSelect={() => onMoveToTab(t.id)}>{t.name}</ContextMenu.Item>{/each}
-        </ContextMenu.SubContent>
-      </ContextMenu.Sub>
+      <CommandItem id="moveToTab" on={plot.id} />
       <ContextMenu.Separator />
       <CommandItem id="close" on={plot.id} />
       {/if}
