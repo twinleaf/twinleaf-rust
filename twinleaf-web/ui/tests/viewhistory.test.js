@@ -447,6 +447,25 @@ describe('view history on the page, each kind of gesture', () => {
     }
   });
 
+  it('has Ctrl+Z take Follow live back to the paused view with its cursors, and Ctrl+Y follow live again as it did', async () => {
+    const p = await page();
+    try {
+      const id = plotIds(p.ws.layout)[0], v = p.views.get(id);
+      await pickFromMenu(id, 'Add X cursors');
+      const paused = one(p, id), cursors = p.ws.plots[id].cursors;
+      await followBy(p, id, 'End');
+      const live = one(p, id);
+      expect([v.live, hasTimeX(p.ws.plots[id].cursors)], 'live, no time X cursors').toEqual([true, false]);
+      document.activeElement?.blur();
+      await keysOn('Control+z');
+      expect([one(p, id), p.ws.plots[id].cursors], 'undone').toEqual([paused, cursors]);
+      await keysOn('Control+y');
+      expect([one(p, id), hasTimeX(p.ws.plots[id].cursors)], 'redone').toEqual([live, false]);
+    } finally {
+      p.dispose();
+    }
+  });
+
   it('has the toolbar’s Live say what the open tab’s plots do, after a tab switch with nothing selected too', async () => {
     const p = await page('rows', 1);
     try {

@@ -546,7 +546,8 @@ describe('a plot closed and brought back by undo', () => {
 // left that paused view to go live, by any route, and no others; an undo
 // or a redo changes them just as the edit history has them, and one that
 // brings them back to a live plot shows the paused view it left as it went
-// live; nothing else changes them.
+// live; a redo of an edit that made the plot live makes it live again as
+// that edit left it, and no other redo makes it live; nothing else changes them.
 describe('a kind switch, and time X cursors across going live', () => {
   const act = fc.constantFrom('switch', 'switch', 'pan', 'legend', 'place', 'place', 'clear', 'pause', 'follow', 'follow', 'back', 'back', 'forward', 'undo', 'undo', 'redo');
   const times = (n, acts) => Array.from({ length: n }, () => acts).flat();
@@ -570,7 +571,7 @@ describe('a kind switch, and time X cursors across going live', () => {
     ['pause', 'place', 'back', 'forward'],
   ];
   it('is a step Back and Forward cross, going on through the steps before it, whatever undo and redo do between, and a live plot has no time X cursors', () => {
-    const count = { crossed: 0, wentOn: 0, undone: 0, redone: 0, xTaken: 0, xBack: 0, xUndone: 0 };
+    const count = { crossed: 0, wentOn: 0, undone: 0, redone: 0, xTaken: 0, xBack: 0, xUndone: 0, redoneLive: 0 };
     fc.assert(
       fc.property(fc.array(act, { minLength: 4, maxLength: 24 }), (acts) => {
         const { ws, views, hub, t, history, cursors, vh } = setup(), id = Object.keys(ws.plots)[0], v = views.get(id);
@@ -588,9 +589,11 @@ describe('a kind switch, and time X cursors across going live', () => {
           return true;
         };
         let crossedLast = false;
+        // What the plot showed just after each edit that made it live: a redo of one shows that again.
+        const wentTo = new Map();
         const run = (a) => {
           t.ms += 1000;
-          const was = x(), before = seen(), wasLive = v.live;
+          const was = x(), before = seen(), wasLive = v.live, top = history.undos.at(-1);
           if (a === 'switch') vh.step(() => history.group('Kind', () => ws.setPlot(id, { kind: ws.plots[id].kind === 'time' ? 'spectrum' : 'time' })));
           else if (a === 'pan') vh.step(() => v.pan(-0.1, t.ms));
           else if (a === 'legend') history.group('Legend', () => ws.setPlot(id, { legend: !ws.plots[id].legend }));
@@ -615,6 +618,9 @@ describe('a kind switch, and time X cursors across going live', () => {
               if (left) expect(seen().slice(seen().indexOf(',')), `${a}: the paused view it left`).toBe(left.slice(left.indexOf(',')));
               count.xUndone++;
             }
+            // A redo of an edit that made the plot live makes it live again, as that edit left it; no other redo makes it live.
+            if (a === 'redo' && wentTo.has(e)) (expect(seen(), 'redo: live again, as it went').toBe(wentTo.get(e)), count.redoneLive++);
+            else if (a === 'redo') expect(!wasLive && v.live, 'redo: live').toBe(false);
           }
           if (a === 'back' || a === 'forward') {
             const by = a === 'back' ? -1 : 1, can = at + by >= 0 && at + by < line.length;
@@ -633,6 +639,7 @@ describe('a kind switch, and time X cursors across going live', () => {
             if (can && to[1] && hasTimeX({ x: want })) (count.xTaken++, (want = { a: null, b: null }));
             else if (can && !to[1] && from[1] && past && hasTimeX({ x: past.xs[by < 0 ? 'before' : 'after'] })) (count.xBack++, (want = past.xs[by < 0 ? 'before' : 'after']));
           } else if (changed(was) && (a === 'undo' || a === 'redo')) count[a === 'undo' ? 'undone' : 'redone']++;
+          if (['follow', 'back', 'forward'].includes(a) && !wasLive && v.live && history.undos.at(-1) !== top) wentTo.set(history.undos.at(-1), seen());
           if (!wasLive && v.live) left = before;
           expect(seen(), `${a}: what the plot shows`).toBe(line[at].shows);
           expect([vh.canBack, vh.canForward], `${a}: Back and Forward`).toEqual([at > 0, at < line.length - 1]);

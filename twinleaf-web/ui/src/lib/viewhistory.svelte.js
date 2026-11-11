@@ -93,6 +93,7 @@ export class ViewHistory {
   #held = null; // the gesture under way, from `begin` to `end`: {tab, before}
   #burst = null; // the burst open to more: {tab, kind, targets, at, before, step, forwards}, its step, if any, the newest
   #bursting = false; // whether a burst's change is running, so a step inside it is part of it
+  #went = new WeakMap(); // edit-history step that made plots live -> Map of plot id -> the View state it left each in
 
   /**
    * `ws` is the page's Workspace and `views` its Views, each View knowing
@@ -181,12 +182,29 @@ export class ViewHistory {
    * way the page goes live, but Back and Forward.
    */
   follow(ids, restore) {
-    this.step(() =>
-      this.edit('Follow live', () => {
-        for (const id of ids) this.views.of(id).follow(restore);
-        this.cursors.followed(ids);
-      }),
-    );
+    this.step(() => {
+      const edit = this.#edited(() =>
+        this.edit('Follow live', () => {
+          for (const id of ids) this.views.of(id).follow(restore);
+          this.cursors.followed(ids);
+        }),
+      );
+      this.#wentLive(edit, ids);
+    });
+  }
+
+  /** The edit-history step running `fn` made, or null when it made none. */
+  #edited(fn) {
+    const top = this.cursors.history.undos.at(-1);
+    fn();
+    const now = this.cursors.history.undos.at(-1);
+    return now !== top ? now : null;
+  }
+
+  /** Keeps, for a redo of `edit`, the views of plots `ids` that it left following live (`edited`). */
+  #wentLive(edit, ids) {
+    const live = ids.filter((id) => this.views.get(id)?.live);
+    if (edit && live.length) this.#went.set(edit, new Map(live.map((id) => [id, this.views.get(id).state()])));
   }
 
   /**
@@ -225,7 +243,9 @@ export class ViewHistory {
 
   /**
    * Runs `fn`, an undo or a redo of the edit history, and returns what it
-   * returns. A plot it gives time X cursors while its view follows live
+   * returns. A redo of an edit that made plots live, as Follow live, makes
+   * them live again, as that edit left them; no other redo makes a plot
+   * live. A plot it gives time X cursors while its view follows live
    * shows the paused view it left as it went live, or pauses where it is,
    * with the notice when the hub has dropped where that starts. Each plot
    * whose kind it changed, or whose view it paused, has a step for that, in
@@ -235,7 +255,11 @@ export class ViewHistory {
     this.end();
     this.#burst = null;
     const before = this.ws.tabs.map((t) => [t.id, this.#read(Object.keys(t.plots))]);
+    const next = this.cursors.history.redos.at(-1);
     const out = fn();
+    // A redo of a step that made plots live makes them live again, as it left them.
+    const redone = next && this.cursors.history.undos.at(-1) === next ? this.#went.get(next) : null;
+    for (const [id, s] of redone ?? []) if (this.views.get(id) && this.ws.tabs.some((t) => t.plots[id])) this.views.get(id).restore(s, this.now());
     let lost = false;
     for (const t of this.ws.tabs) {
       for (const [id, plot] of Object.entries(t.plots)) {
@@ -308,18 +332,22 @@ export class ViewHistory {
     const switched = here.filter(([id, s]) => s.kind !== this.ws.plots[id].kind);
     const followed = here.filter(([id, s]) => s.view.live && hasTimeX(this.ws.plots[id].cursors)).map(([id]) => id);
     const paused = here.filter(([id, s]) => !s.view.live && this.views.get(id).live && (s.x.a !== null || s.x.b !== null));
+    let edit = null;
     if (switched.length || followed.length || paused.length) {
       const name = switched.length && (KINDS.find(([kind]) => kind === switched[0][1].kind)?.[1] ?? switched[0][1].kind);
       const label = !switched.length ? (followed.length ? 'Follow live' : 'Pause') : switched.length > 1 ? `Kind ${name} (${counted(switched.length, 'plot')})` : `Kind ${name}`;
-      this.edit(label, () => {
-        for (const [id, s] of switched) this.ws.setPlot(id, { kind: s.kind });
-        if (followed.length) this.cursors.followed(followed);
-        if (paused.length) this.cursors.set(label, new Map(paused.map(([id, s]) => [id, withXPair(this.ws.plots[id].cursors, 'time', s.x)])));
-      });
+      edit = this.#edited(() =>
+        this.edit(label, () => {
+          for (const [id, s] of switched) this.ws.setPlot(id, { kind: s.kind });
+          if (followed.length) this.cursors.followed(followed);
+          if (paused.length) this.cursors.set(label, new Map(paused.map(([id, s]) => [id, withXPair(this.ws.plots[id].cursors, 'time', s.x)])));
+        }),
+      );
     }
     let lost = false;
     for (const [id, s] of here) lost = this.#put(id, s) || lost;
     if (lost) this.notice(GONE);
+    this.#wentLive(edit, followed);
   }
 
   /**
