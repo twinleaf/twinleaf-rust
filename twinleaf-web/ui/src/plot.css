@@ -119,24 +119,21 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
   .dock { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 }
 .dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: -1px; border-radius: var(--radius); }
-/* A dock's top row, as tall as a field: the dock's button in its corner at
-   the page's edge and, beside it, the filter of the dock's properties where
-   it has one. The row keeps the button's width and a gap clear of what it
-   holds. The panels scroll below the row, not under it, and no panel's fold
-   moves it. */
-.dock-top { flex: none; display: flex; align-items: center; height: 28px; margin-bottom: 6px; }
-.dock-side.left > .dock-top { padding-left: 26px; }
-.dock-side.right > .dock-top { padding-right: 26px; }
-/* A dock's button, which hides it and shows it. It is placed from the
-   frame's corner at the page's edge, which stays put as the dock slides,
-   6 px in from the frame's border each way and centred in the top row's
-   height: one place whether the frame is the dock or its rail, which is as
-   wide as the button and that inset each side. */
-.dock-button { position: absolute; top: 10px; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
+/* A dock's top row, as tall as a field: the dock's button at its right end
+   and, before it, the filter of the dock's properties where it has one. The
+   row keeps the button's width and a gap clear of what it holds. The panels
+   scroll below the row, not under it, and no panel's fold moves it. */
+.dock-top { flex: none; display: flex; align-items: center; height: 28px; margin-bottom: 6px; padding-right: 26px; }
+/* A dock's button, which hides it and shows it, 6 px in from the frame's
+   border each way and centred in the top row's height. Shown, it is in the
+   frame's top right corner: the right dock's at the page's edge, the left
+   dock's beside the tiles, moving with that edge as the dock slides. Hidden,
+   it is on the rail, which is as wide as the button and that inset each
+   side, at the left dock's page edge. */
+.dock-button { position: absolute; top: 10px; right: 6px; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
 .dock-button:hover { background: var(--secondary); color: var(--foreground); }
 .dock-button svg { width: 14px; height: 14px; }
-.dock-frame.left .dock-button { left: 6px; }
-.dock-frame.right .dock-button { right: 6px; }
+.dock-frame.left.rail .dock-button { right: auto; left: 6px; }
 /* The panels are lists inside a list. A panel is as tall as what it shows
    while its dock has the room. Where the panels do not fit, a panel taller
    than two thirds of the dock's height gives way, down to two thirds: its

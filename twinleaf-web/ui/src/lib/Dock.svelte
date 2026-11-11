@@ -7,10 +7,11 @@
   // a hidden dock's rail shows it. Only docks take panels, so none lands on the tiles.
   //
   // A dock that has panels has one button, which hides it and shows it
-  // again, in the dock's top corner at the page's edge: the one place that
-  // is the dock's whether it is shown or is its rail. Shown, the dock has a
-  // top row there, which holds the button and what `top` draws beside it,
-  // and its panels scroll beneath that row, so nothing is under the button.
+  // again, in the dock's top row whether it is shown or is its rail: shown,
+  // at the dock's top right, the left dock's beside the tiles and the right
+  // dock's at the page's edge; hidden, on the rail. Shown, the dock's top
+  // row holds the button and, before it, what `top` draws, and its panels
+  // scroll beneath that row, so nothing is under the button.
   //
   // The header's menu moves a panel without dragging, and the header folds
   // it on Enter, so the keyboard reaches all of it.

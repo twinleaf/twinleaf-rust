@@ -201,10 +201,13 @@ describe('a panel in a dock', () => {
   }, 600_000);
 });
 
-// A dock has one button, which hides it and shows it again, at one place:
-// the dock's top corner at the page's edge, in the dock's top row, which
-// its panels scroll beneath. So a click there hides the dock, the next one
-// there shows it, and nothing of the dock is ever under the button.
+// A dock has one button, which hides it and shows it again, in the dock's
+// top row, which its panels scroll beneath: at the same height whether the
+// dock is shown or hidden; shown, at the dock's top right, the left dock's
+// inner corner beside the tiles and the right dock's at the page's edge;
+// hidden, on the rail. Each is one place however the dock is scrolled. So a
+// click at its place hides the dock, the next one at its place shows it,
+// and nothing of the dock is ever under the button.
 describe('the button that hides and shows a dock', () => {
   const SIDES = ['left', 'right'];
   const FIELD = 'input[aria-label^="Filter the properties"]';
@@ -238,9 +241,12 @@ describe('the button that hides and shows a dock', () => {
     'the properties in the left dock': { left: all(['favorites', 'settings', 'reports', 'actions', 'diagnostics', 'other']), right: all(['devices', 'signals']) },
   };
 
-  it('is at one place, to the pixel, with a filter beside it or none, however its dock is scrolled, and as the dock hides and shows; and three clicks there hide, show and hide the dock', async () => {
+  it('is in the top row at one height, shown or hidden; shown, at the top right, with a filter before it or none; hidden, on the rail; at one place in each, however its dock is scrolled; and clicks at its place hide, show and hide the dock', async () => {
     await browser.viewport(1200, 520);
-    const places = { left: new Map(), right: new Map() }, filtered = { left: new Set(), right: new Set() };
+    // Where each dock's button was, shown and hidden, each place with where it was first seen; and its heights, every frame as it slid too.
+    const places = { left: { shown: new Map(), hidden: new Map() }, right: { shown: new Map(), hidden: new Map() } };
+    const heights = { left: new Map(), right: new Map() }, filtered = { left: new Set(), right: new Set() };
+    const topOf = (side) => `${buttonsOf(side)[0]?.getBoundingClientRect().top} px`;
     let scrolled = 0;
     for (const [arranged, saved] of Object.entries(ARRANGED)) {
       const page = await mountPage([['s0.x']], 'columns', 0, signals(30), tableOf({ setting: 14, report: 14, action: 10, other: 4 }), { routes: ['/', '/0', '/1', '/2', '/3', '/4'], saved: saved ? { 'tl-docks-v1': saved } : {} });
@@ -248,50 +254,59 @@ describe('the button that hides and shows a dock', () => {
         await settle(6);
         for (const side of SIDES) {
           const said = `the ${side} dock, ${arranged}`, frame = frameOf(side), dock = frame.querySelector('.dock');
-          const note = (where, at = placeOf(side)) => places[side].has(at) || places[side].set(at, `${arranged}, ${where}`);
+          const once = (map, at, where) => map.has(at) || map.set(at, `${arranged}, ${where}`);
+          const note = (state, where) => (once(places[side][state], placeOf(side), where), once(heights[side], topOf(side), `${state}, ${where}`));
           const field = frame.querySelector(FIELD);
           filtered[side].add(!!field);
           const button = buttonsOf(side)[0];
           expect(buttonsOf(side).length, `${said}: its buttons that hide or show it`).toBe(1);
-          // The top row: the button in the corner at the page's edge, the field ending short of it, the panels below both.
+          // The top row: the button in the frame's top right corner, the field ending short of it, the panels below both.
           const b = button.getBoundingClientRect(), f = frame.getBoundingClientRect();
-          expect(side === 'left' ? b.left - f.left : f.right - b.right, `${said}: px from the page's edge of its frame to its button`).toBeLessThanOrEqual(8);
+          expect(f.right - b.right, `${said}: px from its frame's right edge to its button`).toBeLessThanOrEqual(8);
           expect(b.bottom, `${said}: its button's bottom, above its panels`).toBeLessThanOrEqual(dock.getBoundingClientRect().top);
           if (field) {
             const r = field.getBoundingClientRect();
-            expect(side === 'left' ? r.left - b.right : b.left - r.right, `${said}: px between its filter's field and its button`).toBeGreaterThanOrEqual(2);
+            expect(b.left - r.right, `${said}: px between its filter's field and its button`).toBeGreaterThanOrEqual(2);
             expect(r.top < b.bottom && r.bottom > b.top, `${said}: its filter's field and its button share a row`).toBe(true);
           }
           const most = dock.scrollHeight - dock.clientHeight;
           if (most > 0) scrolled++;
           for (let top = 0; top <= most; top += 7) {
             dock.scrollTop = top;
-            note(`scrolled ${top} px of ${most}`);
+            note('shown', `scrolled ${top} px of ${most}`);
             expect(covered(side), `${said}, scrolled ${top} px of ${most}: what is under its button`).toEqual([]);
             expect(button.contains(document.elementFromPoint(...centre(button))), `${said}, scrolled ${top} px of ${most}: its button is what the pointer hits`).toBe(true);
           }
           dock.scrollTop = most / 2;
-          // Three clicks at one place, the pointer never moving, and a fourth that leaves the dock shown.
-          await commands.mouse([['move', ...centre(button)]]);
-          const stop = watchFrames(() => placeOf(side));
+          // Four clicks, each at the button's place, which leave the dock shown.
+          const stop = watchFrames(() => topOf(side));
           for (const [n, hidden] of [true, false, true, false].entries()) {
-            await commands.mouse([['down'], ['up']]);
-            expect(await until(() => rests(side, hidden)), `${said}: ${hidden ? 'hidden' : 'shown'} after click ${n + 1} at the one place`).toBe(true);
+            await commands.mouse([['move', ...centre(buttonsOf(side)[0])], ['down'], ['up']]);
+            expect(await until(() => rests(side, hidden)), `${said}: ${hidden ? 'hidden' : 'shown'} after click ${n + 1} at its place`).toBe(true);
             expect(await rested(() => frameOf(side).getBoundingClientRect().width), `${said}: its frame comes to rest`).toBe(true);
             expect(buttonsOf(side).map((el) => el.getAttribute('aria-label')), `${said}, ${hidden ? 'hidden' : 'shown'}: what its button says it does`).toEqual([`${hidden ? 'Show' : 'Hide'} the ${side} dock`]);
-            note(hidden ? 'hidden' : 'shown again');
+            if (hidden) {
+              const on = buttonsOf(side)[0].getBoundingClientRect(), rail = frameOf(side).getBoundingClientRect();
+              expect([on.left >= rail.left, on.right <= rail.right], `${said}, hidden: its button within the rail`).toEqual([true, true]);
+            }
+            note(hidden ? 'hidden' : 'shown', hidden ? 'hidden' : 'shown again');
           }
-          for (const at of stop()) note('at some frame as it hid or showed', at);
+          for (const at of stop()) once(heights[side], at, 'at some frame as it hid or showed');
         }
       } finally {
         page.dispose();
       }
     }
     expect(scrolled, 'docks seen scrolling').toBeGreaterThan(0);
+    const listed = (map) => [...map].map(([at, where]) => `${at} (${where})`);
     for (const side of SIDES) {
       expect([...filtered[side]].sort(), `the ${side} dock was seen with a filter and without one`).toEqual([false, true]);
-      const were = [...places[side]].map(([at, where]) => `${at} (${where})`);
-      expect(were, `where the ${side} dock's button was`).toEqual(were.slice(0, 1));
+      for (const state of ['shown', 'hidden']) {
+        const were = listed(places[side][state]);
+        expect(were, `where the ${side} dock's button was, ${state}`).toEqual(were.slice(0, 1));
+      }
+      const were = listed(heights[side]);
+      expect(were, `the heights the ${side} dock's button was at`).toEqual(were.slice(0, 1));
     }
   }, 120_000);
 });
