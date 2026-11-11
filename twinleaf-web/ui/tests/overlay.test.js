@@ -52,7 +52,8 @@ const TARGETS = {
     return el && [centre(el), 'left'];
   },
   Commands: () => [centre(document.querySelector('button.search')), 'left'],
-  'a plot': (page) => page.pv(page.ids[1])?.geo && [plotArea(page, page.ids[1]), 'right'],
+  // Where the plot area is, a layer open over it or not: the palette, open, covers it, and takes the press.
+  'a plot': (page) => page.pv(page.ids[1])?.geo && [plotArea(page, page.ids[1], true), 'right'],
   'a y axis': (page) => {
     const pv = page.pv(page.ids[1]), P = pv?.geo?.plot, band = pv?.axisBands?.[0];
     if (!P || !band) return null;
@@ -143,6 +144,10 @@ describe('the page’s popup layers', () => {
           [[{ twice: 'Layout' }, { press: 'File' }]],
           [[{ press: 'a plot' }, { press: 'File' }, { hover: 'Layout' }]],
           [[{ press: 'display settings' }, { press: 'the decimation list' }, { press: 'Layout' }]],
+          // The palette open over the plots, and a press where a plot is under it.
+          [[{ press: 'Commands' }, { twice: 'a plot' }, { key: 'Escape' }]],
+          [[{ closing: 'Layout', then: 'Commands' }, { twice: 'a plot' }, { closing: 'Layout', then: 'Layout' }]],
+          [[{ closing: 'Layout', then: 'Commands' }, { closing: 'a plot', then: 'Layout' }, { key: 'Escape' }]],
         ]),
     );
     expect(seen.has(1), 'a layer was open').toBe(true);

@@ -35,14 +35,25 @@ export async function menuPage() {
   return { ...page, ids };
 }
 
-/** A spot of plot `id`'s plot area, in client px, where a press lands on the plot area itself, clear of the readout, the legend and the cursors. */
-export function plotArea(page, id) {
+/**
+ * A spot of plot `id`'s plot area, in client px, where a press lands on the
+ * plot area itself, clear of the readout, the legend and the cursors. With
+ * `under`, a layer open over the page may lie over the spot, as a dialog's
+ * backdrop does: a press there lands on that layer, as a person's would.
+ */
+export function plotArea(page, id, under = false) {
   const pv = page.pv(id), P = pv?.geo?.plot;
   expect(P, `plot ${id} drawn`).toBeTruthy();
   // Its lower right first, then across the rest of it.
   const shares = [[0.75, 0.75], ...[0.5, 0.25, 0.75, 0.9, 0.1].flatMap((y) => [0.5, 0.25, 0.75, 0.9, 0.1].map((x) => [x, y]))];
-  const spot = shares.map(([x, y]) => [P.x + P.w * x, P.y + P.h * y]).find((at) => document.elementFromPoint(...at) === pv.overlay && pv.pressAt(...at)?.part === 'plot');
-  expect(spot, `plot ${id}: a spot of its plot area clear of what lies over it`).toBeTruthy();
+  /** Whether what is on top at `at` is the plot area, or, with `under`, nothing of the plot's tile. */
+  const clear = (at) => {
+    const top = document.elementFromPoint(...at);
+    return top === pv.overlay || (under && !leafOf(id).contains(top));
+  };
+  const spot = shares.map(([x, y]) => [P.x + P.w * x, P.y + P.h * y]).find((at) => clear(at) && pv.pressAt(...at)?.part === 'plot');
+  const over = document.elementFromPoint(P.x + P.w * 0.75, P.y + P.h * 0.75);
+  expect(spot, `plot ${id}: a spot of its plot area clear of what lies over it, as ${over?.dataset.slot ?? over?.className} does its lower right`).toBeTruthy();
   return spot;
 }
 
