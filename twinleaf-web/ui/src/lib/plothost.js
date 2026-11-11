@@ -105,6 +105,10 @@ export class PlotHost {
       picker: (id, action) => !!this.pickers.get(id)?.(action),
       renameTab: (id) => this.#page.renameTab(id),
       closeTab: (tab) => this.#page.closeTab(tab),
+      dockShown: (side) => this.#page.dockShown(side),
+      toggleDock: (side) => this.#page.toggleDock(side),
+      exportTabs: () => this.#page.exportTabs(),
+      importTabs: () => this.#page.importTabs(),
     });
   }
 
@@ -112,9 +116,10 @@ export class PlotHost {
    * Has the page serve this host's plots: `page` is what the commands that
    * need a workspace run through, {split(ids, dir, fromKeys), close(ids,
    * fromKeys), newPlot(keys), copy(plots), copyCheck(plots),
-   * openExport(plots), renameTab(id), closeTab(tab)}, with
-   * `viewChanged(id)`, told as plot `id`'s view moves, and `place`, as the
-   * top of this file lists it.
+   * openExport(plots), renameTab(id), closeTab(tab), dockShown(side),
+   * toggleDock(side), exportTabs(), importTabs()}, with `viewChanged(id)`,
+   * told as plot `id`'s view moves, and `place`, as the top of this file
+   * lists it.
    */
   serve({ place, ...page }) {
     this.#page = page;

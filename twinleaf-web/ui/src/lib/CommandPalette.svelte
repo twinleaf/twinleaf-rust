@@ -1,9 +1,10 @@
 <script>
-  // The command palette, on Ctrl+K or ⌘K: add a signal, open a tab, arrange
-  // the tab, the plot commands that have plots to act on now (commands.js),
-  // the toolbar's actions, and the properties of the checked devices, by
-  // typing part of a name. A signal named here goes onto the selected plots,
-  // or into a new one, alone, by the commands the Signals list runs.
+  // The command palette, on Ctrl+K or ⌘K: add a signal, the commands the
+  // command table lists here (commands.js), under its headings, those on
+  // plots while they have plots to act on, and the properties of the
+  // checked devices, by typing part of a name. A signal named here goes
+  // onto the selected plots, or into a new one, alone, by the commands the
+  // Signals list runs.
   //
   // A property shows its kind by a mark (read, setting, action) and its
   // value at the right as the Properties panels show it, ≠ where the
@@ -15,7 +16,7 @@
   import { getContext, tick, untrack } from 'svelte';
   import { computeCommandScore } from 'bits-ui';
   import * as Command from '$lib/components/ui/command/index.js';
-  import { ARRANGEMENTS } from './constants.js';
+  import { PALETTE } from './commands.js';
   import { escapeTyped } from './keys.js';
   import { mergeRows, sameShown, writersOf } from './properties.js';
   import { actsOf, argProblem, findProperties, searching, step } from './palette.js';
@@ -25,12 +26,8 @@
   import RiAction from '@lucide/svelte/icons/play';
   import RiStar from '@lucide/svelte/icons/star';
 
-  /**
-   * `act` holds the page's actions: toggleDock(side), dockShown(side),
-   * exportTabs(), importTabs(). `devices` are the checked devices, whose
-   * properties it offers.
-   */
-  let { open = $bindable(false), session, ws, act, devices = [] } = $props();
+  /** `session` holds the signals it names, and `devices` are the checked devices, whose properties it offers. */
+  let { open = $bindable(false), session, devices = [] } = $props();
   const history = getContext('history');
   const commands = getContext('commands');
   const writes = getContext('writes');
@@ -64,14 +61,12 @@
   // as palette.js finds it, any other row by the list's own score of its
   // value. The properties come first when the best of them scores higher
   // than any other row.
+  /** The table's commands the palette lists, each a row (commands.js `offered`), as it opens. */
+  const offered = $derived(open ? commands.offered() : []);
   const items = $derived({
     add: session.signals.map((t) => `add ${t.key}`),
     newPlot: session.signals.map((t) => `new plot ${t.key}`),
-    tabs: [...ws.tabs.map((t) => `tab ${t.name}`), 'New layout tab', 'Duplicate this tab'],
-    docks: ['dock left', 'dock right'],
-    arrange: ARRANGEMENTS.map(([, label]) => `arrange ${label}`),
-    plots: commands.offered().map((c) => `command ${c.id} ${c.label}`),
-    view: ['Export every tab', 'Import tabs'],
+    ...Object.fromEntries(PALETTE.map((group) => [group, offered.filter((c) => c.group === group).map((c) => c.find)])),
   });
   const scoreOf = (value) => computeCommandScore(value, state.query);
   /** Whether the row of `value` shows for what is typed. */
@@ -240,42 +235,15 @@
         </Command.Group>
       {/if}
       <Command.Separator />
-      {#if kept.tabs}
-        <Command.Group heading="Tabs">
-          {#each ws.tabs as t (t.id)}
-            {#if keep(`tab ${t.name}`)}<Command.Item value={`tab ${t.name}`} onSelect={() => run(() => ws.selectTab(t.id))}>Go to {t.name}</Command.Item>{/if}
-          {/each}
-          {#if keep('New layout tab')}<Command.Item value="New layout tab" onSelect={() => run(() => history.group('New tab', () => ws.addTab()))}>New layout tab</Command.Item>{/if}
-          {#if keep('Duplicate this tab')}<Command.Item value="Duplicate this tab" onSelect={() => run(() => history.group('Duplicate tab', () => ws.duplicateTab(ws.tab)))}>Duplicate this tab</Command.Item>{/if}
-        </Command.Group>
-      {/if}
-      {#if kept.docks}
-        <Command.Group heading="Docks">
-          {#each ['left', 'right'] as side}
-            {#if keep(`dock ${side}`)}<Command.Item value={`dock ${side}`} onSelect={() => run(() => act.toggleDock(side))}>{act.dockShown(side) ? 'Hide' : 'Show'} the {side} dock</Command.Item>{/if}
-          {/each}
-        </Command.Group>
-      {/if}
-      {#if kept.arrange}
-        <Command.Group heading="Arrange">
-          {#each ARRANGEMENTS as [name, label]}
-            {#if keep(`arrange ${label}`)}<Command.Item value={`arrange ${label}`} onSelect={() => run(() => history.group(`Arrange as ${label}`, () => ws.arrange(name)))}>Arrange as {label}</Command.Item>{/if}
-          {/each}
-        </Command.Group>
-      {/if}
-      {#if kept.plots}
-        <Command.Group heading="Plots">
-          {#each commands.offered() as c (c.id)}
-            {#if keep(`command ${c.id} ${c.label}`)}<Command.Item value={`command ${c.id} ${c.label}`} onSelect={() => run(() => commands.run(c.id, { from: 'palette' }))}>{c.label}</Command.Item>{/if}
-          {/each}
-        </Command.Group>
-      {/if}
-      {#if kept.view}
-        <Command.Group heading="View">
-          {#if keep('Export every tab')}<Command.Item value="Export every tab" onSelect={() => run(act.exportTabs)}>Export every tab</Command.Item>{/if}
-          {#if keep('Import tabs')}<Command.Item value="Import tabs" onSelect={() => run(act.importTabs)}>Import tabs</Command.Item>{/if}
-        </Command.Group>
-      {/if}
+      {#each PALETTE as group (group)}
+        {#if kept[group]}
+          <Command.Group heading={group}>
+            {#each offered.filter((c) => c.group === group) as c}
+              {#if keep(c.find)}<Command.Item value={c.find} data-command={c.id} onSelect={() => run(() => commands.run(c.id, { from: 'palette', how: c.how }))}>{c.label}</Command.Item>{/if}
+            {/each}
+          </Command.Group>
+        {/if}
+      {/each}
       {#if !propertiesFirst}{@render properties()}{/if}
     {/if}
   </Command.List>

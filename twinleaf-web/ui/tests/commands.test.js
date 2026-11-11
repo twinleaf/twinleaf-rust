@@ -19,7 +19,7 @@ import { commands } from 'vitest/browser';
 import fc from 'fast-check';
 import { MENUS, axisPopover, closeAll, openMenu } from './harness/menus.js';
 import { centre, click, clickOn, editCursors, feed, focusPage, leafOf, mountPage, pressKey, rightClick, settle, typeInto, until, wait, withExamples, withYPair } from './harness/page.js';
-import { COMMANDS } from '../src/lib/commands.js';
+import { COMMANDS, PLOTLESS } from '../src/lib/commands.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 
@@ -101,6 +101,7 @@ async function closePalette() {
 const ON_PAGE = {
   'the toolbar': async () => document.querySelector('.top-bar'),
   'the File dropdown': () => MENUS['the File dropdown'](),
+  'the Layout dropdown': () => MENUS['the Layout dropdown'](),
   'the tab strip': async () => document.querySelector('[data-focus=tabs]'),
   // A signal's menu has Add to plot or Remove from plot by what the selected plots show: the first signal whose menu names the command, or else the last.
   'the Signals list’s menu': async (page, on, id) => {
@@ -113,7 +114,7 @@ const ON_PAGE = {
     }
     return menu;
   },
-  'the palette’s signals': async () => (await pressKey('Control+k'), await settle(), document.querySelector('[data-slot=command-list]')),
+  'the palette’s rows': async () => (await pressKey('Control+k'), await settle(), document.querySelector('[data-slot=command-list]')),
 };
 
 /** Every origin a control is found at, by name. */
@@ -200,12 +201,12 @@ describe('a plot command', () => {
           const kinds = (list) => list.filter((p) => !c.kinds || c.kinds.includes(page.ws.plots[p].kind)).sort();
           // The rules, worked out here from the selection alone.
           const fromPlot = kinds(picked.includes(on) ? picked : [on]);
-          const fromPage = c.scope === 'tab' ? [] : kinds(picked.length ? picked : c.scope === 'view' ? ids : []);
+          const fromPage = PLOTLESS.includes(c.scope) ? [] : kinds(picked.length ? picked : c.scope === 'view' ? ids : []);
           /** Makes an origin's gesture, `act`, on the selection, and checks that the command ran once on `want`, a tab command on the open tab or with `onLast` on the last, or with none and not `empty`, not at all. */
           const check = async (origin, want, act, onLast = false) => {
             await closeAll();
-            // The palette, closed, fades out over the page, and takes every press until it has gone.
-            expect(await until(() => !document.querySelector('[data-slot=dialog-overlay]'), 2000), `the palette gone before ${id} from ${origin}`).toBe(true);
+            // The palette, left open or closed, fades out over the page, and takes every press until it has gone.
+            expect(await closePalette(), `the palette gone before ${id} from ${origin}`).toBe(true);
             await focusPage();
             page.ws.selection.only(picked);
             document.activeElement?.blur();
@@ -236,9 +237,9 @@ describe('a plot command', () => {
             await check('the palette', fromPage, async () => {
               await pressKey('Control+k');
               await settle();
-              const item = document.querySelector(`[data-slot=command-item][data-value^="command ${id} "]`);
-              // A command with no plots to act on now is not offered.
-              expect(!!item, `${id} offered with ${picks} selected`).toBe(fromPage.length > 0);
+              const item = document.querySelector(`[data-slot=command-item][data-command="${id}"]`);
+              // A command on plots with none to act on now is not offered; one of a tab or the page always is.
+              expect(!!item, `${id} offered with ${picks} selected`).toBe(PLOTLESS.includes(c.scope) || fromPage.length > 0);
               // The palette that offers nothing to pick is closed as it was opened, by a key.
               if (!item) {
                 await pressKey('Escape');

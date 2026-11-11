@@ -6,7 +6,9 @@
 // an action runs only from a lock; a value a property does not take shows
 // the edit bar's reason and writes nothing; devices that differ show ≠;
 // the list draws only the best matches; and no key but Enter on a valid
-// locked property calls a device. The devices are the stub hub's.
+// locked property calls a device. The devices are the stub hub's. A row
+// of a command of the page or a tab, picked, does what it names: the
+// arrangement, the tab or the dock of that row.
 import { describe, expect, it } from 'vitest';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
@@ -54,6 +56,45 @@ async function type(text) {
   await settle();
 }
 const closed = () => until(() => !document.querySelector('[data-slot=dialog-overlay]'), 2000);
+
+describe('a command in the command palette', () => {
+  /** The palette's row that reads `text`, or null. */
+  const rowOf = (text) => [...document.querySelectorAll('[data-slot=command-item]')].find((i) => i.textContent.trim() === text) ?? null;
+  /** Opens the palette and picks the row that reads `text`, with the mouse. */
+  async function pick(text) {
+    await openPalette();
+    expect(rowOf(text), `the row ${text}`).toBeTruthy();
+    await clickOn(rowOf(text));
+    expect(await closed(), `the palette closes on ${text}`).toBe(true);
+    await settle();
+  }
+
+  it('of the page or a tab does what its row names: the arrangement, the tab and the dock it names, and no other', async () => {
+    const page = await mountPage([['sine.sine'], ['sine.sine'], ['sine.sine']], 'rows', 1, ['sine.sine']);
+    try {
+      const [first, second] = page.ws.tabs;
+      expect(page.ws.arrangement()).toBe('rows');
+      await pick('Arrange as Columns');
+      expect(page.ws.arrangement(), 'the arrangement named').toBe('columns');
+      await pick('Hide the right dock');
+      await openPalette();
+      expect([!!rowOf('Show the right dock'), !!rowOf('Hide the left dock')], 'the right dock hidden, the left as it was').toEqual([true, true]);
+      await pressKey('Escape');
+      expect(await closed()).toBe(true);
+      await pick('Show the right dock');
+      await pick(`Go to ${second.name}`);
+      expect(page.ws.activeId, 'the tab named').toBe(second.id);
+      await pick(`Go to ${first.name}`);
+      await pick('Duplicate this tab');
+      expect(page.ws.tabs.map((t) => t.name), 'the open tab, copied after it').toEqual([first.name, `${first.name} copy`, second.name]);
+      await pick('New layout tab');
+      expect(page.ws.tabs.length, 'a tab more').toBe(4);
+      expect(page.ws.tab, 'the new tab open, last').toBe(page.ws.tabs.at(-1));
+    } finally {
+      page.dispose();
+    }
+  }, 120_000);
+});
 
 describe('a device property in the command palette', () => {
   it('locks on Tab, writes the value typed on Enter to the checked devices with the edit bar’s notice, and Revert puts it back', async () => {

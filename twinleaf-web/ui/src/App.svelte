@@ -75,15 +75,7 @@
   import RiAdd from '@lucide/svelte/icons/plus';
   import RiGrid from '@lucide/svelte/icons/layout-grid';
   import RiDownload from '@lucide/svelte/icons/download';
-  import RiReset from '@lucide/svelte/icons/rotate-ccw';
-  import RiRows from '@lucide/svelte/icons/rows-3';
-  import RiColumns from '@lucide/svelte/icons/columns-3';
-  import RiGridArrange from '@lucide/svelte/icons/layout-grid';
-  import RiQuadrants from '@lucide/svelte/icons/grid-2x2';
-  import RiFocusArrange from '@lucide/svelte/icons/layout-panel-left';
-  import RiUpload from '@lucide/svelte/icons/upload';
   import { counted } from './lib/menus.js';
-  import RiCheck from '@lucide/svelte/icons/check';
   import * as clock from './lib/clock.js';
   import './lib/scrolling.js';
 
@@ -173,6 +165,10 @@
     openExport: (targets) => openExport(targets),
     renameTab: (id) => tabStrip.startRename(id),
     closeTab: (t) => closeTab(t),
+    dockShown: (side) => docks.shown(side),
+    toggleDock: (side) => docks.hide(side, docks.shown(side)),
+    exportTabs,
+    importTabs: () => importInput.click(),
     viewChanged,
     place: {
       startMove: (id, e) => drags.startMove(id, e),
@@ -218,8 +214,6 @@
   const BAR_OFFSET = 7;
   /** Each theme's icon. */
   const THEME_ICONS = { light: RiSun, dark: RiMoon, system: RiSystem };
-  /** Each arrangement's picture in the Layout menu. */
-  const ARRANGE_ICONS = { rows: RiRows, columns: RiColumns, grid: RiGridArrange, quadrants: RiQuadrants, focus: RiFocusArrange };
   /** Reads the toolbar's window: what the first view it acts on can show of its window, which grows as a hub fills. */
   function readWindow() {
     const vs = chosen();
@@ -679,8 +673,6 @@
     delayMs = ms;
     views.setDelay(ms / 1000);
   }
-  const act = { toggleDock: (side) => docks.hide(side, docks.shown(side)), dockShown: (side) => docks.shown(side), exportTabs, importTabs: () => importInput.click() };
-
   let paletteOpen = $state(false);
   let keysOpen = $state(false);
   // The export the dialog offers, or null: plots' signals, the time they
@@ -963,14 +955,10 @@
         <!-- Each arrangement beside a picture of it, as the plot menus lead with icons. -->
         <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET}>
           <!-- A check on the arrangement the tab is in now, if any. -->
-          {@const now = ws.arrangement()}
           <DropdownMenu.Label>Arrange this tab<span class="menu-value">{plotsText(plotIds(ws.layout).length)}</span></DropdownMenu.Label>
-          {#each ARRANGEMENTS as [name, label]}
-            {@const Icon = ARRANGE_ICONS[name]}
-            <DropdownMenu.Item onSelect={() => history.group(`Arrange as ${label}`, () => ws.arrange(name))}><Icon class="menu-icon" />{label}{#if name === now}<span class="menu-value" aria-label="The layout now"><RiCheck /></span>{/if}</DropdownMenu.Item>
-          {/each}
+          {#each ARRANGEMENTS as [name]}<CommandItem id="arrange" how={{ to: name }} menu="dropdown" />{/each}
           <DropdownMenu.Separator />
-          <DropdownMenu.Item onSelect={() => history.group('Reset', () => ws.reset())}><RiReset class="menu-icon" />Reset to default</DropdownMenu.Item>
+          <CommandItem id="resetLayout" menu="dropdown" />
         </DropdownMenu.Content>
       </DropdownMenu.Root>
       <DropdownMenu.Root>
@@ -982,8 +970,8 @@
           {/snippet}
         </Tip>
         <DropdownMenu.Content class="menu-icons w-max" align="end" sideOffset={BAR_OFFSET}>
-          <DropdownMenu.Item onSelect={exportTabs}><RiDownload class="menu-icon" />Export every tab…<span class="menu-value">{counted(ws.tabs.length, 'tab')}</span></DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => importInput.click()}><RiUpload class="menu-icon" />Import tabs…</DropdownMenu.Item>
+          <CommandItem id="exportTabs" menu="dropdown" />
+          <CommandItem id="importTabs" menu="dropdown" />
           <DropdownMenu.Separator />
           <CommandItem id="exportData" menu="dropdown" />
         </DropdownMenu.Content>
@@ -1102,7 +1090,7 @@
 <Toasts />
 <KeysDialog bind:open={keysOpen} />
 <ExportDialog bind:what={exporting} />
-<CommandPalette bind:open={paletteOpen} session={hub.session} {ws} {act} devices={checked} />
+<CommandPalette bind:open={paletteOpen} session={hub.session} devices={checked} />
 
 <AlertDialog.Root open={!!closing} onOpenChange={(o) => !o && (closing = null)}>
   <AlertDialog.Content>

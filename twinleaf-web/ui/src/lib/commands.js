@@ -5,15 +5,17 @@
 // the same thing to the same plots.
 //
 // An entry is {id, scope, kinds, needs, place, show, keys, ctrl, shift,
-// keyless, what, label, icon, active, activeIcon, when, value, disabled,
-// destructive, choices, chosen, palette, find, empty, check, run}:
-// - `scope` is 'view', 'plot' or 'tab': made from the page or the keys with no
+// keyless, what, label, icon, iconOf, active, activeIcon, when, value,
+// disabled, destructive, choices, chosen, palette, find, empty, check,
+// run}:
+// - `scope` is 'view', 'plot', 'tab' or 'page': made from the page or the keys with no
 //   plot selected, a 'view' command acts on every plot shown and a 'plot'
 //   command on none (selection.svelte.js `pageTargets`). Made on a plot, from
 //   its menu or its buttons, a command acts on the selection the plot is in,
 //   or else on the plot alone (`targets`). A 'tab' command acts on no plot
 //   but on a tab of the page: the one it is made on, from its menu, its
-//   buttons or its keys, or else the open one.
+//   buttons or its keys, or else the open one. A 'page' command acts on
+//   the page itself.
 // - `kinds` lists the kinds of plot it acts on, or null for every kind; the
 //   plots of other kinds are dropped from what it acts on.
 // - `needs` lists what it needs beyond plots. Of where its plots are, which
@@ -35,17 +37,21 @@
 //   Its row shows its keys, unless it is `keyless`.
 // - `label`, `icon`, `value`, `disabled` and `destructive` are how its row
 //   reads: `label` is text or a function of the context, and a command with
-//   no label has no row; the icon is `activeIcon` while `active` holds,
-//   else `icon`. `value` is null, text, or {text, icon, warn, title}.
-//   `when`, where there is one, says whether a menu has the row at all; its
-//   key and its buttons run the command either way.
+//   no label has no row; the icon is what `iconOf(ctx, how)` gives, where
+//   there is one, or `activeIcon` while `active` holds, else `icon`.
+//   `value` is null, text, or {text, icon, warn, title, label}, `label`
+//   what an icon alone says. `when`, where there is one, says whether a
+//   menu has the row at all; its key and its buttons run the command either
+//   way.
 // - `choices(ctx, how)`, where there is one, lists the values it sets, as
 //   [value, name]: its row opens a submenu of them, and picking one runs it
 //   with that value as `how.to`. `chosen(ctx, how)` is the value the plot
 //   it is made on has, which the submenu marks; without it the submenu
-//   marks none.
+//   marks none. A row made with a value, `how.to`, is that choice's own.
 // - `palette` is the heading the command palette lists it under (PALETTE),
-//   and a command without it is not listed there.
+//   and a command without it is not listed there; one of choices is listed
+//   once for each. `find`, text or a function of the context, is what the
+//   palette matches what is typed against, its id and label unless given.
 // - `empty` true runs it with no plots to act on too.
 // - `check(ctx)`, where there is one, asks, as a menu opens, what its row
 //   then reads as `how`.
@@ -69,7 +75,7 @@ import { axisSlots, cursorText } from './plot.js';
 import { withX } from './cursors.js';
 import { nearestPeak, peaks, stepPeak } from './snap.js';
 import { chip } from './tabs.js';
-import { KINDS, MODES, kindLabel } from './constants.js';
+import { ARRANGEMENTS, KINDS, MODES, kindLabel } from './constants.js';
 import { writeTables } from './copy.js';
 import { plotIds } from './layout.js';
 import { DIGITS, axisFormat } from './units.js';
@@ -104,6 +110,16 @@ import RiLayout from '@lucide/svelte/icons/layers';
 import RiTab from '@lucide/svelte/icons/app-window';
 import RiRename from '@lucide/svelte/icons/pencil';
 import RiDuplicate from '@lucide/svelte/icons/copy';
+import RiDock from '@lucide/svelte/icons/panel-left';
+import RiArrange from '@lucide/svelte/icons/layout-grid';
+import RiRows from '@lucide/svelte/icons/rows-3';
+import RiColumns from '@lucide/svelte/icons/columns-3';
+import RiQuadrants from '@lucide/svelte/icons/grid-2x2';
+import RiFocus from '@lucide/svelte/icons/layout-panel-left';
+import RiCheck from '@lucide/svelte/icons/check';
+import RiReset from '@lucide/svelte/icons/rotate-ccw';
+import RiDownload from '@lucide/svelte/icons/download';
+import RiUpload from '@lucide/svelte/icons/upload';
 
 /** How far an arrow pans, as a share of the span, and zooms, as a factor. */
 const PAN = 0.1, ZOOM = 1.25;
@@ -236,6 +252,13 @@ function copyReadout(ctx) {
     (error) => ctx.svc.toast.error(`Could not copy: ${error.message}`),
   );
 }
+
+/** The page's tabs, as [id, name]. */
+const tabNames = (ctx) => ctx.svc.ws.tabs.map((t) => [t.id, t.name]);
+/** The page's docks, and their names. */
+const DOCKS = [['left', 'Left'], ['right', 'Right']];
+/** Each arrangement's picture. */
+const ARRANGE_ICONS = { rows: RiRows, columns: RiColumns, grid: RiArrange, quadrants: RiQuadrants, focus: RiFocus };
 
 /** How many plots tab `t` holds, as a row's value. */
 const plotsIn = (t) => counted(plotIds(t.layout).length, 'plot');
@@ -720,12 +743,6 @@ export const COMMANDS = [
     run: (ctx) => void ctx.svc.renameTab(ctx.tab.id),
   },
   {
-    id: 'duplicateTab', scope: 'tab', needs: ['workspace'], empty: true,
-    icon: RiDuplicate, label: 'Duplicate',
-    value: (ctx) => plotsIn(ctx.tab),
-    run: (ctx) => ctx.svc.group('Duplicate tab', () => ctx.svc.ws.duplicateTab(ctx.tab)),
-  },
-  {
     // The page asks first when the tab has plots.
     id: 'closeTab', scope: 'tab', needs: ['workspace'], place: 'tabs', show: ['Delete'], keys: ['Delete'], keyless: true, what: 'close tab', empty: true,
     icon: RiClose, label: 'Close', destructive: true,
@@ -733,10 +750,64 @@ export const COMMANDS = [
     run: (ctx) => void ctx.svc.closeTab(ctx.tab),
   },
   {
+    // Opens tab `how.to`: the palette's row for each tab.
+    id: 'openTab', scope: 'page', needs: ['workspace'], palette: 'Tabs', empty: true,
+    icon: RiTab, label: (ctx, how) => `Go to ${nameIn(tabNames(ctx), how?.to)}`,
+    find: (ctx, how) => `tab ${nameIn(tabNames(ctx), how?.to)}`,
+    choices: tabNames,
+    run: (ctx, how) => void ctx.svc.ws.selectTab(how?.to),
+  },
+  {
     // An empty tab after the others, which it opens.
-    id: 'newTab', scope: 'tab', needs: ['workspace'], empty: true,
-    icon: RiAdd, label: 'New layout',
+    id: 'newTab', scope: 'tab', needs: ['workspace'], palette: 'Tabs', empty: true,
+    icon: RiAdd, label: (ctx) => (ctx.from === 'palette' ? 'New layout tab' : 'New layout'),
+    find: 'New layout tab',
     run: (ctx) => ctx.svc.group('New tab', () => ctx.svc.ws.addTab()),
+  },
+  {
+    id: 'duplicateTab', scope: 'tab', needs: ['workspace'], palette: 'Tabs', empty: true,
+    icon: RiDuplicate, label: (ctx) => (ctx.from === 'palette' ? 'Duplicate this tab' : 'Duplicate'),
+    find: 'Duplicate this tab',
+    value: (ctx) => plotsIn(ctx.tab),
+    run: (ctx) => ctx.svc.group('Duplicate tab', () => ctx.svc.ws.duplicateTab(ctx.tab)),
+  },
+  // The page's own commands.
+  {
+    // Hides dock `how.to`, 'left' or 'right', or shows it while it is hidden: the palette's row for each.
+    id: 'dock', scope: 'page', needs: ['workspace'], palette: 'Docks', empty: true,
+    icon: RiDock, label: (ctx, how) => `${ctx.svc.dockShown(how?.to) ? 'Hide' : 'Show'} the ${how?.to} dock`,
+    find: (ctx, how) => `dock ${how?.to}`,
+    choices: () => DOCKS,
+    run: (ctx, how) => void ctx.svc.toggleDock(how?.to),
+  },
+  {
+    // Lays the open tab's plots out as `how.to` of ARRANGEMENTS, as one edit. Its row has that arrangement's picture, and a check while the tab is laid out so.
+    id: 'arrange', scope: 'page', needs: ['workspace'], palette: 'Arrange', empty: true,
+    icon: RiArrange, iconOf: (ctx, how) => ARRANGE_ICONS[how?.to],
+    label: (ctx, how) => (ctx.from === 'palette' ? `Arrange as ${nameIn(ARRANGEMENTS, how?.to)}` : nameIn(ARRANGEMENTS, how?.to)),
+    find: (ctx, how) => `arrange ${nameIn(ARRANGEMENTS, how?.to)}`,
+    value: (ctx, how) => (how?.to === ctx.svc.ws.arrangement() ? { text: '', icon: RiCheck, label: 'The layout now' } : null),
+    choices: () => ARRANGEMENTS,
+    run: (ctx, how) => (ARRANGEMENTS.some(([name]) => name === how?.to) ? ctx.svc.group(`Arrange as ${nameIn(ARRANGEMENTS, how.to)}`, () => ctx.svc.ws.arrange(how.to)) : false),
+  },
+  {
+    id: 'resetLayout', scope: 'page', needs: ['workspace'], empty: true,
+    icon: RiReset, label: 'Reset to default',
+    run: (ctx) => ctx.svc.group('Reset', () => ctx.svc.ws.reset()),
+  },
+  {
+    // The tabs as a file of layouts, to share.
+    id: 'exportTabs', scope: 'page', needs: ['workspace'], palette: 'View', empty: true,
+    icon: RiDownload, label: (ctx) => (ctx.from === 'palette' ? 'Export every tab' : 'Export every tab…'),
+    find: 'Export every tab',
+    value: (ctx) => counted(ctx.svc.ws.tabs.length, 'tab'),
+    run: (ctx) => void ctx.svc.exportTabs(),
+  },
+  {
+    id: 'importTabs', scope: 'page', needs: ['workspace'], palette: 'View', empty: true,
+    icon: RiUpload, label: (ctx) => (ctx.from === 'palette' ? 'Import tabs' : 'Import tabs…'),
+    find: 'Import tabs',
+    run: (ctx) => void ctx.svc.importTabs(),
   },
 ];
 
@@ -745,7 +816,9 @@ export const commandOf = (id) => COMMANDS.find((c) => c.id === id);
 /** What `label` field `f` of a command reads in `ctx`. */
 const read = (f, ctx, how) => (typeof f === 'function' ? f(ctx, how) : f);
 /** The headings the command palette lists commands under (`palette`), in its order. */
-export const PALETTE = ['Plots'];
+export const PALETTE = ['Tabs', 'Docks', 'Arrange', 'Plots', 'View'];
+/** The scopes of the commands that act on no plot. */
+export const PLOTLESS = ['tab', 'page'];
 /** What a command may need of where its plots are (`needs`). */
 export const HOSTED = ['workspace', 'live'];
 
@@ -761,7 +834,8 @@ export const HOSTED = ['workspace', 'live'];
  * fn)`, which runs `fn` as one edit named `what`, `split(ids, dir,
  * fromKeys)`, `close(ids, fromKeys)`, `newPlot(keys)`, `copy(plots)`,
  * `copyCheck(plots)`, `openExport(plots)`, `picker(id, action)`,
- * `renameTab(id)` and `closeTab(tab)`.
+ * `renameTab(id)`, `closeTab(tab)`, `dockShown(side)`, `toggleDock(side)`,
+ * `exportTabs()` and `importTabs()`.
  *
  * Where a command is made is {on, signal, signals, tab, from}: `on` the
  * plot it is made on, or null for the page; `signal` the signal whose row
@@ -772,7 +846,7 @@ export function commands(svc) {
   /** What command `id`, made at `where`, acts on: its context. */
   function context(id, { on = null, signal = null, signals, tab = null, from = 'menu' } = {}) {
     const c = commandOf(id);
-    if (c.scope === 'tab') return { plots: [], all: [], on: null, lead: null, signals: [], tab: svc.ws.tabs.find((t) => t.id === tab) ?? svc.ws.tab, from, svc };
+    if (PLOTLESS.includes(c.scope)) return { plots: [], all: [], on: null, lead: null, signals: [], tab: c.scope === 'tab' ? (svc.ws.tabs.find((t) => t.id === tab) ?? svc.ws.tab) : null, from, svc };
     const all = (on !== null ? svc.targets(on) : svc.pageTargets(c.scope)).map(svc.plotOf).filter((t) => t.plot);
     const plots = c.kinds ? all.filter((t) => c.kinds.includes(t.plot.kind)) : all;
     const made = on !== null ? svc.plotOf(on) : null;
@@ -803,12 +877,12 @@ export function commands(svc) {
       const c = commandOf(id), ctx = context(id, where);
       return {
         label: read(c.label, ctx, how),
-        icon: c.active?.(ctx, how) ? c.activeIcon : c.icon,
+        icon: c.iconOf?.(ctx, how) ?? (c.active?.(ctx, how) ? c.activeIcon : c.icon),
         value: c.value?.(ctx, how) ?? null,
         disabled: !!c.disabled?.(ctx, how),
         destructive: !!c.destructive,
         show: c.keyless ? null : (c.show ?? null),
-        choices: c.choices?.(ctx, how) ?? null,
+        choices: how?.to === undefined ? (c.choices?.(ctx, how) ?? null) : null,
         chosen: c.chosen?.(ctx, how),
         offered: hosted(c) && (!c.when || !!c.when(ctx, how)),
       };
@@ -818,11 +892,24 @@ export function commands(svc) {
       const c = commandOf(id);
       return c.check && hosted(c) ? c.check(context(id, { on })) : Promise.resolve(null);
     },
-    /** The commands the palette offers now, as {id, label}: each the table lists there (`palette`), with plots to act on now, or else one that runs with none and is on, as Restore is while plots are maximized. */
+    /**
+     * The palette's rows now, in the table's order, as {id, how, label,
+     * find, group}: `how` what the row runs its command with, `find` the
+     * words the palette matches what is typed against, and `group` its
+     * heading. A command the table lists there (`palette`) has a row for
+     * each of its choices, or one: a command on plots while it has plots to
+     * act on now, or runs with none and is on, as Restore is while plots
+     * are maximized; a command of the page or a tab always.
+     */
     offered() {
       return COMMANDS.filter((c) => c.palette && hosted(c)).flatMap((c) => {
         const ctx = context(c.id, { from: 'palette' });
-        return (ctx.plots.length || (c.empty && c.active?.(ctx))) && !c.disabled?.(ctx) ? [{ id: c.id, label: read(c.label, ctx) }] : [];
+        if (!PLOTLESS.includes(c.scope) && !(ctx.plots.length || (c.empty && c.active?.(ctx)))) return [];
+        if (c.disabled?.(ctx)) return [];
+        return (c.choices?.(ctx) ?? [[undefined]]).map(([to]) => {
+          const how = to === undefined ? undefined : { to }, label = read(c.label, ctx, how);
+          return { id: c.id, how, label, find: c.find ? read(c.find, ctx, how) : `command ${c.id} ${label}`, group: c.palette };
+        });
       });
     },
   };

@@ -22,7 +22,7 @@
 </script>
 
 <!-- A row's value in its trailing column, when it has one. -->
-{#snippet trailing()}{#if value}<span class="menu-value" class:warn={value.warn} title={value.title}>{#if value.warn}<RiWarn />{/if}{#if value.icon}<value.icon />{/if}{value.text}</span>{/if}{/snippet}
+{#snippet trailing()}{#if value}<span class="menu-value" class:warn={value.warn} title={value.title} aria-label={value.label}>{#if value.warn}<RiWarn />{/if}{#if value.icon}<value.icon />{/if}{value.text}</span>{/if}{/snippet}
 <!-- One line each, so no space comes between a row's parts. -->
 {#if row.offered && row.choices}
   <Menu.Sub>

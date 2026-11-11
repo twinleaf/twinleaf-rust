@@ -17,7 +17,7 @@
 // rows say why.
 import { afterEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { COMMANDS, HOSTED, PALETTE, commandOf, commands } from './commands.js';
+import { COMMANDS, HOSTED, PALETTE, PLOTLESS, commandOf, commands } from './commands.js';
 import { KEYMAP, actionFor, scopeOf } from './keymap.js';
 import { KINDS } from './constants.js';
 import { SIGNAL, Selection } from './selection.svelte.js';
@@ -31,9 +31,9 @@ describe('the command table', () => {
     expect(new Set(COMMANDS.map((c) => c.id)).size).toBe(COMMANDS.length);
     const kinds = KINDS.map(([k]) => k);
     for (const c of COMMANDS) {
-      expect(['view', 'plot', 'tab'], c.id).toContain(c.scope);
-      // A tab command acts on no plot, so runs with none.
-      if (c.scope === 'tab') expect(c.empty && !c.kinds, c.id).toBe(true);
+      expect(['view', 'plot', ...PLOTLESS], c.id).toContain(c.scope);
+      // A command of a tab or the page acts on no plot, so runs with none.
+      if (PLOTLESS.includes(c.scope)) expect(c.empty && !c.kinds, c.id).toBe(true);
       expect(c.kinds === undefined || c.kinds.every((k) => kinds.includes(k)), c.id).toBe(true);
       expect((c.needs ?? []).every((n) => [...HOSTED, 'axis', 'signals'].includes(n)), c.id).toBe(true);
       expect([undefined, 'page', 'list', 'tabs'], c.id).toContain(c.place);
@@ -104,6 +104,10 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     activeId: 'T',
     duplicateTab: (t) => void log.push(`duplicateTab ${t.id}`),
     addTab: () => void log.push('addTab'),
+    selectTab: (id) => void log.push(`selectTab ${id}`),
+    arrangement: () => 'rows',
+    arrange: (name) => void log.push(`arrange ${name}`),
+    reset: () => void log.push('reset'),
     setView: (id) => void log.push(`setView ${id}`),
     movePlotToTab: (id, tab) => void log.push(`movePlotToTab ${id} ${tab}`),
   };
@@ -135,6 +139,10 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     picker: record('picker'),
     renameTab: (id) => void log.push(`renameTab ${id}`),
     closeTab: (t) => void log.push(`closeTab ${t.id}`),
+    dockShown: (side) => side === 'left',
+    toggleDock: (side) => void log.push(`toggleDock ${side}`),
+    exportTabs: () => void log.push('exportTabs'),
+    importTabs: () => void log.push('importTabs'),
   };
   return { cmds: commands(svc) };
 }
@@ -169,7 +177,7 @@ describe('a command', () => {
         spy(c, seen);
         const p = page(kinds, picked, last === null ? null : IDS[last], []);
         // The oracle, from the rules alone.
-        const ids = c.scope === 'tab' ? [] : made ? (picked.includes(made) ? picked : [made]) : picked.length ? picked : c.scope === 'view' ? shown : [];
+        const ids = PLOTLESS.includes(c.scope) ? [] : made ? (picked.includes(made) ? picked : [made]) : picked.length ? picked : c.scope === 'view' ? shown : [];
         const want = ids.filter((i) => !c.kinds || c.kinds.includes(kinds[IDS.indexOf(i)]));
         const taken = p.cmds.run(id, { on: made, from: made ? 'menu' : 'key', how: {} });
         expect(taken, `${id} taken`).toBe(ids.length > 0 || !!c.empty);
@@ -225,9 +233,19 @@ describe('a command', () => {
     expect(offered).toContain('splitRight');
     expect(COMMANDS.filter((c) => c.palette && c.needs?.some((n) => !HOSTED.includes(n))).map((c) => c.id)).toEqual([]);
     const none = page(['time'], [], null, log);
-    expect(none.cmds.offered().map((c) => c.id)).toEqual(COMMANDS.filter((c) => c.palette && c.scope === 'view').map((c) => c.id));
+    expect([...new Set(none.cmds.offered().map((c) => c.id))]).toEqual(COMMANDS.filter((c) => c.palette && c.scope !== 'plot').map((c) => c.id));
     // With none selected, Restore is offered while plots are maximized, as F then restores.
-    expect(page(['time'], [], null, log, ['a']).cmds.offered()).toContainEqual({ id: 'maximize', label: 'Restore' });
+    expect(page(['time'], [], null, log, ['a']).cmds.offered()).toContainEqual({ id: 'maximize', how: undefined, label: 'Restore', find: 'command maximize Restore', group: 'Plots' });
+    // A command of choices has a row for each, in the words the palette says and matches: a tab to go to, a dock to hide or show, an arrangement.
+    const rows = (id) => none.cmds.offered().filter((c) => c.id === id).map((c) => [c.how.to, c.label, c.find, c.group]);
+    expect(rows('openTab')).toEqual([['T', 'Go to T', 'tab T', 'Tabs'], ['U', 'Go to U', 'tab U', 'Tabs']]);
+    expect(rows('dock')).toEqual([['left', 'Hide the left dock', 'dock left', 'Docks'], ['right', 'Show the right dock', 'dock right', 'Docks']]);
+    expect(rows('arrange')[0]).toEqual(['rows', 'Arrange as Rows', 'arrange Rows', 'Arrange']);
+    // A row made with a choice is that choice's own, with no submenu; a menu words a command its own way, and checks the arrangement the tab is in.
+    expect(none.cmds.row('arrange', { how: { to: 'rows' } })).toMatchObject({ label: 'Rows', choices: null, value: { label: 'The layout now' } });
+    expect(none.cmds.row('arrange', { how: { to: 'grid' } })).toMatchObject({ label: 'Grid', value: null });
+    expect(none.cmds.row('exportTabs')).toMatchObject({ label: 'Export every tab…', value: '2 tabs' });
+    expect(none.cmds.offered().find((c) => c.id === 'exportTabs')).toMatchObject({ label: 'Export every tab', find: 'Export every tab', group: 'View' });
   });
 
   it('whose host has not what it needs does not run, has no row, asks nothing and is not in the palette, and every other command is as on a host that has it', async () => {
