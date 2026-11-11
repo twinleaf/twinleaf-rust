@@ -15,7 +15,10 @@
 // edit history has them, and one that brings them back to a live plot shows
 // the paused view it left; a page loaded again on a hub that holds what
 // it showed shows each plot paused as it was, with its cursors, and each
-// live one live; nothing else changes them. The window field's arrows and wheel turns in a
+// live one live; a drag that starts on an X cursor's line moves that cursor,
+// to one value on every plot the drag acts on, which pauses those that were
+// live, and a press held still there moves nothing; nothing else changes
+// them. The window field's arrows and wheel turns in a
 // burst are one step too, and so is each window typed in it.
 // Then each kind of gesture once: arrow keys, the toolbar's Live, a plot's
 // Pause on a selection, Y cursors, a spectrum's pan and y zoom,
@@ -115,7 +118,7 @@ async function wheel(p, id, turns, { at = 0.5, shift = false } = {}) {
 /** Every way the page has of following live, each on plot `at` or the page: a double-click, End, Space, the plot's play button and the toolbar's Live. */
 const LIVE = ['dblclick', 'End', 'Space', 'play', 'toolbar'];
 const gesture = fc.oneof(
-  { weight: 3, arbitrary: fc.record({ t: fc.constant('drag'), at: fc.nat(), dx: fc.integer({ min: -160, max: 160 }), rest: fc.boolean() }) },
+  { weight: 3, arbitrary: fc.record({ t: fc.constant('drag'), at: fc.nat(), dx: fc.integer({ min: -160, max: 160 }), rest: fc.boolean(), from: fc.constantFrom(null, null, 'a', 'b') }) },
   { weight: 3, arbitrary: fc.record({ t: fc.constant('wheel'), at: fc.nat(), turns: fc.array(fc.constantFrom(-120, 120), { minLength: 1, maxLength: 4 }) }) },
   { weight: 2, arbitrary: fc.record({ t: fc.constant('follow'), at: fc.nat(), how: fc.constantFrom(...LIVE) }) },
   { weight: 1, arbitrary: fc.record({ t: fc.constant('pause'), at: fc.nat() }) },
@@ -187,7 +190,7 @@ describe('a plot’s header', () => {
 
 describe('view history on the page', () => {
   it('makes each gesture one step of the tab, whatever plots it moves, and Back and Forward on any plot go through them; a plot that follows live never has time X cursors', async () => {
-    const count = { back: 0, several: 0, bursts: 0, rested: 0, cursorsKept: 0, xTaken: 0, xBack: 0, xUndone: 0, reloaded: 0, ...Object.fromEntries(LIVE.map((how) => [how, 0])) };
+    const count = { back: 0, several: 0, bursts: 0, rested: 0, cursorOnSeveral: 0, heldOnCursor: 0, cursorsKept: 0, xTaken: 0, xBack: 0, xUndone: 0, reloaded: 0, ...Object.fromEntries(LIVE.map((how) => [how, 0])) };
     await fc.assert(
       // Each run, somewhere among the rest, places X cursors, so Back and
       // Forward go past steps with cursors placed, and drags every plot at
@@ -226,15 +229,36 @@ describe('view history on the page', () => {
             const views = ids.map((i) => one(p, i)), xs = timeXs(p), cursors = cursorsOf(p);
             const live = () => ids.map((i) => p.views.get(i).live);
             const wasLive = live();
+            // The X cursor a drag moved, {name, to, over}: to value `to` on the plots `over`.
+            let dragged = null;
             if (g.t === 'drag') {
               // A drag that rests longer than a burst's idle midway is still one step.
-              const [x, y] = centre(bodyOf(id));
-              const half = [['move', x + g.dx / 4, y], ['move', x + g.dx / 2, y]];
+              // From the middle of the plot, or with `from`, from that X cursor's line where the plot shows it; and no further than the plot's edge, past which a cursor let go is removed.
+              const pv = p.pv(id), P = pv.geo.plot, [middle, y] = centre(bodyOf(id));
+              const x = pv.pressable.find((q) => q.part === 'line' && q.kind === 'x' && q.name === g.from)?.at ?? middle;
+              const dx = Math.max(P.x + 2 - x, Math.min(P.x + P.w - 2 - x, g.dx));
+              // What the press lands on (PlotView `pressAt`): on an X cursor's line the drag moves that cursor,
+              // on every plot the gesture acts on, to the one value the pointer takes it to; elsewhere it pans.
+              const on = pv.pressAt(x, y), name = on?.kind === 'x' ? on.name : null;
+              const was = name && pv.pxOf(xs[ids.indexOf(id)][name]), over = name ? p.ws.selection.targets(id) : [];
+              const half = [['move', x + dx / 4, y], ['move', x + dx / 2, y]];
               await commands.mouse([['move', x, y], ['down'], ...half]);
               if (g.rest) await wait(IDLE_MS + 200);
-              await commands.mouse([['move', x + (3 * g.dx) / 4, y], ['move', x + g.dx, y], ['up']]);
+              await commands.mouse([['move', x + (3 * dx) / 4, y], ['move', x + dx, y], ['up']]);
               await frames();
-              if (moved('drag', xs) && g.rest) count.rested++;
+              if (!dx) {
+                // A press held still moves nothing, on a cursor's line too, whatever plots are selected with it.
+                expect(shown(p), 'a press held still: what the plots show').toBe(line[at].shows);
+                if (over.length > 1) count.heldOnCursor++;
+              } else {
+                if (moved('drag', xs) && g.rest) count.rested++;
+                if (name) {
+                  const to = timeXs(p)[ids.indexOf(id)][name];
+                  expect(Math.abs(pv.pxOf(to) - (was + dx)), 'drag: the cursor goes as far as the pointer').toBeLessThan(1.5);
+                  dragged = { name, to, over };
+                  if (over.length > 1) count.cursorOnSeveral++;
+                }
+              }
             } else if (g.t === 'wheel') {
               // The last burst has rested by now, so this one is a step of its own.
               await wait(IDLE_MS + 100);
@@ -317,10 +341,13 @@ describe('view history on the page', () => {
                 if (/\d/.test(cursors)) count.cursorsKept++;
               }
             }
-            // Going live by any route takes the time X cursors of the plots it made live; nothing else here changes a cursor.
+            // Going live by any route takes the time X cursors of the plots it made live, and a drag
+            // on a cursor's line moves that cursor; nothing else here changes a cursor.
             if (!['addX', 'undo', 'redo', 'back', 'forward', 'reload'].includes(g.t)) {
               const now = live();
-              expect(timeXs(p), `${g.t}: the time X cursors`).toEqual(xs.map((x, k) => (!wasLive[k] && now[k] ? { a: null, b: null } : x)));
+              expect(timeXs(p), `${g.t}: the time X cursors`).toEqual(
+                xs.map((x, k) => (!wasLive[k] && now[k] ? { a: null, b: null } : dragged?.over.includes(ids[k]) ? { ...x, [dragged.name]: dragged.to } : x)),
+              );
             }
             ids.forEach((i, k) => !wasLive[k] && p.views.get(i).live && left.set(i, views[k]));
           };
@@ -343,6 +370,14 @@ describe('view history on the page', () => {
       ], 0, 0, 0],
       // A press held still on an X cursor's line, after a drag moved it there: it moves no cursor.
       [[{ t: 'wheel', at: 0, turns: [-120] }, { t: 'wheel', at: 0, turns: [-120] }, { t: 'back', at: 0 }, { t: 'drag', at: 0, dx: 69, rest: false }, { t: 'forward', at: 0 }, { t: 'drag', at: 0, dx: 0, rest: false }], 2147483627, 0, 0],
+      // A drag that starts on X1's line with every plot selected: it drags X1, on every plot, the live ones
+      // paused. Three runs in which a wheel burst left the line under the middle of its plot, where the drag
+      // of every plot then pressed, each up to that drag, and then the drag from the line wherever it is.
+      [[{ t: 'pause', at: 0 }, { t: 'back', at: 0 }, { t: 'back', at: 0 }, { t: 'wheel', at: 424284508, turns: [-120, -120, 120, 120] }, { t: 'drag', at: 155828251, dx: 120, rest: true, from: 'a' }], 3, 5, 155828251],
+      [[{ t: 'back', at: 0 }, { t: 'back', at: 0 }, { t: 'forward', at: 0 }, { t: 'back', at: 0 }, { t: 'back', at: 0 }, { t: 'forward', at: 0 }, { t: 'wheel', at: 0, turns: [-120, -120, 120, 120] }, { t: 'drag', at: 0, dx: 120, rest: true, from: 'a' }], 0, 8, 0],
+      [[{ t: 'drag', at: 0, dx: 0, rest: true }, { t: 'wheel', at: 377812369, turns: [120, 120, 120] }, { t: 'drag', at: 10, dx: 120, rest: true, from: 'a' }], 1, 3, 10],
+      // A press held still on X1's line, with every plot selected and the others live: nothing moves, and none pauses.
+      [[{ t: 'all', on: true }, { t: 'drag', at: 0, dx: 0, rest: false, from: 'a' }], 0, 3, 0],
       // Paused plots zoomed out before the hub has said what it holds, which end no later than their pause, and the page loaded again: they load paused as they were.
       [[{ t: 'addXFollow', at: 0, how: 'dblclick' }, { t: 'wheel', at: 0, turns: [120, -120, 120] }, { t: 'addX', at: 0 }, { t: 'drag', at: 0, dx: 0, rest: false }, { t: 'reload' }], 0, 0, 0]]),
     );

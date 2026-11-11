@@ -1928,10 +1928,19 @@ export class PlotView {
     else this.hoverTime.t = value;
   }
 
-  /** Shows X cursor `name` at `value`, or removed with null, while a drag moves it, on every plot the drag moves it on (`cursorTargets`). */
+  /**
+   * Shows X cursor `name` at `value`, or removed with null, while a drag
+   * moves it, on every plot the drag moves it on (`cursorTargets`). A time
+   * cursor holds a moment a live view would scroll away, so each of those
+   * plots pauses as the drag first places it there: a press let go where it
+   * was made pauses none.
+   */
   draftX(name, value) {
     const kind = this.config().kind;
-    for (const [p] of this.cursorTargets()) this.cursors.draft(p.plotId, withX(this.cursors.get(p.plotId), kind, name, value));
+    for (const [p] of this.cursorTargets()) {
+      if (kind === 'time' && value !== null) p.view.pause(clock.now());
+      this.cursors.draft(p.plotId, withX(this.cursors.get(p.plotId), kind, name, value));
+    }
   }
 
   /** Shows Y cursor `name` of y axis `key` at `value`, or removed with null, while a drag moves it, on the axis in its units of every plot the drag moves it on. */
@@ -2167,9 +2176,6 @@ export class PlotView {
       clickAfter = true;
       unwatchShift?.();
       unwatchShift = watchShift(onShift);
-      // A time cursor holds a moment the live view would scroll away, so
-      // dragging one pauses every plot it moves on.
-      if (mode === 'xcursor' && isTime()) for (const [p] of this.cursorTargets()) p.view.pause(clock.now());
     });
     // Turns an axis drag that has moved off the press into what its
     // direction says, and says whether it is still to decide.
@@ -2187,11 +2193,9 @@ export class PlotView {
         drag.key = key;
         drag.cursor = pick(this.yPair(key), (v) => Math.abs(this.axisScale(a)(v) - e.clientY));
       } else if (across) {
-        // In from a y axis: an X cursor. A time cursor holds a moment the
-        // live view would scroll away, so it pauses the view.
+        // In from a y axis: an X cursor.
         drag.mode = 'xcursor';
         drag.cursor = pick(this.markers(), (v) => Math.abs(this.pxOf(v) - e.clientX));
-        if (isTime()) for (const [p] of this.cursorTargets()) p.view.pause(clock.now());
       } else if (drag.mode === 'axis') {
         if (isTime()) (drag.mode = 'seek'), (this.seeking = true);
         else drag.mode = 'none';
