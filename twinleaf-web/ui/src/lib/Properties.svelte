@@ -136,6 +136,8 @@
   const active = $derived(rows.findIndex((r) => prefix + r.name === selection.rowAt));
   const current = $derived(active < 0 ? undefined : rows[active]);
   let tableEl = $state(null);
+  /** The table's id: Escape from the edit bar's field goes out to the table, on the row it edits (focus.js `data-focus-out`). */
+  const gridId = $derived(`props-grid-${panel}`);
   $effect(() => {
     const row = current;
     if (row) untrack(() => writes.readMissing(row.name, devices.filter((d) => row.entries.get(d.route)?.readable)));
@@ -267,8 +269,8 @@
   /**
    * Enter in the edit bar's field writes what is typed. Escape, once
    * something is typed, puts the field back as it was filled and keeps the
-   * key; with nothing typed it leaves the key to the page, which goes out a
-   * level (keyrouter.js).
+   * key; with nothing typed it leaves the key to the page, which goes out to
+   * the table, on the row edited (`gridId`).
    */
   function editorKey(e) {
     if (e.key === 'Enter' && bar && draft.trim() !== '') {
@@ -349,6 +351,7 @@
 <ScrollArea class="props" type="auto">
   <Table.Root
     class="props-table"
+    id={gridId}
     role="grid"
     data-focus-own
     tabindex={0}
@@ -439,6 +442,7 @@
         placeholder={differ ? words.MIXED : (bar.rows[0].rpc.type ?? '')}
         aria-label="New value of {bar.label}"
         aria-invalid={problem ? 'true' : undefined}
+        data-focus-out={gridId}
         onkeydown={editorKey}
       />
       <Button size="xs" variant="outline" disabled={!n || draft.trim() === '' || !!problem} onclick={() => writeBar(draft.trim())}>{words.writeTo(n)}</Button>

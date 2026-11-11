@@ -37,7 +37,8 @@ Splitters are not in the tree. The command palette resizes the docks.
    between tabs, a field moves its caret.
 4. **Enter goes one level down**, to the child the node last had, or its
    first: a plot enters its signals, a panel header its contents, which it
-   unfolds first. **Esc goes one level up.** **F6 and Shift+F6 move between
+   unfolds first. **Esc goes one level up**, or where the node says (the edit
+   bar's value field: to its property table). **F6 and Shift+F6 move between
    the regions**, each to where it was last.
 5. **Every other key goes to the highlighted plot**, wherever the cursor is,
    unless what has focus keeps it (keys.js). F on a plot's maximize button
@@ -72,6 +73,7 @@ pressed:
 | `data-focus-arrows` | a node that uses the arrows itself |
 | `data-focus-key` / `data-focus-group` | a node whose children sit elsewhere, as a panel header's in its body |
 | `data-focus-skip` | left out, with everything inside it |
+| `data-focus-out="id"` | a node Esc leaves for the element of that id, not the level up: the edit bar's value field leaves for its property table |
 
 Every control inside a node (a button, a field, a tab) is a node too, a
 child of the nearest node around it. A component that takes a key for

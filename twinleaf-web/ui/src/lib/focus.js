@@ -8,14 +8,17 @@
 //   data-focus-key="k"      a node whose children also sit in the element
 //   data-focus-group="k"    elsewhere, as a panel header's are in its body
 //   data-focus-skip         left out of the tree, with all inside it
+//   data-focus-out="id"     a node Escape leaves for the element of that id,
+//                           while it is usable, not for the node around it
 // Every control inside a node (a button, a field, a tab) is a node too, a
 // child of the nearest node around it. Splitters are not in the tree.
 //
 // The cursor is the node with focus, or the node around what has it. Tab
 // and Shift+Tab step through the cursor's siblings, wrapping; the arrows do
 // too, but in a field or a node that uses them. Enter goes down a level, to
-// the child the node last had, or its first; Escape goes up one. F6 steps
-// through the page's regions, to the node each last had.
+// the child the node last had, or its first; Escape goes out of the node
+// (`out`): up one, or where the node says. F6 steps through the page's
+// regions, to the node each last had.
 
 const NODE = '[data-focus]';
 const CONTROL = 'button, input, select, textarea, a[href], [role=tab], [role=button], [role=checkbox], [role=switch], [role=slider], [role=combobox], [tabindex="0"]';
@@ -101,6 +104,12 @@ export const page = {
   last: (n) => lastChild.get(n ?? ROOT),
 };
 
+/** Where Escape goes from node `n`: the element its `data-focus-out` names, while that is usable, or else the node around it. */
+export function out(n) {
+  const named = n.dataset.focusOut ? document.getElementById(n.dataset.focusOut) : null;
+  return named && usable(named) ? named : parentOf(n);
+}
+
 /** The node the cursor is on, for element `el` with focus: the node itself, the one keeping its own items, or the node around it. */
 export function cursorOf(el) {
   if (!(el instanceof Element) || el === document.body) return null;
@@ -152,7 +161,7 @@ export function navigate(e, at = e.target) {
     to = down(page, n);
   } else if (e.key === 'Escape') {
     if (!n) return false;
-    to = parentOf(n);
+    to = out(n);
   }
   if (!to) return false;
   e.preventDefault();

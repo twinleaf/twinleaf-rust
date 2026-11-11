@@ -22,7 +22,7 @@ import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { OPEN, centre, clickOn, closeAll, editCursors, emptySpots, feed, focusPage, frames, headerSpot, leafOf, mountPage, plotMenu, pressKey, quietApi, settle, until, withExamples, withYPair } from './harness/page.js';
 import { plotIds } from '../src/lib/layout.js';
-import { cursorOf, page as tree } from '../src/lib/focus.js';
+import { cursorOf, out as outOf, page as tree } from '../src/lib/focus.js';
 import { ORDER, lastKey } from '../src/lib/keyrouter.js';
 import { actionFor } from '../src/lib/keymap.js';
 
@@ -65,7 +65,7 @@ function owner(page, drag) {
   const el = document.activeElement;
   if (drag) return 'drag';
   if (el.closest(POPUP)) return null;
-  const n = cursorOf(el), out = n && tree.parent(n) ? 'navigation' : null;
+  const n = cursorOf(el), out = n && outOf(n) ? 'navigation' : null;
   if (el.closest(FIELD)) return out;
   if (page.ws.maximized) return 'restore';
   if (page.ws.selected.size || page.ws.selection.rows.size) return 'deselect';
@@ -145,7 +145,7 @@ describe('Escape', () => {
               } else if (want === 'restore') expect(now, said).toEqual({ max: null, plots: before.plots, rows: before.rows });
               else if (want === 'deselect') expect(now, said).toEqual({ max: null, plots: [], rows: [] });
               else expect(now, said).toEqual({ max: before.max, plots: before.plots, rows: before.rows });
-              if (want === 'navigation') expect(cursorOf(document.activeElement), `${said}: focus`).toBe(tree.parent(cursorOf(before.focus)));
+              if (want === 'navigation') expect(cursorOf(document.activeElement), `${said}: focus`).toBe(outOf(cursorOf(before.focus)));
               if (popup) await until(() => !popup.isConnected || popup.dataset.state === 'closed', 2000);
               seen.add(popup ? 'popup' : (want ?? 'no one'));
               where.add(name);
@@ -193,7 +193,7 @@ describe('Escape', () => {
           await pressKey('Escape');
           flushSync();
           await frames();
-          steps.push({ by: lastKey().by, maximized: !!page.ws.maximized, selected: page.ws.selected.size, focus: document.activeElement === el ? 'the list' : document.activeElement === tree.parent(el) ? 'the level above' : named(document.activeElement) });
+          steps.push({ by: lastKey().by, maximized: !!page.ws.maximized, selected: page.ws.selected.size, focus: document.activeElement === el ? 'the list' : document.activeElement === outOf(el) ? 'the level above' : named(document.activeElement) });
         }
         expect(steps, `three Escapes in ${name}, in a maximized view of a selected plot`).toEqual([
           { by: 'restore', maximized: false, selected: 1, focus: 'the list' },
@@ -228,7 +228,7 @@ describe('Escape', () => {
         const field = fieldsOf()[i];
         field.focus();
         await settle();
-        const was = field.value, parent = tree.parent(cursorOf(field));
+        const was = field.value, parent = outOf(cursorOf(field));
         await pressKey('x');
         await settle();
         const typed = field.value !== was;
@@ -239,13 +239,19 @@ describe('Escape', () => {
           await frames();
           at.push({ by: lastKey().by, shows: field.value === was ? 'as it was' : field.value, focus: document.activeElement === field ? 'the field' : cursorOf(document.activeElement) === parent ? 'the level above' : named(document.activeElement) });
         }
-        steps[name] = { typed, at };
+        // Out of the edit bar's field is the table of the row it edits; out of any other, the node around it.
+        const edited = parent?.matches('[role=grid]') && parent.querySelector(`#${parent.getAttribute('aria-activedescendant')}`)?.getAttribute('aria-selected') === 'true';
+        steps[name] = { typed, at, out: edited ? 'the table, on the row edited' : parent === tree.parent(cursorOf(field)) ? 'the node around it' : named(parent) };
       } finally {
         page.dispose();
       }
     }
-    const want = { typed: true, at: [{ by: null, shows: 'as it was', focus: 'the field' }, { by: 'navigation', shows: 'as it was', focus: 'the level above' }] };
-    expect(steps).toEqual(Object.fromEntries(names.map((n) => [n, want])));
+    const want = (n) => ({
+      typed: true,
+      at: [{ by: null, shows: 'as it was', focus: 'the field' }, { by: 'navigation', shows: 'as it was', focus: 'the level above' }],
+      out: n.includes('New value of') ? 'the table, on the row edited' : 'the node around it',
+    });
+    expect(steps).toEqual(Object.fromEntries(names.map((n) => [n, want(n)])));
   }, 120_000);
 
   it('has its owners in that order in the router, and none before the element but a drag and an open menu', () => {
