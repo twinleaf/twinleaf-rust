@@ -87,6 +87,8 @@ export function cursorsFromJson(v) {
 export class CursorEdits {
   /** What a drag under way shows in place of the tab's cursors, by plot id. */
   drafts = new Map();
+  /** The X cursor an edit here placed or moved last on each plot, 'a' or 'b', by plot id; X1 where an edit placed or moved both. */
+  #movedX = new Map();
 
   /** `ws` is the page's Workspace and `history` its History. */
   constructor(ws, history) {
@@ -102,6 +104,12 @@ export class CursorEdits {
   /** The cursors plot `id` of the open tab shows: a drag's draft of them while it moves one, else the tab's. */
   get(id) {
     return this.drafts.has(id) ? this.drafts.get(id) : this.saved(id);
+  }
+
+  /** The X cursor of plot `id` placed or moved last, 'a' or 'b', where it is still placed; else the one placed, X1 first; else 'a'. */
+  lastX(id) {
+    const kind = this.ws.plots[id]?.kind, pair = xOf(this.get(id), kind), moved = this.#movedX.get(id);
+    return moved && pair[moved] !== null ? moved : pair.a === null && pair.b !== null ? 'b' : 'a';
   }
 
   /** Shows `cursors` on plot `id` until the drag that moves them ends. */
@@ -129,6 +137,11 @@ export class CursorEdits {
   set(what, byId) {
     const changed = [...byId].filter(([id, c]) => this.ws.plots[id] && JSON.stringify(c ?? null) !== JSON.stringify(this.ws.plots[id].cursors ?? null));
     if (!changed.length) return false;
+    for (const [id, c] of changed) {
+      const kind = this.ws.plots[id].kind, was = xOf(this.ws.plots[id].cursors, kind), now = xOf(c, kind);
+      const moved = now.a !== null && now.a !== was.a ? 'a' : now.b !== null && now.b !== was.b ? 'b' : null;
+      if (moved) this.#movedX.set(id, moved);
+    }
     this.history.group(changed.length > 1 ? `${what} (${counted(changed.length, 'plot')})` : what, () => {
       for (const [id, c] of changed) this.ws.setPlot(id, { cursors: c });
     });

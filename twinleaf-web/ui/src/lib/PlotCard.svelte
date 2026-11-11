@@ -44,6 +44,7 @@
   import RiXCursors from '@lucide/svelte/icons/separator-vertical';
   import RiYCursors from '@lucide/svelte/icons/separator-horizontal';
   import RiZoomTo from '@lucide/svelte/icons/zoom-in';
+  import RiPeak from '@lucide/svelte/icons/mountain';
   import { PlotView, axisSlots, colorOf, cursorText, monitorOf } from './plot.js';
   import { colors } from './colors.svelte.js';
   import Swatch from './Swatch.svelte';
@@ -66,6 +67,8 @@
   const commands = getContext('commands');
   /** Runs plot command `id` made on this plot from its button, `how` as the command takes it. */
   const runHere = (id, how) => commands.run(id, { on: plot.id, from: 'button', how });
+  /** The peak commands, as the readout's menu, the plot's menu and the x axis's popover offer them. */
+  const PEAKS = ['x1ToPeak', 'x2ToPeak', 'peakLeft', 'peakRight'];
   /** How Maximize reads on this plot, for its button. */
   const maximizeRow = $derived(commands.row('maximize', { on: plot.id }));
 
@@ -734,6 +737,8 @@
 {#snippet value(text)}{#if text}<span class="menu-value">{text}</span>{/if}{/snippet}
 <!-- The distance between X1 and X2, after a ruler, when a pair is placed. -->
 {#snippet span()}{@const d = xSpan(targetPvs())}{#if d}<span class="menu-value"><RiSpan />{d}</span>{/if}{/snippet}
+<!-- The peak commands' rows, on a plot that shows a signal: each says where its X cursor would go. -->
+{#snippet peakItems()}{#if plot.items.length}{#each PEAKS as id}<CommandItem {id} on={plot.id} />{/each}{/if}{/snippet}
 <!-- A signal's own menu, on its chip and on its row of the legend: what
      it shows, how it looks, where it goes. `close` closes the menu it is in. -->
 {#snippet signalMenu(key, close)}
@@ -1002,6 +1007,18 @@
           {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label="Clear the X cursors" onclick={() => (clearXCursors(), (xAxisOpen = false))}><RiEraser /></button>{/snippet}
         </Tip>
       </div>
+      {#if plot.items.length}
+        <!-- Each peak command's button, its tip saying where its X cursor would go, or why it goes nowhere. -->
+        <div class="axis-row" role="group" aria-label="Peaks">
+          <span>Peaks</span>
+          {#each PEAKS as id}
+            {@const row = commands.row(id, { on: plot.id })}
+            <Tip text="{row.label}: {row.value}" keys={row.show}>
+              {#snippet children(tip)}<button {...tip} class="icon-btn" aria-label={row.label} data-command={id} disabled={row.disabled} onclick={() => (runHere(id), (xAxisOpen = false))}><row.icon /></button>{/snippet}
+            </Tip>
+          {/each}
+        </div>
+      {/if}
     </Popover.Content>
   </Popover.Root>
 
@@ -1156,6 +1173,7 @@
                 <ContextMenu.Content class="menu-icons">
                   <ContextMenu.Item onSelect={copyReadout}><RiCopy class="menu-icon" />Copy table{@render value(counted((c.x ? 1 + plot.items.length : 0) + c.ys.length, 'row'))}</ContextMenu.Item>
                   {#if c.x && c.x.a !== '—' && c.x.b !== '—'}<ContextMenu.Item onSelect={() => pv?.zoomToCursors()}><RiZoomTo class="menu-icon" />Zoom to X1–X2{@render span()}</ContextMenu.Item>{/if}
+                  {@render peakItems()}
                   <ContextMenu.Separator />
                   {#if c.x}<ContextMenu.Item onSelect={clearXCursors}><RiXCursors class="menu-icon" />Clear X cursors{@render value(xFirst())}</ContextMenu.Item>{/if}
                   {#if c.ys.length}<ContextMenu.Item onSelect={() => clearYCursors()}><RiYCursors class="menu-icon" />Clear Y cursors{@render value(counted(targetPvs().reduce((n, p) => n + p.yCursorAxes(), 0), 'axis', 'axes'))}</ContextMenu.Item>{/if}
@@ -1188,6 +1206,13 @@
       <ContextMenu.Label>Cursors</ContextMenu.Label>
       <!-- Cursors are dragged out of the axes; these place a pair in view, Add Y cursors on the axis under the right-click. -->
       <CommandItem id="addXCursors" on={plot.id} />
+      {#if plot.items.length}
+        <!-- The peak commands in a submenu of their own, so the plot's menu stays short. -->
+        <ContextMenu.Sub>
+          <ContextMenu.SubTrigger><RiPeak class="menu-icon" />X cursors to peaks</ContextMenu.SubTrigger>
+          <ContextMenu.SubContent class="menu-icons">{@render peakItems()}</ContextMenu.SubContent>
+        </ContextMenu.Sub>
+      {/if}
       <CommandItem id="addYCursors" on={plot.id} how={region.keys?.[0]} />
       <CommandItem id="clearCursors" on={plot.id} />
       <ContextMenu.Label>Show</ContextMenu.Label>

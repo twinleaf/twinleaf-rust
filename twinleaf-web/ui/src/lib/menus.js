@@ -27,12 +27,12 @@ export function runShownKey(e, at) {
   const key = e.key.toLowerCase(), named = key.length > 1;
   for (const menu of menus) {
     if (e.key === 'Enter' && menu.querySelector('[data-highlighted]')) continue;
-    for (const row of menu.querySelectorAll('[role^=menuitem]:not([data-disabled])')) {
-      const keys = [...row.querySelectorAll('kbd')].map((k) => k.textContent.trim().toLowerCase()).map((k) => KBD[k] ?? k);
-      if (!keys.length || keys.at(-1) !== key) continue;
-      // A key with a name takes the Shift its row shows; a character is typed however its keyboard types it.
-      if (named && keys.includes('shift') !== e.shiftKey) continue;
-      if (keys.includes('control') !== e.ctrlKey) continue;
+    const rows = [...menu.querySelectorAll('[role^=menuitem]')]
+      .map((row) => [row, [...row.querySelectorAll('kbd')].map((k) => k.textContent.trim().toLowerCase()).map((k) => KBD[k] ?? k)])
+      .filter(([, keys]) => keys.length && keys.at(-1) === key && keys.includes('control') === e.ctrlKey);
+    // A row takes the Shift it shows. A character's row that shows none takes it with Shift too, as a keyboard types some characters with Shift, unless another row shows it with Shift.
+    const [row] = rows.find(([, keys]) => keys.includes('shift') === e.shiftKey) ?? (named ? null : rows.find(([, keys]) => !keys.includes('shift'))) ?? [];
+    if (row && !row.hasAttribute('data-disabled')) {
       row.click();
       return true;
     }

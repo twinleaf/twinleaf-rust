@@ -9,13 +9,20 @@
 // plots to read. A command that needs signals acts on those its origin
 // says (a signal's row: the signals picked when it is one of them, or it
 // alone; the palette: the one it names; the page: the signals picked),
-// never runs with none, and its row counts what it acts on.
+// never runs with none, and its row counts what it acts on. The peak
+// commands, on plots drawn from signals with known peaks, put an X cursor on
+// the peak the rule says, step through every peak in order and past the
+// view's edge, each as one edit and one view step, each plot of the lead's
+// kind to a peak of its own; with none to go to, they do nothing and their
+// rows say why.
 import { afterEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 import { COMMANDS, commandOf, commands } from './commands.js';
 import { KEYMAP, actionFor, scopeOf } from './keymap.js';
 import { KINDS } from './constants.js';
 import { SIGNAL, Selection } from './selection.svelte.js';
+import { CursorEdits, xOf } from './cursors.js';
+import { PlotView } from './plot.js';
 
 const IDS = ['a', 'b', 'c', 'd'];
 
@@ -102,7 +109,7 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s']) {
     ws,
     selection,
     viewHistory: { step: (fn) => fn(), burst: (kind, views, fn) => fn(), follow: record('follow') },
-    cursors: { set: (what, byId) => log.push(`cursors ${what} ${[...byId.keys()]}`), clear: record('clear') },
+    cursors: { set: (what, byId) => log.push(`cursors ${what} ${[...byId.keys()]}`), clear: record('clear'), lastX: () => 'a' },
     toast: { error: record('toast') },
     edit: record('edit'),
     split: record('split'),
@@ -240,5 +247,161 @@ describe('a command', () => {
     expect(row('removeFromPlots', [], ['s']).offered).toBe(false);
     expect(row('newPlot', [], ['s', 't'])).toMatchObject({ offered: true, value: '2 signals', show: ['Shift', 'Enter'] });
     expect(row('newPlot', ['a'], ['s']).value).toBe('Time · Overlay');
+  });
+});
+
+/**
+ * A signal of `kind` of 20 slots of 10 points, with a peak in each of
+ * `slots`, as {xs, ys, at}, `at` the x of each peak in order: a triangle
+ * `tall` high, 1 to 3, on a floor of 0, and in each other slot a bump 0.1
+ * high, which stands out by less than the rule asks. A time series's points
+ * are a tenth of a second apart from 0, its y axis 0 to 3, so the rule asks
+ * 0.3; a spectrum's bins 1 Hz apart from 1 Hz, its amplitude 10 to the
+ * power of half that, so its peaks stand 10 to 30 dB and its bumps 1 dB.
+ */
+function bumps(kind, slots, tall) {
+  const lv = Array.from({ length: 200 }, (_, i) => {
+    const k = Math.floor(i / 10), h = slots.includes(k) ? tall[slots.indexOf(k)] : 0.1;
+    return h * Math.max(0, 1 - Math.abs((i % 10) - 5) / 3);
+  });
+  const xs = lv.map((_, i) => (kind === 'time' ? i / 10 : i + 1));
+  return { xs, ys: kind === 'time' ? lv : lv.map((v) => 10 ** (v / 2)), at: [...slots].sort((a, b) => a - b).map((k) => xs[k * 10 + 5]) };
+}
+const peakSlots = fc.uniqueArray(fc.nat(19), { maxLength: 6 }).chain((slots) => fc.tuple(fc.constant(slots), fc.array(fc.double({ min: 1, max: 3, noNaN: true }), { minLength: slots.length, maxLength: slots.length })));
+
+/**
+ * A page of plots `specs`, each {id, kind, g, view}, `g` a signal `bumps`
+ * made and `view` what its x axis shows, with `selected` selected: each a
+ * PlotView as the peak commands read it, drawing what its view shows (a
+ * time plot's sources holding every point, a spectrum's every bin), its
+ * cursors written by a CursorEdits. `log` records each edit and each view
+ * step, and each view a command moves.
+ */
+function peakPage(specs, selected) {
+  const log = { edits: [], steps: 0, views: [] };
+  const plots = Object.fromEntries(specs.map(({ id, kind }) => [id, { id, kind, items: [{ key: `${id}.s` }], cursors: undefined }]));
+  const pvs = {};
+  const ws = {
+    plots,
+    setPlot: (id, patch) => void (plots[id] = { ...plots[id], ...patch }),
+    setView: (id, patch) => void (log.views.push([id, 'fRange', ...patch.fRange]), (pvs[id].xd = patch.fRange)),
+  };
+  const cursors = new CursorEdits(ws, { group: (what, fn) => (log.edits.push(what), fn()) });
+  const views = {};
+  for (const { id, kind, g, view } of specs) {
+    const t = { key: `${id}.s` }, src = { absStart: 0, absEnd: g.xs.length, xAt: (k) => g.xs[k], yAt: (k) => g.ys[k] };
+    const pv = Object.assign(Object.create(PlotView.prototype), {
+      plotId: id, config: () => ({ kind }), spectrum: kind === 'spectrum', logX: false, xd: view, cursors,
+      fExtent: [g.xs[0], g.xs.at(-1)], hoverTime: { t: null }, specHover: null, yAxes: [{ plans: [{ t }], range: [0, 3] }],
+      xKind: () => (kind === 'spectrum' ? 'hz' : 'zero'),
+    });
+    Object.defineProperty(pv, 'drawn', {
+      get() {
+        if (kind === 'spectrum') return { plans: [{ t, s: { f: g.xs, a: g.ys } }] };
+        const first = g.xs.findIndex((x) => x >= pv.xd[0]), past = g.xs.findIndex((x) => x >= pv.xd[1]);
+        return { plans: [{ t, src, a0: Math.max(0, first - 1), a1: past < 0 ? g.xs.length : Math.min(g.xs.length, past + 1) }] };
+      },
+    });
+    pvs[id] = pv;
+    views[id] = {
+      show: (lo, hi) => void (log.views.push([id, 'show', lo, hi]), (pv.xd = [lo, hi])),
+      pause: () => void log.views.push([id, 'pause']),
+    };
+  }
+  const selection = new Selection((id) => !!plots[id], () => Object.keys(plots));
+  selection.only(selected, null);
+  const cmds = commands({
+    targets: (on) => selection.targets(on),
+    pageTargets: (scope) => selection.pageTargets(scope),
+    signalTargets: () => [],
+    plotOf: (id) => ({ id, plot: plots[id], view: views[id], pv: pvs[id] }),
+    last: () => selection.last,
+    ws, selection, cursors,
+    viewHistory: { step: (fn) => (log.steps++, fn()) },
+  });
+  /** X cursor `name` of plot `id`. */
+  const x = (id, name) => xOf(plots[id].cursors, plots[id].kind)[name];
+  return { cmds, cursors, log, pvs, x };
+}
+
+/** The x of slot boundary `k` of a signal `bumps` made, on its floor. */
+const edge = (g, k) => g.xs[Math.min(k * 10, g.xs.length - 1)];
+
+describe('a peak command', () => {
+  it('puts X1 on the peak of the view nearest it, or the middle, then steps right through every peak, past the view’s edge as one view step each, and back left, then does nothing, its row saying so', () => {
+    fc.assert(
+      fc.property(fc.constantFrom('time', 'spectrum'), peakSlots, fc.integer({ min: 0, max: 20 }), fc.integer({ min: 0, max: 20 }), fc.option(fc.double({ min: 0, max: 1, noNaN: true })), (kind, [slots, tall], i, j, start) => {
+        const g = bumps(kind, slots, tall), view = [edge(g, Math.min(i, j)), edge(g, Math.max(i, j))];
+        fc.pre(view[1] > view[0]);
+        const p = peakPage([{ id: 'a', kind, g, view }], ['a']);
+        const from = start === null ? (view[0] + view[1]) / 2 : view[0] + start * (view[1] - view[0]);
+        if (start !== null) p.cursors.set('Prepare', new Map([['a', kind === 'time' ? { x: { a: from, b: null } } : { f: { a: from, b: null } }]]));
+        const inView = g.at.filter((x) => x > view[0] && x < view[1]);
+        const nearest = inView.reduce((best, x) => (best === null || Math.abs(x - from) < Math.abs(best - from) ? x : best), null);
+        /** Runs command `id` from the key, and checks it made one edit and one view step, or with nowhere to go, nothing, its row disabled saying `why`. */
+        const run = (id, why) => {
+          const edits = p.log.edits.length, steps = p.log.steps, views = p.log.views.length, row = p.cmds.row(id, { on: 'a' });
+          const taken = p.cmds.run(id, { from: 'key' });
+          if (why) {
+            expect(row, id).toMatchObject({ disabled: true, value: why });
+            expect([taken, p.log.edits.length, p.log.steps, p.log.views.length], id).toEqual([false, edits, steps, views]);
+            return;
+          }
+          expect(row.disabled, id).toBe(false);
+          expect([taken, p.log.edits.length, p.log.steps], id).toEqual([true, edits + 1, steps + 1]);
+        };
+        run('x1ToPeak', nearest === null && 'No peak in view');
+        if (nearest === null) return;
+        expect(p.x('a', 'a')).toBe(nearest);
+        // A time plot is paused as its X1 is placed.
+        if (kind === 'time') expect(p.log.views).toContainEqual(['a', 'pause']);
+        const span = view[1] - view[0];
+        for (const [id, dir] of [['peakRight', 1], ['peakLeft', -1]]) {
+          const ahead = g.at.filter((x) => dir * (x - p.x('a', 'a')) > 0);
+          for (const want of dir > 0 ? ahead : ahead.reverse()) {
+            const shown = p.pvs.a.xd;
+            run(id);
+            expect(p.x('a', 'a'), `${id} to ${want}`).toBe(want);
+            // The view moves only for a peak past its edge, keeps its span, and shows the peak.
+            const now = p.pvs.a.xd;
+            if (want > shown[0] && want < shown[1]) expect(now).toBe(shown);
+            else {
+              expect(now[1] - now[0]).toBeCloseTo(span, 9);
+              expect(want > now[0] && want < now[1], `${want} shown in ${now}`).toBe(true);
+            }
+          }
+          run(id, `No peak to the ${dir > 0 ? 'right' : 'left'}`);
+        }
+      }),
+    );
+  });
+
+  it('moves the X cursor placed or moved last, X1 where none is, on each selected plot of the lead plot’s kind to a peak of its own, as one edit and one view step', () => {
+    const g = (slots) => bumps('time', slots, slots.map(() => 2));
+    const [ga, gb] = [g([3, 8]), g([5, 12])];
+    const view = [0, 19.9];
+    const p = peakPage([{ id: 'a', kind: 'time', g: ga, view }, { id: 'b', kind: 'time', g: gb, view }, { id: 'c', kind: 'spectrum', g: bumps('spectrum', [4], [2]), view: [1, 200] }], ['a', 'b', 'c']);
+    p.cmds.run('x1ToPeak', { on: 'a', from: 'menu' });
+    // From the middle, 9.95 s: a's nearest peak is at 8.5 s, b's at 12.5 s; the spectrum is left as it was.
+    expect([p.x('a', 'a'), p.x('b', 'a'), p.x('c', 'a')]).toEqual([8.5, 12.5, null]);
+    expect(p.log.edits).toEqual(['X1 to peak (2 plots)']);
+    expect(p.log.steps).toBe(1);
+    // X2 placed last: Next peak right moves X2, each plot from where its own X2 is.
+    p.cursors.set('Prepare', new Map([['a', { x: { a: 8.5, b: 1 } }], ['b', { x: { a: 12.5, b: 1 } }]]));
+    expect(p.cursors.lastX('a')).toBe('b');
+    expect(p.cmds.row('peakRight', { on: 'a' }).value).toBe('X2 Mixed');
+    p.cmds.run('peakRight', { on: 'a', from: 'menu' });
+    expect([p.x('a', 'b'), p.x('b', 'b'), p.x('a', 'a')]).toEqual([3.5, 5.5, 8.5]);
+    expect(p.log.edits.at(-1)).toBe('Next peak right (2 plots)');
+    // X2 removed: the one left, X1, is the one that steps.
+    p.cursors.set('Prepare', new Map([['a', { x: { a: 8.5, b: null } }]]));
+    expect(p.cursors.lastX('a')).toBe('a');
+    // Made on the spectrum, it moves the spectrum alone: X1, not placed, from the view's left edge to its first peak, at 46 Hz.
+    p.cmds.run('peakRight', { on: 'c', from: 'menu' });
+    expect([p.x('c', 'a'), p.x('a', 'a')]).toEqual([46, 8.5]);
+    // A plot with no peak to go to is left as it was while another moves.
+    const q = peakPage([{ id: 'a', kind: 'time', g: g([2]), view }, { id: 'b', kind: 'time', g: g([]), view }], ['a', 'b']);
+    q.cmds.run('x1ToPeak', { on: 'b', from: 'menu' });
+    expect([q.x('a', 'a'), q.x('b', 'a'), q.log.edits]).toEqual([2.5, null, ['X1 to peak']]);
   });
 });

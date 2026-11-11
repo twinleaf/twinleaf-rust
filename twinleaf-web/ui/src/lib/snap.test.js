@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { features, pickSnap, SNAP_ORDER, SNAP_PX, snapCandidates } from './snap.js';
+import { features, nearestPeak, peaks, pickSnap, SNAP_ORDER, SNAP_PX, snapCandidates, STAND, stepPeak } from './snap.js';
 
 /** A signal of points (xs[i], ys[i]), as snap.js reads one. */
 const signal = (key, xs, ys, more = {}) => ({ key, n: xs.length, x: (i) => xs[i], y: (i) => ys[i], stand: 0, ...more });
@@ -100,5 +100,88 @@ describe('the points a cursor dragged with Shift snaps to', () => {
     // At X1, x 1.2, the point at x 1; in view, x 1 to 3, the least -1 and the greatest 4; and 0. The 7 at x 4 is out of view.
     expect(by('data')).toEqual([-1, -1, 4, 0]);
     expect(cands.find((c) => c.from === 'data' && c.v === 4).point).toEqual({ x: 2, y: 4 });
+  });
+});
+
+/** Slots of 10 points; a peak or a bump stands in the middle of its slot, and a slot's ends are on the floor. */
+const SLOTS = 20, SLOT = 10;
+/**
+ * A signal of `kind` with known peaks, as {s, at}, `at` the x of each in
+ * order: a triangle in each slot chosen, in `level`, on a flat floor of 0,
+ * and in every other slot a bump that stands out by less than the stand. A
+ * time series, x a tenth of a second apart, its peaks 1 to 3 over the floor
+ * and its bumps 0.1, against a stand of STAND.timeShare of a range 0 to 3;
+ * or a spectrum, bins 1 Hz from 1 Hz, its peaks 7 to 30 dB over the floor
+ * and its bumps 4 dB.
+ */
+const peaked = (kind) =>
+  fc.uniqueArray(fc.nat(SLOTS - 1), { maxLength: 8 }).chain((slots) =>
+    fc.array(kind === 'time' ? fc.double({ min: 1, max: 3, noNaN: true }) : fc.double({ min: 7, max: 30, noNaN: true }), { minLength: slots.length, maxLength: slots.length }).map((tall) => {
+      const height = Array.from({ length: SLOTS }, (_, k) => (slots.includes(k) ? tall[slots.indexOf(k)] : kind === 'time' ? 0.1 : 4));
+      const lv = Array.from({ length: SLOTS * SLOT }, (_, i) => {
+        const k = Math.floor(i / SLOT), d = Math.abs((i % SLOT) - SLOT / 2);
+        return (kind === 'time' ? height[k] : height[k] / 20) * Math.max(0, 1 - d / 3);
+      });
+      const xs = lv.map((_, i) => (kind === 'time' ? i / 10 : i + 1));
+      const s = kind === 'time' ? signal(kind, xs, lv, { stand: STAND.timeShare * 3 }) : signal(kind, xs, lv.map((v) => 10 ** v), { stand: STAND.spectrumDb / 20, troughs: false, level: Math.log10 });
+      return { s, xs, at: [...slots].sort((a, b) => a - b).map((k) => xs[k * SLOT + SLOT / 2]) };
+    }),
+  );
+/** The x of slot boundary `k`, on the floor, of a signal `peaked` made. */
+const boundary = (xs, k) => xs[Math.min(k * SLOT, xs.length - 1)];
+
+describe('the peaks an X cursor goes to', () => {
+  it('of a time series or a spectrum, are those that stand out by the rule, each once in order; the nearest is the nearest of them', () => {
+    fc.assert(
+      fc.property(fc.constantFrom('time', 'spectrum').chain((kind) => fc.tuple(peaked(kind), fc.double({ min: 0, max: 1, noNaN: true }))), ([{ s, xs, at }, f]) => {
+        const view = [xs[0], xs.at(-1)];
+        // Merged with itself, each once.
+        expect(peaks([s, s], view)).toEqual(at);
+        const from = view[0] + f * (view[1] - view[0]);
+        const nearest = at.reduce((best, x) => (best === null || Math.abs(x - from) < Math.abs(best - from) ? x : best), null);
+        expect(nearestPeak(peaks([s], view), from)).toBe(nearest);
+      }),
+    );
+  });
+
+  it('step right and left through every peak of the view in order and stop at the last, then past the view’s edge to the nearest beyond it', () => {
+    fc.assert(
+      fc.property(fc.constantFrom('time', 'spectrum').chain((kind) => fc.tuple(peaked(kind), fc.integer({ min: 0, max: SLOTS }), fc.integer({ min: 0, max: SLOTS }))), ([{ s, xs, at }, i, j]) => {
+        const held = [xs[0], xs.at(-1)];
+        const view = [boundary(xs, Math.min(i, j)), boundary(xs, Math.max(i, j))];
+        const inView = peaks([s], view);
+        expect(inView).toEqual(at.filter((x) => x > view[0] && x < view[1]));
+        const all = () => peaks([s], held);
+        for (const dir of [1, -1]) {
+          // From the view's far edge, each step the next peak of the view, to the last of them.
+          const seen = [];
+          for (let x = stepPeak(inView, view[dir > 0 ? 0 : 1], dir); x !== null; x = stepPeak(inView, x, dir)) seen.push(x);
+          expect(seen).toEqual(dir > 0 ? inView : [...inView].reverse());
+          // Past the last, the nearest of what the plot holds beyond the view, and on through every one to the end.
+          const past = at.filter((x) => dir * (x - view[dir > 0 ? 1 : 0]) > 0);
+          const beyond = [];
+          for (let x = stepPeak(inView, seen.at(-1) ?? view[dir > 0 ? 1 : 0], dir, all); x !== null; x = stepPeak([], x, dir, all)) beyond.push(x);
+          expect(beyond, `dir ${dir}`).toEqual(dir > 0 ? past : [...past].reverse());
+        }
+        // From the last peak of all, nothing further either way.
+        if (at.length) {
+          expect(stepPeak(peaks([s], held), at.at(-1), 1)).toBeNull();
+          expect(stepPeak(peaks([s], held), at[0], -1)).toBeNull();
+        }
+      }),
+    );
+  });
+
+  it('are peaks alone, on a time plot too, never a trough', () => {
+    const s = signal('s', [0, 1, 2, 3, 4, 5, 6], [0, 1, 0, -5, 0, 1, 0], { stand: 0.5 });
+    expect(peaks([s], [0, 6])).toEqual([1, 5]);
+  });
+
+  it('on a log axis, the nearest along the log scale', () => {
+    // 10 and 1000 about 100: equal on a log scale, so the lower. 300 is nearer 100 than 20 is on a log scale, though not on a linear one.
+    expect(nearestPeak([10, 1000], 100, Math.log10)).toBe(10);
+    expect(nearestPeak([20, 300], 100, Math.log10)).toBe(300);
+    expect(nearestPeak([20, 300], 100)).toBe(20);
+    expect(nearestPeak([], 100)).toBeNull();
   });
 });

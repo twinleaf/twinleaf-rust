@@ -18,6 +18,7 @@ import fc from 'fast-check';
 import { MENUS, closeAll, openMenu } from './harness/menus.js';
 import { centre, click, clickOn, editCursors, feed, focusPage, leafOf, mountPage, pressKey, rightClick, settle, until, wait, withExamples, withYPair } from './harness/page.js';
 import { COMMANDS } from '../src/lib/commands.js';
+import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const SIGNALS = ['sine.sine', 'aux.triangle'];
@@ -30,12 +31,18 @@ const SIGNALS = ['sine.sine', 'aux.triangle'];
 async function commandPage() {
   const page = await mountPage([SIGNALS, SIGNALS, SIGNALS, SIGNALS], 'rows', 1, [...SIGNALS, 'mag.x']);
   feed(page.hub);
+  // Spectra with peaks either side of X1 and X2, so each peak command has somewhere to go on every plot.
+  const session = page.hub.session, perf = clock.now(), f = Float32Array.from({ length: 50 }, (_, i) => i + 1);
+  session.apply({ kind: 'spectra', spectra: [...session.traces.values()].map((t) => ({ id: t.meta.id, f, a: f.map((v) => ([2, 5, 20].includes(v) ? 1 : 0.1)), floor: 0.02 })) }, perf);
+  session.tick(perf);
   const ids = plotIds(page.ws.layout);
   page.history.group('Prepare', () => ids.forEach((id, i) => page.ws.setPlot(id, { legend: true, ...(i === 3 && { kind: 'spectrum' }) })));
   await wait(300);
   await settle();
   for (const id of ids) {
     const kind = page.ws.plots[id].kind;
+    // A time plot paused over the samples, as its X cursors mark moments of them, so they have peaks in view.
+    if (kind === 'time') page.views.get(id).show(10, 20, clock.now());
     editCursors(page, id, (c) => withYPair({ ...c, ...(kind === 'time' ? { x: { a: 14, b: 16 } } : { f: { a: 3, b: 7 } }) }, kind, 'shared', 0.1, 0.5));
   }
   // The legend and the readout show what a frame drew a few times a second.

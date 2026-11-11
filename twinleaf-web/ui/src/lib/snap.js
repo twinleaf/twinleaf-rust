@@ -149,3 +149,32 @@ export function pickSnap(candidates, at, px, reach = SNAP_PX) {
   }
   return best;
 }
+
+// The peaks an X cursor goes to by a command (commands.js): each signal's
+// features that are peaks, by what its own stand out by, as above, the
+// signals' merged in order of x, each x once.
+
+/** The x of the peaks of `signals` among their points in `view`, [lo, hi], with x in `near`, in order, each once. */
+export function peaks(signals, view, near = view) {
+  const xs = signals.flatMap((s) => features(s, view, near, { ...s, troughs: false }).map((i) => s.x(i)));
+  return [...new Set(xs)].sort((a, b) => a - b);
+}
+
+/** Of `xs`, peaks in order, the one nearest `at` along the axis `to(x)` places them on, the lower at one distance, or null for none. */
+export function nearestPeak(xs, at, to = (v) => v) {
+  let best = null;
+  for (const x of xs) if (best === null || Math.abs(to(x) - to(at)) < Math.abs(to(best) - to(at))) best = x;
+  return best;
+}
+
+/**
+ * The x a cursor at `at` steps to at the next peak right (`dir` 1) or left
+ * (-1): of `inView`, the peaks of the view in order, the first past `at`;
+ * past the last of them, the first past `at` of `held()`, the peaks of all
+ * the points the plot holds, in order; or null where there is none.
+ */
+export function stepPeak(inView, at, dir, held = () => []) {
+  const past = (x) => dir * (x - at) > 0;
+  const next = (xs) => (dir > 0 ? xs.find(past) : xs.findLast(past)) ?? null;
+  return next(inView) ?? next(held());
+}

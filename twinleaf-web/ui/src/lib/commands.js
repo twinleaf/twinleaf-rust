@@ -50,6 +50,8 @@
 // signal. `svc` is the page's services, as `commands` takes them.
 import { common, counted } from './menus.js';
 import { cursorText } from './plot.js';
+import { withX } from './cursors.js';
+import { nearestPeak, peaks, stepPeak } from './snap.js';
 import { chip } from './tabs.js';
 import { kindLabel } from './constants.js';
 import * as clock from './clock.js';
@@ -70,6 +72,9 @@ import RiEraser from '@lucide/svelte/icons/eraser';
 import RiSpan from '@lucide/svelte/icons/ruler-dimension-line';
 import RiPlay from '@lucide/svelte/icons/play';
 import RiFit from '@lucide/svelte/icons/unfold-vertical';
+import RiPeak from '@lucide/svelte/icons/mountain';
+import RiPeakRight from '@lucide/svelte/icons/chevron-right';
+import RiPeakLeft from '@lucide/svelte/icons/chevron-left';
 
 /** How far an arrow pans, as a share of the span, and zooms, as a factor. */
 const PAN = 0.1, ZOOM = 1.25;
@@ -115,6 +120,101 @@ export function xSpan(targets) {
 /** Gives each PlotView of `targets` the cursors `fn(pv, axis)` returns, as one edit named `what`. */
 function editCursors(ctx, what, targets, fn) {
   ctx.svc.cursors.set(what, new Map(targets.map(([p, axis]) => [p.plotId, fn(p, axis)])));
+}
+
+// The peak commands move an X cursor to a peak of the signals a plot shows,
+// all of them merged, as the cursor reads every one (snap.js `peaks`): on a
+// spectrum a peak stands 6 dB over the bins about it, on a time plot a share
+// of the y range shown. They read the points the plot drew last.
+
+/** How far inside the view's edge a peak past it comes to rest when the view moves to show it, as a share of the span. */
+const PEAK_ROOM = 0.05;
+
+/**
+ * The signals PlotView `p` drew last, as snap.js reads them, each with what
+ * its peaks stand out by: of a time plot with `whole`, every point the
+ * source it drew from holds. None before it has drawn an x axis.
+ */
+function drawnSignals(p, whole) {
+  const plans = p.drawn?.plans;
+  if (!Array.isArray(plans) || !Array.isArray(p.xd)) return [];
+  return p.snapSignals(whole && !p.spectrum ? plans.map((q) => ({ ...q, a0: q.src.absStart, a1: q.src.absEnd })) : plans).filter((s) => s.n > 0);
+}
+
+/** The peaks of all PlotView `p` holds, in order: a spectrum's among all its bins, a time plot's among all its sources hold. */
+function peaksHeld(p) {
+  const signals = drawnSignals(p, true);
+  if (!signals.length) return [];
+  return peaks(signals, [Math.min(...signals.map((s) => s.x(0))), Math.max(...signals.map((s) => s.x(s.n - 1)))]);
+}
+
+/**
+ * Where X cursor `name` of PlotView `p` goes by a peak command: with `dir`
+ * 0, to the peak of the view nearest it, or nearest the view's middle where
+ * it is not placed; with 1 or -1, to the next peak right or left of it,
+ * or from the view's far edge where it is not placed (snap.js `stepPeak`),
+ * past the view's edge where the plot holds one. As {x, show}, `show` the
+ * range the view moves to, as wide as it is, to show a peak past its edge,
+ * else null; or null for no peak.
+ */
+export function peakMove(p, name, dir) {
+  const view = p.xd, signals = drawnSignals(p, false);
+  if (!signals.length) return null;
+  const [to, from] = p.logX ? [Math.log10, (v) => 10 ** v] : [(v) => v, (v) => v];
+  const at = p.markers()[name], inView = peaks(signals, view);
+  if (!dir) {
+    const x = nearestPeak(inView, at ?? from((to(view[0]) + to(view[1])) / 2), to);
+    return x === null ? null : { x, show: null };
+  }
+  const x = stepPeak(inView, at ?? view[dir > 0 ? 0 : 1], dir, () => peaksHeld(p));
+  if (x === null) return null;
+  if (x >= view[0] && x <= view[1]) return { x, show: null };
+  // Along the axis's own scale, just far enough to have the peak PEAK_ROOM inside the edge; a spectrum's within its bins.
+  const span = to(view[1]) - to(view[0]), v = to(x);
+  let lo = v > to(view[1]) ? v + PEAK_ROOM * span - span : v - PEAK_ROOM * span;
+  if (p.spectrum && p.fExtent) lo = Math.max(to(p.fExtent[0]), Math.min(lo, to(p.fExtent[1]) - span));
+  return { x, show: [from(lo), from(lo + span)] };
+}
+
+/** The X cursor a next-peak command moves on the plots of `ctx`: the one its lead plot placed or moved last (CursorEdits `lastX`). */
+const lastX = (ctx) => (ctx.lead ? ctx.svc.cursors.lastX(ctx.lead.id) : 'a');
+
+/** Where X cursor `name` goes by peak command `dir` on each plot of `ctx` of its lead plot's kind that has a peak to go to (`peakMove`), as [t, pv, move]. */
+function peakMoves(ctx, name, dir) {
+  const lead = ctx.lead?.pv;
+  if (!lead) return [];
+  return cursorPeers(lead, pvs(ctx)).flatMap(([p]) => {
+    const move = peakMove(p, name, dir);
+    return move ? [[ctx.plots.find((t) => t.pv === p), p, move]] : [];
+  });
+}
+
+/** Where X cursor `name` would go on the plots of `ctx` by peak command `dir`, as a row's value, or else why it goes nowhere. */
+function peakValue(ctx, name, dir) {
+  const moves = peakMoves(ctx, name, dir);
+  if (!moves.length) return dir ? `No peak to the ${dir > 0 ? 'right' : 'left'}` : 'No peak in view';
+  const at = common(moves.map(([, p, m]) => cursorText(p.xKind()).at(m.x, p.xd[1] - p.xd[0])));
+  return dir ? `${name === 'a' ? 'X1' : 'X2'} ${at}` : at;
+}
+
+/**
+ * Moves X cursor `name` by peak command `dir` on each plot of `ctx` of its
+ * lead plot's kind (`cursorPeers`), each to a peak of its own signals
+ * (`peakMove`), where a drag would set them all to one value: one edit
+ * named `what`, the time plots paused, as they hold the moment it marks, in
+ * one view step that moves each view that shows a peak past its edge.
+ */
+function toPeak(ctx, name, dir, what) {
+  const moves = peakMoves(ctx, name, dir);
+  if (!moves.length) return false;
+  ctx.svc.viewHistory.step(() => {
+    const perf = clock.now();
+    for (const [t, p, m] of moves) {
+      if (p.config().kind === 'time') m.show ? t.view.show(...m.show, perf) : t.view.pause(perf);
+      else if (m.show) ctx.svc.ws.setView(t.id, { fRange: m.show });
+    }
+    ctx.svc.cursors.set(what, new Map(moves.map(([, p, m]) => [p.plotId, withX(p.placed, p.config().kind, name, m.x)])));
+  });
 }
 
 /** Has the plots of `ctx` follow the newest samples again, back at their windows with `restore` (ViewHistory `follow`). */
@@ -237,6 +337,36 @@ export const COMMANDS = [
         pvs(ctx).forEach((p) => p.config().kind === 'time' && p.view.pause(clock.now()));
         editCursors(ctx, 'Add X cursors', pvs(ctx).map((p) => [p]), (p) => p.xCursorsAdded());
       }),
+  },
+  {
+    // The nearest peak in view to X1, or to the view's middle, placing it (`toPeak`).
+    id: 'x1ToPeak', scope: 'plot', show: ['P'], keys: ['p', 'P'], shift: false, what: 'X1 to peak',
+    icon: RiPeak, label: 'X1 to peak',
+    value: (ctx) => peakValue(ctx, 'a', 0),
+    disabled: (ctx) => !peakMoves(ctx, 'a', 0).length,
+    run: (ctx) => toPeak(ctx, 'a', 0, 'X1 to peak'),
+  },
+  {
+    id: 'x2ToPeak', scope: 'plot', show: ['Shift', 'P'], keys: ['p', 'P'], shift: true, what: 'X2 to peak',
+    icon: RiPeak, label: 'X2 to peak',
+    value: (ctx) => peakValue(ctx, 'b', 0),
+    disabled: (ctx) => !peakMoves(ctx, 'b', 0).length,
+    run: (ctx) => toPeak(ctx, 'b', 0, 'X2 to peak'),
+  },
+  {
+    // The X cursor placed or moved last to the next peak right, past the view's edge where the plot holds one (`toPeak`).
+    id: 'peakRight', scope: 'plot', show: ['.'], keys: ['.'], what: 'Next peak right',
+    icon: RiPeakRight, label: 'Next peak right',
+    value: (ctx) => peakValue(ctx, lastX(ctx), 1),
+    disabled: (ctx) => !peakMoves(ctx, lastX(ctx), 1).length,
+    run: (ctx) => toPeak(ctx, lastX(ctx), 1, 'Next peak right'),
+  },
+  {
+    id: 'peakLeft', scope: 'plot', show: [','], keys: [','], what: 'Next peak left',
+    icon: RiPeakLeft, label: 'Next peak left',
+    value: (ctx) => peakValue(ctx, lastX(ctx), -1),
+    disabled: (ctx) => !peakMoves(ctx, lastX(ctx), -1).length,
+    run: (ctx) => toPeak(ctx, lastX(ctx), -1, 'Next peak left'),
   },
   {
     // On the axis of each plot in the units of y axis `how` of the plot it is made on.
