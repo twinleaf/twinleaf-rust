@@ -191,12 +191,19 @@ Where the lines come from:
   logger (`twinleaf-tools/src/logging.rs`) hands each record it writes to
   `twinleaf_web::console(level, source, text)`, after the console's own
   filter, so what the terminal shows is what the log holds. `text` is the
-  record's text and `part` its `source`, the last part of the record's
-  target as the console prints it (`server`, `mdns`, a link's URL). Error,
+  record's text and `part` the last part of the record's target as the
+  console prints it (`server`, `mdns`, `client`). Error,
   warn and info
-  keep their level, and debug and trace are `debug`. Three things are left
-  out: a record of target `device::<route>`, which is a device's log packet
-  the proxy echoes and the hub already takes from the packet itself, a
+  keep their level, and debug and trace are `debug`. Every record of a
+  link has the one part `link`: the link's own (`Opening`, `Closing`), its
+  worker's (target `twinleaf::proxy::worker`), and those the worker logs
+  of its device under `proxy::<url>`, whose text then starts with the URL.
+  Four things are left out: a record of target `device::<route>`, which is
+  a device's log packet the proxy echoes and the hub already takes from the
+  packet itself, a record of target `status::<url>`, which says a link
+  status the proxy also tells its clients ("Sensor disconnected", "Sensor
+  reconnected", "Stopping reconnection attempts due to timeout") and the
+  hub says as the link's own line, a
   record the log's own owner writes of a line it says in the log (`loss.rs`
   "fell behind", inside `logbook::unheard`), and what the proxy prints
   without the `log` crate, as its "Plots:" line. A record that comes with
@@ -208,14 +215,24 @@ A line of a loss has `loss`, by `cause`, so nothing reads a loss out of
 
 | `loss` | Said when | Level |
 |---|---|---|
-| `{cause: "link", seconds: null}` | the device's link drops (`loss.link.times` grows) | `error` |
-| `{cause: "link", seconds}` | the link is back, after `seconds` down, to a tenth | `info` |
+| `{cause: "link", seconds: null, why?, url?}` | the device's link drops (`loss.link.times` grows) | `error` |
+| `{cause: "link", seconds, url?}` | the link is back, after `seconds` down, to a tenth | `info` |
 | `{cause: "skipped", stream, samples}` | the counts are sent (each second they grew): what `loss.streams[stream].skipped` grew by | `warn` |
 | `{cause: "proxy", stream, samples}` | the same, of `.proxy` | `warn` |
 | `{cause: "hub", stream, samples}` | the same, of `.hub` | `warn` |
 
 The rows lost with a link down (`loss.streams[stream].link`) are no line
 of their own: the link's two lines stand for them.
+
+A link's two lines are the hub's, one for the drop and one for the return.
+`why` is why the proxy lost the device, `disconnected` (the device went
+quiet on its link or the transport closed), `stopped` (the proxy stopped),
+`failed_to_connect`, `failed_to_reconnect` or `quiet` (silent for 3 s while
+its link stayed up), and `url` the address of the link that serves the
+device. The hub has both from the proxy, through its connection
+(`Device::link_updates`): the proxy's watch of a device says the link's
+URL, and the cause of a loss ahead of the lost presence it explains. A hub
+that lost its own connection to the proxy has neither to say.
 
 **The two clocks.** A plot's x is its device's own time, the timestamps of
 its samples. A log packet carries no time on that clock the hub can place

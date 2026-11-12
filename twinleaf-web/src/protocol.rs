@@ -307,8 +307,16 @@ pub(crate) enum Source {
 #[serde(tag = "cause", rename_all = "lowercase")]
 pub(crate) enum LossLine {
     /// The device's link dropped, with no `seconds` yet, or is back after
-    /// `seconds` down.
-    Link { seconds: Option<f64> },
+    /// `seconds` down. `why` is why the proxy lost the device, on the line
+    /// of the drop, and `url` the address of the link that serves it, each
+    /// when the proxy has said it.
+    Link {
+        seconds: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        why: Option<Why>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
     /// The device skipped `samples` of `stream`, or its link lost them
     /// while it stayed up.
     Skipped { stream: String, samples: u64 },
@@ -316,6 +324,22 @@ pub(crate) enum LossLine {
     Proxy { stream: String, samples: u64 },
     /// The hub's connection dropped `samples` of `stream`.
     Hub { stream: String, samples: u64 },
+}
+
+/// Why the proxy lost a device.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Why {
+    /// The device went quiet on its link, or the link's transport closed.
+    Disconnected,
+    /// The proxy stopped.
+    Stopped,
+    /// The link's transport did not open.
+    FailedToConnect,
+    /// The proxy gave up reconnecting the link.
+    FailedToReconnect,
+    /// The device was silent for 3 s while its link stayed up.
+    Quiet,
 }
 
 /// One capture RPC as the page lists it.

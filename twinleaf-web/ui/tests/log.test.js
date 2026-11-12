@@ -104,10 +104,10 @@ function story(hub) {
   hub.line('warn', 'field lock lost, reacquiring');
   hub.line('info', 'field lock acquired');
   hub.line('info', 'calibration loaded from flash', { route: '/0' });
-  hub.line('warn', 'Sensor disconnected', { source: 'proxy', part: 'udp://192.168.1.41', route: null });
-  hub.linkDown('/0');
+  hub.line('info', 'udp://192.168.1.41: Text: boot', { source: 'proxy', part: 'link', route: null });
+  hub.linkDown('/0', { why: 'disconnected', url: 'udp://192.168.1.41' });
   hub.line('error', 'heater current over limit, output held');
-  hub.linkBack('/0', 11);
+  hub.linkBack('/0', 11, { url: 'udp://192.168.1.41' });
   hub.lose('/', 'sine', { skipped: 312 });
   hub.lose('/', 'sine', { hub: 1400 });
   hub.lose('/', 'sine', { hub: 700 });
@@ -121,8 +121,12 @@ function story(hub) {
 /** A count as the page writes it, to two figures from a thousand on. */
 const counted = (n) => (n >= 1e3 ? `${+(n / 1e3).toPrecision(2)} k` : String(n));
 /** What a line of a loss reads as. */
-function lossWords({ cause, stream, samples, seconds }) {
-  if (cause === 'link') return seconds === null ? 'link down' : `link back after ${seconds.toFixed(1)} s`;
+function lossWords({ cause, stream, samples, seconds, why, url }) {
+  if (cause === 'link') {
+    const WHY = { disconnected: 'sensor disconnected', quiet: 'silent for 3 s' };
+    const said = seconds === null ? `link down${why ? `, ${WHY[why]}` : ''}` : `link back after ${seconds.toFixed(1)} s`;
+    return url ? `${said} · ${url}` : said;
+  }
   const n = `${counted(samples)} ${samples === 1 ? 'sample' : 'samples'}`;
   return cause === 'skipped' ? `${n} of ${stream} skipped` : `${cause} dropped ${n} of ${stream}`;
 }
@@ -240,7 +244,12 @@ describe('the log drawer', () => {
     // The sources the rows show, found on the page: the proxy's parts are those no device is named.
     const shown = new Set(rowEls().map((row) => cell(row, 'src')));
     const partsShown = [...shown].filter((name) => !Object.values(NAMES).includes(name)).sort();
-    expect(partsShown).toEqual(['hub', 'link', 'server', 'udp://192.168.1.41']);
+    expect(partsShown).toEqual(['hub', 'link', 'server']);
+    // A link's drop and its return are one row each, the hub's, with why and where.
+    expect(rows().filter((r) => r[2].includes('link down') || r[2].includes('link back'))).toEqual([
+      ['ERROR', 'hub', 'OMG 0077 (/0): link down, sensor disconnected · udp://192.168.1.41', ''],
+      ['INFO', 'hub', 'OMG 0077 (/0): link back after 11.0 s · udp://192.168.1.41', ''],
+    ]);
     await clickOn(sourceSelect());
     expect(await until(() => document.querySelector('[data-slot=select-content]')), 'the list opens').toBe(true);
     const listed = [...document.querySelectorAll('[data-slot=select-content] :is([role=option], [data-slot=select-label])')].map((el) => (el.matches('[role=option]') ? el.textContent.trim() : `# ${el.textContent.trim()}`));
@@ -275,7 +284,7 @@ describe('the log drawer', () => {
         fc.record({
           levels: fc.record({ error: fc.boolean(), warn: fc.boolean(), info: fc.boolean(), debug: fc.boolean() }),
           lossOnly: fc.boolean(),
-          source: fc.constantFrom('', '', 'part:hub', 'part:server', 'part:link', 'part:udp://192.168.1.41', '/', '/0'),
+          source: fc.constantFrom('', '', 'part:hub', 'part:server', 'part:link', '/', '/0'),
           query: fc.constantFrom('', '', 'lock', 'LINK down', 'omg', 'sine dropped', 'warn', 'no such words'),
         }),
         async (filter) => {
@@ -299,7 +308,6 @@ describe('the log drawer', () => {
         [{ ...START, levels: EVERY, source: 'part:hub' }],
         [{ ...START, levels: EVERY, source: 'part:server' }],
         [{ ...START, levels: EVERY, source: 'part:link' }],
-        [{ ...START, levels: EVERY, source: 'part:udp://192.168.1.41' }],
         [{ ...START, levels: EVERY, source: '/0' }],
         [{ ...START, levels: EVERY, source: '/' }],
         [{ ...START, levels: EVERY, query: 'lock' }],

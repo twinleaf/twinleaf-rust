@@ -133,10 +133,40 @@ fn source_of(target: &str) -> &str {
 /// What the target of a device's own log record starts with.
 const DEVICE: &str = "device::";
 
+/// What the target starts with of a record that says a link status the
+/// proxy also announces to its clients.
+const STATUS: &str = "status::";
+
+/// What the target starts with of a record a link's worker logs of its
+/// device, ahead of the link's URL.
+const LINK: &str = "proxy::";
+
+/// The module whose records are a link's worker's too.
+const WORKER: &str = "twinleaf::proxy::worker";
+
+/// The part of the proxy a link's records are said by, on the page.
+const LINK_PART: &str = "link";
+
+/// What the page's log takes of a record of `target` saying `text`, as the
+/// part of the proxy that said it and its words, or `None` for a record
+/// the page's hub hears through its own connection, a device's own log
+/// record or a link status the proxy announces. Every record of a link is
+/// said by the one part, its worker's with the link's URL ahead of the
+/// words, and any other record by the source the console names.
+fn for_page(target: &str, text: String) -> Option<(&str, String)> {
+    if target.starts_with(DEVICE) || target.starts_with(STATUS) {
+        return None;
+    }
+    Some(match target.strip_prefix(LINK) {
+        Some(url) => (LINK_PART, format!("{url}: {text}")),
+        None if target == WORKER => (LINK_PART, text),
+        None => (source_of(target), text),
+    })
+}
+
 /// The proxy's logger over `builder`, which says what it writes and where.
 /// It writes each record in the proxy's format, and hands `sink` each
-/// record it writes but a device's own, which the page's hub reads from the
-/// device's log packets.
+/// record it writes that is for the page ([`for_page`]).
 fn proxy_logger(mut builder: env_logger::Builder, sink: Option<Sink>) -> ProxyLogger {
     use std::io::Write;
     let console = builder
@@ -172,13 +202,10 @@ impl Log for ProxyLogger {
             return;
         }
         self.console.log(record);
-        let target = record.target();
-        if let Some(sink) = self.sink.as_ref().filter(|_| !target.starts_with(DEVICE)) {
-            sink(
-                record.level(),
-                source_of(target),
-                &record.args().to_string(),
-            );
+        if let Some(sink) = &self.sink {
+            if let Some((part, text)) = for_page(record.target(), record.args().to_string()) {
+                sink(record.level(), part, &text);
+            }
         }
     }
 
@@ -290,12 +317,28 @@ mod tests {
         text.lines().map(|line| line[12..].to_string()).collect()
     }
 
-    const RECORDS: [(Level, &str, &str); 5] = [
-        (Level::Warn, "proxy::udp://127.0.0.1", "Sensor disconnected"),
+    const RECORDS: [(Level, &str, &str); 9] = [
+        (
+            Level::Warn,
+            "status::udp://127.0.0.1",
+            "Sensor disconnected",
+        ),
         (Level::Info, "twinleaf::proxy::server", "client 3 ended"),
         (Level::Debug, "twinleaf::proxy::server", "under the filter"),
         (Level::Debug, "device::/0", "a device's own line"),
         (Level::Error, "plain", "no path"),
+        (
+            Level::Info,
+            "twinleaf::proxy::link",
+            "Opening udp://127.0.0.1",
+        ),
+        (Level::Info, "proxy::udp://127.0.0.1", "Text: hello"),
+        (
+            Level::Warn,
+            "twinleaf::proxy::worker",
+            "Failed to find RPC timeout in map",
+        ),
+        (Level::Info, "status::udp://127.0.0.1", "Sensor reconnected"),
     ];
 
     /// The console writes the same bytes with a sink as with none, each
@@ -309,7 +352,14 @@ mod tests {
         log_all(&proxy_logger(console(&with), Some(sink)), &RECORDS);
         assert_eq!(lines(&with), lines(&alone));
         let bold = env_logger::fmt::style::Style::new().bold();
-        assert_eq!(lines(&alone).len(), 4);
+        assert_eq!(lines(&alone).len(), 8);
+        assert!(lines(&alone)[7].ends_with(&format!(
+            " {bold}udp://127.0.0.1:{bold:#} Sensor reconnected"
+        )));
+        assert!(lines(&alone)[5].ends_with(&format!(" {bold}udp://127.0.0.1:{bold:#} Text: hello")));
+        assert!(lines(&alone)[6].ends_with(&format!(
+            " {bold}worker:{bold:#} Failed to find RPC timeout in map"
+        )));
         assert!(
             lines(&alone)[0].ends_with(&format!(
                 " {bold}udp://127.0.0.1:{bold:#} Sensor disconnected"
@@ -328,8 +378,10 @@ mod tests {
     }
 
     /// The sink takes each record the console writes, with its level, the
-    /// source the console names and its text, in order. It takes none the
-    /// filter stops, and none of a device's own, which the console writes.
+    /// part that said it and its text, in order. It takes none the filter
+    /// stops, and none of a device's own or of a link status the proxy
+    /// announces, which the console writes. A link's records are all said
+    /// by the part link, its worker's with the link's URL ahead of them.
     #[test]
     fn the_sink_takes_what_the_console_writes_but_a_devices_own_records() {
         let taken: Arc<Mutex<Vec<(Level, String, String)>>> = Arc::default();
@@ -344,11 +396,13 @@ mod tests {
         assert_eq!(
             *taken.lock().unwrap(),
             [
-                own(Level::Warn, "udp://127.0.0.1", "Sensor disconnected"),
                 own(Level::Info, "server", "client 3 ended"),
                 own(Level::Error, "plain", "no path"),
+                own(Level::Info, "link", "Opening udp://127.0.0.1"),
+                own(Level::Info, "link", "udp://127.0.0.1: Text: hello"),
+                own(Level::Warn, "link", "Failed to find RPC timeout in map"),
             ]
         );
-        assert_eq!(lines(&written).len(), 4, "the console wrote the device's");
+        assert_eq!(lines(&written).len(), 8, "the console wrote them all");
     }
 }

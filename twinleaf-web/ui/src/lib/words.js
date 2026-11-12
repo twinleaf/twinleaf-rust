@@ -69,9 +69,25 @@ export const LOG_DEVICES = 'Devices';
 export const LOG_PARTS = 'Proxy';
 /** What the drawer says in place of its rows when none shows: with only the lines of a loss showing, or under any other filter. */
 export const logEmpty = (lossOnly, any) => (lossOnly ? 'No data has been lost' : any ? 'Nothing matches' : 'No lines yet');
-/** What a line of a loss says, of `loss` {cause, stream, samples, seconds} (protocol.js), in the page's words. */
-export function lossLine({ cause, stream, samples, seconds }) {
-  if (cause === 'link') return seconds == null ? 'link down' : `link back after ${seconds.toFixed(1)} s`;
+/** Why the proxy lost a device, in the page's words, by what a link's line says of it (protocol.js `why`). */
+export const LOST_WHY = {
+  disconnected: 'sensor disconnected',
+  stopped: 'the proxy stopped',
+  failed_to_connect: 'the link did not open',
+  failed_to_reconnect: 'the proxy gave up reconnecting',
+  quiet: 'silent for 3 s',
+};
+/**
+ * What a line of a loss says, of `loss` {cause, stream, samples, seconds,
+ * why, url} (protocol.js), in the page's words: a link's drop with why the
+ * proxy lost the device and the link's address, where the hub knows them,
+ * and its return with the address.
+ */
+export function lossLine({ cause, stream, samples, seconds, why, url }) {
+  if (cause === 'link') {
+    const said = seconds == null ? `link down${LOST_WHY[why] ? `, ${LOST_WHY[why]}` : ''}` : `link back after ${seconds.toFixed(1)} s`;
+    return url ? `${said} · ${url}` : said;
+  }
   const n = `${countText(samples)} ${samples === 1 ? 'sample' : 'samples'}`;
   if (cause === 'skipped') return `${n} of ${stream} skipped`;
   return `${cause} dropped ${n} of ${stream}`;

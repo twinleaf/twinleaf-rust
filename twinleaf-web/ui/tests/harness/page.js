@@ -168,8 +168,10 @@ const typed = (text) => (text === 'true' ? true : text === 'false' ? false : tex
  * device at `route`, or of none with null, said by the device unless
  * `source` is 'proxy', then by the proxy's `part`, the hub unless given,
  * its time the newest sample's unless given, and its time of day
- * the page's clock's. `linkDown(route)` drops a device's link and
- * `linkBack(route, seconds)` brings it back after that long, and
+ * the page's clock's. `linkDown(route, link)` drops a device's link and
+ * `linkBack(route, seconds, link)` brings it back after that long, each
+ * line with what `link` says of the link, {why, url}, nothing unless
+ * given, and
  * `lose(route, stream, {skipped, proxy, hub})` loses samples of a stream,
  * each as the server says it: the device's presence, the lines of the
  * loss, and the device's `loss` counts.
@@ -199,16 +201,16 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
   const lost = new Map();
   const lostOf = (route) => lost.get(route) ?? lost.set(route, { times: 0, seconds: 0, streams: {} }).get(route);
   const tellLost = (route) => hub.text({ type: 'loss', seq: hub.seq + 1, route, link: { times: lostOf(route).times, seconds: lostOf(route).seconds }, streams: structuredClone(lostOf(route).streams) });
-  hub.linkDown = (route) => {
+  hub.linkDown = (route, link = {}) => {
     lostOf(route).times++;
     hub.presence(route, 'lost');
-    hub.line('error', 'The link is down', { route, source: 'proxy', loss: { cause: 'link', seconds: null } });
+    hub.line('error', 'The link is down', { route, source: 'proxy', loss: { cause: 'link', seconds: null, ...link } });
     tellLost(route);
   };
-  hub.linkBack = (route, seconds) => {
+  hub.linkBack = (route, seconds, link = {}) => {
     lostOf(route).seconds += seconds;
     hub.presence(route, 'alive');
-    hub.line('info', `The link is back after ${seconds.toFixed(1)} s`, { route, source: 'proxy', loss: { cause: 'link', seconds } });
+    hub.line('info', `The link is back after ${seconds.toFixed(1)} s`, { route, source: 'proxy', loss: { cause: 'link', seconds, ...link } });
     tellLost(route);
   };
   hub.lose = (route, stream, samples) => {

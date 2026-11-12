@@ -25,17 +25,20 @@
 //! page is sent in their place says how many (`Message::Hub`).
 //!
 //! Each loss is a line of the log too, as it is counted. A link that drops
-//! is one line and its return another, which says how long it was down.
+//! is one line, with why the proxy lost the device and the link's address
+//! as the proxy says them, and its return another, which says how long it
+//! was down.
 //! The rows a stream lost since the counts were last sent are a line for
 //! each place they were lost, but for those lost with the link down, which
 //! the link's own lines stand for.
 
 use crate::feed::Feed;
 use crate::logbook::{self, Logbook};
-use crate::protocol::{Frame, Level, Link, LossLine, Lost, Message};
+use crate::protocol::{Frame, Level, Link, LossLine, Lost, Message, Why};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use twinleaf::device::{LinkState, LostCause};
 use twinleaf::{DeviceRoute, SampleBatch};
 
 /// The counts of every device, and the feed they go out on.
@@ -107,22 +110,33 @@ impl Losses {
     /// Counts a drop of the link to the device at `route`, which went down
     /// at `since`. Only a link that was up drops, so a device lost before
     /// the hub heard it counts none, and a link that is down drops no
-    /// further.
-    pub(crate) fn link_down(&self, route: DeviceRoute, since: Instant) {
+    /// further. `link` is what the proxy says of the link that serves the
+    /// device, if it has, which the line of the drop carries.
+    pub(crate) fn link_down(&self, route: DeviceRoute, since: Instant, link: Option<&LinkState>) {
         let mut devices = self.devices.lock().unwrap();
         let device = devices.entry(route).or_default();
         if std::mem::take(&mut device.up) {
             device.down = Some(since);
             device.drops += 1;
-            let loss = LossLine::Link { seconds: None };
-            let text = "The link is down".to_string();
+            let why = link.and_then(|link| link.lost).and_then(why_of);
+            let url = link.map(|link| link.url.clone());
+            let text = match &url {
+                Some(url) => format!("The link at {url} is down"),
+                None => "The link is down".to_string(),
+            };
+            let loss = LossLine::Link {
+                seconds: None,
+                why,
+                url,
+            };
             self.log.proxy(Level::Error, Some(route), text, Some(loss));
         }
     }
 
     /// Notes that the device at `route` is heard, which ends the outage of
-    /// its link if it is down.
-    pub(crate) fn link_up(&self, route: DeviceRoute) {
+    /// its link if it is down. `link` is what the proxy says of the link,
+    /// whose address the line of the return carries.
+    pub(crate) fn link_up(&self, route: DeviceRoute, link: Option<&LinkState>) {
         let mut devices = self.devices.lock().unwrap();
         let device = devices.entry(route).or_default();
         device.up = true;
@@ -132,6 +146,8 @@ impl Losses {
             let seconds = (down * 10.0).round() / 10.0;
             let loss = LossLine::Link {
                 seconds: Some(seconds),
+                why: None,
+                url: link.map(|link| link.url.clone()),
             };
             let text = format!("The link is back after {seconds:.1} s");
             self.log.proxy(Level::Info, Some(route), text, Some(loss));
@@ -238,6 +254,19 @@ impl Losses {
     }
 }
 
+/// Why the proxy lost a device, as the page is told, or `None` for a cause
+/// the page has no word for.
+fn why_of(cause: LostCause) -> Option<Why> {
+    match cause {
+        LostCause::Disconnected => Some(Why::Disconnected),
+        LostCause::Stopped => Some(Why::Stopped),
+        LostCause::FailedToConnect => Some(Why::FailedToConnect),
+        LostCause::FailedToReconnect => Some(Why::FailedToReconnect),
+        LostCause::Quiet => Some(Why::Quiet),
+        _ => None,
+    }
+}
+
 /// The message of the `counts` of the device at `route`.
 fn message(route: DeviceRoute, (link, streams): &(Link, BTreeMap<String, Lost>)) -> Message {
     Message::Loss {
@@ -283,14 +312,14 @@ mod tests {
         assert!(heard(&mut rx).is_empty(), "nothing was lost");
 
         let since = Instant::now() - Duration::from_secs(3);
-        losses.link_down(root, since);
+        losses.link_down(root, since, None);
         losses.send_changed();
         assert!(heard(&mut rx).is_empty(), "a link never up did not drop");
-        losses.link_up(root);
-        losses.link_down(root, since);
-        losses.link_down(root, Instant::now());
-        losses.link_up(root);
-        losses.link_up(root);
+        losses.link_up(root, None);
+        losses.link_down(root, since, None);
+        losses.link_down(root, Instant::now(), None);
+        losses.link_up(root, None);
+        losses.link_up(root, None);
         losses.send_changed();
         losses.send_changed();
         let sent = heard(&mut rx);
@@ -313,14 +342,14 @@ mod tests {
         let mut rx = feed.subscribe().1;
         let losses = losses(feed);
         let root = DeviceRoute::root();
-        losses.link_down(root, Instant::now());
-        losses.link_up(root);
+        losses.link_down(root, Instant::now(), None);
+        losses.link_up(root, None);
         assert!(lines(&mut rx).is_empty(), "a link never up did not drop");
         let since = Instant::now() - Duration::from_secs(2);
-        losses.link_down(root, since);
-        losses.link_down(root, Instant::now());
-        losses.link_up(root);
-        losses.link_up(root);
+        losses.link_down(root, since, None);
+        losses.link_down(root, Instant::now(), None);
+        losses.link_up(root, None);
+        losses.link_up(root, None);
         let said = lines(&mut rx);
         assert_eq!(said.len(), 2, "{said:?}");
         assert_eq!(said[0]["level"], "error");
@@ -332,6 +361,32 @@ mod tests {
         );
         assert_eq!(said[1]["level"], "info");
         assert_eq!(said[1]["loss"]["cause"], "link");
+        assert!(said[1]["loss"].get("url").is_none(), "the proxy said none");
+
+        // With what the proxy says of the link, the drop's line carries why
+        // and where, and the return's where.
+        let link = |lost| LinkState {
+            url: "udp://127.0.0.1:1".to_string(),
+            lost,
+        };
+        for (cause, why) in [
+            (LostCause::Disconnected, "disconnected"),
+            (LostCause::Stopped, "stopped"),
+            (LostCause::FailedToConnect, "failed_to_connect"),
+            (LostCause::FailedToReconnect, "failed_to_reconnect"),
+            (LostCause::Quiet, "quiet"),
+        ] {
+            losses.link_down(root, Instant::now(), Some(&link(Some(cause))));
+            losses.link_up(root, Some(&link(Some(cause))));
+            let said = lines(&mut rx);
+            assert_eq!(said.len(), 2, "{said:?}");
+            assert_eq!(
+                said[0]["loss"],
+                serde_json::json!({"cause": "link", "seconds": null, "why": why, "url": "udp://127.0.0.1:1"})
+            );
+            assert_eq!(said[1]["loss"]["url"], "udp://127.0.0.1:1");
+            assert!(said[1]["loss"].get("why").is_none());
+        }
         let seconds = said[1]["loss"]["seconds"].as_f64().unwrap();
         assert!((2.0..2.5).contains(&seconds), "{seconds}");
     }
@@ -342,10 +397,11 @@ mod tests {
         let feed = Feed::new();
         let mut rx = feed.subscribe().1;
         let losses = losses(feed);
-        losses.link_up(DeviceRoute::root());
+        losses.link_up(DeviceRoute::root(), None);
         losses.link_down(
             DeviceRoute::root(),
             Instant::now() - Duration::from_secs(10),
+            None,
         );
         losses.send_changed();
         std::thread::sleep(Duration::from_millis(250));

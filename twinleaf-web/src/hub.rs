@@ -1698,6 +1698,8 @@ mod tests {
     /// none, behind a proxy of the test's own, and a hub over a connection
     /// to it.
     struct Fed {
+        /// The URL the proxy opens the device at.
+        url: String,
         stop: Arc<std::sync::atomic::AtomicBool>,
         proxy: twinleaf::proxy::Proxy,
         live: Live,
@@ -1727,7 +1729,7 @@ mod tests {
                 name: "a test".to_string(),
                 default: Some(Layout {
                     mounts: vec![Mount {
-                        url,
+                        url: url.clone(),
                         source: root,
                         prefix: root,
                     }],
@@ -1738,7 +1740,22 @@ mod tests {
             let connection = Connection::open(&proxy.endpoint()).unwrap();
             let runtime = tokio::runtime::Handle::current();
             let live = Live::over(connection, None, &runtime).unwrap();
-            Fed { stop, proxy, live }
+            Fed {
+                url,
+                stop,
+                proxy,
+                live,
+            }
+        }
+
+        /// Serves the device again at the address it had, after it was
+        /// stopped.
+        fn restart(&mut self) {
+            let port = self.url.rsplit(':').next().unwrap().to_string();
+            self.stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let args = ["--no-drop", "--samplerate", "5000", "--port", &port];
+            let url = twinleaf_tools::tools::simulate::serve(&args, self.stop.clone());
+            assert_eq!(url, self.url);
         }
     }
 
@@ -2151,6 +2168,57 @@ mod tests {
         assert_eq!(line["level"], "error");
         assert_eq!(line["part"], "server");
         assert!(line["seq"].as_u64().is_some(), "a change every page hears");
+    }
+
+    /// A device whose link drops is one line of the log, which carries why
+    /// the proxy lost it and the address of its link, and a link that
+    /// returns is one line, which carries the address and how long it was
+    /// down.
+    #[tokio::test]
+    async fn a_link_that_drops_and_returns_is_one_line_each_with_why_and_where() {
+        let mut fed = Fed::start();
+        let (snapshot, mut changes) = fed.live.snapshot(0).await.unwrap();
+        next_message(snapshot, &mut changes, "device", |device| {
+            device["presence"] == "alive"
+        })
+        .await;
+        fed.stop.store(true, Ordering::Relaxed);
+        let of_link = |line: &serde_json::Value| line["loss"]["cause"] == "link";
+        let down = next_message(Vec::new(), &mut changes, "log", of_link).await;
+        assert_eq!(down["route"], "/");
+        assert_eq!(down["part"], "hub");
+        assert_eq!(down["level"], "error");
+        let url = fed.url.clone();
+        assert_eq!(
+            down["loss"],
+            serde_json::json!({"cause": "link", "seconds": null, "why": "disconnected", "url": url})
+        );
+        // The device answers again at the same address.
+        fed.restart();
+        let back = next_message(Vec::new(), &mut changes, "log", of_link).await;
+        assert_eq!(back["level"], "info");
+        assert_eq!(back["loss"]["url"], url);
+        assert!(back["loss"]["seconds"].as_f64() > Some(0.0), "{back}");
+        assert!(back["loss"].get("why").is_none());
+        // No other line of the link came between them or comes after.
+        let more = message_within(
+            Duration::from_secs(2),
+            Vec::new(),
+            &mut changes,
+            "log",
+            of_link,
+        );
+        assert_eq!(more.await, None);
+        let (again, _) = fed.live.snapshot(0).await.unwrap();
+        let held = again.iter().filter(|frame| match frame {
+            Frame::Text(text) => text.contains("\"cause\":\"link\""),
+            Frame::Binary(_) => false,
+        });
+        assert_eq!(
+            held.count(),
+            2,
+            "one line for the drop and one for the return"
+        );
     }
 
     #[test]

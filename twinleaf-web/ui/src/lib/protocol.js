@@ -32,7 +32,10 @@
 // `part` the part of the proxy that said it, `hub` for the hub's own and
 // else the source the proxy's console names; and
 // `loss`, on a line of a loss alone, what was lost: {cause: 'link',
-// seconds}, null as the link drops and how long it was down as it is back,
+// seconds, why, url}, `seconds` null as the link drops and how long it was
+// down as it is back, `why` on the drop the reason the proxy lost the
+// device (disconnected, stopped, failed_to_connect, failed_to_reconnect or
+// quiet) and `url` the link's address, each where the proxy said it,
 // or {cause, stream, samples} with `cause` skipped, proxy or hub. A line
 // may come in a snapshot and again as a change; the page keeps it once, by
 // `n` (log.svelte.js).

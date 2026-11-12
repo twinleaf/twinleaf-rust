@@ -194,6 +194,16 @@ describe('the words of a row', () => {
     expect(logMessage({ source: 'proxy', route: '/0', text: 'x', loss: { cause: 'hub', stream: 'sine', samples: 2100 } }, named)).toBe('OMG (/0): hub dropped 2.1 k samples of sine');
     expect(lossLine({ cause: 'link', seconds: null })).toBe('link down');
     expect(lossLine({ cause: 'link', seconds: 2.34 })).toBe('link back after 2.3 s');
+    // A link's line with why the proxy lost the device and the link's address, where the hub knows them.
+    expect(lossLine({ cause: 'link', seconds: null, why: 'disconnected', url: 'udp://192.168.1.41' })).toBe('link down, sensor disconnected · udp://192.168.1.41');
+    expect(['stopped', 'failed_to_connect', 'failed_to_reconnect', 'quiet', 'a cause the page has no word for'].map((why) => lossLine({ cause: 'link', seconds: null, why }))).toEqual([
+      'link down, the proxy stopped',
+      'link down, the link did not open',
+      'link down, the proxy gave up reconnecting',
+      'link down, silent for 3 s',
+      'link down',
+    ]);
+    expect(lossLine({ cause: 'link', seconds: 29.2, url: 'udp://192.168.1.41' })).toBe('link back after 29.2 s · udp://192.168.1.41');
     expect(lossLine({ cause: 'skipped', stream: 'aux', samples: 1 })).toBe('1 sample of aux skipped');
     expect(lossLine({ cause: 'proxy', stream: 'aux', samples: 12 })).toBe('proxy dropped 12 samples of aux');
     expect(outageText('VMR', undefined)).toBe('link to VMR down');

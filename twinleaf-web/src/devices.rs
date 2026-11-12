@@ -243,6 +243,11 @@ async fn watch_device(
     log: Arc<Logbook>,
 ) {
     let presence = device.presence_updates();
+    let link = device.link_updates();
+    // What the proxy last said of the device's link. It says why it lost
+    // the device ahead of the lost presence, so the newest is read as a
+    // presence comes.
+    let mut linked = None;
     let metadata = device.metadata_updates();
     let table = device.rpc_registry_updates();
     let settings = device.settings_updates();
@@ -262,17 +267,30 @@ async fn watch_device(
     loop {
         tokio::select! {
             update = presence.recv_async() => match update {
-                Ok(update) => identity.presence = match update {
-                    twinleaf::device::Presence::Alive { .. } => {
-                        losses.link_up(route);
-                        Presence::Alive
+                Ok(update) => {
+                    while let Ok(Some(newest)) = link.try_recv() {
+                        linked = Some(newest);
                     }
-                    twinleaf::device::Presence::Lost { since } => {
-                        losses.link_down(route, since);
-                        Presence::Lost
+                    identity.presence = match update {
+                        twinleaf::device::Presence::Alive { .. } => {
+                            losses.link_up(route, linked.as_ref());
+                            Presence::Alive
+                        }
+                        twinleaf::device::Presence::Lost { since } => {
+                            losses.link_down(route, since, linked.as_ref());
+                            Presence::Lost
+                        }
+                        _ => Presence::Connecting,
                     }
-                    _ => Presence::Connecting,
-                },
+                }
+                Err(RecvError::Lagged(_)) => continue,
+                Err(_) => return,
+            },
+            update = link.recv_async() => match update {
+                Ok(newest) => {
+                    linked = Some(newest);
+                    continue;
+                }
                 Err(RecvError::Lagged(_)) => continue,
                 Err(_) => return,
             },
