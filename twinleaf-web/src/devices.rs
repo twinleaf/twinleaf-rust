@@ -8,7 +8,9 @@
 //! what each is a capture of. Each message is the newest value of its kind,
 //! as the proxy keeps it, so [`Devices`] keeps the newest of each for a
 //! page's snapshot, and sends nothing that changes nothing. `captures`
-//! keeps where each capture RPC stands here too.
+//! keeps where each capture RPC stands here too. A device as its metadata
+//! first names it, or names it anew, and a table that did not load are
+//! each a line of the log.
 //!
 //! A device is named by its route, as `/` or `/0`, which is also how traces
 //! name theirs. The routes message lists the devices there are. A device it
@@ -18,10 +20,11 @@
 
 use crate::captures::is_capture;
 use crate::feed::Feed;
+use crate::logbook::Logbook;
 use crate::loss::Losses;
 use crate::protocol::{
-    Access, CallReply, CaptureInfo, CaptureLabel, Frame, Message, MountInfo, Outcome, Presence,
-    ReadReply, Refusal, RpcInfo, TableInfo, TableState,
+    Access, CallReply, CaptureInfo, CaptureLabel, Frame, Level, Message, MountInfo, Outcome,
+    Presence, ReadReply, Refusal, RpcInfo, TableInfo, TableState,
 };
 use axum::http::StatusCode;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -188,12 +191,13 @@ impl Devices {
 /// Starts the watchers of every device `connection` sees, on `runtime`, for
 /// as long as the connection lasts. `mounts` is what the hub mounted, or
 /// `None` for the proxy's default. Each drop of a device's link is counted
-/// in `losses`.
+/// in `losses`, and `log` takes the watchers' lines.
 pub(crate) fn watch(
     connection: &Connection,
     mounts: Option<Vec<MountInfo>>,
     devices: Arc<Devices>,
     losses: Arc<Losses>,
+    log: Arc<Logbook>,
     runtime: &tokio::runtime::Handle,
 ) {
     let tree = connection.tree(DeviceRoute::root());
@@ -212,7 +216,7 @@ pub(crate) fn watch(
                 if watched.insert(route) {
                     let device = tree.device(route).expect("a route the tree heard is in it");
                     let (devices, losses) = (devices.clone(), losses.clone());
-                    spawner.spawn(watch_device(device, route, devices, losses));
+                    spawner.spawn(watch_device(device, route, devices, losses, log.clone()));
                 }
             }
         }
@@ -229,12 +233,14 @@ struct Identity {
 }
 
 /// Sends what the proxy keeps of `device` as it changes, until the
-/// connection ends, and counts each drop of its link in `losses`.
+/// connection ends, counts each drop of its link in `losses`, and says in
+/// `log` what its metadata names it and that a table did not load.
 async fn watch_device(
     device: Device,
     route: DeviceRoute,
     devices: Arc<Devices>,
     losses: Arc<Losses>,
+    log: Arc<Logbook>,
 ) {
     let presence = device.presence_updates();
     let metadata = device.metadata_updates();
@@ -273,9 +279,16 @@ async fn watch_device(
             update = metadata.recv_async() => match update {
                 Ok(MetadataState::Ready(snapshot)) => {
                     let view = snapshot.device();
-                    identity.name = Some(view.name().to_string());
-                    identity.serial = Some(view.serial().to_string());
-                    identity.firmware = Some(view.firmware().to_string());
+                    let named = (
+                        Some(view.name().to_string()),
+                        Some(view.serial().to_string()),
+                        Some(view.firmware().to_string()),
+                    );
+                    if named != (identity.name.clone(), identity.serial.clone(), identity.firmware.clone()) {
+                        let text = format!("Found {}, serial {}, firmware {}", view.name(), view.serial(), view.firmware());
+                        log.proxy(Level::Info, Some(route), text, None);
+                    }
+                    (identity.name, identity.serial, identity.firmware) = named;
                 }
                 Ok(_) | Err(RecvError::Lagged(_)) => continue,
                 Err(_) => return,
@@ -289,7 +302,10 @@ async fn watch_device(
                         let rpcs = registry.iter().filter(|desc| shown(desc)).map(describe).collect();
                         TableState::Loaded(TableInfo { rpcs })
                     }
-                    Ok(Err(error)) => TableState::Failed { error: error.to_string() },
+                    Ok(Err(error)) => {
+                        log.proxy(Level::Warn, Some(route), format!("The RPC table did not load. {error}"), None);
+                        TableState::Failed { error: error.to_string() }
+                    }
                     Err(RecvError::Lagged(_)) => continue,
                     Err(_) => return,
                 };

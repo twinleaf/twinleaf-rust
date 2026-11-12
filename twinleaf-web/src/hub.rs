@@ -37,6 +37,10 @@
 //! counts them by device and stream in its [`Losses`], with each drop of a
 //! device's link, and sends every page the counts each second they grew.
 //!
+//! The hub keeps the log's lines in its [`Logbook`], those its devices
+//! send as log packets and its own, and notes there the time of the newest
+//! sample it took of each device, which stamps that device's lines.
+//!
 //! A run lasts across lost samples, and [`Run::boundaries`] says where they
 //! fell. The hub splits the points it sends there, so the page lifts the pen.
 //!
@@ -49,6 +53,7 @@ use crate::captures::{Captures, Outbox, Want};
 use crate::devices::Devices;
 use crate::export::ExportTrace;
 use crate::feed::Feed;
+use crate::logbook::{self, Logbook};
 use crate::loss::Losses;
 use crate::protocol::{self, Frame, Message, MountInfo, Rows, TraceInfo, Window, WindowChunk};
 use crate::pyramid::{self, Level, Point, Pyramid, Slice};
@@ -156,6 +161,9 @@ pub(crate) struct Hub {
     /// What was lost of each device and stream before the hub held it, which
     /// the watchers of the devices add each drop of a link to.
     losses: Arc<Losses>,
+    /// The log's lines, which the hub tells the time of each device's
+    /// newest sample.
+    log: Arc<Logbook>,
 }
 
 /// A `memory` message as a page shows it: its bytes, budget, seconds,
@@ -205,6 +213,8 @@ pub(crate) struct Live {
     pub(crate) devices: Arc<Devices>,
     /// What was lost of each device, which the hub's thread sends.
     losses: Arc<Losses>,
+    /// The log's lines, which a snapshot holds the newest of.
+    log: Arc<Logbook>,
     /// The tree the connection sees, which the page's calls go through.
     pub(crate) tree: DeviceTree,
     /// The captures the pages ask for.
@@ -277,13 +287,16 @@ impl Live {
                 .collect()
         });
         let losses = hub.losses.clone();
+        let log = hub.log.clone();
         crate::devices::watch(
             &connection,
             mounts,
             devices.clone(),
             losses.clone(),
+            log.clone(),
             runtime,
         );
+        runtime.spawn(logbook::read(connection.packets(), log.clone()));
         let captures = Captures::new(devices.clone(), &tree, runtime);
         let end = End {
             connection: connection.clone(),
@@ -306,6 +319,7 @@ impl Live {
             mailbox,
             devices,
             losses,
+            log,
             tree,
             captures,
             next_page: AtomicU64::new(0),
@@ -417,8 +431,9 @@ impl Live {
     /// behind, when the snapshot comes in their place, and 0 as the page
     /// connects. The hub's thread takes both in one job, so no point is
     /// missed or doubled. The messages of the devices and of what was lost
-    /// each replace the last of their kind, so one heard twice does no
-    /// harm, and they are taken after subscribing.
+    /// each replace the last of their kind, and a line of the log is known
+    /// by its number, so one heard twice does no harm, and they are taken
+    /// after subscribing.
     pub(crate) async fn snapshot(
         &self,
         behind: u64,
@@ -438,6 +453,7 @@ impl Live {
         frames.extend(hub);
         frames.extend(self.devices.snapshot());
         frames.extend(self.losses.snapshot());
+        frames.extend(self.log.snapshot());
         Ok((frames, rx))
     }
 }
@@ -604,6 +620,7 @@ fn gap_times(run: Option<&Run>) -> Vec<f64> {
 impl Hub {
     fn new() -> Hub {
         let feed = Feed::new();
+        let log = Logbook::new(feed.clone());
         Hub {
             buffer: {
                 let mut buffer = Buffer::with_budget(RAW_BYTES);
@@ -617,7 +634,8 @@ impl Hub {
             held: None,
             holders: BTreeSet::new(),
             memory_sent: None,
-            losses: Losses::new(feed.clone()),
+            losses: Losses::new(feed.clone(), log.clone()),
+            log,
             feed,
             history_seconds: RAW_SECONDS,
             mailbox: None,
@@ -639,9 +657,10 @@ impl Hub {
 
     fn ingest(&mut self, batch: &SampleBatch) {
         self.losses.count(batch);
-        if batch.is_empty() {
+        let Some(newest) = batch.timestamps().last() else {
             return;
-        }
+        };
+        self.log.heard(batch.route(), *newest);
         self.buffer.process_batch(batch);
         // As the buffer drops what the held history keeps, the held history
         // costs more, and gives up its oldest to stay within the room left.
@@ -2027,6 +2046,85 @@ mod tests {
         assert!(told(&hub, &mut rx).is_empty(), "nothing more was lost");
         let in_snapshot = hub.losses.snapshot();
         assert_eq!(in_snapshot.len(), 1, "a snapshot holds the counts");
+    }
+
+    /// What a stream lost is a line of the log for each place it was lost,
+    /// once the counts are sent, with the stream and the samples as data.
+    /// Each line carries the time of the newest sample the hub took of the
+    /// device before it. Counts that did not grow are no line.
+    #[test]
+    fn what_a_stream_lost_is_a_line_of_the_log_for_each_place() {
+        let mut hub = Hub::new();
+        let mut rx = hub.feed.subscribe().1;
+        let mut parser = parser();
+        let root = DeviceRoute::root();
+        let mut newest = f64::NAN;
+        let mut feed = |hub: &mut Hub, parser: &mut PacketParser, first: u32| {
+            for batch in samples(parser, first, 10) {
+                newest = *batch.timestamps().last().unwrap();
+                hub.ingest(&batch);
+            }
+        };
+        feed(&mut hub, &mut parser, 0);
+        feed(&mut hub, &mut parser, 15);
+        parser
+            .push_packet(&Packet::dropped(1, 1).with_route(root))
+            .unwrap();
+        feed(&mut hub, &mut parser, 32);
+        assert!(logbook::tests::heard(&mut rx).is_empty());
+        hub.losses.send_changed();
+        let lines = logbook::tests::heard(&mut rx);
+        let lost: Vec<serde_json::Value> = lines.iter().map(|line| line["loss"].clone()).collect();
+        assert_eq!(
+            lost,
+            [
+                serde_json::json!({"cause": "skipped", "stream": "field", "samples": 5}),
+                serde_json::json!({"cause": "proxy", "stream": "field", "samples": 7}),
+            ]
+        );
+        for line in &lines {
+            assert_eq!(line["time"], newest, "{line}");
+            assert_eq!(line["level"], "warn");
+            assert_eq!(line["source"], "proxy");
+            assert_eq!(line["route"], "/");
+        }
+        hub.losses.send_changed();
+        assert!(logbook::tests::heard(&mut rx).is_empty(), "nothing more");
+    }
+
+    /// A log packet of a device is a line every page hears, said by the
+    /// device at its route, with a time on its samples' clock, and the
+    /// snapshot of a page that connects later holds it, with the proxy's
+    /// line that names the device.
+    #[tokio::test]
+    async fn a_devices_log_packet_is_a_line_the_pages_hear_and_a_snapshot_holds() {
+        let fed = Fed::start();
+        let (snapshot, mut changes) = fed.live.snapshot(0).await.unwrap();
+        let said = |line: &serde_json::Value| line["source"] == "device" && !line["time"].is_null();
+        let line = next_message(snapshot, &mut changes, "log", said).await;
+        assert_eq!(line["route"], "/");
+        let text = line["text"].as_str().unwrap();
+        assert!(text.contains("lucky number"), "{text}");
+        let level = line["level"].as_str().unwrap();
+        assert!(["error", "warn", "info"].contains(&level), "{level}");
+        assert!(line.get("loss").is_none());
+        let trace = fed.live.ask("newest", |hub| {
+            let run = hub.buffer.run(&hub.traces[0].key.stream_key());
+            run.and_then(Run::last_timestamp)
+        });
+        let newest = trace.await.unwrap().expect("the stream has rows");
+        let time = line["time"].as_f64().unwrap();
+        assert!(time <= newest && newest - time < 60.0, "{time} {newest}");
+
+        let (again, mut later) = fed.live.snapshot(0).await.unwrap();
+        let same = |held: &serde_json::Value| held["n"] == line["n"];
+        let held = next_message(again.clone(), &mut later, "log", same).await;
+        assert_eq!(held["text"], line["text"]);
+        assert!(held.get("seq").is_none(), "a snapshot's line has no number");
+        let found = |held: &serde_json::Value| held["source"] == "proxy";
+        let named = next_message(again, &mut later, "log", found).await;
+        assert_eq!(named["route"], "/");
+        assert!(named["text"].as_str().unwrap().starts_with("Found "));
     }
 
     #[test]

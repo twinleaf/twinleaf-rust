@@ -16,8 +16,8 @@
 //! frames of points, spectra and captures are in `wire`. The hub is in
 //! `hub`, the decimations a paused view's windows are read from in
 //! `pyramid`, the devices and their RPCs in `devices`, the captures taken
-//! for the pages that ask in `captures`, the routes in `routes`, and the
-//! checks every request passes in `guard`.
+//! for the pages that ask in `captures`, the log's lines in `logbook`, the
+//! routes in `routes`, and the checks every request passes in `guard`.
 
 mod assets;
 mod captures;
@@ -27,6 +27,7 @@ mod export;
 mod feed;
 mod guard;
 mod hub;
+mod logbook;
 mod loss;
 mod protocol;
 mod pyramid;

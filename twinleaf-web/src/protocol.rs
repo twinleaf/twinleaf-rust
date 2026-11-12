@@ -13,12 +13,14 @@
 //!   of every point the hub has sent, a [`Message::Config`], and the newest
 //!   [`Message::Routes`], [`Message::Device`], [`Message::Table`],
 //!   [`Message::Settings`], [`Message::Captures`] and [`Message::Capture`]
-//!   of every device, and the newest [`Message::Loss`] of every device
-//!   that lost anything. The page replaces all it holds of any hub with it.
+//!   of every device, the newest [`Message::Loss`] of every device that
+//!   lost anything, and the newest lines of the log, a [`Message::Log`]
+//!   each. The page replaces all it holds of any hub with it.
 //! - A change comes after it, numbered one more than the change before. It
 //!   is a points frame as each flush has new points, a spectrum frame per
 //!   trace as each is estimated, a [`Message::Trace`] as a new column
-//!   appears, a device's message as the proxy learns more of it, or
+//!   appears, a device's message as the proxy learns more of it, a
+//!   [`Message::Log`] as a line of the log is taken, or
 //!   [`Message::Clear`] when the decimation changes, followed by the history
 //!   again and a [`Message::Config`]. A message of a snapshot carries no
 //!   number and a binary frame of one carries 0.
@@ -53,6 +55,16 @@
 //! it grows, and a snapshot holds it. The fifth is the page's own, the
 //! changes it fell behind the hub, which the snapshot sent in their place
 //! says in `behind` of its [`Message::Hub`].
+//!
+//! # The log
+//!
+//! [`Message::Log`] is one line of the log, which `logbook` keeps. A device
+//! says a line in a log packet, and the proxy says the hub's own, each
+//! loss the counts above grow by among them, with what was lost as a
+//! [`LossLine`]. A line is a change every page hears, and a snapshot holds
+//! the newest 500. The lines are numbered from 1 since the hub started, so
+//! a page that hears one again, in a snapshot and as a change after it,
+//! knows it by its number.
 //!
 //! # Captures
 //!
@@ -161,6 +173,26 @@ pub(crate) enum Message {
         link: Link,
         streams: BTreeMap<String, Lost>,
     },
+    /// One line of the log. `n` numbers the lines from 1 since the hub
+    /// started. `wall` is the host's clock as the hub took the line, in
+    /// Unix seconds, and `time` the time of the newest sample the hub had
+    /// taken of the line's device then, on the clock its traces' points
+    /// are on, or `null` for a device no sample was taken of and for a line
+    /// of no device. `source` says who said it, and `route` names the
+    /// device it is of, the device that said it or the one the proxy says
+    /// it of, or `null` for none. `loss` is what the line says was lost,
+    /// and a line of no loss has none.
+    Log {
+        n: u64,
+        wall: f64,
+        time: Option<f64>,
+        level: Level,
+        source: Source,
+        route: Option<String>,
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        loss: Option<LossLine>,
+    },
     /// One device's RPC table, or why it did not load.
     Table {
         route: String,
@@ -244,6 +276,42 @@ pub(crate) struct Lost {
 pub(crate) struct Link {
     pub(crate) times: u64,
     pub(crate) seconds: f64,
+}
+
+/// How grave a line of the log is. A device's critical line is an error.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Level {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+/// Who said a line of the log.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Source {
+    /// The device the line names, in a log packet.
+    Device,
+    /// The proxy, of what its hub sees.
+    Proxy,
+}
+
+/// What a line of the log says was lost of its device, by `cause`.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "cause", rename_all = "lowercase")]
+pub(crate) enum LossLine {
+    /// The device's link dropped, with no `seconds` yet, or is back after
+    /// `seconds` down.
+    Link { seconds: Option<f64> },
+    /// The device skipped `samples` of `stream`, or its link lost them
+    /// while it stayed up.
+    Skipped { stream: String, samples: u64 },
+    /// The proxy dropped `samples` of `stream` from its queue for the hub.
+    Proxy { stream: String, samples: u64 },
+    /// The hub's connection dropped `samples` of `stream`.
+    Hub { stream: String, samples: u64 },
 }
 
 /// One capture RPC as the page lists it.

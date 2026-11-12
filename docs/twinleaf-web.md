@@ -73,8 +73,9 @@ snapshot:
    changes behind (`Lagged`): `hub {id, seq, behind}`, a `trace` per trace, one
    points frame of all history sent so far, `config`, `memory`, `routes`, then each
    listed device's newest `device`, `table`, `settings`, `captures` and a
-   `capture` per capture RPC the hub has taken, and a `loss` per device
-   that lost anything. The page drops
+   `capture` per capture RPC the hub has taken, a `loss` per device
+   that lost anything, and the newest 500 lines of the log, a `log` each.
+   The page drops
    everything of any hub and builds a new `Session` from it. `behind` is
    how many changes the page fell behind, 0 as a socket opens.
 2. **Changes**, each numbered `seq` one more than the last (`feed.rs`):
@@ -82,7 +83,8 @@ snapshot:
    `trace` for a new column, device messages, `memory` when what the buffer
    holds or may hold changed (checked each second: `bytes` of `budget`, the
    `seconds` held of `max_age`, and the bytes per second `rate`), `loss`
-   when a device lost more (checked each second), and on a
+   when a device lost more (checked each second), `log` as a line of
+   the log is taken, and on a
    decimation change `clear`, the history again and `config`.
 3. **Gaps** go back through 1: a change numbered other than the next, or a
    frame naming a trace the session does not have, makes the page close its
@@ -140,6 +142,71 @@ with a dashed line, and a gap wide enough to see, as a link's outage is,
 with a band from the last point before it to the first after: it tells
 the two apart by the gap's width, which is all a points frame says of a
 break.
+
+### The log
+
+`log {n, wall, time, level, source, route, text, loss?}` is one line of the
+log (`logbook.rs`):
+
+| Field | What it is |
+|---|---|
+| `n` | The line's number, from 1 since the hub started, in the order the hub took the lines. |
+| `wall` | The host's clock as the hub took the line, in Unix seconds, to a millisecond. |
+| `time` | The time of the newest sample the hub had taken of the line's device as it took the line, on the clock that device's points are on; `null` for a device no sample was taken of yet, and for a line of no device. |
+| `level` | `error`, `warn`, `info` or `debug`. |
+| `source` | `device`, a line the device said in a log packet, or `proxy`, a line of the hub's own. |
+| `route` | The device the line is of, as `/` or `/0`: the one that said it, or the one the proxy says it of; `null` for a line of no device. The device's name is its `device` message's. |
+| `text` | The line's words. |
+| `loss` | Only on a line of a loss: what was lost, as data (below). |
+
+Where the lines come from:
+
+- **A device's.** The hub reads every packet of its connection
+  (`Connection::packets`) and takes each log packet as a line of the device
+  at the packet's route, its text as sent. The device's level 0 and 1
+  (critical, error) are `error`, 2 `warn`, 4 `debug`, and 3 or any other
+  `info`. A device sends only what its `dev.loglevel` lets through.
+- **The proxy's.** The hub's own: a device as its metadata first names it
+  or names it anew (`info`), a device's RPC table that did not load
+  (`warn`), the device lines missed when the hub's reader of packets fell
+  behind its queue of 8192 (`warn`, of no device), and each loss as
+  `loss.rs` counts it. What the proxy process writes through the `log`
+  crate to its console is not among them: the hub is a client of the
+  proxy and hears none of it.
+
+A line of a loss has `loss`, by `cause`, so nothing reads a loss out of
+`text`:
+
+| `loss` | Said when | Level |
+|---|---|---|
+| `{cause: "link", seconds: null}` | the device's link drops (`loss.link.times` grows) | `error` |
+| `{cause: "link", seconds}` | the link is back, after `seconds` down, to a tenth | `info` |
+| `{cause: "skipped", stream, samples}` | the counts are sent (each second they grew): what `loss.streams[stream].skipped` grew by | `warn` |
+| `{cause: "proxy", stream, samples}` | the same, of `.proxy` | `warn` |
+| `{cause: "hub", stream, samples}` | the same, of `.hub` | `warn` |
+
+The rows lost with a link down (`loss.streams[stream].link`) are no line
+of their own: the link's two lines stand for them.
+
+**The two clocks.** A plot's x is its device's own time, the timestamps of
+its samples. A log packet carries no time on that clock the hub can place
+(its one number is the sender's own, the uptime in ms on Twinleaf
+devices), so the hub stamps each line as it takes it: `time` is the
+timestamp of the newest sample it has taken of that device, whichever of
+its streams it is of. The line was said no later than that sample by more
+than what waited in the hub's two queues, of packets and of batches, and
+one sample period: a few milliseconds while the hub keeps up. A proxy's
+line of a device is stamped the same way, so a link's drop carries the
+time of the last sample before it, and its return the first after. `wall`
+is the host's clock, which the page shows as the line's time of day;
+`time` is what places the line on a plot.
+
+**The bound.** The hub keeps the newest 500 lines (`logbook::KEPT`) for a
+snapshot, oldest first; older ones are gone from the hub. A line is a
+numbered change as it is taken, and a snapshot's lines carry no `seq`. A
+line may reach a page in a snapshot and again as a change after it, as the
+snapshot's lines are read after the page subscribes: the page keeps a line
+only when its `n` is past the last it holds of that hub.
 
 ### Captures
 

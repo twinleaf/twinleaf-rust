@@ -23,9 +23,16 @@
 //! The fifth place is past the hub: a page that reads too slowly falls
 //! behind the hub's changes. That is each page's own, and the snapshot the
 //! page is sent in their place says how many (`Message::Hub`).
+//!
+//! Each loss is a line of the log too, as it is counted. A link that drops
+//! is one line and its return another, which says how long it was down.
+//! The rows a stream lost since the counts were last sent are a line for
+//! each place they were lost, but for those lost with the link down, which
+//! the link's own lines stand for.
 
 use crate::feed::Feed;
-use crate::protocol::{Frame, Link, Lost, Message};
+use crate::logbook::Logbook;
+use crate::protocol::{Frame, Level, Link, LossLine, Lost, Message};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -35,6 +42,8 @@ use twinleaf::{DeviceRoute, SampleBatch};
 pub(crate) struct Losses {
     devices: Mutex<BTreeMap<DeviceRoute, Device>>,
     feed: Arc<Feed>,
+    /// The log, which each loss is a line of.
+    log: Arc<Logbook>,
 }
 
 /// What was lost of one device.
@@ -69,10 +78,11 @@ impl Device {
 }
 
 impl Losses {
-    pub(crate) fn new(feed: Arc<Feed>) -> Arc<Losses> {
+    pub(crate) fn new(feed: Arc<Feed>, log: Arc<Logbook>) -> Arc<Losses> {
         Arc::new(Losses {
             devices: Mutex::new(BTreeMap::new()),
             feed,
+            log,
         })
     }
 
@@ -104,6 +114,9 @@ impl Losses {
         if std::mem::take(&mut device.up) {
             device.down = Some(since);
             device.drops += 1;
+            let loss = LossLine::Link { seconds: None };
+            let text = "The link is down".to_string();
+            self.log.proxy(Level::Error, Some(route), text, Some(loss));
         }
     }
 
@@ -114,12 +127,20 @@ impl Losses {
         let device = devices.entry(route).or_default();
         device.up = true;
         if let Some(since) = device.down.take() {
-            device.seconds += since.elapsed().as_secs_f64();
+            let down = since.elapsed().as_secs_f64();
+            device.seconds += down;
+            let seconds = (down * 10.0).round() / 10.0;
+            let loss = LossLine::Link {
+                seconds: Some(seconds),
+            };
+            let text = format!("The link is back after {seconds:.1} s");
+            self.log.proxy(Level::Info, Some(route), text, Some(loss));
         }
     }
 
     /// Sends the counts of each device whose counts changed since they were
-    /// last sent, and logs how many rows the hub dropped meanwhile.
+    /// last sent, with a line of the log for the rows each stream lost
+    /// meanwhile in each place, and logs how many rows the hub dropped.
     pub(crate) fn send_changed(&self) {
         let now = Instant::now();
         let mut dropped = 0;
@@ -132,11 +153,56 @@ impl Losses {
                 streams.values().map(|lost| lost.hub).sum()
             };
             dropped += hub(&counts.1) - hub(&device.sent.1);
+            for (stream, lost) in &counts.1 {
+                let before = device.sent.1.get(stream).copied().unwrap_or_default();
+                self.lines(*route, stream, lost, &before);
+            }
             self.feed.message(&message(*route, &counts));
             device.sent = counts;
         }
         if dropped > 0 {
             log::warn!("The web page's hub fell behind and dropped {dropped} samples");
+        }
+    }
+
+    /// Says in the log what stream `stream` of the device at `route` lost
+    /// between the counts `before` and `lost`, a line for each place.
+    fn lines(&self, route: DeviceRoute, stream: &str, lost: &Lost, before: &Lost) {
+        let skipped = lost.skipped - before.skipped;
+        let proxy = lost.proxy - before.proxy;
+        let hub = lost.hub - before.hub;
+        let stream = || stream.to_string();
+        let said = [
+            (
+                skipped,
+                "skipped by the device or lost on its link",
+                LossLine::Skipped {
+                    stream: stream(),
+                    samples: skipped,
+                },
+            ),
+            (
+                proxy,
+                "dropped by the proxy",
+                LossLine::Proxy {
+                    stream: stream(),
+                    samples: proxy,
+                },
+            ),
+            (
+                hub,
+                "dropped by the hub",
+                LossLine::Hub {
+                    stream: stream(),
+                    samples: hub,
+                },
+            ),
+        ];
+        for (samples, how, loss) in said {
+            if samples > 0 {
+                let text = format!("{samples} samples of {} {how}", stream());
+                self.log.proxy(Level::Warn, Some(route), text, Some(loss));
+            }
         }
     }
 
@@ -181,15 +247,22 @@ fn message(route: DeviceRoute, (link, streams): &(Link, BTreeMap<String, Lost>))
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logbook::tests::heard as lines;
     use std::time::Duration;
+
+    /// The counts over `feed`, with a log of their own on it.
+    fn losses(feed: Arc<Feed>) -> Arc<Losses> {
+        Losses::new(feed.clone(), Logbook::new(feed))
+    }
 
     /// The loss messages `rx` heard, as JSON.
     fn heard(rx: &mut tokio::sync::broadcast::Receiver<Arc<Frame>>) -> Vec<serde_json::Value> {
         std::iter::from_fn(|| rx.try_recv().ok())
             .map(|frame| match &*frame {
-                Frame::Text(text) => serde_json::from_str(text).unwrap(),
+                Frame::Text(text) => serde_json::from_str::<serde_json::Value>(text).unwrap(),
                 Frame::Binary(_) => panic!("a loss is a message"),
             })
+            .filter(|message| message["type"] == "loss")
             .collect()
     }
 
@@ -201,7 +274,7 @@ mod tests {
     fn a_link_that_drops_is_counted_once_with_how_long_it_was_down() {
         let feed = Feed::new();
         let mut rx = feed.subscribe().1;
-        let losses = Losses::new(feed);
+        let losses = losses(feed);
         let root = DeviceRoute::root();
         losses.send_changed();
         assert!(heard(&mut rx).is_empty(), "nothing was lost");
@@ -228,12 +301,44 @@ mod tests {
         assert_eq!(losses.snapshot().len(), 1);
     }
 
+    /// A link that drops is a line of the log as it drops, and its return
+    /// another, which says how long it was down. A link said down again
+    /// while it is down, or up while it is up, is no line.
+    #[test]
+    fn a_link_that_drops_and_returns_is_two_lines_of_the_log() {
+        let feed = Feed::new();
+        let mut rx = feed.subscribe().1;
+        let losses = losses(feed);
+        let root = DeviceRoute::root();
+        losses.link_down(root, Instant::now());
+        losses.link_up(root);
+        assert!(lines(&mut rx).is_empty(), "a link never up did not drop");
+        let since = Instant::now() - Duration::from_secs(2);
+        losses.link_down(root, since);
+        losses.link_down(root, Instant::now());
+        losses.link_up(root);
+        losses.link_up(root);
+        let said = lines(&mut rx);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert_eq!(said[0]["level"], "error");
+        assert_eq!(said[0]["source"], "proxy");
+        assert_eq!(said[0]["route"], "/");
+        assert_eq!(
+            said[0]["loss"],
+            serde_json::json!({"cause": "link", "seconds": null})
+        );
+        assert_eq!(said[1]["level"], "info");
+        assert_eq!(said[1]["loss"]["cause"], "link");
+        let seconds = said[1]["loss"]["seconds"].as_f64().unwrap();
+        assert!((2.0..2.5).contains(&seconds), "{seconds}");
+    }
+
     /// While a link is down its outage grows with each send.
     #[test]
     fn an_outage_that_lasts_grows_until_the_link_is_up() {
         let feed = Feed::new();
         let mut rx = feed.subscribe().1;
-        let losses = Losses::new(feed);
+        let losses = losses(feed);
         losses.link_up(DeviceRoute::root());
         losses.link_down(
             DeviceRoute::root(),
