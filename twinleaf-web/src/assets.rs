@@ -1,8 +1,10 @@
 //! The built page, `ui/dist`, which a release build embeds in the binary.
 //!
 //! A debug build reads the files from `ui/dist` as they are when asked, so
-//! a page rebuilt with `npm run build` shows on the next reload. A checkout
-//! without `ui/dist` still builds, and its page says how to build it.
+//! a page rebuilt with `npm run build` shows on the next reload. A release
+//! build of a checkout without `ui/dist` builds it first, in `build.rs`,
+//! where Node and npm are installed. A binary built without `ui/dist` still
+//! runs, and its page says how to build it.
 
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};

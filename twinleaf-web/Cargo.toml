@@ -8,8 +8,9 @@ description = "The web page of the Twinleaf proxy: live plots of a device's data
 homepage = "https://twinleaf.com"
 repository = "https://github.com/twinleaf/twinleaf-rust"
 publish = false
-# The built page goes in the published crate, so installing needs no Node.
-include = ["src/**", "ui/dist/**", "Cargo.toml"]
+# The built page goes in the published crate, so installing that needs no Node.
+# A release build of a checkout without the built page builds it, in build.rs.
+include = ["src/**", "ui/dist/**", "build.rs", "Cargo.toml"]
 
 [lints.clippy]
 self_named_module_files = "deny"
