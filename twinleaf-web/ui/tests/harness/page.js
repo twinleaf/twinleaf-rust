@@ -221,10 +221,14 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
  * signal's window, each count answered `rowsLatency` ms of the page's
  * time after it is asked, as a hub's reply takes. Its clock is virtual, stepped by `frames`, `settle`,
  * `wait` and `until`, until it is disposed of; with `realClock`, the
- * browser's own, as the smoke tests of real time mount it. It returns the
- * page's state, each plot's view and PlotView among it.
+ * browser's own, as the smoke tests of real time mount it. It mounts with
+ * no button or key held and no drag under way, whatever a test that failed
+ * midway left. It returns the page's state, each plot's view and PlotView
+ * among it.
  */
 export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null, rowsLatency = 0, fromSaved = false, realClock = false, captures = null } = {}) {
+  await commands.mouse([['release']]);
+  expect(await dropped(), 'the drag a page before left, landed').toBe(true);
   virtual?.end();
   virtual = realClock ? null : clock.virtual();
   const mine = virtual;
