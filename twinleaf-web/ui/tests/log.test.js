@@ -586,7 +586,10 @@ describe('the log drawer', () => {
     expect(heights).toEqual(heights.map(() => box(liveButton).height));
     expect(look(followButton(), 'fontSize', 'fontFamily', 'borderTopLeftRadius')).toEqual(look(liveButton, 'fontSize', 'fontFamily', 'borderTopLeftRadius'));
     const device = document.querySelector('.device'), dockHead = document.querySelector('.dock-head');
-    expect(box(rowEls()[0]).height).toBe(box(device).height);
+    // A line of the log is as tall as a device's row is without the line of its firmware under its name, and the gap between the two.
+    const firmware = device.querySelector('.firmware');
+    const under = firmware ? box(firmware).height + parseFloat(getComputedStyle(device).rowGap) : 0;
+    expect(box(rowEls()[0]).height).toBe(box(device).height - under);
     expect(look(rowEls()[0], 'fontFamily', 'fontSize')).toEqual(look(device, 'fontFamily', 'fontSize'));
     expect(look(drawer().querySelector('.log-title'), 'fontFamily', 'fontSize', 'fontWeight', 'color')).toEqual(look(dockHead, 'fontFamily', 'fontSize', 'fontWeight', 'color'));
     const closeButton = drawer().querySelector('.dock-button'), dockButton = left.querySelector('.dock-button');

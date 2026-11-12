@@ -25,6 +25,7 @@ import { MENUS, axisPopover, closeAll, openMenu } from './harness/menus.js';
 import { centre, click, clickOn, editCursors, feed, focusPage, leafOf, mountPage, pressKey, rightClick, settle, typeInto, until, wait, withExamples, withYPair } from './harness/page.js';
 import { COMMANDS, PLOTLESS } from '../src/lib/commands.js';
 import * as clock from '../src/lib/clock.js';
+import { installed, release, serveFirmware } from './harness/firmware.js';
 import { plotIds } from '../src/lib/layout.js';
 
 const SIGNALS = ['sine.sine', 'aux.triangle'];
@@ -37,6 +38,8 @@ const SIGNALS = ['sine.sine', 'aux.triangle'];
  */
 async function commandPage() {
   const page = await mountPage([SIGNALS, SIGNALS, SIGNALS, SIGNALS], 'rows', 1, [...SIGNALS, 'mag.x']);
+  // A device a newer release is published for, so each firmware command can be chosen.
+  serveFirmware(page.hub, [{ route: '/', name: 'VMR', installed: installed('VMR', 'R4', '2026-01-10', 'aaaaaa'), releases: [release('VMR', 'R4', '2026-07-01', '5d1494')] }]).say('/');
   feed(page.hub);
   // Spectra with peaks either side of X1 and X2, so each peak command has somewhere to go on every plot.
   const session = page.hub.session, perf = clock.now(), f = Float32Array.from({ length: 50 }, (_, i) => i + 1);
