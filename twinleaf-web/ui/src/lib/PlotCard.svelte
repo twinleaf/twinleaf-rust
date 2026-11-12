@@ -33,7 +33,7 @@
   import { PlotView, axisSlots, colorOf, monitorOf, shownUnit } from './plot.js';
   import Swatch from './Swatch.svelte';
   import { DRAG_START, isSlice, kindLabel } from './constants.js';
-  import { kindWith } from './tabs.js';
+  import { kindWith, yLogOf } from './tabs.js';
   import { DEVICE_GONE } from './protocol.js';
   import { stepIn } from './keymap.js';
   import WindowField from './WindowField.svelte';
@@ -247,7 +247,7 @@
     const fixed = fixedHere(), lo = fromUnit(Number(bounds.lo), fixed), hi = fromUnit(Number(bounds.hi), fixed);
     if (!isFinite(lo) || !isFinite(hi) || bounds.lo.trim() === '' || bounds.hi.trim() === '') boundsError = 'Enter a number in each';
     else if (lo >= hi) boundsError = 'Max must be above min';
-    else if (plot.kind === 'spectrum' && plot.yScale !== 'linear' && lo <= 0) boundsError = 'A log axis starts above zero';
+    else if (yLogOf(plot) && lo <= 0) boundsError = 'A log axis starts above zero';
     else {
       boundsError = '';
       runHere('yRange', { key: region.keys[0], lo, hi });
@@ -489,7 +489,7 @@
       onFrequencies: (lo, hi) => host.setView(plot.id, { fRange: [lo, hi] }),
       onFitY: (key) => runHere('fitYAxis', key),
       viewHistory,
-      config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null, shots: plot.shots, shotCount: plot.shotCount, yFormat: plot.yFormat ?? null, xFormat: plot.xFormat ?? null, grid: plot.grid ?? true, xTime: plot.xTime ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
+      config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: yLogOf(plot), fRange: plot.fRange ?? null, shots: plot.shots, shotCount: plot.shotCount, yFormat: plot.yFormat ?? null, xFormat: plot.xFormat ?? null, grid: plot.grid ?? true, xTime: plot.xTime ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
     });
     registry.add(pv);
     host.pickers.set(plot.id, openPicker);
@@ -1104,10 +1104,10 @@
         <input aria-label="Highest value shown" type="text" inputmode="decimal" bind:value={bounds.hi} onkeydown={boundsKey} onblur={applyBounds} />
         {@render tool('fitYAxis', region.keys[0])}
       </div>
-      {#if plot.kind === 'spectrum'}
-        <div class="axis-row" role="group" aria-label="Density scale">
+      {#if isSlice(plot.kind)}
+        <div class="axis-row" role="group" aria-label={plot.kind === 'spectrum' ? 'Density scale' : 'Y scale'}>
           <span>Scale</span>
-          {@render scale('yScale', { key: region.keys[0] }, plot.yScale !== 'linear')}
+          {@render scale('yScale', { key: region.keys[0] }, yLogOf(plot))}
         </div>
       {/if}
       <!-- This axis's Y cursors, which a pull up off the x axis also draws out. -->

@@ -82,8 +82,8 @@ import { common, counted } from './menus.js';
 import { axisSlots, cursorText } from './plot.js';
 import { placedIn, withX } from './cursors.js';
 import { nearestPeak, peaks, stepPeak } from './snap.js';
-import { APART, joined } from './tabs.js';
-import { ARRANGEMENTS, CAPTURE_DELAY, CAPTURE_DELAYS, KINDS, MODES, kindLabel, kindsFor } from './constants.js';
+import { APART, joined, yScaleField } from './tabs.js';
+import { ARRANGEMENTS, CAPTURE_DELAY, CAPTURE_DELAYS, KINDS, MODES, isSlice, kindLabel, kindsFor } from './constants.js';
 import { SHOT_COUNTS, SHOT_MODES, shotCount, shotMode } from './shots.js';
 import { writeTables } from './copy.js';
 import { plotIds } from './layout.js';
@@ -716,11 +716,13 @@ export const COMMANDS = [
     },
   },
   {
-    // A spectrum's density scale, `how.to` 'log' or 'linear', on the plots with an axis in the units of y axis `how.key`.
+    // The y scale of a slice, a spectrum's density or a capture's values, `how.to` 'log' or 'linear', on the plots with an axis in the units of y axis `how.key`, each in the field that holds its own (tabs.js `yScaleField`).
     id: 'yScale', scope: 'plot', needs: ['axis'],
     run: (ctx, how) => {
       const { key, to } = how ?? {}, has = new Set(axesLike(ctx.on?.pv, pvs(ctx), key).map(([p]) => p.plotId));
-      ctx.svc.edit(ids(ctx), to === 'log' ? 'Log density scale' : 'Linear density scale', (plot) => (has.has(plot.id) ? { yScale: to } : null));
+      if (to !== 'log' && to !== 'linear') return false;
+      const what = ctx.on?.plot.kind === 'capture' ? 'y' : 'density';
+      ctx.svc.edit(ids(ctx), `${to === 'log' ? 'Log' : 'Linear'} ${what} scale`, (plot) => (has.has(plot.id) && isSlice(plot.kind) ? { [yScaleField(plot)]: to } : null));
     },
   },
   {

@@ -21,7 +21,10 @@
 // range key ('shared', or the signal key of an axis of its own), and
 // `xFormat` the digits and notation of a spectrum's or a capture's x axis,
 // each as units.js `axisFormat` reads them, a setting absent at Auto;
-// `fRange` is the stretch of that axis shown, absent for all of it. `layout` is
+// `fRange` is the stretch of that axis shown, absent for all of it.
+// `xScale` and `yScale` are a spectrum's frequency and density scales, and
+// `captureYScale` a capture plot's y scale, each 'log' or 'linear'
+// (`yScaleField`). `layout` is
 // the split tree of layout.js over the plot ids, or null for an empty tab.
 //
 // The tabs are kept in localStorage under SAVE_KEY as {tabs, activeId}.
@@ -53,6 +56,16 @@ export const PLOT_DEFAULTS = Object.freeze({ xScale: 'log', yScale: 'log', legen
 /** Plot fields that are what its view shows, not what was edited: no undo step holds them. */
 export const VIEW_FIELDS = new Set(['fRange']);
 export const newPlot = (kind, mode, keys) => ({ id: uid('p'), kind, mode, ...PLOT_DEFAULTS, items: keys.map(chip) });
+
+/**
+ * The field of `plot` that holds the scale of the y axis it draws, 'log' or
+ * 'linear': a capture plot's `captureYScale`, linear until set, as a
+ * capture's values are of either sign; any other plot's `yScale`, a
+ * spectrum's density scale, log until set (PLOT_DEFAULTS).
+ */
+export const yScaleField = (plot) => (plot.kind === 'capture' ? 'captureYScale' : 'yScale');
+/** Whether the y axis `plot` draws is log (`yScaleField`): a time plot's never is. */
+export const yLogOf = (plot) => (plot.kind === 'time' ? false : yScaleField(plot) === 'yScale' ? plot.yScale !== 'linear' : plot[yScaleField(plot)] === 'log');
 
 /** What the page says where a plot takes none of the signals given it, by `kindWith`. */
 export const APART = 'A capture and a signal do not share a plot';

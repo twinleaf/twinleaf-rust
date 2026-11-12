@@ -11,12 +11,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { commands, page as browser } from 'vitest/browser';
 import { flushSync } from 'svelte';
-import { centre, clickOn, closeAll, dropped, frames, leafOf, mountPage, pickItem, pressKey, rightClick, settle, typeInto, until, wait } from './harness/page.js';
-import { fid, keyOf } from './harness/captures.js';
+import { centre, clickOn, closeAll, dropped, feed, frames, leafOf, mountPage, pickItem, pressKey, rightClick, settle, typeInto, until, wait } from './harness/page.js';
+import { asKind, fid, keyOf } from './harness/captures.js';
 import { plotIds } from '../src/lib/layout.js';
 import { APART, SAVE_KEY } from '../src/lib/tabs.js';
 import { SHOT_COUNTS } from '../src/lib/shots.js';
 import { CAPTURE_DELAY } from '../src/lib/constants.js';
+import { prefs } from '../src/lib/prefs.svelte.js';
 
 /** Where VITE_TL_SHOTS names a folder, relative to this file, the screenshots go there. */
 const SHOTS = import.meta.env.VITE_TL_SHOTS;
@@ -50,6 +51,41 @@ async function trigger(page, id) {
 const slice = (page, id) => page.pv(id).drawn?.plans[0]?.s;
 
 afterEach(() => vi.restoreAllMocks());
+
+/**
+ * Pictures of a capture plot in each of `states`, beside a spectrum and a
+ * time plot, in light and dark at 1280 × 800 and 900 × 600, where
+ * VITE_TL_SHOTS names a folder: each state {name, set(page, ids)}, `set`
+ * putting the capture plot in it.
+ */
+async function pictures(states) {
+  if (!SHOTS) return;
+  for (const [w, h] of [[1280, 800], [900, 600]])
+    for (const theme of ['light', 'dark']) {
+      await browser.viewport(w, h);
+      prefs.setTheme(theme);
+      const page = await mountPage([[K.fid], ['sine.sin'], ['sine.cos']], 'rows', 0, SIGNALS, [], { captures: [FID, PHASE] });
+      try {
+        const ids = plotIds(page.ws.layout);
+        asKind(page, ids[1], 'spectrum');
+        feed(page.hub);
+        page.plots.commands.run('captureShots', { on: ids[0], how: { to: 'overlay' } });
+        page.plots.commands.run('captureCount', { on: ids[0], how: { to: 4 } });
+        for (let n = 0; n < 4; n++) (page.plots.commands.run('captureNow', { on: ids[0] }), await wait(TAKEN));
+        for (const { name, set } of states) {
+          await set(page, ids);
+          await settle();
+          await wait(100);
+          await settle(6);
+          await shoot(`look-${name}-${theme}-${w}x${h}`);
+        }
+      } finally {
+        page.dispose();
+        prefs.setTheme('system');
+      }
+    }
+  await browser.viewport(1200, 900);
+}
 
 describe('the Signals list', () => {
   it('lists a device’s captures under its signals, headed Captures, each by its metadata’s name and units, or its RPC’s name, and its search finds them', async () => {
@@ -418,6 +454,73 @@ describe('a capture plot', () => {
     }
   });
 
+  it('offers on its y axis every setting a spectrum’s and a time plot’s y axis have, by the same commands, and a log scale that fits its values above zero', async () => {
+    const page = await mount([[K.fid], ['sine.sin'], ['sine.cos']]);
+    try {
+      const [capture, spectrum, time] = plotIds(page.ws.layout), pv = page.pv(capture);
+      asKind(page, spectrum, 'spectrum');
+      feed(page.hub);
+      await trigger(page, capture);
+      await wait(100);
+      await settle(4);
+      const pop = () => document.querySelector('[data-slot=popover-content]');
+      /** What the y axis popover of plot `id` offers: the commands its controls run, and its groups by name. */
+      const offered = async (id) => {
+        const P = page.pv(id).geo.plot;
+        await rightClick([P.x - 12, P.y + P.h / 2]);
+        expect(await until(() => pop()), `plot ${id}'s y axis popover`).toBe(true);
+        const got = { commands: new Set([...pop().querySelectorAll('[data-command]')].map((el) => el.dataset.command)), groups: [...pop().querySelectorAll('[role=group]')].map((g) => g.getAttribute('aria-label')) };
+        await closeAll();
+        return got;
+      };
+      const [c, s, t] = [await offered(capture), await offered(spectrum), await offered(time)];
+      for (const [name, other] of [['spectrum', s], ['time plot', t]]) {
+        expect([...other.commands].filter((id) => !c.commands.has(id)), `the commands a ${name}'s y axis has and a capture plot's lacks`).toEqual([]);
+        expect(other.groups.filter((g) => g !== 'Density scale' && !c.groups.includes(g)), `the rows a ${name}'s y axis has and a capture plot's lacks`).toEqual([]);
+      }
+      expect(c.groups, 'a scale of values, not of a density').toContain('Y scale');
+      // Linear until set, its values of either sign shown.
+      const shown = slice(page, capture).a, positive = [...shown].filter((v) => v > 0);
+      expect([page.ws.plots[capture].captureYScale, pv.logY, pv.yBounds('shared')[0] < 0]).toEqual([undefined, false, true]);
+      // Log, from its popover: the range holds the values above zero, the spectrum's scale as it was.
+      const P = pv.geo.plot;
+      await rightClick([P.x - 12, P.y + P.h / 2]);
+      expect(await until(() => pop())).toBe(true);
+      await clickOn([...pop().querySelectorAll('[aria-label="Y scale"] button')].find((b) => b.textContent.trim() === 'Log'));
+      await settle();
+      await wait(100);
+      await settle(4);
+      expect([page.ws.plots[capture].captureYScale, page.ws.plots[spectrum].yScale, page.history.undos.at(-1)?.label]).toEqual(['log', 'log', 'Log y scale']);
+      expect(page.pv(capture).yBounds('shared'), 'a range on the log axis').not.toBe(null);
+      const [lo, hi] = page.pv(capture).yBounds('shared');
+      expect(page.pv(capture).logY).toBe(true);
+      expect(lo > 0 && lo <= Math.min(...positive) && hi >= Math.max(...positive), `[${lo}, ${hi}] holds the values above zero, ${Math.min(...positive)} to ${Math.max(...positive)}`).toBe(true);
+      // A bound at or below zero is refused on a log axis, and said so.
+      const fields = pop().querySelectorAll('[aria-label="Y axis range"] input');
+      await typeInto(fields[0], '-1');
+      await pressKey('Enter');
+      await settle();
+      expect(pop().querySelector('.axis-error')?.textContent).toBe('A log axis starts above zero');
+      await closeAll();
+      await shoot('log-y', leafOf(capture));
+      // Linear again: its values of either sign.
+      page.plots.commands.run('yScale', { on: capture, how: { key: 'shared', to: 'linear' } });
+      await settle();
+      await wait(100);
+      await settle(4);
+      expect([page.ws.plots[capture].captureYScale, page.pv(capture).logY, page.pv(capture).yBounds('shared')[0] < 0]).toEqual(['linear', false, true]);
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('looks as the page does in each of its states, beside a spectrum and a time plot', { timeout: 120_000 }, async () => {
+    await pictures([
+      { name: 'linear-y', set: () => {} },
+      { name: 'log-y', set: (page, [id]) => page.plots.commands.run('yScale', { on: id, how: { key: 'shared', to: 'log' } }) },
+    ]);
+  });
+
   it('takes cursors, peaks, its axes’ settings, a copy of its data and the export dialog as a spectrum does', async () => {
     const written = [];
     const page = await mount([[K.fid]]);
@@ -468,11 +571,11 @@ describe('a capture plot', () => {
       await settle();
       await wait(100);
       expect(page.pv(id).xd).toEqual([0, Math.fround(1499 * 5e-7)]);
-      // The y axis's popover: a range, its unit among those of volts, and no scale.
+      // The y axis's popover: a range, its unit among those of volts, and its scale, of values, not a density's.
       await rightClick([P.x - 12, P.y + P.h / 2]);
       expect(await until(() => pop())).toBe(true);
       const yLabels = [...pop().querySelectorAll('[role=group]')].map((g) => g.getAttribute('aria-label'));
-      expect(yLabels).toEqual(expect.arrayContaining(['Y axis range', 'Y cursors', 'Unit']));
+      expect(yLabels).toEqual(expect.arrayContaining(['Y axis range', 'Y cursors', 'Unit', 'Y scale']));
       expect(yLabels).not.toContain('Density scale');
       await closeAll();
       // The unit fixed at mV: the axis's numbers and the chip's unit follow.

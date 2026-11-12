@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SAVE_KEY, defaultContent, exportText, importText, joined, kindWith, loadTabs, makeTab, newPlot, remapIds, saveTabs, tabFromJson } from './tabs.js';
+import { SAVE_KEY, defaultContent, exportText, importText, joined, kindWith, loadTabs, makeTab, newPlot, remapIds, saveTabs, tabFromJson, yLogOf, yScaleField } from './tabs.js';
 import { plotIds, presets } from './layout.js';
 
 /** A localStorage of one Map. */
@@ -143,5 +143,14 @@ describe('a plot and the signals given it', () => {
     expect(keysOf(joined(plot('time', [SIGNALS[1]]), mixed))).toEqual([SIGNALS[1], SIGNALS[0]]);
     expect(joined(plot('time', SIGNALS), mixed)).toBe(null);
     expect(joined(plot('time', SIGNALS), CAPTURES)).toBe(null);
+  });
+
+  it('draws a log y axis as its own scale says: a spectrum log until set, a capture plot linear until set, a time plot never', () => {
+    const made = (kind, more = {}) => ({ ...plot(kind, []), ...more });
+    expect([made('spectrum'), made('capture'), made('time')].map(yLogOf)).toEqual([true, false, false]);
+    expect([made('spectrum', { yScale: 'linear' }), made('capture', { captureYScale: 'log' }), made('time', { yScale: 'log', captureYScale: 'log' })].map(yLogOf)).toEqual([false, true, false]);
+    // Each holds its own: a capture plot's density scale is no scale of its values.
+    expect([made('capture', { yScale: 'log' })].map(yLogOf)).toEqual([false]);
+    expect(['spectrum', 'capture', 'time'].map((kind) => yScaleField(made(kind)))).toEqual(['yScale', 'captureYScale', 'yScale']);
   });
 });

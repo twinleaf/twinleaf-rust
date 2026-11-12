@@ -12,7 +12,8 @@
 // selected plot moves for every selected plot; or a slice, drawn by one
 // path (`drawSlice`): a spectrum, each signal's newest estimate along
 // frequency, its axes log or linear; or a capture, each capture's shots
-// (shots.js) along the x its device gives them, its axes linear. A slice
+// (shots.js) along the x its device gives them, its x axis linear and its
+// y axis log or linear. A slice
 // is {f, a, floor}, its x and y values and a spectrum's noise floor; a
 // capture's holds `under` too, the shots an overlay draws beneath it, and
 // `note`, what it says of how many shots it shows.
@@ -826,13 +827,13 @@ export class PlotView {
 
   /**
    * The y ranges of the plot's kind, which its view holds, range key ->
-   * {range, auto}. Each kind keeps its own, and a spectrum its own for each
+   * {range, auto}. Each kind keeps its own, and a slice its own for each
    * y scale, as a log axis's are log10 of what it shows: switching kind or
    * scale and back finds each as it was left.
    */
   get y() {
     const cfg = this.config();
-    const kind = cfg.kind === 'spectrum' ? `spectrum:${cfg.yLog ? 'log' : 'linear'}` : cfg.kind;
+    const kind = isSlice(cfg.kind) ? `${cfg.kind}:${cfg.yLog ? 'log' : 'linear'}` : cfg.kind;
     let ranges = this.view.yByKind.get(kind);
     if (!ranges) this.view.yByKind.set(kind, (ranges = new Map()));
     return ranges;
@@ -1050,14 +1051,15 @@ export class PlotView {
   }
 
   /**
-   * What sets the plot's x axis apart as a slice's, {density, unit, log}:
+   * What sets the plot's axes apart as a slice's, {density, unit, log}:
    * `density` whether it shows spectra, densities along frequency, whose
-   * axes are log where the plot says so, or captures, along the x their
-   * device gives them, in `unit`, on linear axes.
+   * x axis is log where the plot says so, or captures, along the x their
+   * device gives them, in `unit`, on a linear x axis; either's y axis log
+   * where the plot says so (`cfg.yLog`).
    */
   sliceAxes(cfg) {
     const density = cfg.kind === 'spectrum';
-    return { density, unit: density ? 'Hz' : (this.traces()[0]?.meta.xUnits ?? ''), log: { x: density && !!cfg.xLog, y: density && !!cfg.yLog } };
+    return { density, unit: density ? 'Hz' : (this.traces()[0]?.meta.xUnits ?? ''), log: { x: density && !!cfg.xLog, y: !!cfg.yLog } };
   }
 
   /** Takes `legend` as what this frame drew, {rows, cursors}, and gives it to `onReadout` when its cursors read otherwise than the last frame's. */
@@ -1077,9 +1079,11 @@ export class PlotView {
     for (const t of traces) {
       const s = this.sliceOf(t);
       if (!s || s.f.length < 2) continue;
+      // A log axis has no place for a value at or below zero: it fits the rest, and its line breaks there.
       let lo = Infinity, hi = -Infinity;
       for (const line of [s, ...(s.under ?? [])]) {
         for (const a of line.a) {
+          if (slice.log.y && !(a > 0)) continue;
           if (a < lo) lo = a;
           if (a > hi) hi = a;
         }
