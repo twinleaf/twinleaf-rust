@@ -219,11 +219,18 @@ describe('a dock, while a panel is dragged', () => {
       const frame = frameOf(side), f = frame.getBoundingClientRect();
       // A dock sliding shut has faded its panels out by the time it is narrow.
       const faded = Number(getComputedStyle(frame.querySelector('.dock')).opacity) < 0.01;
-      const heads = faded ? [] : [...frame.querySelectorAll('.dock-head')].map((head) => head.getBoundingClientRect()).filter((r) => r.width > 0 && r.height > 0 && r.left < f.right && r.right > f.left);
+      const heads = faded ? [] : [...frame.querySelectorAll('.dock-head')].filter((head) => {
+        const r = head.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.left < f.right && r.right > f.left;
+      });
       const narrow = frame.classList.contains('rail') || f.width < LEAST;
       if (narrow && heads.length) out.push(`the ${side} dock, ${frame.classList.contains('rail') ? 'a rail ' : ''}${Math.round(f.width)} px wide, draws ${heads.length} panel${heads.length > 1 ? 's' : ''}`);
       const b = frame.querySelector('.dock-button')?.getBoundingClientRect();
-      if (b && heads.some((r) => r.left < b.right && r.right > b.left && r.top < b.bottom && r.bottom > b.top)) out.push(`the ${side} dock's button is over a header`);
+      const box = (r) => [r.left, r.top, r.right, r.bottom].map(Math.round).join(' ');
+      for (const head of heads) {
+        const r = head.getBoundingClientRect(), panel = head.closest('.dock-panel');
+        if (b && r.left < b.right && r.right > b.left && r.top < b.bottom && r.bottom > b.top) out.push(`the ${side} dock's button, at ${box(b)}, is over the header of ${panel.getAttribute('aria-label')}${panel.classList.contains('shadow') ? ', a placeholder,' : ''} at ${box(r)}, panel ${[...panel.parentElement.children].indexOf(panel) + 1} of its dock`);
+      }
     }
     return out.join('; ');
   }
