@@ -59,12 +59,17 @@ const TARGETS = {
     if (!P || !band) return null;
     return [[(band.x0 + band.x1) / 2, P.y + P.h / 2], 'right'];
   },
-  'a chip': () => [centre(document.querySelector('.trace-chip .name')), 'right'],
-  'a tab': () => [centre(document.querySelector('[role=tab]')), 'right'],
-  'a dock header': () => [centre(document.querySelector('.dock-head')), 'right'],
-  'the kind picker': () => [centre(document.querySelector('.kind-select')), 'left'],
-  'the + button': (page) => [centre(document.querySelector(`.leaf[data-plot="${page.ids[1]}"] button[aria-label="Add a signal"]`)), 'left'],
+  'a chip': () => on(document.querySelector('.trace-chip .name'), 'right'),
+  'a tab': () => on(document.querySelector('[role=tab]'), 'right'),
+  'a dock header': () => on(document.querySelector('.dock-head'), 'right'),
+  'the kind picker': () => on(document.querySelector('.kind-select'), 'left'),
+  // The second plot's, which a step may have closed or left in another tab, as a press on a tab's fading menu does.
+  'the + button': (page) => on(document.querySelector(`.leaf[data-plot="${page.ids[1]}"] button[aria-label="Add a signal"]`), 'left'),
 };
+/** Where `el` is pressed with `button`, or null while the page does not show it. */
+function on(el, button) {
+  return el && [centre(el), button];
+}
 const KEYS = ['Escape', 'Tab', 'Enter', 'Space', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
 
 /**
@@ -148,6 +153,9 @@ describe('the page’s popup layers', () => {
           [[{ press: 'Commands' }, { twice: 'a plot' }, { key: 'Escape' }]],
           [[{ closing: 'Layout', then: 'Commands' }, { twice: 'a plot' }, { closing: 'Layout', then: 'Layout' }]],
           [[{ closing: 'Layout', then: 'Commands' }, { closing: 'a plot', then: 'Layout' }, { key: 'Escape' }]],
+          // A press on a tab's fading menu that leaves the second plot in another tab, then a step on its +.
+          [[{ closing: 'a tab', then: 'the kind picker' }, { hover: 'the + button' }, { closing: 'Layout', then: 'Layout' }]],
+          [[{ press: 'a tab' }, { closing: 'the kind picker', then: 'the + button' }, { press: 'Layout' }]],
         ]),
     );
     expect(seen.has(1), 'a layer was open').toBe(true);
