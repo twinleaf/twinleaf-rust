@@ -2,7 +2,7 @@
 // plot shows of them, each against a rule worked out apart from the module.
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { SHOTS_KEPT, SHOT_COUNT, SHOT_COUNTS, alike, calibrated, keep, mean, run, shotCount, shotMode, shotOf, shotsCsv, shown, shownText, xsOf } from './shots.js';
+import { SHOTS_KEPT, SHOT_COUNT, SHOT_COUNTS, alike, calibrated, keep, mean, run, shotCount, shotMode, shotOf, shotsCsv, shown, shownText, spectraShown, xsOf } from './shots.js';
 
 /** A shot numbered `number` of shape `shape`, [n, x0, dx], its values `number` + i. */
 const shot = (number, [n, x0, dx]) => ({ number, n, x0, dx, y: Float32Array.from({ length: n }, (_, i) => number + i) });
@@ -37,8 +37,19 @@ describe('a capture’s elements', () => {
 
   it('make a shot: the frame’s number, its length, where its x starts and steps, its values, its element type and when it was received', () => {
     const frame = { number: 7, x0: 1, dx: 0.25, calibration: 0.5, type: 0x21, elements: Int16Array.of(1, -2, 3) };
-    expect(shotOf(frame, 1234)).toEqual({ number: 7, n: 3, x0: 1, dx: 0.25, y: Float32Array.of(0.5, -1, 1.5), type: 0x21, received: 1234 });
+    expect(shotOf(frame, 1234)).toEqual({ number: 7, n: 3, x0: 1, dx: 0.25, y: Float32Array.of(0.5, -1, 1.5), type: 0x21, received: 1234, spectrum: null });
     expect([...xsOf(shotOf(frame, 0))]).toEqual([1, 1.25, 1.5]);
+  });
+
+  it('carry the hub’s spectrum in Hz and per √Hz where their x is time, and none where it is not', () => {
+    const frame = (xUnits) => ({ number: 1, x0: 0, dx: 1, calibration: 1, type: 0x42, xUnits, elements: Float32Array.of(0, 1), spectrum: { f: Float32Array.of(0.25, 0.5), a: Float32Array.of(2, 4) } });
+    expect(shotOf(frame('s'), 0).spectrum).toEqual({ f: Float32Array.of(0.25, 0.5), a: Float32Array.of(2, 4) });
+    // Cycles a µs are a million Hz; a density per root cycle a µs is a thousandth of it per √Hz.
+    const us = shotOf(frame('µs'), 0).spectrum;
+    expect([...us.f]).toEqual([250000, 500000]);
+    expect([...us.a].map((a) => +a.toPrecision(6))).toEqual([0.002, 0.004]);
+    expect(shotOf(frame('rad'), 0).spectrum, 'an x that is no time').toBe(null);
+    expect(shotOf({ ...frame('s'), spectrum: { f: new Float32Array(), a: new Float32Array() } }, 0).spectrum, 'no estimate').toBe(null);
   });
 });
 
@@ -118,6 +129,27 @@ describe('what a plot shows of a capture’s shots', () => {
     expect(shownText('average', { count: 16, of: 16 })).toBe('avg 16 of 16');
     expect(shownText('overlay', { count: 3, of: 4 })).toBe('last 3 of 4');
     expect(shownText('latest', { count: 1, of: 1 })).toBe('');
+  });
+
+  it('as spectra: the newest’s, each of an overlay’s, or the power average of the spectra of the shots alike, not the spectrum of their mean', () => {
+    const withSpectrum = (s) => ({ ...s, spectrum: { f: Float32Array.of(1, 2, 3), a: Float32Array.from({ length: 3 }, (_, i) => s.number + i) } });
+    fc.assert(
+      fc.property(shots, count, (plain, n) => {
+        const held = plain.map(withSpectrum), newest = held.at(-1).spectrum;
+        expect(spectraShown(held, 'latest', n)).toMatchObject({ line: newest, under: [], count: 1 });
+        const o = spectraShown(held, 'overlay', n), s = shown(held, 'overlay', n);
+        expect([o.line, o.under.map((u) => u.shot), o.under.map((u) => u.a), o.under.map((u) => u.alpha)]).toEqual([newest, s.under.map((u) => u.shot), s.under.map((u) => u.shot.spectrum.a), s.under.map((u) => u.alpha)]);
+        // Each bin the root of the mean of the squares over the run of shots alike.
+        const of = run(held, n), a = spectraShown(held, 'average', n);
+        expect([a.count, a.under]).toEqual([of.length, []]);
+        [...a.line.a].forEach((v, i) => expect(v).toBeCloseTo(Math.sqrt(of.reduce((sum, x) => sum + (x.number + i) ** 2, 0) / of.length), 3));
+      }),
+    );
+    // Two shots of opposite sign average to nothing; their spectra, each of density 1, to 1.
+    const a = { ...shot(1, [2, 0, 1]), y: Float32Array.of(1, -1), spectrum: { f: Float32Array.of(1), a: Float32Array.of(1) } }, b = { ...a, number: 2, y: Float32Array.of(-1, 1) };
+    expect([...shown([a, b], 'average', 4).line.y]).toEqual([0, 0]);
+    expect([...spectraShown([a, b], 'average', 4).line.a]).toEqual([1]);
+    expect(spectraShown([{ ...a, spectrum: null }], 'latest', 4)).toBe(null);
   });
 
   it('is written as CSV: a header of what it is, then its x and a column per shot shown, as the plot shows them', () => {

@@ -11,8 +11,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { commands, page as browser } from 'vitest/browser';
 import { flushSync } from 'svelte';
-import { centre, clickOn, closeAll, dropped, feed, frames, leafOf, mountPage, pickItem, pressKey, rightClick, settle, typeInto, until, wait } from './harness/page.js';
-import { asKind, fid, keyOf } from './harness/captures.js';
+import { centre, clearNotices, clickOn, closeAll, dropped, feed, frames, leafOf, mountPage, pickItem, pressKey, rightClick, settle, typeInto, until, wait } from './harness/page.js';
+import { FID_PEAK, asKind, fid, keyOf } from './harness/captures.js';
 import { plotIds } from '../src/lib/layout.js';
 import { APART, SAVE_KEY } from '../src/lib/tabs.js';
 import { SHOT_COUNTS } from '../src/lib/shots.js';
@@ -515,10 +515,100 @@ describe('a capture plot', () => {
   });
 
   it('looks as the page does in each of its states, beside a spectrum and a time plot', { timeout: 120_000 }, async () => {
+    const run = (page, id, command, to) => page.plots.commands.run(command, { on: id, how: { to } });
     await pictures([
       { name: 'linear-y', set: () => {} },
       { name: 'log-y', set: (page, [id]) => page.plots.commands.run('yScale', { on: id, how: { key: 'shared', to: 'log' } }) },
+      { name: 'spectrum-overlay', set: (page, [id]) => run(page, id, 'captureView', 'spectrum') },
+      { name: 'spectrum-average', set: (page, [id]) => run(page, id, 'captureShots', 'average') },
+      { name: 'spectrum-latest-cursors', set: (page, [id]) => (run(page, id, 'captureShots', 'latest'), page.plots.commands.run('addXCursors', { on: id }), page.plots.commands.run('x1ToPeak', { on: id })) },
+      { name: 'time-again', set: (page, [id]) => run(page, id, 'captureView', 'time') },
     ]);
+  });
+
+  it('shows the spectra of its shots in its Spectrum view as a spectrum shows its own: in Hz to its Nyquist, per √Hz, on log axes, its cursors and peaks in Hz, an average of their power', async () => {
+    const ANGLE = { rpc: 'angle.capture', label: { name: 'Angle', units: 'rad', x_name: 'Turn', x_units: 'rad' }, shot: () => ({ type: 0x42, calibration: 1, x0: 0, dx: 0.01, elements: Float32Array.from({ length: 100 }, (_, i) => i) }) };
+    const page = await mountPage([[K.fid], ['sine.sin'], [keyOf('angle.capture')]], 'rows', 0, SIGNALS, [], { captures: [FID, PHASE, ANGLE] });
+    try {
+      const [id, spectrum, angle] = plotIds(page.ws.layout), cmds = page.plots.commands, pv = () => page.pv(id);
+      asKind(page, spectrum, 'spectrum');
+      feed(page.hub);
+      for (let n = 0; n < 3; n++) await trigger(page, id);
+      await trigger(page, angle);
+      const head = () => leafOf(id).querySelector('.plot-head').getBoundingClientRect(), body = () => leafOf(id).querySelector('.plot-body').getBoundingClientRect();
+      const [headBefore, bodyBefore] = [head(), body()];
+      // From the x axis's popover: its View, first, Time pressed.
+      const P = pv().geo.plot, pop = () => document.querySelector('[data-slot=popover-content]');
+      await rightClick([P.x + P.w / 2, P.y + P.h + 14]);
+      expect(await until(() => pop())).toBe(true);
+      const views = () => [...pop().querySelectorAll('[aria-label="View"] button')];
+      expect(pop().querySelector('[role=group]').getAttribute('aria-label'), 'the first row').toBe('View');
+      expect(views().map((b) => [b.textContent.trim(), b.getAttribute('aria-pressed')])).toEqual([['Time', 'true'], ['Spectrum', 'false']]);
+      await clickOn(views()[1]);
+      await settle();
+      await wait(100);
+      await settle(4);
+      expect([page.ws.plots[id].captureView, page.history.undos.at(-1)?.label, pv().config().kind]).toEqual(['spectrum', 'View Spectrum', 'spectrum']);
+      // The popover is a spectrum's now, its View where it was.
+      const groups = [...pop().querySelectorAll('[role=group]')].map((g) => g.getAttribute('aria-label'));
+      expect(groups.slice(0, 2), 'View, then the frequencies').toEqual(['View', 'Frequency range']);
+      expect(groups).toContain('Frequency scale');
+      expect(pop().querySelector('.axis-head').textContent.replace(/\s+/g, ' ').trim()).toBe('FrequencyHz');
+      const field = (end) => Number(pop().querySelector(`input[aria-label="${end} frequency shown"]`).value);
+      expect([field('Lowest'), field('Highest')], 'its fields read the frequencies it shows').toEqual(pv().xd.map((v) => +v.toPrecision(6)));
+      await shoot('spectrum-x-popover', pop());
+      await closeAll();
+      // The newest shot's spectrum, in Hz, from one bin above zero to below Nyquist, on log axes, per √Hz.
+      const shots = page.hub.session.byKey.get(K.fid).shots, s = slice(page, id);
+      expect([...s.f]).toEqual([...FID.shot(3).spectrum.f]);
+      expect([...s.a]).toEqual([...FID.shot(3).spectrum.a]);
+      expect(s.f.at(-1)).toBeLessThan(1 / (2 * Math.fround(5e-7)));
+      expect([pv().logX, pv().logY, pv().axisUnits('shared'), pv().xKind()]).toEqual([true, true, 'V/√Hz', 'hz']);
+      expect(leafOf(id).querySelector('.trace-chip .units').textContent).toBe('V/√Hz');
+      for (const text of pv().tickLabels.filter((t) => t.axis === undefined).map((t) => t.text)) expect(text).toMatch(/Hz$/);
+      // The header and the body stay where they were.
+      expect([head(), body()].map((r) => [r.x, r.y, r.width, r.height])).toEqual([headBefore, bodyBefore].map((r) => [r.x, r.y, r.width, r.height]));
+      // Average: the power average of the shots' spectra, bin by bin.
+      cmds.run('captureShots', { on: id, how: { to: 'average' } });
+      cmds.run('captureCount', { on: id, how: { to: 4 } });
+      await settle();
+      await wait(100);
+      const avg = slice(page, id);
+      expect(avg.note).toBe('avg 3 of 4');
+      [...avg.a].forEach((v, k) => expect(v).toBeCloseTo(Math.sqrt(shots.reduce((sum, x) => sum + x.spectrum.a[k] ** 2, 0) / 3), 9));
+      // Overlay: a spectrum a shot.
+      cmds.run('captureShots', { on: id, how: { to: 'overlay' } });
+      await settle();
+      await wait(100);
+      expect(slice(page, id).under.map((u) => [u.shot.number, u.a])).toEqual(shots.slice(0, 2).map((x) => [x.number, x.spectrum.a]));
+      // X cursors in Hz, kept apart from those along its x; X1 to the line.
+      cmds.run('captureShots', { on: id, how: { to: 'latest' } });
+      cmds.run('addXCursors', { on: id });
+      await settle();
+      await wait(100);
+      cmds.run('x1ToPeak', { on: id });
+      await settle();
+      await wait(100);
+      const cursors = page.ws.plots[id].cursors;
+      expect([cursors.f?.a, cursors.c ?? null]).toEqual([FID.shot(3).spectrum.f[FID_PEAK - 1], null]);
+      expect(await until(() => [...leafOf(id).querySelectorAll('.cursor-readout tr')].some((tr) => /Hz/.test(tr.textContent)))).toBe(true);
+      // Back to Time: its own x, its own cursors, the frequencies' range gone with them.
+      cmds.run('fRange', { on: id, how: { range: [1e4, 1e5] } });
+      cmds.run('captureView', { on: id, how: { to: 'time' } });
+      await settle();
+      await wait(100);
+      expect([pv().config().kind, page.ws.plots[id].fRange ?? null, pv().logX, pv().xd]).toEqual(['capture', null, false, [0, Math.fround(1499 * 5e-7)]]);
+      expect(page.ws.plots[id].cursors.f.a, 'the spectrum’s cursors kept for it').toBe(cursors.f.a);
+      // A capture whose x is no time has no Spectrum to choose, and says why.
+      const row = cmds.row('captureView', { on: angle });
+      expect([row.disabled, row.value]).toEqual([true, 'Its x is in rad, not time']);
+      cmds.run('captureView', { on: angle, how: { to: 'spectrum' } });
+      expect(await until(() => notices().length), 'a notice').toBe(true);
+      expect([page.ws.plots[angle].captureView ?? 'time', notices().some((n) => n.includes('Its x is in rad, not time'))], JSON.stringify(notices())).toEqual(['time', true]);
+      await clearNotices();
+    } finally {
+      page.dispose();
+    }
   });
 
   it('takes cursors, peaks, its axes’ settings, a copy of its data and the export dialog as a spectrum does', async () => {

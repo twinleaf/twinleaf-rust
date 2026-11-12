@@ -364,7 +364,10 @@ u32 n, u8 element type, u8 element bytes, u16 pad
 f32 y calibration, f32 x offset, f32 x stride, u32 pad
 6 × u16 byte lengths of route, rpc, name, units, x name, x units, u32 pad
 the six strings (UTF-8), zero padded to a multiple of 8 bytes
-n × element, little endian, exactly as the device sent them
+n × element, little endian, exactly as the device sent them,
+  zero padded to a multiple of 8 bytes
+u32 m, u32 pad
+m × f32 frequency, m × f32 density
 ```
 
 The elements are in the device's own type and width (`0x10` u8, `0x11`
@@ -372,7 +375,12 @@ i8, `0x20` u16, `0x21` i16, `0x40` u32, `0x41` i32, `0x42` f32, `0x80`
 u64, `0x81` i64, `0x82` f64; a capture of any other type is an `error`).
 Element `i` is `element × y calibration` in `units` at `x offset + i × x
 stride` in the x units. They start on a multiple of 8 bytes, so the page
-can view them in place as a typed array. The frame is not a numbered
+can view them in place as a typed array. The `m` bins after them are the
+capture's amplitude spectral density, estimated as a signal's spectrum is
+(`Welch`: four Hann windowed segments, half overlapped, over all its
+values), along the reciprocal of its x: frequency in cycles per x unit,
+density in its units per root cycle per x unit; none (`m` 0) for a
+capture too short for an estimate or of no positive x stride. The frame is not a numbered
 change (`seq` 0) and is in no snapshot: a page is sent the captures read
 after it asked.
 
@@ -641,17 +649,29 @@ canvas and its WebGL layer.
 5. A capture plot is a slice, as a spectrum is, drawn by the same path
    (`PlotView.drawSlice`): its x axis is the capture's own, `x offset + i ×
    x stride` in the capture's x units, written with an SI prefix (0 to 750
-   µs), and its axes are linear. What it shows of the shots is the plot's
+   µs), its x axis linear and its y axis linear until set log
+   (`captureYScale`). What it shows of the shots is the plot's
    setting (`shots`, `shotCount`): the newest, the newest over the ones
    before it, the older the fainter, or the mean of the newest alike, value
    by value. Cursors, peaks, the axis popovers, the legend, Copy data and
    Copy image are a slice's, so a capture plot has them as a spectrum has.
    Where its capture stands, and how many shots it shows, is written in the
    plot's lower left corner.
+6. In its Spectrum view (`captureView`, set by the `captureView` command
+   from its menu or its x axis popover) a capture plot is drawn as a
+   spectrum (`constants.js` `drawnKind`): the hub's spectrum of each shot,
+   in Hz and per √Hz where the capture's x is seconds, with a spectrum's
+   log axes, scales, cursors and peaks. Of the newest, of each shot of an
+   overlay, or the power average of the spectra of the newest alike, bin
+   by bin, not the spectrum of their mean. A capture whose metadata names
+   x units that are no time has no Spectrum view.
+7. Export writes a capture plot's data as a CSV the page makes of the
+   shots it held as the dialog opened, as the plot shows them, a header
+   naming what they are (`shots.js` `shotsCsv`); no HDF5 holds a capture.
 
 A spectrum's processing settings, when it has them, belong beside a
-capture's: plot settings set by commands (`captureShots`, `captureCount`),
-listed under Show in the plot's menu.
+capture's: plot settings set by commands (`captureView`, `captureShots`,
+`captureCount`), listed under Show in the plot's menu.
 
 ### A firmware upgrade
 

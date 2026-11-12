@@ -8,10 +8,10 @@ import path from 'node:path';
 import { captureKey, captureMessage, decodeFrame, isCaptureKey, signalKey } from './protocol.js';
 import { ELEMENTS, encodeCapture } from '../../tests/harness/captures.js';
 
-/** The frame of capture 258 of fid.capture of the device at /0: three 16-bit samples, 1, -2 and 3, 0.5 V each, from 1 s on, 0.25 s apart. */
+/** The frame of capture 258 of fid.capture of the device at /0: three 16-bit samples, 1, -2 and 3, 0.5 V each, from 1 s on, 0.25 s apart, and a spectrum of two bins, 0.5 at 1 and 0.25 at 2. */
 const KEPT = fs.readFileSync(path.resolve('tests/fixtures/capture-frame.bin'));
 const kept = () => KEPT.buffer.slice(KEPT.byteOffset, KEPT.byteOffset + KEPT.length);
-const FID = { route: '/0', rpc: 'fid.capture', number: 258, type: 0x21, calibration: 0.5, x0: 1, dx: 0.25, name: 'FID', units: 'V', xName: 'Time', xUnits: 's' };
+const FID = { route: '/0', rpc: 'fid.capture', number: 258, type: 0x21, calibration: 0.5, x0: 1, dx: 0.25, name: 'FID', units: 'V', xName: 'Time', xUnits: 's', spectrum: { f: Float32Array.of(1, 2), a: Float32Array.of(0.5, 0.25) } };
 
 /** Text a device may name a capture, its units or its route by. */
 const text = fc.string({ maxLength: 12 });
@@ -27,6 +27,7 @@ const capture = fc.constantFrom(...Object.keys(ELEMENTS).map(Number)).chain((typ
     x0: fc.float({ noNaN: true, noDefaultInfinity: true }),
     dx: fc.float({ noNaN: true, noDefaultInfinity: true }),
     elements: fc.array(element, { maxLength: 40 }).map((values) => Elements.from(values)),
+    spectrum: fc.array(fc.tuple(fc.float({ noNaN: true }), fc.float({ noNaN: true })), { maxLength: 12 }).map((bins) => ({ f: Float32Array.from(bins, ([f]) => f), a: Float32Array.from(bins, ([, a]) => a) })),
   });
 });
 

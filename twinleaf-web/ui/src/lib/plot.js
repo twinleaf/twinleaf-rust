@@ -13,7 +13,9 @@
 // path (`drawSlice`): a spectrum, each signal's newest estimate along
 // frequency, its axes log or linear; or a capture, each capture's shots
 // (shots.js) along the x its device gives them, its x axis linear and its
-// y axis log or linear. A slice
+// y axis log or linear. A capture plot in its Spectrum view is drawn as a
+// spectrum, `kind` 'spectrum' in its settings with `captures` set, of the
+// spectra of its shots (shots.js `spectraShown`). A slice
 // is {f, a, floor}, its x and y values and a spectrum's noise floor; a
 // capture's holds `under` too, the shots an overlay draws beneath it, and
 // `note`, what it says of how many shots it shows.
@@ -22,7 +24,7 @@ import { scaleLinear, scaleLog, scaleTime } from 'd3-scale';
 import { DRAG_START, isSlice } from './constants.js';
 import { prefs } from './prefs.svelte.js';
 import { axisFormat, fixedUnit, formOf, numberText, rangeText, si, spanText, tickText } from './units.js';
-import { shotCount, shotMode, shown, shownText, xsOf } from './shots.js';
+import { shotCount, shotMode, shown, shownText, spectraShown, xsOf } from './shots.js';
 import { WINDOW_LIMITS, windowText } from './window.js';
 import { placedIn, withX, withY, withoutX, withoutY, xOf, yOf } from './cursors.js';
 import * as clock from './clock.js';
@@ -746,7 +748,7 @@ export class PlotView {
   /** The traces of the plot's signals the hub has: a capture plot's captures, any other's signals that stream. */
   traces() {
     const out = [];
-    const session = this.hub.session, cfg = this.config(), captures = cfg.kind === 'capture';
+    const session = this.hub.session, cfg = this.config(), captures = !!cfg.captures;
     for (const key of cfg.keys) {
       const t = session.byKey.get(key);
       if (t && !!t.shots === captures) out.push(t);
@@ -1118,7 +1120,7 @@ export class PlotView {
           return pts;
         });
       };
-      for (const under of p.s.under ?? []) line(under, under.shot, under.shot, under.alpha);
+      for (const under of p.s.under ?? []) line(under, under.of, under.of, under.alpha);
       line(p.s, p.t, p.s, 1);
     }
     const xd = plans.length ? [f0, f1] : null;
@@ -1229,7 +1231,8 @@ export class PlotView {
       this.showLegend({ rows: {}, cursors: null });
       this.pressable = [];
       ctx.fillStyle = T.axisText;
-      const msg = !traces.length ? 'drop signals here' : slice && !spectrum ? 'no capture yet' : 'waiting for data…';
+      const shot = cfg.captures && spectrum && traces.some((t) => t.shots.length);
+      const msg = !traces.length ? 'drop signals here' : shot ? 'no spectrum of this capture' : cfg.captures ? 'no capture yet' : 'waiting for data…';
       ctx.textAlign = 'center';
       ctx.fillText(msg, body.x + body.w / 2, body.y + body.h / 2);
       return;
@@ -2623,21 +2626,29 @@ export class PlotView {
   }
 
   /**
-   * What the plot shows of capture `c`'s shots, as its settings say
-   * (shots.js `shown`), as a slice: {f, a, floor, under, note, number},
-   * `under` each shot an overlay draws beneath it as {shot, f, a, alpha},
-   * `note` what it says of how many it shows, and `number` the hub's of
-   * its newest; or null with no shot. The same slice until a shot arrives
-   * or a setting changes.
+   * What the plot shows of capture `c`'s shots, as its settings say, as a
+   * slice: {f, a, floor, under, note, number}: along their x (shots.js
+   * `shown`), or drawn as a spectrum, their spectra (`spectraShown`).
+   * `under` is each shot an overlay draws beneath it as {shot, of, f, a,
+   * alpha}, `of` what it draws of the shot; `note` what it says of how many
+   * it shows, and `number` the hub's of its newest; or null with no shot,
+   * or no spectrum of it. The same slice until a shot arrives or a setting
+   * changes.
    */
   shotsOf(c) {
-    const cfg = this.config(), mode = shotMode(cfg.shots), count = shotCount(cfg.shotCount), newest = c.shots.at(-1);
-    this.shotSlices ??= new WeakMap(); // Capture -> {newest, mode, count, slice}
+    const cfg = this.config(), mode = shotMode(cfg.shots), count = shotCount(cfg.shotCount), newest = c.shots.at(-1), spectra = cfg.kind === 'spectrum';
+    this.shotSlices ??= new WeakMap(); // Capture -> {newest, mode, count, spectra, slice}
     const was = this.shotSlices.get(c);
-    if (was && was.newest === newest && was.mode === mode && was.count === count) return was.slice;
-    const s = shown(c.shots, mode, count);
-    const slice = s && { f: xsOf(s.line), a: s.line.y, floor: null, under: s.under.map(({ shot, alpha }) => ({ shot, f: xsOf(shot), a: shot.y, alpha })), note: shownText(mode, s), number: newest.number };
-    this.shotSlices.set(c, { newest, mode, count, slice });
+    if (was && was.newest === newest && was.mode === mode && was.count === count && was.spectra === spectra) return was.slice;
+    let slice = null;
+    if (spectra) {
+      const s = spectraShown(c.shots, mode, count);
+      slice = s && { f: s.line.f, a: s.line.a, floor: null, under: s.under.map((u) => ({ ...u, of: u.shot.spectrum })), note: shownText(mode, s), number: newest.number };
+    } else {
+      const s = shown(c.shots, mode, count);
+      slice = s && { f: xsOf(s.line), a: s.line.y, floor: null, under: s.under.map(({ shot, alpha }) => ({ shot, of: shot, f: xsOf(shot), a: shot.y, alpha })), note: shownText(mode, s), number: newest.number };
+    }
+    this.shotSlices.set(c, { newest, mode, count, spectra, slice });
     return slice;
   }
 

@@ -83,8 +83,8 @@ import { axisSlots, cursorText } from './plot.js';
 import { placedIn, withX } from './cursors.js';
 import { nearestPeak, peaks, stepPeak } from './snap.js';
 import { APART, joined, yScaleField } from './tabs.js';
-import { ARRANGEMENTS, CAPTURE_DELAY, CAPTURE_DELAYS, KINDS, MODES, isSlice, kindLabel, kindsFor } from './constants.js';
-import { SHOT_COUNTS, SHOT_MODES, shotCount, shotMode } from './shots.js';
+import { ARRANGEMENTS, CAPTURE_DELAY, CAPTURE_DELAYS, KINDS, MODES, drawnKind, isSlice, kindLabel, kindsFor } from './constants.js';
+import { CAPTURE_VIEWS, SHOT_COUNTS, SHOT_MODES, captureView, secondsPer, shotCount, shotMode } from './shots.js';
 import { writeTables } from './copy.js';
 import { plotIds } from './layout.js';
 import { DIGITS, axisFormat, unitChoices } from './units.js';
@@ -146,6 +146,7 @@ import RiFirmware from '@lucide/svelte/icons/hard-drive-upload';
 import RiUpgradeAll from '@lucide/svelte/icons/circle-arrow-up';
 import { deviceText, hasUpdate } from './firmware.js';
 import RiCount from '@lucide/svelte/icons/list-ordered';
+import RiView from '@lucide/svelte/icons/audio-lines';
 
 /** How far an arrow pans, as a share of the span, and zooms, as a factor. */
 const PAN = 0.1, ZOOM = 1.25;
@@ -223,9 +224,9 @@ function setYAxis(ctx, field, { key, to }) {
 
 /** Sets `field` of the x axis settings of each plot of `ctx`, of the lead plot's kind, to `to`, as one edit: a spectrum's frequencies, or a capture plot's x. */
 function setXAxis(ctx, field, { to }) {
-  const { what, names } = AXIS_SETTINGS[field], kind = ctx.lead?.plot.kind;
+  const { what, names } = AXIS_SETTINGS[field], kind = ctx.lead && drawnKind(ctx.lead.plot);
   if (!names.has(to)) return false;
-  ctx.svc.edit(ids(ctx), `${kind === 'capture' ? 'X' : 'Frequency'} ${what.toLowerCase()} ${names.get(to)}`, (plot) => (plot.kind === kind ? { xFormat: withSetting(plot.xFormat, field, to) } : null));
+  ctx.svc.edit(ids(ctx), `${kind === 'capture' ? 'X' : 'Frequency'} ${what.toLowerCase()} ${names.get(to)}`, (plot) => (drawnKind(plot) === kind ? { xFormat: withSetting(plot.xFormat, field, to) } : null));
 }
 
 /** How `field` is set on the axes a y axis command of `ctx` made on y axis `key` acts on, as a row's value: the name of the value they share, or Mixed. */
@@ -442,6 +443,17 @@ const signalsNamed = (ctx) => (ctx.signals.length > 1 ? counted(ctx.signals.leng
 
 /** Whether a command of a capture plot's is made on one, where a menu has its row. */
 const onCapture = (ctx) => ctx.on?.plot.kind === 'capture';
+/**
+ * Why the captures the lead plot of `ctx` shows have no spectrum, or null:
+ * their metadata names x units that are no time (shots.js `secondsPer`).
+ * A capture whose metadata has not come yet may have one.
+ */
+function noSpectrum(ctx) {
+  const units = (ctx.lead?.pv?.traces() ?? []).filter((t) => t.label).map((t) => t.meta.xUnits);
+  return units.length && units.every((u) => secondsPer(u) === null) ? `Its x is ${units[0] ? `in ${units[0]}` : 'of no units'}, not time` : null;
+}
+/** Whether the lead plot of `ctx` shows its captures along their x and has no spectrum of them to show, so its view stays. */
+const viewFixed = (ctx) => !!noSpectrum(ctx) && captureView(ctx.lead?.plot.captureView) === 'time';
 /** A delay between two captures as a row names it: "0.5 s". */
 const delayName = (s) => `${s} s`;
 
@@ -658,7 +670,7 @@ export const COMMANDS = [
     // The cursors' readout shown or hidden on every plot it acts on, as the lead plot's turns; a menu has its row while the lead plot has cursors placed.
     id: 'readout', scope: 'plot', palette: 'Plots',
     icon: RiReadout, label: (ctx) => (ctx.lead?.plot.readout === false ? 'Show the readout' : 'Hide the readout'),
-    when: (ctx) => !!ctx.lead && placedIn(ctx.lead.plot.cursors, ctx.lead.plot.kind) > 0,
+    when: (ctx) => !!ctx.lead && placedIn(ctx.lead.plot.cursors, drawnKind(ctx.lead.plot)) > 0,
     run: (ctx) => {
       const on = ctx.lead.plot.readout === false;
       ctx.svc.edit(ids(ctx), on ? 'Show the readout' : 'Hide the readout', () => ({ readout: on ? undefined : false }));
@@ -721,20 +733,20 @@ export const COMMANDS = [
     run: (ctx, how) => {
       const { key, to } = how ?? {}, has = new Set(axesLike(ctx.on?.pv, pvs(ctx), key).map(([p]) => p.plotId));
       if (to !== 'log' && to !== 'linear') return false;
-      const what = ctx.on?.plot.kind === 'capture' ? 'y' : 'density';
+      const what = ctx.on && drawnKind(ctx.on.plot) === 'capture' ? 'y' : 'density';
       ctx.svc.edit(ids(ctx), `${to === 'log' ? 'Log' : 'Linear'} ${what} scale`, (plot) => (has.has(plot.id) && isSlice(plot.kind) ? { [yScaleField(plot)]: to } : null));
     },
   },
   {
-    // The frequency scale of the spectra, `how.to` 'log' or 'linear'.
+    // The frequency scale of the plots drawn as spectra (constants.js `drawnKind`), `how.to` 'log' or 'linear'.
     id: 'xScale', scope: 'plot', needs: ['axis'],
-    run: (ctx, how) => ctx.svc.edit(ids(ctx), how?.to === 'log' ? 'Log frequency scale' : 'Linear frequency scale', (plot) => (plot.kind === 'spectrum' ? { xScale: how?.to } : null)),
+    run: (ctx, how) => ctx.svc.edit(ids(ctx), how?.to === 'log' ? 'Log frequency scale' : 'Linear frequency scale', (plot) => (drawnKind(plot) === 'spectrum' ? { xScale: how?.to } : null)),
   },
   {
-    // The stretch of x the slices of the lead plot's kind show, a spectrum's frequencies or a capture plot's x, `how.range` as [low, high], or null for all of it, as one view step. Its button shows all of it.
+    // The stretch of x the slices drawn as the lead plot is (constants.js `drawnKind`) show, a spectrum's frequencies or a capture plot's x, `how.range` as [low, high], or null for all of it, as one view step. Its button shows all of it.
     id: 'fRange', scope: 'plot', kinds: ['spectrum', 'capture'], needs: ['axis'],
-    icon: RiFitX, label: (ctx) => (ctx.lead?.plot.kind === 'capture' ? 'Show the whole capture' : 'Show every frequency'),
-    run: (ctx, how) => ctx.svc.viewHistory.step(() => ctx.plots.forEach((t) => t.plot.kind === ctx.lead.plot.kind && ctx.svc.ws.setView(t.id, { fRange: how?.range ?? null }))),
+    icon: RiFitX, label: (ctx) => (ctx.lead && drawnKind(ctx.lead.plot) === 'capture' ? 'Show the whole capture' : 'Show every frequency'),
+    run: (ctx, how) => ctx.svc.viewHistory.step(() => ctx.plots.forEach((t) => drawnKind(t.plot) === drawnKind(ctx.lead.plot) && ctx.svc.ws.setView(t.id, { fRange: how?.range ?? null }))),
   },
   {
     // Signal `how.key`'s axis on side `how.to` of SIDES, hidden with 'none', on each independent plot that shows the signal. A menu has its row on an independent plot. A row or a button made with a side moves the axis there.
@@ -789,6 +801,22 @@ export const COMMANDS = [
     choices: () => CAPTURE_DELAYS.map((s) => [s, delayName(s)]),
     chosen: (ctx) => ctx.lead?.plot.autoDelay ?? CAPTURE_DELAY,
     run: (ctx, how) => (CAPTURE_DELAYS.includes(how?.to) ? ctx.svc.edit(ids(ctx), `Auto delay ${delayName(how.to)}`, () => ({ autoDelay: how.to })) : false),
+  },
+  {
+    // Along their x or as their spectra, `how.to` of CAPTURE_VIEWS, as one edit; each plot then shows all of its x, as a range of one is none of the other's. Spectrum cannot be chosen where the lead plot's capture says its x is no time, as its spectrum has no frequencies.
+    id: 'captureView', scope: 'plot', kinds: ['capture'], palette: 'Plots',
+    icon: RiView, label: 'View',
+    when: onCapture,
+    value: (ctx) => (viewFixed(ctx) ? noSpectrum(ctx) : common(ctx.plots.map((t) => nameIn(CAPTURE_VIEWS, captureView(t.plot.captureView))))),
+    disabled: viewFixed,
+    choices: () => CAPTURE_VIEWS,
+    chosen: (ctx) => captureView(ctx.lead?.plot.captureView),
+    run: (ctx, how) => {
+      if (!CAPTURE_VIEWS.some(([view]) => view === how?.to)) return false;
+      if (how.to === 'spectrum' && noSpectrum(ctx)) return void ctx.svc.toast.warning(noSpectrum(ctx));
+      ctx.svc.edit(ids(ctx), `View ${nameIn(CAPTURE_VIEWS, how.to)}`, () => ({ captureView: how.to }));
+      ctx.svc.viewHistory.step(() => ids(ctx).forEach((id) => ctx.svc.ws.setView(id, { fRange: null })));
+    },
   },
   {
     id: 'captureShots', scope: 'plot', kinds: ['capture'], palette: 'Plots',

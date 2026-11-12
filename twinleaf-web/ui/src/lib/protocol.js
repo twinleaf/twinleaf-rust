@@ -120,10 +120,12 @@ const CAPTURE_HEAD = HEADER + 48;
  * pen before the chunk's first point; the spectra of a round, as
  * {kind: 'spectra', seq, spectra: [{id, f, a, floor}]}, a floor null when
  * there is none; or a capture, as {kind: 'capture', seq: 0, route, rpc,
- * number, type, calibration, x0, dx, name, units, xName, xUnits, elements}:
- * `elements` the device's own, a typed array of their type over the
- * frame's bytes, element i being `elements[i] * calibration` in `units` at
- * `x0 + i * dx` in `xUnits`. A frame of another kind, or a capture of an
+ * number, type, calibration, x0, dx, name, units, xName, xUnits, elements,
+ * spectrum}: `elements` the device's own, a typed array of their type over
+ * the frame's bytes, element i being `elements[i] * calibration` in `units`
+ * at `x0 + i * dx` in `xUnits`, and `spectrum` the hub's estimate of their
+ * amplitude spectral density, {f, a}, f in cycles per x unit and a in
+ * `units` per root cycle per x unit, empty where it has none. A frame of another kind, or a capture of an
  * element type the page does not read, is null.
  */
 export function decodeFrame(buf) {
@@ -174,8 +176,10 @@ export function decodeFrame(buf) {
       off += length;
       return text;
     });
-    const elements = new Elements(buf, Math.ceil(off / 8) * 8, dv.getUint32(24, true));
-    return { kind: 'capture', seq, route, rpc, number: Number(dv.getBigUint64(16, true)), type, calibration: dv.getFloat32(32, true), x0: dv.getFloat32(36, true), dx: dv.getFloat32(40, true), name, units, xName, xUnits, elements };
+    const start = Math.ceil(off / 8) * 8, elements = new Elements(buf, start, dv.getUint32(24, true));
+    const bins = Math.ceil((start + elements.byteLength) / 8) * 8, m = dv.getUint32(bins, true);
+    const spectrum = { f: new Float32Array(buf, bins + 8, m), a: new Float32Array(buf, bins + 8 + 4 * m, m) };
+    return { kind: 'capture', seq, route, rpc, number: Number(dv.getBigUint64(16, true)), type, calibration: dv.getFloat32(32, true), x0: dv.getFloat32(36, true), dx: dv.getFloat32(40, true), name, units, xName, xUnits, elements, spectrum };
   }
   return null;
 }

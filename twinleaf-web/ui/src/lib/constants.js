@@ -20,6 +20,12 @@ export const KINDS = [['time', 'Time'], ['spectrum', 'Spectrum'], ['capture', 'C
 export const kindsFor = (kind) => KINDS.filter(([k]) => (k === 'capture') === (kind === 'capture'));
 /** Whether a plot of `kind` shows slices, along an x axis of their own, and not a stretch of time. */
 export const isSlice = (kind) => kind !== 'time';
+/**
+ * The kind `plot` is drawn as: a capture plot in its Spectrum view
+ * (`captureView`, tabs.js) as a spectrum, with a spectrum's axes, cursors
+ * and scales; any other plot as its kind.
+ */
+export const drawnKind = (plot) => (plot.kind === 'capture' && plot.captureView === 'spectrum' ? 'spectrum' : plot.kind);
 
 /** The delays a capture plot on Auto offers between two captures, in seconds, and the one it takes until set. The hub takes 0.05 s to 10 s. */
 export const CAPTURE_DELAYS = [0.1, 0.2, 0.5, 1, 2, 5];

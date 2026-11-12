@@ -1,16 +1,18 @@
 // A capture's shots, and what a plot shows of them.
 //
 // A shot is one capture the hub read, {number, n, x0, dx, y, type,
-// received}: the hub's number of it, its `n` values `y`, calibrated, in the
-// capture's units, value i at `x0 + i * dx` in its x units, the protocol's
-// code of the device's element type, and the wall time in ms the page
-// received it, as the capture carries no time. A capture keeps its newest
+// received, spectrum}: the hub's number of it, its `n` values `y`,
+// calibrated, in the capture's units, value i at `x0 + i * dx` in its x
+// units, the protocol's code of the device's element type, the wall time in
+// ms the page received it, as the capture carries no time, and the hub's
+// estimate of its spectrum, where its x is time. A capture keeps its newest
 // SHOTS_KEPT shots, oldest first. A plot shows them one of three ways
 // (SHOT_MODES): the newest alone; the newest over the `count` - 1 before
 // it, the older the fainter; or the mean of the newest `count`, value by
 // value. A mean is of shots alike, as many values at the same x: it takes
 // the run of them that ends at the newest, so a shot that differs from the
-// one before starts the mean again.
+// one before starts the mean again. A plot shows them along their x or, in
+// its Spectrum view, as their spectra (CAPTURE_VIEWS, `spectraShown`).
 
 import { value } from './copy.js';
 import { ELEMENT_NAMES } from './protocol.js';
@@ -43,8 +45,18 @@ export function calibrated(elements, calibration) {
   return y;
 }
 
-/** The shot of a decoded capture frame (protocol.js `decodeFrame`), which the page received at wall time `received`, in ms. */
-export const shotOf = (frame, received) => ({ number: frame.number, n: frame.elements.length, x0: frame.x0, dx: frame.dx, y: calibrated(frame.elements, frame.calibration), type: frame.type, received });
+/**
+ * The shot of a decoded capture frame (protocol.js `decodeFrame`), which
+ * the page received at wall time `received`, in ms. Its `spectrum` is the
+ * frame's, the hub's estimate of its amplitude spectral density, {f, a}, in
+ * Hz and in its units per √Hz, where its x is time (`secondsPer`) and the
+ * hub made one; else null.
+ */
+export function shotOf(frame, received) {
+  const s = secondsPer(frame.xUnits), bins = frame.spectrum;
+  const spectrum = s && bins?.f.length ? { f: bins.f.map((f) => f / s), a: bins.a.map((a) => a * Math.sqrt(s)) } : null;
+  return { number: frame.number, n: frame.elements.length, x0: frame.x0, dx: frame.dx, y: calibrated(frame.elements, frame.calibration), type: frame.type, received, spectrum };
+}
 
 /** Adds `shot` to `shots` as the newest, and drops the oldest past SHOTS_KEPT. */
 export function keep(shots, shot) {
@@ -94,6 +106,37 @@ export function shown(shots, mode, count) {
   const alpha = (i) => (before.length < 2 ? FAINT[1] : FAINT[0] + ((FAINT[1] - FAINT[0]) * i) / (before.length - 1));
   return { line: newest, under: before.map((shot, i) => ({ shot, alpha: alpha(i) })), count: before.length + 1, of: count };
 }
+
+/**
+ * The spectra of what a plot in `mode` of `count` shows of `shots`, as
+ * `shown` picks the shots: {line, under, count, of}, `line` and each of
+ * `under` {f, a} of a shot's spectrum (`shotOf`), `under` with its `shot`
+ * and `alpha`; or null where the newest has none. Of 'average', `line` is
+ * the power average of the spectra of the run of shots alike, bin by bin,
+ * the root of the mean of their squares, as a spectrum averages its
+ * segments, and not the spectrum of their mean.
+ */
+export function spectraShown(shots, mode, count) {
+  const s = shown(shots, mode, count), newest = shots.at(-1)?.spectrum;
+  if (!s || !newest) return null;
+  if (mode === 'average') {
+    const of = run(shots, count).filter((shot) => shot.spectrum?.a.length === newest.a.length);
+    const a = new Float32Array(newest.a.length);
+    for (let i = 0; i < a.length; i++) {
+      let sum = 0;
+      for (const shot of of) sum += shot.spectrum.a[i] ** 2;
+      a[i] = Math.sqrt(sum / of.length);
+    }
+    return { line: { f: newest.f, a }, under: [], count: of.length, of: count };
+  }
+  const under = s.under.filter((u) => u.shot.spectrum).map((u) => ({ shot: u.shot, f: u.shot.spectrum.f, a: u.shot.spectrum.a, alpha: u.alpha }));
+  return { line: newest, under, count: s.count, of: s.of };
+}
+
+/** How a capture plot shows its shots: along their x, or as their spectra. */
+export const CAPTURE_VIEWS = [['time', 'Time'], ['spectrum', 'Spectrum']];
+/** The view a plot's settings name, 'time' for none of CAPTURE_VIEWS. */
+export const captureView = (view) => (view === 'spectrum' ? 'spectrum' : 'time');
 
 /** What a plot says of what `shown` gave it, beside the capture's state: "avg 5 of 16", "last 5 of 16", or nothing of one shot alone. */
 export const shownText = (mode, { count, of }) => (mode === 'average' ? `avg ${count} of ${of}` : mode === 'overlay' ? `last ${count} of ${of}` : '');

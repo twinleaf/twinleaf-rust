@@ -9,7 +9,9 @@
 // capture plot's `auto` is whether it asks for captures again and again,
 // `autoDelay` seconds after each (constants.js CAPTURE_DELAY when absent),
 // and `shots` and `shotCount` how it shows them (shots.js), the newest
-// alone when absent. `legend` is whether the
+// alone when absent, and `captureView` whether along their x, 'time', or
+// as their spectra, 'spectrum' (constants.js `drawnKind`), along their x
+// when absent. `legend` is whether the
 // legend shows in the plot, and `legendAt` where it was dragged, {x, y} each
 // a share of the room around it, 0 to 1, top right when absent. `axisSides`
 // places an independent plot's axes, signal key to 'left', 'right' or
@@ -37,6 +39,7 @@
 import { cursorsFromJson, withoutX } from './cursors.js';
 import { fromJson, plotIds, presets } from './layout.js';
 import { isCaptureKey } from './protocol.js';
+import { drawnKind } from './constants.js';
 
 export const SAVE_KEY = 'tl-plot-tabs-v2';
 /** The `format` of an exported file of tabs. */
@@ -59,13 +62,14 @@ export const newPlot = (kind, mode, keys) => ({ id: uid('p'), kind, mode, ...PLO
 
 /**
  * The field of `plot` that holds the scale of the y axis it draws, 'log' or
- * 'linear': a capture plot's `captureYScale`, linear until set, as a
- * capture's values are of either sign; any other plot's `yScale`, a
- * spectrum's density scale, log until set (PLOT_DEFAULTS).
+ * 'linear': a capture plot's `captureYScale` along its x, linear until
+ * set, as a capture's values are of either sign; any other plot's, and a
+ * capture plot's in its Spectrum view, `yScale`, a spectrum's density
+ * scale, log until set (PLOT_DEFAULTS).
  */
-export const yScaleField = (plot) => (plot.kind === 'capture' ? 'captureYScale' : 'yScale');
+export const yScaleField = (plot) => (drawnKind(plot) === 'capture' ? 'captureYScale' : 'yScale');
 /** Whether the y axis `plot` draws is log (`yScaleField`): a time plot's never is. */
-export const yLogOf = (plot) => (plot.kind === 'time' ? false : yScaleField(plot) === 'yScale' ? plot.yScale !== 'linear' : plot[yScaleField(plot)] === 'log');
+export const yLogOf = (plot) => (drawnKind(plot) === 'time' ? false : yScaleField(plot) === 'yScale' ? plot.yScale !== 'linear' : plot[yScaleField(plot)] === 'log');
 
 /** What the page says where a plot takes none of the signals given it, by `kindWith`. */
 export const APART = 'A capture and a signal do not share a plot';

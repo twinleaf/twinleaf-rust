@@ -32,6 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
+use twinleaf::data::ops::Welch;
+use twinleaf::data::{ColumnArray, ColumnOp};
 use twinleaf::device::capture::{
     Capture, CaptureError, CaptureMetadata, CaptureReadout, CaptureStatus,
 };
@@ -72,6 +74,25 @@ const ELEMENTS: [DataType; 10] = [
     DataType::F32,
     DataType::F64,
 ];
+
+/// The amplitude spectral density of the capture `readout` holds, as the
+/// hub estimates a signal's, by [`Welch`] over all its values, along the
+/// reciprocal of its x: its `(frequency, density)` bins, frequency in
+/// cycles per x unit and density in its units per root cycle per x unit.
+/// None where its values do not decode, its x step is not a positive
+/// number, or it has fewer values than an estimate needs.
+pub(crate) fn spectrum_of(readout: &CaptureReadout) -> Vec<(f64, f64)> {
+    let Ok(values) = readout.values_f64() else {
+        return Vec::new();
+    };
+    let mut welch = Welch::new(values.len(), 1.0 / f64::from(readout.metadata.x_stride));
+    welch.update_batch(&[], &ColumnArray::F64(values.into()));
+    welch
+        .output()
+        .as_ref()
+        .map(|estimate| estimate.points.clone())
+        .unwrap_or_default()
+}
 
 /// Whether `desc` is a capture RPC, by its flag or by its name.
 pub(crate) fn is_capture(desc: &RpcDescriptor) -> bool {
@@ -411,7 +432,8 @@ impl Captures {
         let slot = slots.get_mut(key).expect("a running capture has a slot");
         slot.number += 1;
         let route = key.0.to_string();
-        let bytes = wire::encode_capture(&route, &key.1, slot.number, readout);
+        let bytes =
+            wire::encode_capture(&route, &key.1, slot.number, readout, &spectrum_of(readout));
         let frame = Arc::new(Frame::Binary(bytes));
         let once = std::mem::take(&mut slot.once);
         let asked = once.iter().chain(
@@ -1065,6 +1087,106 @@ mod tests {
                 Err(Failure::Stands(CaptureState::Error { .. }))
             ));
         }
+    }
+
+    /// A capture of `n` 32-bit floats `dx` seconds apart, a sine of `amplitude`
+    /// volts at `hz`, times `calibration`.
+    fn sine(n: usize, dx: f32, hz: f64, amplitude: f64, calibration: f32) -> CaptureReadout {
+        let data = (0..n)
+            .flat_map(|i| {
+                let t = i as f64 * f64::from(dx);
+                ((amplitude * (2.0 * std::f64::consts::PI * hz * t).sin() / f64::from(calibration))
+                    as f32)
+                    .to_le_bytes()
+            })
+            .collect::<Vec<u8>>();
+        CaptureReadout {
+            metadata: CaptureMetadata {
+                size: data.len() as u32,
+                blocksize: 64,
+                data_type: DataType::F32,
+                length: n as u32,
+                y_calibration: calibration,
+                x_offset: 0.0,
+                x_stride: dx,
+                name: "FID".into(),
+                units: "V".into(),
+                x_name: "Time".into(),
+                x_units: "s".into(),
+            },
+            data,
+        }
+    }
+
+    /// Where the spectrum of a sine of `amplitude` at `hz`, `n` values `dx`
+    /// apart, peaks, and how its peak's density stands to the density a sine
+    /// exactly on a bin has. The estimate is four Hann windowed segments of
+    /// `n / 2.5` values each, half overlapped, each zero padded to a power of
+    /// two (twinleaf `Welch`). A Hann window of N values, sin²(πi / (N - 1)),
+    /// sums to (N - 1) / 2, its squares to 3(N - 1) / 8, so its equivalent
+    /// noise bandwidth is 1.5 / (N - 1) of the sample rate, and a sine on a
+    /// bin has the one sided density amplitude / √(2 × bandwidth).
+    fn peak(n: usize, dx: f32, hz: f64, amplitude: f64) -> (f64, f64, f64) {
+        let bins = spectrum_of(&sine(n, dx, hz, amplitude, 0.5));
+        let rate = 1.0 / f64::from(dx);
+        let segment = (n as f64 / 2.5) as usize;
+        let spacing = rate / segment.next_power_of_two() as f64;
+        let bandwidth = 1.5 * rate / (segment - 1) as f64;
+        let (f, density) =
+            bins.iter().copied().fold(
+                (0.0, 0.0),
+                |best, bin| if bin.1 > best.1 { bin } else { best },
+            );
+        (f, density / (amplitude / (2.0 * bandwidth).sqrt()), spacing)
+    }
+
+    /// The worst a Hann window reads a sine between two bins, 1.42 dB low,
+    /// at half a bin of its unpadded DFT; padding only brings a bin nearer.
+    const HANN_SCALLOPING: f64 = 0.849;
+
+    /// The spectrum of an FID capture, a 175 kHz sine read 1500 times at
+    /// 2 MS/s, peaks at the bin nearest 175 kHz, its density that of the
+    /// sine within the window's scalloping, its frequencies in cycles per
+    /// second of the capture's x.
+    #[test]
+    fn a_capture_s_spectrum_peaks_at_its_sine() {
+        let (f, ratio, spacing) = peak(1500, 5e-7, 175e3, 0.8);
+        assert!(
+            (f - 175e3).abs() <= spacing / 2.0,
+            "peak at {f} Hz, bins {spacing} Hz apart"
+        );
+        assert!(
+            (HANN_SCALLOPING..=1.02).contains(&ratio),
+            "peak density {ratio} of a sine on a bin"
+        );
+        let bins = spectrum_of(&sine(1500, 5e-7, 175e3, 0.8, 0.5));
+        assert!(
+            (bins[0].0 - spacing).abs() < 1e-6 && bins.last().unwrap().0 < 1e6,
+            "from one bin above zero to below Nyquist"
+        );
+    }
+
+    proptest::proptest! {
+        /// A sine at any frequency clear of zero and of Nyquist, in a capture
+        /// of any length an estimate takes, peaks at the bin nearest it, its
+        /// density within the window's scalloping of a sine on a bin.
+        #[test]
+        fn a_sine_s_spectrum_peaks_at_its_bin(n in 200usize..10_000, at in 0.05f64..0.45, amplitude in 0.01f64..10.0) {
+            let dx = 5e-7f32;
+            let hz = at / f64::from(dx);
+            let (f, ratio, spacing) = peak(n, dx, hz, amplitude);
+            proptest::prop_assert!((f - hz).abs() <= spacing / 2.0 + 1e-6, "peak at {} Hz for {} Hz, bins {} Hz apart", f, hz, spacing);
+            proptest::prop_assert!((HANN_SCALLOPING..=1.02).contains(&ratio), "peak density {} of a sine on a bin", ratio);
+        }
+    }
+
+    /// A capture too short for an estimate, of no positive x step or whose
+    /// values do not decode has no spectrum.
+    #[test]
+    fn a_capture_with_no_estimate_has_no_spectrum() {
+        assert!(spectrum_of(&sine(59, 5e-7, 175e3, 1.0, 1.0)).is_empty());
+        assert!(spectrum_of(&sine(1500, 0.0, 175e3, 1.0, 1.0)).is_empty());
+        assert!(spectrum_of(&readout(DataType::F32, 100, 8)).is_empty());
     }
 
     /// An outbox keeps one capture of each RPC, the newest put in it.

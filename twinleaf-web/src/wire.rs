@@ -36,7 +36,9 @@
 //! f32 y calibration, f32 x offset, f32 x stride, u32 pad,
 //! 6 × u16 bytes of route, rpc, name, units, x name, x units, u32 pad,
 //! the six strings, UTF-8, then zeros up to a multiple of 8 bytes,
-//! n × element, as the device sent them
+//! n × element, as the device sent them, then zeros up to a multiple of
+//! 8 bytes, u32 m, u32 pad,
+//! m × f32 frequency, m × f32 density
 //! ```
 //!
 //! Element `i` is `element × y calibration` in `units`, at
@@ -44,7 +46,11 @@
 //! protocol's code, 0x10 for u8, 0x11 i8, 0x20 u16, 0x21 i16, 0x40 u32,
 //! 0x41 i32, 0x42 f32, 0x80 u64, 0x81 i64 and 0x82 f64. Its high half is
 //! the bytes of one element. The elements start at a multiple of 8 bytes,
-//! so a page reads them in place as an array of their type.
+//! so a page reads them in place as an array of their type. The `m` bins
+//! after them are the capture's amplitude spectral density, as the hub
+//! estimates a signal's (`captures::spectrum_of`), along the reciprocal of
+//! its x: frequency in cycles per x unit, density in its units per root
+//! cycle per x unit; none where it has none.
 
 use twinleaf::device::capture::CaptureReadout;
 
@@ -120,12 +126,14 @@ pub(crate) fn encode_spectra(spectra: &[Spectrum], seq: u64) -> Vec<u8> {
 }
 
 /// Encodes the capture `readout` holds as one frame, capture `number` of
-/// `rpc` on the device at `route`. Its data is its elements and no more.
+/// `rpc` on the device at `route`, with `spectrum`, its `(frequency,
+/// density)` bins: its elements, then the bins.
 pub(crate) fn encode_capture(
     route: &str,
     rpc: &str,
     number: u64,
     readout: &CaptureReadout,
+    spectrum: &[(f64, f64)],
 ) -> Vec<u8> {
     let meta = &readout.metadata;
     let strings = [
@@ -138,7 +146,8 @@ pub(crate) fn encode_capture(
     ];
     let text: usize = strings.iter().map(|string| string.len()).sum();
     let padded = text.next_multiple_of(8);
-    let mut buf = header(3, 0, 48 + padded + readout.data.len());
+    let data = readout.data.len().next_multiple_of(8);
+    let mut buf = header(3, 0, 48 + padded + data + 8 + spectrum.len() * 8);
     buf.extend_from_slice(&number.to_le_bytes());
     buf.extend_from_slice(&meta.length.to_le_bytes());
     buf.push(meta.data_type.value());
@@ -157,6 +166,15 @@ pub(crate) fn encode_capture(
     }
     buf.resize(CAPTURE_HEAD + padded, 0);
     buf.extend_from_slice(&readout.data);
+    buf.resize(CAPTURE_HEAD + padded + data, 0);
+    buf.extend_from_slice(&(spectrum.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&[0; 4]);
+    for &(f, _) in spectrum {
+        buf.extend_from_slice(&(f as f32).to_le_bytes());
+    }
+    for &(_, a) in spectrum {
+        buf.extend_from_slice(&(a as f32).to_le_bytes());
+    }
     buf
 }
 
@@ -177,6 +195,8 @@ pub(crate) struct Captured {
     pub(crate) x_units: String,
     /// The elements, as many bytes as the frame says they take.
     pub(crate) data: Vec<u8>,
+    /// The spectrum's `(frequency, density)` bins.
+    pub(crate) spectrum: Vec<(f32, f32)>,
 }
 
 /// Decodes a capture frame, as the page does.
@@ -200,7 +220,18 @@ pub(crate) fn decode_capture(frame: &[u8]) -> Captured {
         .collect();
     let data = at.next_multiple_of(8);
     assert!(frame[at..data].iter().all(|&pad| pad == 0));
-    assert_eq!(frame.len(), data + n * element, "its elements and no more");
+    let end = data + n * element;
+    let bins = end.next_multiple_of(8);
+    assert!(frame[end..bins].iter().all(|&pad| pad == 0));
+    let m = u32_at(bins) as usize;
+    assert_eq!(
+        frame.len(),
+        bins + 8 + m * 8,
+        "its elements and its bins and no more"
+    );
+    let spectrum = (0..m)
+        .map(|i| (f32_at(bins + 8 + 4 * i), f32_at(bins + 8 + 4 * (m + i))))
+        .collect();
     let [route, rpc, name, units, x_name, x_units] = strings.try_into().unwrap();
     Captured {
         route,
@@ -214,7 +245,8 @@ pub(crate) fn decode_capture(frame: &[u8]) -> Captured {
         units,
         x_name,
         x_units,
-        data: frame[data..].to_vec(),
+        data: frame[data..end].to_vec(),
+        spectrum,
     }
 }
 
@@ -373,7 +405,13 @@ mod tests {
 
     #[test]
     fn a_capture_frame_holds_what_the_capture_is_of_then_its_elements() {
-        let frame = encode_capture("/0", "fid.capture", 258, &capture());
+        let frame = encode_capture(
+            "/0",
+            "fid.capture",
+            258,
+            &capture(),
+            &[(1.0, 0.5), (2.0, 0.25)],
+        );
         let mut expected = vec![3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         expected.extend_from_slice(&[2, 1, 0, 0, 0, 0, 0, 0]);
         expected.extend_from_slice(&[3, 0, 0, 0, 0x21, 2, 0, 0]);
@@ -385,8 +423,17 @@ mod tests {
         expected.extend_from_slice(b"/0fid.captureFIDVTimes");
         expected.extend_from_slice(&[0; 2]);
         expected.extend_from_slice(&[1, 0, 0xfe, 0xff, 3, 0]);
+        expected.extend_from_slice(&[0; 2]);
+        expected.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
+        for value in [1.0f32, 2.0, 0.5, 0.25] {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
         assert_eq!(frame, expected);
-        assert_eq!((frame.len() - 6) % 8, 0, "the elements start on 8 bytes");
+        assert_eq!(
+            (frame.len() - 6 - 2 - 8 - 16) % 8,
+            0,
+            "the elements start on 8 bytes"
+        );
         // The page's tests decode these bytes from a file, and encode them.
         let kept = include_bytes!("../ui/tests/fixtures/capture-frame.bin");
         assert_eq!(frame, &kept[..], "the frame the page's tests keep");
@@ -395,7 +442,13 @@ mod tests {
     #[test]
     fn a_capture_frame_decodes_to_its_capture() {
         let readout = capture();
-        let decoded = decode_capture(&encode_capture("/", "fid.capture", 1, &readout));
+        let decoded = decode_capture(&encode_capture(
+            "/",
+            "fid.capture",
+            1,
+            &readout,
+            &[(3.0, 1.5)],
+        ));
         assert_eq!(
             decoded,
             Captured {
@@ -411,6 +464,7 @@ mod tests {
                 x_name: "Time".into(),
                 x_units: "s".into(),
                 data: readout.data,
+                spectrum: vec![(3.0, 1.5)],
             }
         );
     }

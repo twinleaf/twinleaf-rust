@@ -47,7 +47,7 @@
   import WriteNotice from './lib/WriteNotice.svelte';
   import { MAX_COPY_ROWS, blockTable, lostSeconds, writeTables } from './lib/copy.js';
   import { timeAxis, titleOf } from './lib/plot.js';
-  import { isSlice } from './lib/constants.js';
+  import { drawnKind, isSlice } from './lib/constants.js';
   import { navigate, remember } from './lib/focus.js';
   import KeysDialog from './lib/KeysDialog.svelte';
   import ExportDialog from './lib/ExportDialog.svelte';
@@ -785,7 +785,7 @@
     let total = 0, lost = 0;
     for (const { plot, view, pv } of plots) {
       if (isSlice(plot.kind)) {
-        const slices = slicesOf(plot, pv), spectrum = plot.kind === 'spectrum', meta = slices[0]?.[0].meta;
+        const slices = slicesOf(plot, pv), spectrum = drawnKind(plot) === 'spectrum', meta = slices[0]?.[0].meta;
         const table = blockTable(
           slices.map(([t, s]) => ({ key: titleOf(t), units: spectrum ? (t.meta.units ? `${t.meta.units}/√Hz` : '/√Hz') : t.meta.units, x: [...s.f], y: [...s.a] })),
           spectrum ? 'frequency (Hz)' : `${meta?.xName || 'x'}${meta?.xUnits ? ` (${meta.xUnits})` : ''}`,

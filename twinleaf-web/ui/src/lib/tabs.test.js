@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { SAVE_KEY, defaultContent, exportText, importText, joined, kindWith, loadTabs, makeTab, newPlot, remapIds, saveTabs, tabFromJson, yLogOf, yScaleField } from './tabs.js';
+import { drawnKind } from './constants.js';
 import { plotIds, presets } from './layout.js';
 
 /** A localStorage of one Map. */
@@ -149,8 +150,11 @@ describe('a plot and the signals given it', () => {
     const made = (kind, more = {}) => ({ ...plot(kind, []), ...more });
     expect([made('spectrum'), made('capture'), made('time')].map(yLogOf)).toEqual([true, false, false]);
     expect([made('spectrum', { yScale: 'linear' }), made('capture', { captureYScale: 'log' }), made('time', { yScale: 'log', captureYScale: 'log' })].map(yLogOf)).toEqual([false, true, false]);
-    // Each holds its own: a capture plot's density scale is no scale of its values.
+    // Each holds its own: a capture plot's density scale is no scale of its values, and drawn as a spectrum it takes a spectrum's.
     expect([made('capture', { yScale: 'log' })].map(yLogOf)).toEqual([false]);
+    const spectral = made('capture', { captureView: 'spectrum', captureYScale: 'linear' });
+    expect([yLogOf(spectral), yLogOf({ ...spectral, yScale: 'linear' }), drawnKind(spectral), drawnKind(made('capture'))]).toEqual([true, false, 'spectrum', 'capture']);
     expect(['spectrum', 'capture', 'time'].map((kind) => yScaleField(made(kind)))).toEqual(['yScale', 'captureYScale', 'yScale']);
+    expect(yScaleField(spectral)).toBe('yScale');
   });
 });

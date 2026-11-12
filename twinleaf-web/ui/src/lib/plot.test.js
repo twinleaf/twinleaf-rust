@@ -532,11 +532,11 @@ describe('A plot’s view', () => {
     cfg.shots = 'latest';
     expect(plot(cfg, view).sliceOf(c)).toBe(held);
   });
-  it('draws of its signals those its kind shows: a capture plot the captures, any other the signals that stream', () => {
+  it('draws of its signals those its kind shows: a capture plot the captures, drawn along their x or as spectra, any other the signals that stream', () => {
     const stream = { key: 'sine.sine' }, capture = { key: 'capture:fid.capture', shots: [] };
     const hub = { session: { byKey: new Map([[stream.key, stream], [capture.key, capture]]) } };
-    const of = (kind) => Object.assign(plot({ kind, keys: [stream.key, capture.key, 'gone.signal'] }, null), { hub }).traces();
-    expect([of('time'), of('spectrum'), of('capture')]).toEqual([[stream], [stream], [capture]]);
+    const of = (kind, captures = false) => Object.assign(plot({ kind, captures, keys: [stream.key, capture.key, 'gone.signal'] }, null), { hub }).traces();
+    expect([of('time'), of('spectrum'), of('capture', true), of('spectrum', true)]).toEqual([[stream], [stream], [capture], [capture]]);
   });
   it('fits a time plot’s y at once to what its last frame showed, so a fit is a change made then', () => {
     const view = new View({ now: () => 0 }), pv = plot({ kind: 'time' }, view);

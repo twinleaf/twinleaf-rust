@@ -16,7 +16,7 @@
   import * as Popover from '$lib/components/ui/popover/index.js';
   import ColorPicker from './ColorPicker.svelte';
   import { colorOf, shownUnit } from './plot.js';
-  import { MODES } from './constants.js';
+  import { MODES, drawnKind } from './constants.js';
   import { AXIS_SETTINGS } from './commands.js';
   import { axisFormat, fromUnit, inUnit, unitChoices } from './units.js';
 
@@ -39,7 +39,7 @@
   const axisSignals = $derived(plot.items.filter((i) => axisOf(i.key) === axis));
   const unitsOf = (key) => session.trace(key)?.meta.units ?? '';
   /** The unit the copy's plot shows signal `key` in (plot.js `shownUnit`), as the plot's own chips and legend name it. */
-  const unitShown = (key) => shownUnit({ kind: plot.kind, mode: plot.mode, keys: plot.items.filter((i) => !i.hidden).map((i) => i.key), yFormat: plot.yFormat }, key, unitsOf);
+  const unitShown = (key) => shownUnit({ kind: drawnKind(plot), mode: plot.mode, keys: plot.items.filter((i) => !i.hidden).map((i) => i.key), yFormat: plot.yFormat }, key, unitsOf);
   const set = $derived(axisFormat(plot.yFormat?.[axis]));
   /** Each value of axis setting `field` as a <select> holds it, and back. */
   const optionOf = (v) => (v === null ? 'auto' : String(v));
@@ -48,7 +48,7 @@
   const setAxis = (field, to) => copy.commands.run({ label: 'yLabel', digits: 'yDigits', notation: 'yNotation', unit: 'yUnit' }[field], { on: cid, how: { key: axis, to } });
 
   /** The units the axis shows (PlotView `axisUnits`), the units it may fix its numbers in, and the one it fixes, which its range fields read and take (PlotView `yFixed`). */
-  const units = $derived((plot.items, plot.mode, plot.kind, (axis && copy.pv(cid)?.axisUnits(axis)) ?? ''));
+  const units = $derived((plot.items, plot.mode, plot.kind, plot.captureView, (axis && copy.pv(cid)?.axisUnits(axis)) ?? ''));
   const choices = $derived(unitChoices(units));
   const fixed = $derived((plot.yFormat, axis ? copy.pv(cid)?.yFixed(axis) : undefined));
   /** The value of each axis setting `field` as its <select> shows it: a unit the axis's units do not offer at Auto. */
@@ -85,7 +85,7 @@
     readout: { name: 'Cursors', command: 'readout', shown: (p) => p.readout !== false, field: 'readoutAt', fallback: { x: 0, y: 0 }, what: 'Move the readout', el: '.cursor-readout' },
   };
   const atOf = (which) => plot[OVERLAYS[which].field] ?? OVERLAYS[which].fallback;
-  const hasCursors = $derived(placedIn(plot.cursors, plot.kind) > 0);
+  const hasCursors = $derived(placedIn(plot.cursors, drawnKind(plot)) > 0);
   /** The box of overlay `which` on the copy's plot, in client px, or null while it shows none. */
   const boxOf = (which) => copy.pv(cid)?.body.querySelector(OVERLAYS[which].el)?.getBoundingClientRect() ?? null;
   const overlap = (a, b) => !!a && !!b && a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;

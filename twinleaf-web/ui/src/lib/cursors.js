@@ -4,8 +4,10 @@
 //   {x: {a, b}, f: {a, b}, c: {a, b}, y: {<kind>: {<axis key>: {a, b}}}}
 //
 // `x` is a time plot's X1 and X2, in device time, `f` a spectrum's, in Hz,
-// and `c` a capture plot's, in its captures' x units;
-// `y` holds Y1 and Y2 of each y axis, by the plot's kind and the axis's
+// and `c` a capture plot's, in its captures' x units, a capture plot in
+// its Spectrum view keeping its own in `f`, as it is drawn as a spectrum
+// (constants.js `drawnKind`); `y` holds Y1 and Y2 of each y axis, by the
+// kind the plot is drawn as and the axis's
 // range key (plot.js `rangeKey`), in the units the axis shows. `a` is
 // cursor 1 and `b` cursor 2, a number or null when not placed. A part with
 // nothing placed is left out, and a plot with no cursor has no `cursors`,
@@ -29,6 +31,7 @@
 // ends.
 
 import { counted } from './menus.js';
+import { drawnKind } from './constants.js';
 
 const NONE = Object.freeze({ a: null, b: null });
 /** The field of X1 and X2 on a plot of each kind. */
@@ -112,7 +115,7 @@ export class CursorEdits {
 
   /** The X cursor of plot `id` placed or moved last, 'a' or 'b', where it is still placed; else the one placed, X1 first; else 'a'. */
   lastX(id) {
-    const kind = this.ws.plots[id]?.kind, pair = xOf(this.get(id), kind), moved = this.#movedX.get(id);
+    const plot = this.ws.plots[id], pair = xOf(this.get(id), plot && drawnKind(plot)), moved = this.#movedX.get(id);
     return moved && pair[moved] !== null ? moved : pair.a === null && pair.b !== null ? 'b' : 'a';
   }
 
@@ -142,7 +145,7 @@ export class CursorEdits {
     const changed = [...byId].filter(([id, c]) => this.ws.plots[id] && JSON.stringify(c ?? null) !== JSON.stringify(this.ws.plots[id].cursors ?? null));
     if (!changed.length) return false;
     for (const [id, c] of changed) {
-      const kind = this.ws.plots[id].kind, was = xOf(this.ws.plots[id].cursors, kind), now = xOf(c, kind);
+      const kind = drawnKind(this.ws.plots[id]), was = xOf(this.ws.plots[id].cursors, kind), now = xOf(c, kind);
       const moved = now.a !== null && now.a !== was.a ? 'a' : now.b !== null && now.b !== was.b ? 'b' : null;
       if (moved) this.#movedX.set(id, moved);
     }

@@ -13,13 +13,20 @@ export const ELEMENTS = { 0x10: Uint8Array, 0x11: Int8Array, 0x20: Uint16Array, 
  * The frame of capture `number` of `rpc` of the device at `route`, as the
  * hub encodes it: `elements` the device's own, of element type `type`,
  * each times `calibration` in `units`, element i at `x0 + i * dx` in
- * `xUnits`. Returns its ArrayBuffer.
+ * `xUnits`, and `spectrum`, {f, a}, the hub's estimate of their spectrum
+ * along the reciprocal of x, none unless given. Returns its ArrayBuffer.
  */
-export function encodeCapture({ route, rpc, number, type, calibration, x0, dx, name, units, xName, xUnits, elements }) {
+export function encodeCapture({ route, rpc, number, type, calibration, x0, dx, name, units, xName, xUnits, elements, spectrum = { f: [], a: [] } }) {
   const utf8 = new TextEncoder(), strings = [route, rpc, name, units, xName, xUnits].map((s) => utf8.encode(s));
   const text = strings.reduce((n, s) => n + s.length, 0), padded = Math.ceil(text / 8) * 8;
   const data = new Uint8Array(elements.buffer, elements.byteOffset, elements.byteLength);
-  const bytes = new Uint8Array(64 + padded + data.length), dv = new DataView(bytes.buffer);
+  const bins = 64 + padded + Math.ceil(data.length / 8) * 8, m = spectrum.f.length;
+  const bytes = new Uint8Array(bins + 8 + 8 * m), dv = new DataView(bytes.buffer);
+  dv.setUint32(bins, m, true);
+  for (let i = 0; i < m; i++) {
+    dv.setFloat32(bins + 8 + 4 * i, spectrum.f[i], true);
+    dv.setFloat32(bins + 8 + 4 * (m + i), spectrum.a[i], true);
+  }
   dv.setUint8(0, 3);
   dv.setBigUint64(16, BigInt(number), true);
   dv.setUint32(24, elements.length, true);
@@ -57,10 +64,25 @@ export function asKind(page, id, kind, more = {}) {
   page.history.group('Prepare', () => page.ws.setPlot(id, { kind, items: captures.map((c) => chip(keyOf(c.rpc))), ...more }));
 }
 
-/** A capture an FID magnetometer's ADC reads out: `n` 16-bit samples 0.5 µs apart, a decaying sine of `amplitude` counts, 1e-4 V a count, as shot `number`, each shot a little larger than the last. */
+/** Where the spectrum `fid` gives a shot peaks, as a bin of FID_BINS, near the sine's 2 MHz / (24π), 26.5 kHz. */
+export const FID_PEAK = 14;
+/** How many bins the spectrum `fid` gives a shot has, one above zero to one below its Nyquist of 1 MHz, 2 MHz / 1024 apart, as the hub's estimate of 1500 samples has. */
+export const FID_BINS = 511;
+/**
+ * A capture an FID magnetometer's ADC reads out: `n` 16-bit samples 0.5 µs
+ * apart, a decaying sine of `amplitude` counts, 1e-4 V a count, as shot
+ * `number`, each shot a little larger than the last; with a spectrum as
+ * the hub would send it, in cycles a second of its x: FID_BINS bins
+ * 2 MHz / 1024 apart, a line at bin FID_PEAK over a floor, as large as the
+ * shot.
+ */
 export const fid = (n = 1500, amplitude = 20000) => (number) => ({
   type: 0x21, calibration: 1e-4, x0: 0, dx: 5e-7,
   elements: Int16Array.from({ length: n }, (_, i) => Math.round(amplitude * (1 + number / 100) * Math.exp(-i / (n / 3)) * Math.sin(i / 12))),
+  spectrum: {
+    f: Float32Array.from({ length: FID_BINS }, (_, k) => ((k + 1) * 2e6) / 1024),
+    a: Float32Array.from({ length: FID_BINS }, (_, k) => (1 + number / 100) * (1e-3 / (1 + ((k + 1 - FID_PEAK) / 1.5) ** 2) + 2e-6)),
+  },
 });
 
 /**
