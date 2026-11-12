@@ -105,6 +105,8 @@ export class PlotHost {
       split: (ids, dir, fromKeys) => this.#page.split(ids, dir, fromKeys),
       close: (ids, fromKeys) => this.#page.close(ids, fromKeys),
       newPlot: (keys) => this.#page.newPlot(keys),
+      trigger: (keys) => hub.trigger(keys),
+      titleOf: (key) => hub.session.byKey.get(key)?.title ?? key,
       copy: (plots) => this.#page.copy(plots),
       copyCheck: (plots) => this.#page.copyCheck(plots),
       copyImage: (id) => this.#page.copyImage(id),
@@ -287,9 +289,9 @@ export class PlotHost {
     return this.ws.tabs.find((t) => t.plots[id])?.plots[id];
   }
 
-  /** The traces of `plot`'s signals the hub has. */
+  /** The traces of `plot`'s signals that stream which the hub has: those it holds a history of, which a capture plot has none of. */
   #tracesOf(plot) {
-    return plot.items.map((i) => this.hub.session.byKey.get(i.key)).filter(Boolean);
+    return plot.items.map((i) => this.hub.session.byKey.get(i.key)).filter((t) => t && !t.shots);
   }
 
   /** The most points a window read asks for: DETAIL_POINTS for each CSS px across the surface, a point for each device pixel of its pictures at least. */

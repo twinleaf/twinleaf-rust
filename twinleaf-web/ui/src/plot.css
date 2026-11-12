@@ -386,6 +386,12 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
    inset 8px, and 22px at the top, which clears the LIVE tag; --clear-top
    clears a monitor's header. */
 .pinned-legend { --clear-top: 0px; --room-l: calc(var(--frame-l, 0px) + 8px); --room-t: max(calc(var(--frame-t, 0px) + 22px), var(--clear-top)); --room-r: calc(var(--frame-r, 0px) + 8px); --room-b: calc(var(--frame-b, 0px) + 8px); position: absolute; left: calc(var(--room-l) + var(--x) * (100% - var(--room-l) - var(--room-r))); top: calc(var(--room-t) + var(--y) * (100% - var(--room-t) - var(--room-b))); transform: translate(calc(var(--x) * -100%), calc(var(--y) * -100%)); z-index: 2; cursor: grab; touch-action: none; max-width: calc(100% - var(--room-l) - var(--room-r)); max-height: max(40%, 36px); overflow: hidden auto; scrollbar-width: thin; padding: 1px 6px; font: 10px/16px var(--font-data); font-variant-numeric: tabular-nums; background: color-mix(in oklch, var(--card) 85%, transparent); backdrop-filter: blur(2px); border: 1px solid var(--border); }
+/* A capture plot's state, in the plot's lower left corner. */
+.capture-state { position: absolute; left: calc(var(--frame-l, 0px) + 6px); bottom: calc(var(--frame-b, 0px) + 4px); max-width: calc(100% - var(--frame-l, 0px) - var(--frame-r, 0px) - 12px); font: 11px/15px var(--font-data); color: var(--muted-foreground); pointer-events: none; }
+.capture-state div { display: flex; gap: 6px; white-space: nowrap; overflow: hidden; }
+.capture-state b { font-weight: 600; color: var(--foreground); }
+.capture-state .state { overflow: hidden; text-overflow: ellipsis; }
+.capture-state .failed .state { color: var(--destructive); }
 .pinned-legend .row { display: flex; align-items: center; gap: 5px; height: 16px; white-space: nowrap; }
 .pinned-legend .swatch i { width: 8px; height: 3px; background: var(--c); }
 .pinned-legend .name { max-width: 16ch; overflow: hidden; text-overflow: ellipsis; color: var(--foreground); }
@@ -495,6 +501,9 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .palette .chip:hover { background: var(--accent); border-color: color-mix(in oklch, var(--foreground) 25%, var(--border)); }
 .palette .sig-key { overflow: hidden; text-overflow: ellipsis; }
 .palette .sig-units { color: var(--muted-foreground); font-size: 11px; }
+/* A device's captures, under its signals: the first is headed, in the room it keeps above it. */
+.palette .chip.captures-first { margin-top: 20px; position: relative; }
+.palette .chip.captures-first::before { content: 'Captures'; position: absolute; left: 1px; top: -19px; font: 600 11px/14px var(--font-ui); color: var(--muted-foreground); pointer-events: none; }
 .sig-empty { padding: 8px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
 .tiles.drop-target { border: 1px dashed var(--primary); border-radius: var(--radius); }
 

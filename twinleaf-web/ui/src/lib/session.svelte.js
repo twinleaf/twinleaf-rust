@@ -5,11 +5,14 @@
 // it. What is keyed by a Trace object (GPU buffers, a plot's paused spectra)
 // goes with it.
 //
-// Points are not reactive: the plots read them every frame. What the page's
-// components show is: `signals`, `devices`, `mounts`, `pps` and `detailsDropped`.
+// Points and a capture's shots are not reactive: the plots read them every
+// frame. What the page's components show is: `signals`, `captures`, each
+// capture's `label` and `status`, `devices`, `mounts`, `pps` and
+// `detailsDropped`.
 
 import { SvelteMap } from 'svelte/reactivity';
-import { api, signalKey } from './protocol.js';
+import { api, captureKey, signalKey } from './protocol.js';
+import { keep, shotOf } from './shots.js';
 import { colors } from './colors.svelte.js';
 import * as clock from './clock.js';
 
@@ -253,6 +256,37 @@ Detail.prototype.yAt = Trace.prototype.yAt;
 Detail.prototype.extent = Trace.prototype.extent;
 
 /**
+ * One capture RPC of one device: what its metadata names it, where it
+ * stands, and the shots the hub sent this page of it, newest last
+ * (shots.js). A plot names it as it names a Trace, by `key` and `meta`.
+ */
+export class Capture {
+  /** What its metadata says a capture of it is of, {name, units, x_name, x_units}, or null while the device has not said. */
+  label = $state.raw(null);
+  /**
+   * Where it stands, as the hub's `capture` says: {state, number, repeat,
+   * read, size, error, since}. `state` is idle, capturing, reading (`read` of
+   * `size` bytes), waiting, busy, timeout or error (with `error`); `number`
+   * that of the last capture the hub read of it; `repeat` the seconds
+   * between captures while a page asks for them again and again, or null;
+   * `since` the page time, in ms, the hub said so.
+   */
+  status = $state.raw({ state: 'idle', number: 0, repeat: null, since: 0 });
+  /** Its shots, which only the session adds to. */
+  shots = [];
+  /** What a person reads it as: the name its metadata gives, or its RPC's, after its device's route as a signal key has it. */
+  title = $derived(`${this.key.slice(0, this.key.lastIndexOf('/') + 1)}${this.label?.name || this.rpc}`);
+  /** Its units and those of its x axis, with the x axis's name, as a plot reads a signal's `meta`. */
+  meta = $derived({ units: this.label?.units ?? '', xName: this.label?.x_name ?? '', xUnits: this.label?.x_units ?? '' });
+
+  constructor(route, rpc) {
+    this.route = route;
+    this.rpc = rpc;
+    this.key = captureKey({ route, rpc });
+  }
+}
+
+/**
  * One device as the hub's connection sees it. Each field is its own state,
  * and each announced value its own entry of `values`, so a change to one
  * device, or to one of its values, redraws only what shows it.
@@ -302,6 +336,8 @@ export const sameValue = (a, b) => a === b || JSON.stringify(a) === JSON.stringi
 export class Session {
   /** The traces, sorted by signal key: what the signal lists show. */
   signals = $state.raw([]);
+  /** The capture RPCs the devices list, each a Capture, sorted by key. */
+  captures = $state.raw([]);
   /** Each Device by route, in the order the hub listed them. */
   devices = new SvelteMap();
   /** The devices the hub mounted, [{url, source, prefix}], or null for the proxy's default. */
@@ -322,7 +358,7 @@ export class Session {
   firstHeld = {};
 
   traces = new Map(); // trace id -> Trace
-  byKey = new Map(); // signal key -> Trace
+  byKey = new Map(); // signal key -> Trace, and capture key -> Capture
   /** Each paused plot's windows of the hub's history, by layer. */
   windows = new Map(); // plot id -> {detail, overview}: each a Map, trace -> Detail
   /** How many times every window was dropped, for the page to read them again. */
@@ -343,10 +379,18 @@ export class Session {
     return undefined;
   }
 
-  /** The trace of signal `key`, read reactively: a component asks again as traces arrive. */
+  /** The trace of signal `key`, or the Capture of a capture's, read reactively: a component asks again as traces arrive and captures are listed. */
   trace(key) {
     this.signals;
+    this.captures;
     return this.byKey.get(key);
+  }
+
+  /** Lists the captures `keep(capture)` holds of those listed, and gives each listed a colour. */
+  #listCaptures(keep) {
+    for (const c of this.captures) if (!keep(c)) this.byKey.delete(c.key);
+    this.captures = [...this.byKey.values()].filter((c) => c instanceof Capture).sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    colors.give(this.captures.map((c) => c.key));
   }
 
   /** Device time that page time `perfMs` corresponds to, smoothed. */
@@ -387,7 +431,7 @@ export class Session {
         const t = new Trace(msg.trace);
         this.traces.set(t.meta.id, t);
         this.byKey.set(t.key, t);
-        this.signals = [...this.byKey.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+        this.signals = [...this.traces.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
         colors.give(this.signals.map((s) => s.key));
         return;
       }
@@ -409,7 +453,21 @@ export class Session {
         this.mounts = msg.mounts;
         for (const route of [...this.devices.keys()]) if (!msg.routes.includes(route)) this.devices.delete(route);
         for (const route of msg.routes) this.device(route);
+        this.#listCaptures((c) => msg.routes.includes(c.route));
         return;
+      case 'captures':
+        for (const { rpc, label } of msg.captures) {
+          const key = captureKey({ route: msg.route, rpc });
+          if (!this.byKey.has(key)) this.byKey.set(key, new Capture(msg.route, rpc));
+          this.byKey.get(key).label = label ?? null;
+        }
+        this.#listCaptures((c) => c.route !== msg.route || msg.captures.some((listed) => listed.rpc === c.rpc));
+        return;
+      case 'capture': {
+        const c = this.byKey.get(captureKey(msg));
+        if (c) c.status = { state: msg.state, number: msg.number, repeat: msg.repeat ?? null, read: msg.read, size: msg.size, error: msg.error, since: clock.now() };
+        return;
+      }
       // The server sends a device's messages only while the routes list it.
       case 'device': {
         const d = this.devices.get(msg.route);
@@ -430,9 +488,15 @@ export class Session {
   /**
    * Applies one decoded binary frame. Returns false when it names a trace
    * this session never heard of, a gap the page fills with a new snapshot.
-   * `perfMs` is the page time it arrived.
+   * `perfMs` is the page time it arrived. A capture is the newest shot of
+   * its Capture, and one of a capture no device lists is dropped.
    */
   apply(frame, perfMs = clock.now()) {
+    if (frame.kind === 'capture') {
+      const c = this.byKey.get(captureKey(frame));
+      if (c) keep(c.shots, shotOf(frame));
+      return true;
+    }
     if (frame.kind === 'spectra') {
       for (const { id, f, a, floor } of frame.spectra) {
         const t = this.traces.get(id);

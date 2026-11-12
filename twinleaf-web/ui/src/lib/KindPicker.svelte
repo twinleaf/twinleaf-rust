@@ -16,7 +16,8 @@
   import RiIndependent from '@lucide/svelte/icons/unfold-vertical';
   import RiStacked from '@lucide/svelte/icons/rows-3';
   import Tip from './Tip.svelte';
-  import { KINDS, MODES } from './constants.js';
+  import RiCapture from '@lucide/svelte/icons/camera';
+  import { KINDS, MODES, kindsFor } from './constants.js';
   import { commandOf } from './commands.js';
 
   /**
@@ -31,7 +32,7 @@
   /** Runs command `id`, made on this plot from its dropdown, with the value chosen. */
   const choose = (id) => (to) => commands.run(id, { on: plot.id, from: 'button', how: { to } });
 
-  const ICONS = { time: RiTime, spectrum: RiSpectrum, overlay: RiOverlay, independent: RiIndependent, stacked: RiStacked };
+  const ICONS = { time: RiTime, spectrum: RiSpectrum, capture: RiCapture, overlay: RiOverlay, independent: RiIndependent, stacked: RiStacked };
   const nameOf = (list, value) => list.find(([v]) => v === value)?.[1] ?? value;
   let layoutOpen = $state(false);
   let kindTrigger = $state(null);
@@ -79,7 +80,8 @@
       </Select.Trigger>
     {/snippet}
   </Tip>
-  <Select.Content>{@render items(KINDS)}</Select.Content>
+  <!-- The kinds the plot may be: a plot of captures stays one (constants.js `kindsFor`). -->
+  <Select.Content>{@render items(kindsFor(plot.kind))}</Select.Content>
 </Select.Root>
 <Select.Root type="single" value={plot.mode} onValueChange={choose('setLayout')} bind:open={layoutOpen} onOpenChange={changed}>
   <Tip text="Layout: {nameOf(MODES, plot.mode)}">

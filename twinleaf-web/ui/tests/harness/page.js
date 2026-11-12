@@ -26,7 +26,8 @@ import { Views } from '../../src/lib/views.js';
 import { PlotHost } from '../../src/lib/plothost.js';
 import { colors } from '../../src/lib/colors.svelte.js';
 import { presets } from '../../src/lib/layout.js';
-import { emptyTab, loadTabs, makeTab, newPlot } from '../../src/lib/tabs.js';
+import { emptyTab, joined, loadTabs, makeTab, newPlot } from '../../src/lib/tabs.js';
+import { serveCaptures } from './captures.js';
 import { api } from '../../src/lib/protocol.js';
 import * as clock from '../../src/lib/clock.js';
 import '../../src/app.css';
@@ -140,30 +141,30 @@ const typed = (text) => (text === 'true' ? true : text === 'false' ? false : tex
  * announces announces it. While `slow`, each reply waits for `release()`,
  * which answers the oldest call waiting. `announce(route, values)` has a
  * device announce new values, as another client's write would, and
- * `presence(route, state)` changes a device's presence.
+ * `presence(route, state)` changes a device's presence. Each change it
+ * sends is numbered the next after the last the hub applied.
  */
 export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
   const hub = new Hub();
   hub.close();
-  let seq = 0;
-  hub.text({ type: 'hub', id: 'test', seq });
+  hub.text({ type: 'hub', id: 'test', seq: 0 });
   signals.forEach((key, id) => {
     const [stream, column] = key.split('.');
-    hub.text({ type: 'trace', seq: ++seq, trace: { id, route: '/', stream, column, units: units[key] ?? 'V', rate: 100 } });
+    hub.text({ type: 'trace', seq: hub.seq + 1, trace: { id, route: '/', stream, column, units: units[key] ?? 'V', rate: 100 } });
   });
   const table = rpcs.map(({ name, channel, type = 'f32', access = ['read', 'write'] }) => ({ name, channel, type, access, readable: access.includes('read') }));
   const announced = new Set(rpcs.filter((p) => (p.access ?? ['read', 'write']).includes('read') && p.announced !== false).map((p) => p.name));
   const values = new Map(routes.map((route, i) => [route, Object.fromEntries(rpcs.filter((p) => announced.has(p.name)).map((p) => [p.name, (Array.isArray(p.value) ? p.value[i] : p.value) ?? 0]))]));
   hub.announce = (route, patch) => {
     Object.assign(values.get(route), patch);
-    hub.text({ type: 'settings', seq: ++seq, route, values: { ...values.get(route) } });
+    hub.text({ type: 'settings', seq: hub.seq + 1, route, values: { ...values.get(route) } });
   };
-  hub.presence = (route, presence) => hub.text({ type: 'device', seq: ++seq, route, name: 'test', serial: route, firmware: '1', presence });
+  hub.presence = (route, presence) => hub.text({ type: 'device', seq: hub.seq + 1, route, name: 'test', serial: route, firmware: '1', presence });
   if (rpcs.length) {
-    hub.text({ type: 'routes', seq: ++seq, mounts: {}, routes });
+    hub.text({ type: 'routes', seq: hub.seq + 1, mounts: {}, routes });
     for (const route of routes) {
       hub.presence(route, 'alive');
-      hub.text({ type: 'table', seq: ++seq, route, rpcs: table });
+      hub.text({ type: 'table', seq: hub.seq + 1, route, rpcs: table });
       hub.announce(route, {});
     }
   }
@@ -206,18 +207,20 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
  * browser's own, as the smoke tests of real time mount it. It returns the
  * page's state, each plot's view and PlotView among it.
  */
-export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null, rowsLatency = 0, fromSaved = false, realClock = false } = {}) {
+export async function mountPage(keys = [[], [], [], []], preset = 'grid', more = 0, signals = [], rpcs = [], { routes = ['/'], saved = {}, units = {}, rowsPerSecond = null, rowsLatency = 0, fromSaved = false, realClock = false, captures = null } = {}) {
   virtual?.end();
   virtual = realClock ? null : clock.virtual();
   const mine = virtual;
   localStorage.clear();
   for (const [k, v] of Object.entries(saved)) localStorage.setItem(k, JSON.stringify(v));
-  const ps = keys.map((k) => newPlot('time', 'overlay', k));
+  // A plot of captures' keys is a capture plot, any other a time plot (tabs.js `joined`).
+  const ps = keys.map((k) => newPlot('time', 'overlay', [])).map((p, i) => ({ ...p, ...joined(p, keys[i]) }));
   const tab = makeTab('A', { plots: Object.fromEntries(ps.map((p) => [p.id, p])), layout: ps.length ? presets[preset](ps.map((p) => p.id)) : null });
   const ws = new Workspace(fromSaved ? loadTabs(localStorage) : { tabs: [tab, ...Array.from({ length: more }, (_, i) => emptyTab(`Layout ${i + 2}`))], activeId: tab.id });
   const history = new History(ws, new Favorites(null));
   const target = document.body.appendChild(document.createElement('div'));
   const hub = stubHub(signals, rpcs, routes, units);
+  if (captures) serveCaptures(hub, captures);
   const registry = new Set();
   const views = new Views(hub);
   const fetched = window.fetch;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SAVE_KEY, defaultContent, exportText, importText, loadTabs, makeTab, newPlot, remapIds, saveTabs, tabFromJson } from './tabs.js';
+import { SAVE_KEY, defaultContent, exportText, importText, joined, kindWith, loadTabs, makeTab, newPlot, remapIds, saveTabs, tabFromJson } from './tabs.js';
 import { plotIds, presets } from './layout.js';
 
 /** A localStorage of one Map. */
@@ -98,5 +98,50 @@ describe('a tab read from JSON', () => {
     const p = { id: 'p1', kind: 'time', mode: 'overlay', items: [] };
     const layout = { type: 'split', dir: 'row', ratio: 0.5, a: { type: 'leaf', plotId: 'p1' }, b: { type: 'leaf', plotId: 'p1' } };
     expect(tabFromJson({ name: 'A', plots: { p1: p }, layout })).toBe(null);
+  });
+
+  it('keeps of each plot the signals its kind shows, with a capture plot’s settings', () => {
+    const plots = {
+      p1: { id: 'p1', kind: 'time', mode: 'overlay', items: [{ key: 'sine.sine' }, { key: 'capture:fid.capture' }] },
+      p2: { id: 'p2', kind: 'capture', mode: 'overlay', auto: true, autoDelay: 0.2, shots: 'average', shotCount: 64, items: [{ key: 'sine.sine' }, { key: '0/capture:fid.capture' }] },
+    };
+    const back = tabFromJson({ name: 'A', plots, layout: null });
+    expect(back.plots.p1.items.map((i) => i.key)).toEqual(['sine.sine']);
+    expect(back.plots.p2.items.map((i) => i.key)).toEqual(['0/capture:fid.capture']);
+    expect(back.plots.p2).toMatchObject({ kind: 'capture', auto: true, autoDelay: 0.2, shots: 'average', shotCount: 64 });
+  });
+});
+
+describe('a plot and the signals given it', () => {
+  const CAPTURES = ['capture:fid.capture', '0/capture:phase.capture'], SIGNALS = ['sine.sine', '0/aux.x'];
+  const plot = (kind, keys) => newPlot(kind, 'overlay', keys);
+  const keysOf = (p) => p?.items.map((i) => i.key);
+
+  it('shows captures or signals that stream, never both: with some it takes only its own sort, and its kind stays', () => {
+    for (const kind of ['time', 'spectrum']) {
+      for (const key of CAPTURES) expect(kindWith(plot(kind, ['sine.sine']), key)).toBe(null);
+      for (const key of SIGNALS) expect(kindWith(plot(kind, ['sine.sine']), key)).toBe(kind);
+    }
+    for (const key of SIGNALS) expect(kindWith(plot('capture', [CAPTURES[0]]), key)).toBe(null);
+    for (const key of CAPTURES) expect(kindWith(plot('capture', [CAPTURES[0]]), key)).toBe('capture');
+  });
+
+  it('with none takes either: a capture makes it a capture plot, a signal a time plot again, or leaves a spectrum one', () => {
+    for (const kind of ['time', 'spectrum', 'capture']) for (const key of CAPTURES) expect(kindWith(plot(kind, []), key)).toBe('capture');
+    expect(SIGNALS.map((key) => kindWith(plot('capture', []), key))).toEqual(['time', 'time']);
+    expect(SIGNALS.map((key) => kindWith(plot('spectrum', []), key))).toEqual(['spectrum', 'spectrum']);
+  });
+
+  it('joins those it lacks and can show, after its own, in the order given, the first deciding for an empty plot', () => {
+    const mixed = [SIGNALS[0], CAPTURES[0], SIGNALS[1], CAPTURES[1]];
+    expect(joined(plot('time', []), mixed)).toMatchObject({ kind: 'time' });
+    expect(keysOf(joined(plot('time', []), mixed))).toEqual(SIGNALS);
+    expect(keysOf(joined(plot('time', []), mixed.toReversed()))).toEqual(CAPTURES.toReversed());
+    expect(joined(plot('time', []), mixed.toReversed()).kind).toBe('capture');
+    expect(keysOf(joined(plot('capture', [CAPTURES[0]]), mixed))).toEqual(CAPTURES);
+    // One it shows already is not added again; with none to add it stays as it is.
+    expect(keysOf(joined(plot('time', [SIGNALS[1]]), mixed))).toEqual([SIGNALS[1], SIGNALS[0]]);
+    expect(joined(plot('time', SIGNALS), mixed)).toBe(null);
+    expect(joined(plot('time', SIGNALS), CAPTURES)).toBe(null);
   });
 });

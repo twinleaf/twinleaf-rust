@@ -184,6 +184,19 @@ function plain(v, digits, of) {
 export const si = (v, unit) => numberText(v, { digits: 4, notation: 'si' }, unit);
 
 /**
+ * `v` of reported unit `unit` as a tick of an axis reads on Auto: as few
+ * digits as it needs, four at most, with the SI prefix its size gives it
+ * where the page knows the unit, as 250 µs and 1.5 ms; in any other unit
+ * as reported, and in none bare.
+ */
+export function tickText(v, unit) {
+  const u = unitOf(unit), base = u ? ten(v, u.e) : v;
+  if (!u || base === 0) return `${+v.toPrecision(4)}${unit && unit !== 'arb' ? ` ${unit}` : ''}`;
+  const e = prefixOf(Math.abs(base));
+  return `${+(base / 10 ** e).toPrecision(4)} ${PREFIXES[e]}${u.base}${u.per}`;
+}
+
+/**
  * The range lo … hi of reported unit `unit` in `form`, as `numberText`
  * writes each end, the unit once after both: in 'si' in a known unit both
  * ends with the prefix of the larger, and in 'plain' with its decimals.

@@ -2,9 +2,14 @@
 // how tabs are kept in this browser and moved between people as a file.
 //
 // A tab is {id, name, plots, layout}. `plots` maps a plot id to
-// {id, kind, mode, items, legend?, legendAt?}: `kind` is time or spectrum,
-// `mode` one of plot.js's modes, `items` the plot's signals as [{id, key}],
-// each `key` a signal key (protocol.js `signalKey`), `legend` whether the
+// {id, kind, mode, items, legend?, legendAt?}: `kind` is time, spectrum or
+// capture, `mode` one of plot.js's modes, `items` the plot's signals as
+// [{id, key}], each `key` a signal key (protocol.js `signalKey`), or on a
+// capture plot a capture's (`captureKey`), never both (`kindWith`). A
+// capture plot's `auto` is whether it asks for captures again and again,
+// `autoDelay` seconds after each (constants.js CAPTURE_DELAY when absent),
+// and `shots` and `shotCount` how it shows them (shots.js), the newest
+// alone when absent. `legend` is whether the
 // legend shows in the plot, and `legendAt` where it was dragged, {x, y} each
 // a share of the room around it, 0 to 1, top right when absent. `axisSides`
 // places an independent plot's axes, signal key to 'left', 'right' or
@@ -14,8 +19,9 @@
 // `readoutAt` where it was dragged, a share as `legendAt` is, top left when
 // absent. `yFormat` holds each y axis's label, digits, notation and unit, by its
 // range key ('shared', or the signal key of an axis of its own), and
-// `xFormat` a spectrum's frequency axis's digits and notation, each as
-// units.js `axisFormat` reads them, a setting absent at Auto. `layout` is
+// `xFormat` the digits and notation of a spectrum's or a capture's x axis,
+// each as units.js `axisFormat` reads them, a setting absent at Auto;
+// `fRange` is the stretch of that axis shown, absent for all of it. `layout` is
 // the split tree of layout.js over the plot ids, or null for an empty tab.
 //
 // The tabs are kept in localStorage under SAVE_KEY as {tabs, activeId}.
@@ -27,6 +33,7 @@
 
 import { cursorsFromJson, withoutX } from './cursors.js';
 import { fromJson, plotIds, presets } from './layout.js';
+import { isCaptureKey } from './protocol.js';
 
 export const SAVE_KEY = 'tl-plot-tabs-v2';
 /** The `format` of an exported file of tabs. */
@@ -47,6 +54,34 @@ export const PLOT_DEFAULTS = Object.freeze({ xScale: 'log', yScale: 'log', legen
 export const VIEW_FIELDS = new Set(['fRange']);
 export const newPlot = (kind, mode, keys) => ({ id: uid('p'), kind, mode, ...PLOT_DEFAULTS, items: keys.map(chip) });
 
+/** What the page says where a plot takes none of the signals given it, by `kindWith`. */
+export const APART = 'A capture and a signal do not share a plot';
+
+/**
+ * The kind `plot` is once it shows the signal of `key` too, or null where
+ * it cannot: a plot shows captures or the signals that stream, never both,
+ * as they share no x axis. A plot with no signal takes either, and becomes
+ * a capture plot with a capture, and a time plot again with a signal.
+ */
+export function kindWith(plot, key) {
+  const capture = isCaptureKey(key);
+  if (!plot.items.length) return capture ? 'capture' : plot.kind === 'capture' ? 'time' : plot.kind;
+  return capture === (plot.kind === 'capture') ? plot.kind : null;
+}
+
+/**
+ * `plot` with those of the signals `keys` it lacks and can show
+ * (`kindWith`), after the ones it has: {kind, items}, or null where it
+ * takes none.
+ */
+export function joined(plot, keys) {
+  let { kind, items } = plot;
+  for (const key of keys) {
+    const next = items.some((i) => i.key === key) ? null : kindWith({ kind, items }, key);
+    if (next) [kind, items] = [next, [...items, chip(key)]];
+  }
+  return items === plot.items ? null : { kind, items };
+}
 /** The plots and layout a new page starts with, of the simulator's signals. */
 export function defaultContent() {
   const ps = [
@@ -105,7 +140,9 @@ export function tabFromJson(t, paused = null) {
     const view = paused && p.kind === 'time' ? pausedFromJson(p.view) : null;
     if (view) views.set(id, view);
     const { cursors: _, view: __, ...rest } = p, read = cursorsFromJson(p.cursors), cursors = view ? read : withoutX(read, 'time');
-    plots[id] = { ...PLOT_DEFAULTS, ...rest, id, items: p.items.filter((i) => i && typeof i.key === 'string').map((i) => chip(i.key)), ...(cursors && { cursors }) };
+    // A signal its plot's kind does not show is left out (`kindWith`).
+    const keys = p.items.filter((i) => i && typeof i.key === 'string').map((i) => i.key).filter((key) => isCaptureKey(key) === (p.kind === 'capture'));
+    plots[id] = { ...PLOT_DEFAULTS, ...rest, id, items: keys.map(chip), ...(cursors && { cursors }) };
   }
   const layout = t.layout ? fromJson(t.layout) : null;
   const ids = plotIds(layout);

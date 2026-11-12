@@ -9,12 +9,19 @@
 //                `sides` in the settings places (axisSlots)
 //   stacked      one lane per trace, sharing x
 // Kinds: time, each plot with a View of its own, which a gesture on a
-// selected plot moves for every selected plot; or spectrum (log-log).
+// selected plot moves for every selected plot; or a slice, drawn by one
+// path (`drawSlice`): a spectrum, each signal's newest estimate along
+// frequency, its axes log or linear; or a capture, each capture's shots
+// (shots.js) along the x its device gives them, its axes linear. A slice
+// is {f, a, floor}, its x and y values and a spectrum's noise floor; a
+// capture's holds `under` too, the shots an overlay draws beneath it, and
+// `note`, what it says of how many shots it shows.
 
 import { scaleLinear, scaleLog, scaleTime } from 'd3-scale';
-import { DRAG_START } from './constants.js';
+import { DRAG_START, isSlice } from './constants.js';
 import { prefs } from './prefs.svelte.js';
-import { axisFormat, fixedUnit, formOf, numberText, rangeText, si, spanText } from './units.js';
+import { axisFormat, fixedUnit, formOf, numberText, rangeText, si, spanText, tickText } from './units.js';
+import { shotCount, shotMode, shown, shownText, xsOf } from './shots.js';
 import { WINDOW_LIMITS, windowText } from './window.js';
 import { placedIn, withX, withY, withoutX, withoutY, xOf, yOf } from './cursors.js';
 import * as clock from './clock.js';
@@ -161,7 +168,8 @@ export function timeAxis(epoch, origin = null) {
 
 /**
  * How a menu names the X cursors of a plot, by the kind of its x axis:
- * 'unix', any other epoch, or 'hz' for a spectrum's frequencies.
+ * 'unix', any other epoch, 'hz' for a spectrum's frequencies, or {unit}
+ * for a capture's x in that unit, which reads as frequencies do.
  * `at(x, span)` names a cursor at x of a pair `span` apart, to as many
  * decimals as tell the pair apart: whole seconds for a span of 2 s or more,
  * milliseconds from 2 ms, microseconds below. A Unix time is the time of
@@ -172,7 +180,8 @@ export function timeAxis(epoch, origin = null) {
  * an SI prefix throughout.
  */
 export function cursorText(kind) {
-  if (kind === 'hz') return { at: (f) => si(f, 'Hz'), span: (s) => si(s, 'Hz') };
+  const unit = kind === 'hz' ? 'Hz' : kind?.unit;
+  if (unit !== undefined) return { at: (f) => si(f, unit), span: (s) => si(s, unit) };
   const decimals = (span) => (span >= 2 ? 0 : span >= 2e-3 ? 3 : 6);
   /** `t` to `d` decimals, as its whole seconds and the digits after the point. */
   const split = (t, d) => {
@@ -482,29 +491,36 @@ export function shownUnit(cfg, key, unitOf) {
 }
 /** How a spectrum's x axis writes a frequency on Auto: a cursor's place, and the distance between two. */
 export const F_AUTO = { at: { digits: 4, notation: 'fig' }, span: { digits: 4, notation: 'si' } };
+/** How a slice's x axis writes a value on Auto, by the plot's kind, as F_AUTO lays it out: a capture's with the SI prefix its size gives it. */
+export const X_AUTO = { spectrum: F_AUTO, capture: { at: { digits: 4, notation: 'si' }, span: { digits: 4, notation: 'si' } } };
+/** How a tick of a slice's linear x axis in `unit` reads on Auto: a frequency as `hzLabel`, any other as units.js `tickText`. */
+const xTickText = (unit) => (unit === 'Hz' ? hzLabel : (v) => tickText(v, unit));
 
 /**
- * The text of each of a y axis's numbered `ticks`, or of a spectrum's
- * frequency axis's with `hz`, in axis format `f` (units.js `axisFormat`).
+ * The text of each of a y axis's numbered `ticks`, or of a slice's x
+ * axis's in unit `x`, in axis format `f` (units.js `axisFormat`).
  * On Auto they read as `auto(v)`: the scale's own tick format, a log
- * axis's decades as 1e+3, or `hzLabel`. Else they read in f's notation, or
+ * axis's decades as 1e+3, or `xTickText`. Else they read in f's notation, or
  * with Auto in that of `auto`'s place, plain on a linear y axis, an
- * exponent on a log one and an SI prefix on Hz, to f's digits, or with Auto
+ * exponent on a log one and an SI prefix on an x axis, to f's digits, or with Auto
  * the fewest; and with more where fewer would write two ticks alike. Plain
  * numbers on a linear axis, `log` false, take the decimals of the largest.
  * An axis in `units` whose format fixes a unit (units.js `fixedUnit`)
  * writes its ticks in that unit, Auto or not.
  */
-export function tickTexts(ticks, f, auto, { log = false, hz = false, units = '' } = {}) {
-  const fixed = fixedUnit(f, hz ? 'Hz' : units);
+export function tickTexts(ticks, f, auto, { log = false, x = null, units = '' } = {}) {
+  const fixed = fixedUnit(f, x ?? units);
   if (f.digits === null && f.notation === 'auto' && !fixed) return ticks.map(auto);
-  const notation = f.notation !== 'auto' ? f.notation : hz ? 'si' : log ? 'exp' : 'plain';
+  const notation = f.notation !== 'auto' ? f.notation : x !== null ? 'si' : log ? 'exp' : 'plain';
   const of = Math.max(0, ...ticks.map(Math.abs));
   for (let digits = f.digits ?? 1; ; digits++) {
-    const texts = ticks.map((v) => numberText(v, { digits, notation, fixed }, hz ? 'Hz' : '', log ? v : of || v));
+    const texts = ticks.map((v) => numberText(v, { digits, notation, fixed }, x ?? '', log ? v : of || v));
     if (digits >= 17 || new Set(texts).size === texts.length) return texts;
   }
 }
+
+/** What a plot names trace `t`: a capture's title, a signal's key. */
+export const titleOf = (t) => t.title ?? t.key;
 
 /**
  * The plot's colours, read from the theme's tokens in app.css. They are the
@@ -724,13 +740,13 @@ export class PlotView {
     return (slots[variant] ??= {});
   }
 
-  /** The traces of the plot's signals the hub has. */
+  /** The traces of the plot's signals the hub has: a capture plot's captures, any other's signals that stream. */
   traces() {
     const out = [];
-    const session = this.hub.session;
-    for (const key of this.config().keys) {
+    const session = this.hub.session, cfg = this.config(), captures = cfg.kind === 'capture';
+    for (const key of cfg.keys) {
       const t = session.byKey.get(key);
-      if (t) out.push(t);
+      if (t && !!t.shots === captures) out.push(t);
     }
     return out;
   }
@@ -798,7 +814,7 @@ export class PlotView {
       // A signal's units as the plot shows them (`shownUnit`).
       const unitOf = (t) => shownUnit(cfg, t.key, (k) => traces.find((x) => x.key === k)?.meta.units ?? '');
       const units = [...new Set(ts.map(unitOf).filter(Boolean))];
-      const named = units.length > 1 ? ts.map((t) => (unitOf(t) ? `${t.key} (${unitOf(t)})` : t.key)).join(', ') : `${ts.map((t) => t.key).join(', ')}${units.length ? ` (${units[0]})` : ''}`;
+      const named = units.length > 1 ? ts.map((t) => (unitOf(t) ? `${titleOf(t)} (${unitOf(t)})` : titleOf(t))).join(', ') : `${ts.map(titleOf).join(', ')}${units.length ? ` (${units[0]})` : ''}`;
       const y0 = Math.max(lane.y, head + CLEAR) + CLEAR, y1 = lane.y + lane.h - Math.min(2, tabs[i]) * (TAB.h + CLEAR) - CLEAR;
       const text = [f.label === 'name' && named, units.join(', ')].find((s) => s && this.ctx.measureText(s).width <= y1 - y0);
       if (text) out.set(key, { text, side, slot, y0, y1 });
@@ -898,7 +914,7 @@ export class PlotView {
     const geo = this.geometry(body, cfg, traces.length);
     this.geo = geo;
     this.publishFrame(body, geo.plot);
-    if (cfg.kind === 'spectrum') this.drawSpectrum(cfg, traces, geo, body);
+    if (isSlice(cfg.kind)) this.drawSlice(cfg, traces, geo, body);
     else this.drawTime(cfg, traces, geo, body, perf);
     this.placeReadout(body, cfg.readoutAt ?? null);
   }
@@ -1028,24 +1044,39 @@ export class PlotView {
       const ring = this.renderer.ring(p.src);
       if (this.renderer.lane(lane, ring.base, x0, x1, y0, y1, prefs.traceWidth, rgbaOf(p.t, this.colors))) this.renderer.drawTrace(p.src, ring, p.a0, p.a1);
     });
-    this.drawOverlay(cfg, geo, body, plans, ranges, [x0, x1], false);
+    this.drawOverlay(cfg, geo, body, plans, ranges, [x0, x1], null);
   }
 
-  drawSpectrum(cfg, traces, geo, body) {
+  /**
+   * What sets the plot's x axis apart as a slice's, {density, unit, log}:
+   * `density` whether it shows spectra, densities along frequency, whose
+   * axes are log where the plot says so, or captures, along the x their
+   * device gives them, in `unit`, on linear axes.
+   */
+  sliceAxes(cfg) {
+    const density = cfg.kind === 'spectrum';
+    return { density, unit: density ? 'Hz' : (this.traces()[0]?.meta.xUnits ?? ''), log: { x: density && !!cfg.xLog, y: density && !!cfg.yLog } };
+  }
+
+  /** Draws a spectrum plot or a capture plot: of each signal the slice it shows (`sliceOf`), over the shots an overlay draws beneath it. */
+  drawSlice(cfg, traces, geo, body) {
+    const slice = this.sliceAxes(cfg);
     // Each axis is log or linear: a log axis's GL coordinates are log10.
-    const lx = cfg.xLog ? Math.log10 : (v) => v, ly = cfg.yLog ? Math.log10 : (v) => v;
+    const lx = slice.log.x ? Math.log10 : (v) => v, ly = slice.log.y ? Math.log10 : (v) => v;
     const plans = [];
     let fmin = Infinity, fmax = -Infinity;
     for (const t of traces) {
-      const s = this.spectrumOf(t);
+      const s = this.sliceOf(t);
       if (!s || s.f.length < 2) continue;
       let lo = Infinity, hi = -Infinity;
-      for (const a of s.a) {
-        if (a < lo) lo = a;
-        if (a > hi) hi = a;
+      for (const line of [s, ...(s.under ?? [])]) {
+        for (const a of line.a) {
+          if (a < lo) lo = a;
+          if (a > hi) hi = a;
+        }
+        fmin = Math.min(fmin, line.f[0]);
+        fmax = Math.max(fmax, line.f.at(-1));
       }
-      fmin = Math.min(fmin, s.f[0]);
-      fmax = Math.max(fmax, s.f.at(-1));
       plans.push({ t, s, lo: ly(lo), hi: ly(hi), index: traces.indexOf(t) });
     }
     const ext = new Map();
@@ -1057,25 +1088,31 @@ export class PlotView {
     // The frequencies shown: those the plot was set to, or every bin.
     const [f0, f1] = cfg.fRange ?? [fmin, fmax];
     const lx0 = lx(f0), lx1 = lx(f1);
-    const variant = `spectrum:${cfg.xLog}:${cfg.yLog}`;
+    const variant = `slice:${slice.log.x}:${slice.log.y}`;
     for (const p of plans) {
       const lane = geo.lanes[this.laneOf(cfg, p.index)];
       const [y0, y1] = ranges.get(this.rangeKey(cfg, p.t));
-      if (!this.renderer.lane(lane, 0, lx0, lx1, y0, y1, prefs.traceWidth, rgbaOf(p.t, this.colors))) continue;
-      this.renderer.drawStatic(this.slotOf(p.t, variant), p.s, () => {
-        const pts = new Float32Array(p.s.f.length * 2);
-        for (let i = 0; i < p.s.f.length; i++) {
-          pts[i * 2] = lx(p.s.f[i]);
-          pts[i * 2 + 1] = ly(p.s.a[i]);
-        }
-        return pts;
-      });
+      const rgba = rgbaOf(p.t, this.colors);
+      // Each line from a buffer of its own, uploaded once: the slice's by the signal, a shot's beneath it by the shot.
+      const line = ({ f, a }, of, source, alpha) => {
+        if (!this.renderer.lane(lane, 0, lx0, lx1, y0, y1, prefs.traceWidth, [rgba[0], rgba[1], rgba[2], rgba[3] * alpha])) return;
+        this.renderer.drawStatic(this.slotOf(of, variant), source, () => {
+          const pts = new Float32Array(f.length * 2);
+          for (let i = 0; i < f.length; i++) {
+            pts[i * 2] = lx(f[i]);
+            pts[i * 2 + 1] = ly(a[i]);
+          }
+          return pts;
+        });
+      };
+      for (const under of p.s.under ?? []) line(under, under.shot, under.shot, under.alpha);
+      line(p.s, p.t, p.s, 1);
     }
     const xd = plans.length ? [f0, f1] : null;
-    // What this frame draws: the frequencies, and each signal's spectrum.
+    // What this frame draws: the stretch of x, and each signal's slice.
     this.drawn = { x0: f0, x1: f1, plans };
     this.fExtent = plans.length ? [fmin, fmax] : null;
-    this.drawOverlay(cfg, geo, body, plans, ranges, xd, true, traces);
+    this.drawOverlay(cfg, geo, body, plans, ranges, xd, slice, traces);
   }
 
   /**
@@ -1116,7 +1153,7 @@ export class PlotView {
    * `pressable`, 'tip', with the `value` it writes, which a press goes through.
    */
   drawTip(ctx, T, lane, near, value, px, py) {
-    const name = near.t.key.length > 18 ? `${near.t.key.slice(0, 17)}…` : near.t.key;
+    const title = titleOf(near.t), name = title.length > 18 ? `${title.slice(0, 17)}…` : title;
     const SWATCH = 8, PAD = 5, H = 16, GAP = 10;
     const nameW = ctx.measureText(name).width, valueW = ctx.measureText(value).width;
     const w = PAD + SWATCH + PAD + nameW + PAD + valueW + PAD;
@@ -1160,13 +1197,14 @@ export class PlotView {
 
   /**
    * Draws all but the traces: axes, grid, gaps, cursors, the hover and its
-   * readouts. `spectrum` says the plot shows spectra, whose axes are each
-   * log or linear as the plot sets them; a time plot's are linear. With
+   * readouts. `slice` is what `sliceAxes` gives of a plot that shows
+   * slices, whose x axis is theirs and whose axes are each log or linear
+   * as it says, or null for a time plot, whose axes are linear. With
    * `cfg.grid` false the grid is not drawn, and with `cfg.xTime`
    * 'seconds' a time axis reads the seconds from its left end.
    */
-  drawOverlay(cfg, geo, body, plans, ranges, xd, spectrum, allTraces) {
-    const logX = spectrum && cfg.xLog, logY = spectrum && cfg.yLog, kind = spectrum ? 'spectrum' : 'time';
+  drawOverlay(cfg, geo, body, plans, ranges, xd, slice, allTraces) {
+    const spectrum = !!slice?.density, logX = !!slice?.log.x, logY = !!slice?.log.y, kind = spectrum ? 'spectrum' : 'time';
     const ctx = this.ctx;
     const T = cfg.grid === false ? { ...this.theme(), grid: 'rgb(0 0 0 / 0)' } : this.theme();
     ctx.setTransform(this.dpr, 0, 0, this.dpr, -body.x * this.dpr, -body.y * this.dpr);
@@ -1178,7 +1216,7 @@ export class PlotView {
       this.legend = { rows: {}, cursors: null };
       this.pressable = [];
       ctx.fillStyle = T.axisText;
-      const msg = traces.length ? 'waiting for data…' : 'drop signals here';
+      const msg = !traces.length ? 'drop signals here' : slice && !spectrum ? 'no capture yet' : 'waiting for data…';
       ctx.textAlign = 'center';
       ctx.fillText(msg, body.x + body.w / 2, body.y + body.h / 2);
       return;
@@ -1195,7 +1233,7 @@ export class PlotView {
     const dt = Math.min(100, frameAt - (this.overlayAt ?? frameAt));
     this.overlayAt = frameAt;
     const pointer = this.hover;
-    const edgeX = pointer && !spectrum && this.view.live ? P.x + this.liveEdge() * P.w : Infinity;
+    const edgeX = pointer && !slice && this.view.live ? P.x + this.liveEdge() * P.w : Infinity;
     const target = pointer && this.inPlot(pointer.x, pointer.y) && pointer.x >= edgeX ? 1 : 0, was = this.zone ?? 0;
     this.zone = reducedMotion?.matches ? target : was + (target - was) * (1 - Math.exp(-dt / (target ? LIVE_FADE_MS.in : LIVE_FADE_MS.out)));
     if (Math.abs(this.zone - target) < 0.01) this.zone = target;
@@ -1217,7 +1255,7 @@ export class PlotView {
     // X grid and labels. A log axis showing under two decades labels its 2s
     // and 5s too. A label that would run into the one before it, or past the
     // plot's edge, is left out, so a narrow plot labels fewer ticks.
-    const xticks = logX ? sx.ticks(6) : spectrum ? sx.ticks(Math.max(2, P.w / 90)) : time.ticks(xd[0], xd[1], Math.max(2, P.w / 120));
+    const xticks = logX ? sx.ticks(6) : slice ? sx.ticks(Math.max(2, P.w / 90)) : time.ticks(xd[0], xd[1], Math.max(2, P.w / 120));
     const fewDecades = logX && Math.log10(xd[1] / xd[0]) < 2;
     const labelled = (f) => decade(f) || (fewDecades && [2, 5].includes(Math.round(f / 10 ** Math.floor(Math.log10(f) + 1e-9))));
     // The ticks an X cursor dragged with Shift snaps to: each one the grid has a line at.
@@ -1229,9 +1267,9 @@ export class PlotView {
     // With no room beside the plot, the X cursors' tabs rest on the axis's left end.
     const xTabsBeside = P.x - body.x >= 2 * TAB.w + 6;
     let labelEnd = xTabsBeside ? -Infinity : P.x + 2 * TAB.w + 4;
-    // A spectrum's frequencies as its x axis's settings write them.
-    const xFormat = axisFormat(spectrum ? cfg.xFormat : null), fTicks = spectrum ? xticks.filter((f) => !logX || labelled(f)) : [];
-    const fTexts = new Map(tickTexts(fTicks, xFormat, hzLabel, { hz: true, log: logX }).map((text, i) => [fTicks[i], text]));
+    // A slice's x as its x axis's settings write it.
+    const xFormat = axisFormat(slice ? cfg.xFormat : null), fTicks = slice ? xticks.filter((f) => !logX || labelled(f)) : [];
+    const fTexts = new Map(tickTexts(fTicks, xFormat, xTickText(slice?.unit), { x: slice?.unit ?? null, log: logX }).map((text, i) => [fTicks[i], text]));
     for (const tv of xticks) {
       const px = Math.round(sx(tv)) + 0.5;
       if (px < P.x || px > P.x + P.w) continue;
@@ -1242,7 +1280,7 @@ export class PlotView {
         ctx.lineTo(px, lane.y + lane.h);
         ctx.stroke();
       }
-      const label = spectrum ? (fTexts.get(tv) ?? '') : time.label(tv);
+      const label = slice ? (fTexts.get(tv) ?? '') : time.label(tv);
       if (!label) continue;
       const half = ctx.measureText(label).width / 2;
       if (px - half < labelEnd + X_LABEL_GAP || px + half > body.x + body.w) continue;
@@ -1303,7 +1341,7 @@ export class PlotView {
     const rawOf = (p) => (!p.fromWindow || p.src.ratio === 1 ? p.src : p.t.levels[p.level]);
     const rowsOf = (lane, sy) => [(y) => Math.floor(sy(y) - lane.y), Math.ceil(lane.h)];
     // Leaving the axis lets the columns go, so the next hover fades them in.
-    if (!hoverLane || !overAxis || spectrum) this.phosphor.clear();
+    if (!hoverLane || !overAxis || slice) this.phosphor.clear();
     else {
       const axis = axes.find((a) => a.lane === hoverLane && a.side === overAxis.side && a.slot === overAxis.slot);
       const scaled = axis?.plans ?? [];
@@ -1385,7 +1423,7 @@ export class PlotView {
     // link to the device was down, is a band from the last point before it
     // to the first after, between two such lines.
     this.gaps = [];
-    if (!spectrum) {
+    if (!slice) {
       ctx.setLineDash([3, 3]);
       ctx.strokeStyle = ctx.fillStyle = T.gap;
       plans.forEach((p) => {
@@ -1415,6 +1453,7 @@ export class PlotView {
 
     // Cursors: the hover crosshair, and the placed A and B.
     this.xd = xd;
+    this.slice = slice;
     this.spectrum = spectrum;
     this.logX = logX;
     this.logY = logY;
@@ -1445,7 +1484,7 @@ export class PlotView {
     // clear of the X cursors' tabs where they rest on the axis. Drawn before
     // the cursors, whose names on the axis show over it.
     const open = this.seeking || (!this.view.live && this.axisHover !== null);
-    if ((this.seeking || !this.view.live) && !spectrum && this.history) {
+    if ((this.seeking || !this.view.live) && !slice && this.history) {
       const [h0, h1] = this.history;
       const [top, height] = open ? [P.y + P.h + AXIS_BELOW + 2, 18] : [body.y + body.h - SEEK_BAR, SEEK_BAR];
       const at = (t) => P.x + ((Math.min(Math.max(t, h0), h1) - h0) / (h1 - h0)) * P.w;
@@ -1568,13 +1607,13 @@ export class PlotView {
     // Readouts, which the page shows in the plot's header: each trace's value
     // at the hover, or its newest value while live, and its values at A and
     // B with B - A. Each is written as its y axis's settings say, and a
-    // spectrum's frequencies as its x axis's.
-    const fx = spectrum ? this.fText() : time.readout;
+    // slice's x as its x axis's.
+    const fx = slice ? this.fText() : time.readout;
     const yText = (key, place, units) => this.yText(key, place, units);
     const rows = {};
     // Where a pixel's column holds several points, the hover reads all of
     // them, lowest to highest, as one point there would be any of them.
-    const halfPx = spectrum || marks.hover === null ? 0 : (xd[1] - xd[0]) / P.w / 2;
+    const halfPx = slice || marks.hover === null ? 0 : (xd[1] - xd[0]) / P.w / 2;
     const now = clock.now(), held = this.hoverRead;
     const hold = held && this.hover && held.x === this.hover.x && held.y === this.hover.y && now - held.at < READ_MS;
     // What the numbers say, held between reads; the marker reads anew.
@@ -1583,7 +1622,7 @@ export class PlotView {
     plans.forEach((p) => {
       const lane = this.laneOf(cfg, p.index);
       const sy = yScale(ranges.get(this.rangeKey(cfg, p.t)), geo.lanes[lane]);
-      const at = (v) => (v === null ? null : spectrum ? spectrumAt(p.s, v) : traceAt(p.src, v));
+      const at = (v) => (v === null ? null : slice ? spectrumAt(p.s, v) : traceAt(p.src, v));
       const hover = at(marks.hover);
       const span = halfPx && hover ? traceSpan(p.src, marks.hover - halfPx, marks.hover + halfPx) : null;
       if (!hold) reads.set(p.t.key, { v: hover?.y, span });
@@ -1609,15 +1648,15 @@ export class PlotView {
       const key = this.rangeKey(cfg, p.t), fy = yText(key, 'legend');
       let value = '';
       if (pts.hover && read?.v !== undefined) value = fy(read.v);
-      else if (!spectrum && this.view.live && p.t.length) value = fy(p.t.yAt(p.t.absEnd - 1));
-      // Where the points come from: raw samples, or how many raw rows per point.
-      let info = `${p.t.meta.rate} Hz`;
-      if (!spectrum) info += p.fromWindow ? (p.src.ratio === 1 ? ' · raw' : ` · 1:${p.src.ratio}`) : p.level ? ` · live, level ${p.level}` : ' · live';
+      else if (!slice && this.view.live && p.t.length) value = fy(p.t.yAt(p.t.absEnd - 1));
+      // Where the points come from: raw samples, or how many raw rows per point; a capture's, how many it is of.
+      let info = p.t.shots ? `${p.s.f.length} points` : `${p.t.meta.rate} Hz`;
+      if (!slice) info += p.fromWindow ? (p.src.ratio === 1 ? ' · raw' : ` · 1:${p.src.ratio}`) : p.level ? ` · live, level ${p.level}` : ' · live';
       const fv = yText(key, 'value', p.t.meta.units);
       const cell = (pt) => (pt ? fv(pt.y) : '—');
       // A spectrum's floor, which its chip shows in place of a value, or a dash while there is none.
       const floor = spectrum ? (p.s.floor ? yText(key, 'floor')(p.s.floor) : '—') : null;
-      rows[p.t.key] = { value, floor, info, a: cell(pts.a), b: cell(pts.b), d: pts.a && pts.b ? fv(pts.b.y - pts.a.y) : '—' };
+      rows[p.t.key] = { value, floor, info, note: p.s?.note ?? '', a: cell(pts.a), b: cell(pts.b), d: pts.a && pts.b ? fv(pts.b.y - pts.a.y) : '—' };
     });
     // The cursors' readout: where X1 and X2 are, with each signal's value
     // there, and each y axis's Y1 and Y2, a spectrum's also as a ratio in dB.
@@ -1626,11 +1665,11 @@ export class PlotView {
       marks.a === null && marks.b === null
         ? null
         : {
-            v: spectrum ? 'f' : 't',
+            v: spectrum ? 'f' : slice ? 'x' : 't',
             a: marks.a === null ? '—' : fx(marks.a),
             b: marks.b === null ? '—' : fx(marks.b),
-            d: delta ? (spectrum ? numberText(marks.b - marks.a, formOf(F_AUTO.span, xFormat), 'Hz') : si(marks.b - marks.a, 's')) : '—',
-            rate: delta && !spectrum && marks.b !== marks.a ? si(1 / Math.abs(marks.b - marks.a), 'Hz') : '',
+            d: delta ? (slice ? numberText(marks.b - marks.a, formOf(X_AUTO[cfg.kind].span, xFormat), slice.unit) : si(marks.b - marks.a, 's')) : '—',
+            rate: delta && !slice && marks.b !== marks.a ? si(1 / Math.abs(marks.b - marks.a), 'Hz') : '',
           };
     const ys = [];
     for (const a of axes) {
@@ -1640,7 +1679,7 @@ export class PlotView {
       const both = yc.a !== null && yc.b !== null;
       ys.push({
         key: a.key,
-        name: a.plans.map((p) => p.t.key).join(', '),
+        name: a.plans.map((p) => titleOf(p.t)).join(', '),
         color: a.key === 'shared' ? null : a.color,
         a: yc.a === null ? '—' : fv(yc.a),
         b: yc.b === null ? '—' : fv(yc.b),
@@ -1657,7 +1696,7 @@ export class PlotView {
       const value = v === undefined ? '' : span ? rangeText(span.lo, span.hi, this.yForm(key, 'value'), u) : yText(key, 'value', u)(v);
       this.drawTip(ctx, T, hoverLane, near, value, sx(marks.hover), hy);
     }
-    if (!spectrum) this.drawWindow(ctx, T, P, open, frameAt);
+    if (!slice) this.drawWindow(ctx, T, P, open, frameAt);
   }
 
   /**
@@ -1723,7 +1762,7 @@ export class PlotView {
     const color = { a: T.cursorA, b: T.cursorB };
     const xName = { a: 'X1', b: 'X2' }, yName = { a: 'Y1', b: 'Y2' };
     const inView = (v) => v !== null && v >= xd[0] && v <= xd[1];
-    const fx = this.spectrum ? this.fText() : time.readout;
+    const fx = this.slice ? this.fText() : time.readout;
     // The box and text of a tag centred on (cx, cy), or, with `align`, beside cx on that side.
     const tag = (cx, cy, text, align = 'center') => {
       const w = Math.max(TAB.w, ctx.measureText(text).width + 6);
@@ -1930,10 +1969,10 @@ export class PlotView {
     this.showRange(this.dataAt(Math.min(x0, x1)), this.dataAt(Math.max(x0, x1)));
   }
 
-  /** Shows x from `a` to `b`: a time plot's views that time, paused; a spectrum those frequencies. */
+  /** Shows x from `a` to `b`: a time plot's views that time, paused; a slice that stretch of its x. */
   showRange(a, b) {
     if (a === null || b === null || !(b > a)) return;
-    if (this.config().kind === 'spectrum') this.onFrequencies?.(a, b);
+    if (isSlice(this.config().kind)) this.onFrequencies?.(a, b);
     else for (const v of this.targets()) v.show(a, b, clock.now());
   }
 
@@ -2061,23 +2100,25 @@ export class PlotView {
   /** The signals of y axis `key`, as the readout names them, or null while the plot draws no such axis. */
   axisName(key) {
     const a = this.yAxes.find((a) => a.key === key);
-    return a ? a.plans.map((p) => p.t.key).join(', ') : null;
+    return a ? a.plans.map((p) => titleOf(p.t)).join(', ') : null;
   }
 
-  /** What the plot's x axis counts, for `cursorText`: 'hz' on a spectrum, else its first trace's epoch. */
+  /** What the plot's x axis counts, for `cursorText`: 'hz' on a spectrum, a capture plot's unit as {unit}, else its first trace's epoch. */
   xKind() {
-    return this.config().kind === 'spectrum' ? 'hz' : (this.traces()[0]?.meta.epoch ?? 'zero');
+    const cfg = this.config();
+    if (!isSlice(cfg.kind)) return this.traces()[0]?.meta.epoch ?? 'zero';
+    return cfg.kind === 'spectrum' ? 'hz' : { unit: this.sliceAxes(cfg).unit };
   }
 
   /** The hover position and the X1 and X2 cursors, as a and b, in this plot's x units. */
   markers() {
     const kind = this.config().kind;
-    return { hover: kind === 'spectrum' ? this.specHover : this.hoverTime.t, ...xOf(this.placed, kind) };
+    return { hover: isSlice(kind) ? this.specHover : this.hoverTime.t, ...xOf(this.placed, kind) };
   }
 
-  /** Sets the hover position: a spectrum's own, or the time every time plot marks. */
+  /** Sets the hover position: a slice's own, or the time every time plot marks. */
   setHover(value) {
-    if (this.config().kind === 'spectrum') this.specHover = value;
+    if (isSlice(this.config().kind)) this.specHover = value;
     else this.hoverTime.t = value;
   }
 
@@ -2104,15 +2145,17 @@ export class PlotView {
 
   /**
    * The signals of `plans`, as this frame draws them, for snap.js: a time
-   * plot's points from what it draws them from, a spectrum's bins, each
-   * with what its features stand out by.
+   * plot's points from what it draws them from, a slice's values, each
+   * with what its features stand out by: a spectrum's peaks by decibels,
+   * any other's peaks and troughs by a share of the y range shown.
    */
   snapSignals(plans) {
     if (this.spectrum)
       return plans.map(({ t, s }) => ({ key: t.key, n: s.f.length, x: (i) => s.f[i], y: (i) => s.a[i], stand: STAND.spectrumDb / 20, troughs: false, level: Math.log10 }));
-    return plans.map(({ t, src, a0, a1 }) => {
-      const range = this.yAxes.find((a) => a.plans.some((p) => p.t === t))?.range ?? [0, 0];
-      return { key: t.key, n: Math.max(0, a1 - a0), x: (i) => src.xAt(a0 + i), y: (i) => src.yAt(a0 + i), stand: STAND.timeShare * (range[1] - range[0]) };
+    return plans.map(({ t, s, src, a0, a1 }) => {
+      const range = this.yAxes.find((a) => a.plans.some((p) => p.t === t))?.range ?? [0, 0], stand = STAND.timeShare * (range[1] - range[0]);
+      if (s) return { key: t.key, n: s.f.length, x: (i) => s.f[i], y: (i) => s.a[i], stand };
+      return { key: t.key, n: Math.max(0, a1 - a0), x: (i) => src.xAt(a0 + i), y: (i) => src.yAt(a0 + i), stand };
     });
   }
 
@@ -2214,10 +2257,10 @@ export class PlotView {
     return fixedUnit(axisFormat(this.config().yFormat?.[key]), this.axisUnits(key) ?? '');
   }
 
-  /** How a spectrum's x axis writes a frequency at a cursor's place, as its settings say. */
+  /** How a slice's x axis writes a value at a cursor's place, as its settings say, in its unit. */
   fText() {
-    const form = formOf(F_AUTO.at, axisFormat(this.config().xFormat));
-    return (f) => numberText(f, form, 'Hz');
+    const cfg = this.config(), form = formOf((X_AUTO[cfg.kind] ?? F_AUTO).at, axisFormat(cfg.xFormat)), unit = this.sliceAxes(cfg).unit;
+    return (f) => numberText(f, form, unit);
   }
 
   /** The key of this plot's y axis in `units`, as `axisUnits` names them: signal `key`'s axis when it is one of them, else the first; or null for none. */
@@ -2556,13 +2599,33 @@ export class PlotView {
   }
 
   /**
-   * The spectrum of trace `t` this plot shows: the newest while its view
+   * The slice of trace `t` this plot shows, a signal's spectrum or what the
+   * plot shows of a capture's shots (`shotsOf`): the newest while its view
    * streams, and the one it showed when the view paused until it streams again.
    */
-  spectrumOf(t) {
+  sliceOf(t) {
     const held = this.view.spectra;
-    if (this.view.live || !held.has(t)) held.set(t, t.spectrum);
+    if (this.view.live || !held.has(t)) held.set(t, t.shots ? this.shotsOf(t) : t.spectrum);
     return held.get(t);
+  }
+
+  /**
+   * What the plot shows of capture `c`'s shots, as its settings say
+   * (shots.js `shown`), as a slice: {f, a, floor, under, note, number},
+   * `under` each shot an overlay draws beneath it as {shot, f, a, alpha},
+   * `note` what it says of how many it shows, and `number` the hub's of
+   * its newest; or null with no shot. The same slice until a shot arrives
+   * or a setting changes.
+   */
+  shotsOf(c) {
+    const cfg = this.config(), mode = shotMode(cfg.shots), count = shotCount(cfg.shotCount), newest = c.shots.at(-1);
+    this.shotSlices ??= new WeakMap(); // Capture -> {newest, mode, count, slice}
+    const was = this.shotSlices.get(c);
+    if (was && was.newest === newest && was.mode === mode && was.count === count) return was.slice;
+    const s = shown(c.shots, mode, count);
+    const slice = s && { f: xsOf(s.line), a: s.line.y, floor: null, under: s.under.map(({ shot, alpha }) => ({ shot, f: xsOf(shot), a: shot.y, alpha })), note: shownText(mode, s), number: newest.number };
+    this.shotSlices.set(c, { newest, mode, count, slice });
+    return slice;
   }
 
 }
@@ -2679,7 +2742,7 @@ export class View {
   /** What the hub holds of the plot's signals, as Session `held` gives it. Views sets it for the plot the view is of. */
   held = () => ({ oldest: null, dropped: false, history: null });
   yByKind = new Map(); // plot kind, a spectrum's by y scale -> range key -> {range, auto}: PlotView's `y`
-  spectra = new Map(); // Trace -> the spectrum a spectrum plot shows of it, held while paused: PlotView's `spectrumOf`
+  spectra = new Map(); // Trace or Capture -> the slice a spectrum or a capture plot shows of it, held while paused: PlotView's `sliceOf`
   /** The paused view, as `state` gives it, that the view left when it last went live, or null while it never has. */
   left = null;
   listeners = new Set();

@@ -23,7 +23,7 @@
   import { FORMATS, exportName, exportStamp, fetchExport, mayAskWhere, saveFiles } from './exportfile.js';
   import { IMAGE_FORMATS, LEAST_SIDE, SHAPES, UNITS, bandsOf, canvasFits, devicesText, fileSafe, pictureSize, stampText } from './figure.js';
   import { xOf } from './cursors.js';
-  import { timeAxis } from './plot.js';
+  import { timeAxis, titleOf } from './plot.js';
   import { prefs } from './prefs.svelte.js';
   import { api } from './protocol.js';
   import { bytesEstimate, bytesText, spanText } from './units.js';
@@ -231,34 +231,38 @@
       const key = `${e.cid}|${t0}|${t1}`;
       if (asked.has(key)) continue;
       asked.add(key);
-      Promise.all(e.traces.map((t) => api.rows({ hub: hub.session.id, id: t.meta.id, t0, t1, limit: 0 }))).then(
+      Promise.all(e.traces.filter(streams).map((t) => api.rows({ hub: hub.session.id, id: t.meta.id, t0, t1, limit: 0 }))).then(
         (replies) => (counts = { ...counts, [key]: replies.reduce((n, r) => n + r.count, 0) }),
         () => {},
       );
     }
   });
   const countOf = (e, t0, t1) => counts[`${e.cid}|${t0}|${t1}`] ?? null;
+  /** Whether trace `t` is a signal that streams, whose samples the hub holds and writes to a file: a capture is none. */
+  const streams = (t) => !t.shots;
 
   /**
    * The data files the choices make, each {name, request, samples, holds}:
    * one of every signal of the plots ticked over the time they span, or one
    * each. One file of them is the request the hub always had for them: each
    * signal once, from the earliest to the latest time the plots show, or the
-   * whole capture with no time plot among them.
+   * whole capture with no time plot among them. A plot of captures has no
+   * part in them, as the hub holds no capture.
    */
   const dataFiles = $derived.by(() => {
-    if (!chosen.length) return [];
+    const held = chosen.filter((e) => e.traces.some(streams));
+    if (!held.length) return [];
     const stamp = exportStamp(new Date(openedWall)), ext = FORMATS[format].ext;
     const ask = (es) => {
-      const traces = [...new Map(es.flatMap((e) => e.traces).map((t) => [t.key, t])).values()];
+      const traces = [...new Map(es.flatMap((e) => e.traces.filter(streams)).map((t) => [t.key, t])).values()];
       const spans = es.map((e) => stretchOf(e, range, true)).filter(Boolean);
       const whole = [Math.min(...es.map((e) => e.oldest)), openedAt];
       const [t0, t1] = spans.length ? [Math.min(...spans.map((s) => s[0])), Math.max(...spans.map((s) => s[1]))] : whole;
       const samples = es.reduce((n, e) => (n === null || countOf(e, ...(stretchOf(e, range, true) ?? whole)) === null ? null : n + countOf(e, ...(stretchOf(e, range, true) ?? whole))), 0);
       return { request: { hub: hub.session.id, ids: traces.map((t) => t.meta.id), t0, t1 }, samples, holds: traces.length === 1 ? traces[0].key : `${traces.length} signals`, keys: traces.map((t) => t.key) };
     };
-    if (files === 'one' || chosen.length === 1) return [{ name: exportName(format, new Date(openedWall)), ...ask(chosen) }];
-    return unique(chosen.map((e) => ({ name: `twinleaf-${stamp}-${fileSafe(e.traces.map((t) => t.key).join('+'))}.${ext}`, ...ask([e]) })));
+    if (files === 'one' || held.length === 1) return [{ name: exportName(format, new Date(openedWall)), ...ask(held) }];
+    return unique(held.map((e) => ({ name: `twinleaf-${stamp}-${fileSafe(e.traces.map((t) => t.key).join('+'))}.${ext}`, ...ask([e]) })));
   });
   /** The image files the choices make, each {name, holds, entries}: one image of the plots ticked, one above another, or one each. */
   const imageFiles = $derived.by(() => {
@@ -460,7 +464,7 @@
           <div class="thumb" class:off={!e.on} class:at={i === at}>
             <button class="pick" aria-pressed={i === at} aria-label="Show plot {i + 1}" onclick={() => (at = i)}>
               {#if e.thumb}<img src={e.thumb.src} alt="" style="width: {e.thumb.w}px; height: {e.thumb.h}px" />{:else}<span class="blank"></span>{/if}
-              <small>{e.traces.map((t) => t.key).join(', ') || 'Empty plot'}</small>
+              <small>{e.traces.map(titleOf).join(', ') || 'Empty plot'}</small>
             </button>
             <label><input type="checkbox" bind:checked={e.on} aria-label="Include plot {i + 1}" /> Plot {i + 1}</label>
           </div>
@@ -488,7 +492,7 @@
                   <td class="n">{sizeOf(f) === null ? '…' : bytesEstimate(sizeOf(f))}</td>
                 </tr>
               {:else}
-                <tr><td class="c" colspan="4">Nothing: tick a plot at the side.</td></tr>
+                <tr><td class="c" colspan="4">{chosen.length ? 'No data file of a capture: copy its data from the plot.' : 'Nothing: tick a plot at the side.'}</td></tr>
               {/each}
             </tbody>
           </table>
@@ -612,7 +616,7 @@
         <button class="btn go" onclick={() => place(progress.ready)}>Save file…</button>
       {:else}
         <button class="btn" onclick={close}>Cancel</button>
-        <button class="btn go" disabled={!chosen.length || (tab === 'image' && !!refused)} onclick={save}>{saveLabel}</button>
+        <button class="btn go" disabled={!filesShown.length || (tab === 'image' && !!refused)} onclick={save}>{saveLabel}</button>
       {/if}
     </div>
   </Dialog.Content>

@@ -27,7 +27,7 @@
 
 import { Selection } from './selection.svelte.js';
 import { append, equal, plotIds, presets, removePlot, setRatio, splitBeside } from './layout.js';
-import { ARRANGEMENTS } from './constants.js';
+import { ARRANGEMENTS, CAPTURE_DELAY } from './constants.js';
 import { VIEW_FIELDS, defaultContent, emptyTab, newPlot, remapIds } from './tabs.js';
 
 /** `v` with every object in it frozen, in development; as it is otherwise. */
@@ -172,6 +172,24 @@ export class Workspace {
       if (p?.kind === 'spectrum') for (const i of p.items) keys.add(i.key);
     }
     return [...keys];
+  }
+
+  /**
+   * The captures the open tab's capture plots show, as a Map of capture key
+   * to the seconds between captures its plots on Auto ask for, the shortest
+   * of theirs, or null where none of them is on Auto.
+   */
+  captureAsks() {
+    const asks = new Map();
+    for (const id of plotIds(this.layout)) {
+      const p = this.plots[id];
+      if (p?.kind !== 'capture') continue;
+      for (const i of p.items) {
+        const delay = p.auto ? (p.autoDelay ?? CAPTURE_DELAY) : null, had = asks.get(i.key) ?? null;
+        asks.set(i.key, delay === null ? had : had === null ? delay : Math.min(had, delay));
+      }
+    }
+    return asks;
   }
 
   /** Opens tab `id`, every plot of it showing and none selected. Selecting the tab that is open is no change. */

@@ -24,9 +24,14 @@
 // did not name, sends the page back for a snapshot: it closes the socket
 // and connects again. So does the hub's retiring, which closes the socket.
 //
-// The page sends one message, `spectra`, naming the trace ids it shows as
-// spectra, after each snapshot and whenever the set changes. The hub
-// estimates only those.
+// The page sends `spectra`, naming the trace ids it shows as spectra, after
+// each snapshot and whenever the set changes: the hub estimates only those.
+// It sends `hold` while it holds a plot paused, and of each capture RPC its
+// plots show, `capture` for one capture now, `repeat` for captures again
+// and again, and `stop` to take both back. Each device's `captures` lists
+// its capture RPCs, each one's `capture` says where it stands, and a
+// capture the hub read for this page comes as a capture frame, which is no
+// numbered change.
 //
 // Every /api request answers JSON. One the server cannot serve answers a
 // status other than 2xx with {error}, which `request` throws as an Error.
@@ -46,13 +51,42 @@ export function signalKey(trace) {
   return `${at}${trace.stream}.${trace.column}`;
 }
 
+/** What marks a capture's key among signal keys, ahead of its RPC's name. */
+const CAPTURE = 'capture:';
+
+/**
+ * The name a plot keeps a capture by: its RPC's name after `capture:`, with
+ * the device's route ahead as `signalKey` puts it, as `capture:fid.capture`
+ * and `0/capture:fid.capture`. No signal's key reads so.
+ */
+export function captureKey({ route, rpc }) {
+  const at = route && route !== '/' ? `${route.slice(1)}/` : '';
+  return `${at}${CAPTURE}${rpc}`;
+}
+
+/** Whether `key` is a capture's (`captureKey`) and no signal's. */
+export const isCaptureKey = (key) => key.slice(key.lastIndexOf('/') + 1).startsWith(CAPTURE);
+
+/** What a capture's `error` says once the hub has lost its device, as it drops every page's ask of it (twinleaf-web/src/captures.rs `gone`). */
+export const DEVICE_GONE = 'the device is gone';
+
+/** The typed array of each element type a capture frame carries, by the protocol's code. */
+const ELEMENTS = { 0x10: Uint8Array, 0x11: Int8Array, 0x20: Uint16Array, 0x21: Int16Array, 0x40: Uint32Array, 0x41: Int32Array, 0x42: Float32Array, 0x80: BigUint64Array, 0x81: BigInt64Array, 0x82: Float64Array };
+/** The bytes of a capture frame before its strings. */
+const CAPTURE_HEAD = HEADER + 48;
+
 /**
  * Decodes one binary frame, change `seq` or 0 in a snapshot: points, as
  * {kind: 'points', seq, chunks: [{id, level, brk, xs, ys}]}, where `level` is
  * the decimation the points are of, 0 the finest, and `brk` lifts the
- * pen before the chunk's first point, or the spectra of a round, as
+ * pen before the chunk's first point; the spectra of a round, as
  * {kind: 'spectra', seq, spectra: [{id, f, a, floor}]}, a floor null when
- * there is none.
+ * there is none; or a capture, as {kind: 'capture', seq: 0, route, rpc,
+ * number, type, calibration, x0, dx, name, units, xName, xUnits, elements}:
+ * `elements` the device's own, a typed array of their type over the
+ * frame's bytes, element i being `elements[i] * calibration` in `units` at
+ * `x0 + i * dx` in `xUnits`. A frame of another kind, or a capture of an
+ * element type the page does not read, is null.
  */
 export function decodeFrame(buf) {
   const dv = new DataView(buf);
@@ -92,6 +126,19 @@ export function decodeFrame(buf) {
     }
     return { kind: 'spectra', seq, spectra };
   }
+  if (kind === 3) {
+    const type = dv.getUint8(28), Elements = ELEMENTS[type];
+    if (!Elements) return null;
+    const utf8 = new TextDecoder();
+    let off = CAPTURE_HEAD;
+    const [route, rpc, name, units, xName, xUnits] = Array.from({ length: 6 }, (_, i) => {
+      const length = dv.getUint16(48 + 2 * i, true), text = utf8.decode(new Uint8Array(buf, off, length));
+      off += length;
+      return text;
+    });
+    const elements = new Elements(buf, Math.ceil(off / 8) * 8, dv.getUint32(24, true));
+    return { kind: 'capture', seq, route, rpc, number: Number(dv.getBigUint64(16, true)), type, calibration: dv.getFloat32(32, true), x0: dv.getFloat32(36, true), dx: dv.getFloat32(40, true), name, units, xName, xUnits, elements };
+  }
   return null;
 }
 
@@ -99,6 +146,12 @@ export function decodeFrame(buf) {
 export const spectraMessage = (ids) => JSON.stringify({ type: 'spectra', traces: ids });
 /** Whether the page holds a plot paused, so the hub holds its history as it was then. */
 export const holdMessage = (on) => JSON.stringify({ type: 'hold', on });
+/**
+ * The page's ask of capture RPC `rpc` of the device at `route`: `type`
+ * 'capture' for one capture now, 'repeat' for captures again and again
+ * `delay` seconds after each, or 'stop' to take both back.
+ */
+export const captureMessage = (type, route, rpc, delay) => JSON.stringify({ type, route, rpc, ...(type === 'repeat' && { delay }) });
 
 /**
  * Sends one /api request and returns its reply, or throws the server's

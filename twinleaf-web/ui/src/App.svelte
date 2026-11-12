@@ -19,7 +19,7 @@
   import { MediaQuery, SvelteSet } from 'svelte/reactivity';
   import { Drags } from './lib/drag.svelte.js';
   import { plotIds } from './lib/layout.js';
-  import { exportText, importText, newPlot, saveTabs } from './lib/tabs.js';
+  import { APART, exportText, importText, joined, newPlot, saveTabs } from './lib/tabs.js';
   import { ARRANGEMENTS, DECIMATIONS } from './lib/constants.js';
   import { claim } from './lib/keyrouter.js';
   import CommandItem from './lib/CommandItem.svelte';
@@ -37,7 +37,7 @@
   import { Docks, PANELS, SIDES } from './lib/docks.svelte.js';
   import { byRoute, panelRows } from './lib/properties.js';
   import { ROWS, SIGNAL } from './lib/selection.svelte.js';
-  import SignalList, { matching } from './lib/SignalList.svelte';
+  import SignalList, { listed } from './lib/SignalList.svelte';
   import TabStrip from './lib/TabStrip.svelte';
   import DragOverlay from './lib/DragOverlay.svelte';
   import FocusRing from './lib/FocusRing.svelte';
@@ -46,7 +46,8 @@
   import { DeviceWrites } from './lib/writes.svelte.js';
   import WriteNotice from './lib/WriteNotice.svelte';
   import { MAX_COPY_ROWS, blockTable, lostSeconds, writeTables } from './lib/copy.js';
-  import { timeAxis } from './lib/plot.js';
+  import { timeAxis, titleOf } from './lib/plot.js';
+  import { isSlice } from './lib/constants.js';
   import { navigate, remember } from './lib/focus.js';
   import KeysDialog from './lib/KeysDialog.svelte';
   import ExportDialog from './lib/ExportDialog.svelte';
@@ -115,6 +116,8 @@
   setContext('writes', writes);
   drags.closePlot = (id) => closePlot(id);
   drags.axisDropAt = (plotId, x, y) => plots.pv(plotId)?.axisDropAt(x, y) ?? null;
+  drags.refused = () => toast.warning(APART);
+  drags.step = (fn) => viewHistory.step(fn);
   /** Whether the host has its surface, the canvas behind the page, which the plots mount once it has. */
   let surfaced = $state(false);
   let glCanvas;
@@ -144,6 +147,8 @@
   });
   // The hub estimates the spectra of the open tab's spectrum plots only.
   $effect(() => hub.showSpectra(ws.spectrumKeys()));
+  // And takes the captures its capture plots show: again and again for a plot on Auto, and none of a capture no plot shows.
+  $effect(() => hub.showCaptures(ws.captureAsks()));
   // A new session, or a new decimation, drops every window, so each paused
   // plot reads its own again.
   $effect(() => {
@@ -304,7 +309,7 @@
       .flatMap((side) => docks[side].filter((p) => p.open))
       .flatMap(({ id }) =>
         SIGNAL === `${id}:`
-          ? matching(hub.session.signals, signalQuery).map((t) => SIGNAL + t.key)
+          ? listed(hub.session, signalQuery).map((t) => SIGNAL + t.key)
           : PANELS[id].channels
             ? panelRows(checked, PANELS[id].channels, history.favorites, propertyFilter).map((r) => `${id}:${r.name}`)
             : [],
@@ -579,8 +584,10 @@
     });
   });
 
+  /** Adds a plot of the signals `keys`, of the kind that shows the first, with those of them that kind shows (tabs.js `joined`): a time plot of signals, a capture plot of captures. */
   function newPlotWith(keys) {
-    history.group('New plot', () => ws.addPlot(newPlot('time', 'overlay', keys)));
+    const empty = newPlot('time', 'overlay', []);
+    history.group('New plot', () => ws.addPlot({ ...empty, ...joined(empty, keys) }));
   }
   /** Moves keyboard focus to plot `id`, once it is on the page. */
   async function focusPlot(id) {
@@ -697,6 +704,18 @@
   }
 
   /**
+   * The slices `plot`, a spectrum or a capture plot, shows, each as [trace,
+   * slice]: as its PlotView `pv` shows them (PlotView `sliceOf`), or with
+   * none on the page, each signal's newest spectrum; a signal with no slice
+   * yet as one of no values.
+   */
+  function slicesOf(plot, pv) {
+    const captures = plot.kind === 'capture';
+    const traces = plot.items.map((i) => hub.session.byKey.get(i.key)).filter((t) => t && !!t.shots === captures);
+    return traces.map((t) => [t, (pv ? pv.sliceOf(t) : t.spectrum) ?? { f: [], a: [] }]);
+  }
+
+  /**
    * What Ctrl+C on `targets`, plots as commands.js gives them, would copy,
    * from the hub's count of the rows, as {state, rows, reason}: 'ok',
    * 'too-many' past what a paste holds, or 'partial' when history no longer
@@ -705,10 +724,10 @@
   async function copyCheck(targets) {
     const session = hub.session, now = hub.now(clock.now());
     let total = 0, lost = 0;
-    for (const { plot, view } of targets) {
+    for (const { plot, view, pv } of targets) {
       if (!plot.items.length) continue;
-      if (plot.kind === 'spectrum') {
-        total += Math.max(0, ...plot.items.map((i) => session.byKey.get(i.key)?.spectrum?.f.length ?? 0));
+      if (isSlice(plot.kind)) {
+        total += Math.max(0, ...slicesOf(plot, pv).map(([, s]) => s.f.length));
         continue;
       }
       const [t0, t1] = view.range(now);
@@ -737,15 +756,14 @@
     const blocks = [];
     let total = 0, lost = 0;
     for (const { plot, view, pv } of plots) {
-      if (plot.kind === 'spectrum') {
-        const traces = plot.items.map((i) => session.byKey.get(i.key)).filter(Boolean);
-        const spectra = traces.map((t) => pv?.spectrumOf(t) ?? t.spectrum).map((sp) => sp ?? { f: [], a: [] });
+      if (isSlice(plot.kind)) {
+        const slices = slicesOf(plot, pv), spectrum = plot.kind === 'spectrum', meta = slices[0]?.[0].meta;
         const table = blockTable(
-          traces.map((t, i) => ({ key: t.key, units: t.meta.units ? `${t.meta.units}/√Hz` : '/√Hz', x: [...spectra[i].f], y: [...spectra[i].a] })),
-          'frequency (Hz)',
+          slices.map(([t, s]) => ({ key: titleOf(t), units: spectrum ? (t.meta.units ? `${t.meta.units}/√Hz` : '/√Hz') : t.meta.units, x: [...s.f], y: [...s.a] })),
+          spectrum ? 'frequency (Hz)' : `${meta?.xName || 'x'}${meta?.xUnits ? ` (${meta.xUnits})` : ''}`,
         );
         total += table.rows.length;
-        blocks.push({ title: `Spectrum of ${traces.map((t) => t.key).join(', ')}`, ...table });
+        blocks.push({ title: `${spectrum ? 'Spectrum' : 'Capture'} of ${slices.map(([t]) => titleOf(t)).join(', ')}`, ...table });
         continue;
       }
       const [t0, t1] = view.range(now);

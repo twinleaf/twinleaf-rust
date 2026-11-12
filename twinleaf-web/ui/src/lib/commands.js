@@ -81,8 +81,9 @@ import { common, counted } from './menus.js';
 import { axisSlots, cursorText } from './plot.js';
 import { placedIn, withX } from './cursors.js';
 import { nearestPeak, peaks, stepPeak } from './snap.js';
-import { chip } from './tabs.js';
-import { ARRANGEMENTS, KINDS, MODES, kindLabel } from './constants.js';
+import { APART, joined } from './tabs.js';
+import { ARRANGEMENTS, CAPTURE_DELAY, CAPTURE_DELAYS, KINDS, MODES, kindLabel, kindsFor } from './constants.js';
+import { SHOT_COUNTS, SHOT_MODES, shotCount, shotMode } from './shots.js';
 import { writeTables } from './copy.js';
 import { plotIds } from './layout.js';
 import { DIGITS, axisFormat, unitChoices } from './units.js';
@@ -133,6 +134,11 @@ import RiCheck from '@lucide/svelte/icons/check';
 import RiReset from '@lucide/svelte/icons/rotate-ccw';
 import RiDownload from '@lucide/svelte/icons/download';
 import RiUpload from '@lucide/svelte/icons/upload';
+import RiTrigger from '@lucide/svelte/icons/zap';
+import RiAuto from '@lucide/svelte/icons/repeat';
+import RiDelay from '@lucide/svelte/icons/timer';
+import RiShots from '@lucide/svelte/icons/copy-plus';
+import RiCount from '@lucide/svelte/icons/list-ordered';
 
 /** How far an arrow pans, as a share of the span, and zooms, as a factor. */
 const PAN = 0.1, ZOOM = 1.25;
@@ -208,11 +214,11 @@ function setYAxis(ctx, field, { key, to }) {
   });
 }
 
-/** Sets `field` of the x axis settings of each spectrum of `ctx` to `to`, as one edit. */
+/** Sets `field` of the x axis settings of each plot of `ctx`, of the lead plot's kind, to `to`, as one edit: a spectrum's frequencies, or a capture plot's x. */
 function setXAxis(ctx, field, { to }) {
-  const { what, names } = AXIS_SETTINGS[field];
+  const { what, names } = AXIS_SETTINGS[field], kind = ctx.lead?.plot.kind;
   if (!names.has(to)) return false;
-  ctx.svc.edit(ids(ctx), `Frequency ${what.toLowerCase()} ${names.get(to)}`, (plot) => ({ xFormat: withSetting(plot.xFormat, field, to) }));
+  ctx.svc.edit(ids(ctx), `${kind === 'capture' ? 'X' : 'Frequency'} ${what.toLowerCase()} ${names.get(to)}`, (plot) => (plot.kind === kind ? { xFormat: withSetting(plot.xFormat, field, to) } : null));
 }
 
 /** How `field` is set on the axes a y axis command of `ctx` made on y axis `key` acts on, as a row's value: the name of the value they share, or Mixed. */
@@ -325,7 +331,7 @@ const PEAK_ROOM = 0.05;
 function drawnSignals(p, whole) {
   const plans = p.drawn?.plans;
   if (!Array.isArray(plans) || !Array.isArray(p.xd)) return [];
-  return p.snapSignals(whole && !p.spectrum ? plans.map((q) => ({ ...q, a0: q.src.absStart, a1: q.src.absEnd })) : plans).filter((s) => s.n > 0);
+  return p.snapSignals(whole && !p.slice ? plans.map((q) => ({ ...q, a0: q.src.absStart, a1: q.src.absEnd })) : plans).filter((s) => s.n > 0);
 }
 
 /** The peaks of all PlotView `p` holds, in order: a spectrum's among all its bins, a time plot's among all its sources hold. */
@@ -359,7 +365,7 @@ export function peakMove(p, name, dir) {
   // Along the axis's own scale, just far enough to have the peak PEAK_ROOM inside the edge; a spectrum's within its bins.
   const span = to(view[1]) - to(view[0]), v = to(x);
   let lo = v > to(view[1]) ? v + PEAK_ROOM * span - span : v - PEAK_ROOM * span;
-  if (p.spectrum && p.fExtent) lo = Math.max(to(p.fExtent[0]), Math.min(lo, to(p.fExtent[1]) - span));
+  if (p.slice && p.fExtent) lo = Math.max(to(p.fExtent[0]), Math.min(lo, to(p.fExtent[1]) - span));
   return { x, show: [from(lo), from(lo + span)] };
 }
 
@@ -425,7 +431,12 @@ const lacking = (ctx) => ctx.plots.filter((t) => ctx.signals.some((key) => !show
 /** How many signals `ctx` acts on and how many of `plots`, as a row's value, each when more than one, `word` between them: "4 signals to 2 plots". */
 const signalsValue = (ctx, plots, word) => [ctx.signals.length > 1 && counted(ctx.signals.length, 'signal'), plots.length > 1 && counted(plots.length, 'plot')].filter(Boolean).join(` ${word} `) || null;
 /** The signals of `ctx` as an edit names them: the one signal, or how many. */
-const signalsNamed = (ctx) => (ctx.signals.length > 1 ? counted(ctx.signals.length, 'signal') : ctx.signals[0]);
+const signalsNamed = (ctx) => (ctx.signals.length > 1 ? counted(ctx.signals.length, 'signal') : (ctx.svc.titleOf?.(ctx.signals[0]) ?? ctx.signals[0]));
+
+/** Whether a command of a capture plot's is made on one, where a menu has its row. */
+const onCapture = (ctx) => ctx.on?.plot.kind === 'capture';
+/** A delay between two captures as a row names it: "0.5 s". */
+const delayName = (s) => `${s} s`;
 
 /** Every plot command, the plot keys first in the order the keys sheet lists them. */
 export const COMMANDS = [
@@ -487,13 +498,31 @@ export const COMMANDS = [
     run: (ctx) => ctx.svc.close(ids(ctx), ctx.from === 'key'),
   },
   {
-    // Made on a plot it pauses while that plot follows live; from the page, while any it acts on does. Else they follow live.
-    id: 'pause', scope: 'view', needs: ['live'], place: 'page', show: ['Space'], keys: [' '], what: 'Pause, or follow live', empty: true,
+    // Made on a plot it pauses while that plot follows live; from the page, while any it acts on does. Else they follow live. A capture plot shows a capture until the next it asks for, with its own commands.
+    id: 'pause', scope: 'view', kinds: ['time', 'spectrum'], needs: ['live'], place: 'page', show: ['Space'], keys: [' '], what: 'Pause, or follow live', empty: true,
     run: (ctx) => {
       const live = ctx.on ? ctx.on.view.live : ctx.plots.some((t) => t.view.live);
       if (!live) return void follow(ctx, false);
       const perf = clock.now();
       ctx.svc.viewHistory.step(() => ctx.plots.forEach((t) => t.view.pause(perf)));
+    },
+  },
+  {
+    // One capture now of every capture the capture plots it acts on show.
+    id: 'captureNow', scope: 'view', kinds: ['capture'], palette: 'Plots', show: ['T'], keys: ['t', 'T'], what: 'Trigger a capture',
+    icon: RiTrigger, label: 'Trigger',
+    when: onCapture,
+    run: (ctx) => ctx.svc.trigger(ctx.plots.flatMap((t) => t.plot.items.map((i) => i.key))),
+  },
+  {
+    // Captures again and again, or no more, on every capture plot it acts on, as the lead plot's turns: the page asks the hub for what its plots show (App.svelte).
+    id: 'captureAuto', scope: 'view', kinds: ['capture'], palette: 'Plots', show: ['R'], keys: ['r', 'R'], what: 'Auto: capture again and again',
+    icon: RiAuto, label: (ctx) => (ctx.lead?.plot.auto ? 'Stop Auto' : 'Auto'),
+    when: onCapture,
+    value: (ctx) => (ctx.lead ? delayName(ctx.lead.plot.autoDelay ?? CAPTURE_DELAY) : null),
+    run: (ctx) => {
+      const on = !ctx.lead.plot.auto;
+      ctx.svc.edit(ids(ctx), on ? 'Auto capture' : 'Stop Auto capture', () => ({ auto: on }));
     },
   },
   {
@@ -598,13 +627,13 @@ export const COMMANDS = [
     run: (ctx, how) => setYAxis(ctx, 'unit', how ?? {}),
   },
   {
-    id: 'xDigits', scope: 'plot', kinds: ['spectrum'], needs: ['axis'],
+    id: 'xDigits', scope: 'plot', kinds: ['spectrum', 'capture'], needs: ['axis'],
     icon: RiDigits, label: 'Digits',
     value: (ctx) => xAxisValue(ctx, 'digits'),
     run: (ctx, how) => setXAxis(ctx, 'digits', how ?? {}),
   },
   {
-    id: 'xNotation', scope: 'plot', kinds: ['spectrum'], needs: ['axis'],
+    id: 'xNotation', scope: 'plot', kinds: ['spectrum', 'capture'], needs: ['axis'],
     icon: RiNotation, label: 'Notation',
     value: (ctx) => xAxisValue(ctx, 'notation'),
     run: (ctx, how) => setXAxis(ctx, 'notation', how ?? {}),
@@ -693,10 +722,10 @@ export const COMMANDS = [
     run: (ctx, how) => ctx.svc.edit(ids(ctx), how?.to === 'log' ? 'Log frequency scale' : 'Linear frequency scale', (plot) => (plot.kind === 'spectrum' ? { xScale: how?.to } : null)),
   },
   {
-    // The frequencies the spectra show, `how.range` as [low, high], or null for every frequency, as one view step. Its button shows every frequency.
-    id: 'fRange', scope: 'plot', kinds: ['spectrum'], needs: ['axis'],
-    icon: RiFitX, label: 'Show every frequency',
-    run: (ctx, how) => ctx.svc.viewHistory.step(() => ctx.plots.forEach((t) => ctx.svc.ws.setView(t.id, { fRange: how?.range ?? null }))),
+    // The stretch of x the slices of the lead plot's kind show, a spectrum's frequencies or a capture plot's x, `how.range` as [low, high], or null for all of it, as one view step. Its button shows all of it.
+    id: 'fRange', scope: 'plot', kinds: ['spectrum', 'capture'], needs: ['axis'],
+    icon: RiFitX, label: (ctx) => (ctx.lead?.plot.kind === 'capture' ? 'Show the whole capture' : 'Show every frequency'),
+    run: (ctx, how) => ctx.svc.viewHistory.step(() => ctx.plots.forEach((t) => t.plot.kind === ctx.lead.plot.kind && ctx.svc.ws.setView(t.id, { fRange: how?.range ?? null }))),
   },
   {
     // Signal `how.key`'s axis on side `how.to` of SIDES, hidden with 'none', on each independent plot that shows the signal. A menu has its row on an independent plot. A row or a button made with a side moves the axis there.
@@ -710,7 +739,8 @@ export const COMMANDS = [
     run: (ctx, how) => {
       const { key, to } = how ?? {};
       if (!SIDES.some(([side]) => side === to)) return false;
-      ctx.svc.edit(ids(ctx), to === 'none' ? `Hide ${key}'s axis` : `${key}'s axis on the ${to}`, (plot) => (sided(plot, key) ? { axisSides: { ...plot.axisSides, [key]: to } } : null));
+      const named = ctx.svc.titleOf?.(key) ?? key;
+      ctx.svc.edit(ids(ctx), to === 'none' ? `Hide ${named}'s axis` : `${named}'s axis on the ${to}`, (plot) => (sided(plot, key) ? { axisSides: { ...plot.axisSides, [key]: to } } : null));
     },
   },
   {
@@ -727,9 +757,10 @@ export const COMMANDS = [
     id: 'setKind', scope: 'plot', palette: 'Plots',
     icon: RiKind, label: 'Kind',
     value: (ctx) => common(ctx.plots.map((t) => nameIn(KINDS, t.plot.kind))),
-    choices: () => KINDS,
+    // The kinds the lead plot may be, which each plot it acts on becomes where it may (constants.js `kindsFor`).
+    choices: (ctx) => kindsFor(ctx.lead?.plot.kind ?? 'time'),
     chosen: (ctx) => ctx.lead?.plot.kind,
-    run: (ctx, how) => (KINDS.some(([kind]) => kind === how?.to) ? ctx.svc.edit(ids(ctx), `Kind ${nameIn(KINDS, how.to)}`, () => ({ kind: how.to })) : false),
+    run: (ctx, how) => (KINDS.some(([kind]) => kind === how?.to) ? ctx.svc.edit(ids(ctx), `Kind ${nameIn(KINDS, how.to)}`, (plot) => (kindsFor(plot.kind).some(([kind]) => kind === how.to) ? { kind: how.to } : null)) : false),
   },
   {
     id: 'setLayout', scope: 'plot', palette: 'Plots',
@@ -738,6 +769,36 @@ export const COMMANDS = [
     choices: () => MODES,
     chosen: (ctx) => ctx.lead?.plot.mode,
     run: (ctx, how) => (MODES.some(([mode]) => mode === how?.to) ? ctx.svc.edit(ids(ctx), `Layout ${nameIn(MODES, how.to)}`, () => ({ mode: how.to })) : false),
+  },
+  // A capture plot's settings: how long Auto waits after each capture, and
+  // what it shows of the shots it has (shots.js), `how.to` the value each sets.
+  {
+    id: 'captureDelay', scope: 'plot', kinds: ['capture'], palette: 'Plots',
+    icon: RiDelay, label: 'Auto delay',
+    when: onCapture,
+    value: (ctx) => common(ctx.plots.map((t) => delayName(t.plot.autoDelay ?? CAPTURE_DELAY))),
+    choices: () => CAPTURE_DELAYS.map((s) => [s, delayName(s)]),
+    chosen: (ctx) => ctx.lead?.plot.autoDelay ?? CAPTURE_DELAY,
+    run: (ctx, how) => (CAPTURE_DELAYS.includes(how?.to) ? ctx.svc.edit(ids(ctx), `Auto delay ${delayName(how.to)}`, () => ({ autoDelay: how.to })) : false),
+  },
+  {
+    id: 'captureShots', scope: 'plot', kinds: ['capture'], palette: 'Plots',
+    icon: RiShots, label: 'Shots',
+    when: onCapture,
+    value: (ctx) => common(ctx.plots.map((t) => nameIn(SHOT_MODES, shotMode(t.plot.shots)))),
+    choices: () => SHOT_MODES,
+    chosen: (ctx) => shotMode(ctx.lead?.plot.shots),
+    run: (ctx, how) => (SHOT_MODES.some(([mode]) => mode === how?.to) ? ctx.svc.edit(ids(ctx), `Shots ${nameIn(SHOT_MODES, how.to)}`, () => ({ shots: how.to })) : false),
+  },
+  {
+    // How many shots an overlay or an average takes. A menu has its row while the lead plot shows either.
+    id: 'captureCount', scope: 'plot', kinds: ['capture'], palette: 'Plots',
+    icon: RiCount, label: 'Shot count',
+    when: (ctx) => onCapture(ctx) && shotMode(ctx.on.plot.shots) !== 'latest',
+    value: (ctx) => common(ctx.plots.map((t) => String(shotCount(t.plot.shotCount)))),
+    choices: () => SHOT_COUNTS.map((n) => [n, String(n)]),
+    chosen: (ctx) => shotCount(ctx.lead?.plot.shotCount),
+    run: (ctx, how) => (SHOT_COUNTS.includes(how?.to) ? ctx.svc.edit(ids(ctx), `Shot count ${how.to}`, () => ({ shotCount: how.to })) : false),
   },
   {
     // To the end of tab `how.to`, as one edit. Its row names the open tab, and cannot be chosen while that is the only one.
@@ -759,17 +820,16 @@ export const COMMANDS = [
     run: (ctx) => ctx.svc.edit(ids(ctx), 'Remove every signal', () => ({ items: [] })),
   },
   {
-    // Each selected plot gets those of the signals it lacks. A menu has its row unless every selected plot shows them all.
+    // Each selected plot gets those of the signals it lacks and can show (tabs.js `joined`), and where none can show any, a notice says why. A menu has its row unless every selected plot shows them all.
     id: 'addToPlots', scope: 'plot', needs: ['signals'], place: 'list', show: ['Enter'], keys: ['Enter'], shift: false, what: 'Add to the selected plots',
     icon: RiAdd, label: 'Add to plot',
     when: (ctx) => !ctx.plots.length || lacking(ctx).length > 0,
     value: (ctx) => (ctx.plots.length ? signalsValue(ctx, lacking(ctx), 'to') : 'No plot selected'),
     disabled: (ctx) => !ctx.plots.length,
-    run: (ctx) =>
-      ctx.svc.edit(ids(ctx), `Add ${signalsNamed(ctx)}`, (plot) => {
-        const lacks = ctx.signals.filter((key) => !shows(plot, key));
-        return lacks.length ? { items: [...plot.items, ...lacks.map(chip)] } : null;
-      }),
+    run: (ctx) => {
+      if (lacking(ctx).length && !ctx.plots.some((t) => joined(t.plot, ctx.signals))) return void ctx.svc.toast.warning(APART);
+      ctx.svc.edit(ids(ctx), `Add ${signalsNamed(ctx)}`, (plot) => joined(plot, ctx.signals));
+    },
   },
   {
     // Each selected plot loses those of the signals it shows. A menu has its row, in place of Add to plot, where every selected plot shows them all.
@@ -893,7 +953,9 @@ export const listed = (c) => !!c.label && !c.needs?.some((n) => ORIGIN.includes(
  * last; and what the commands write through: `ws`, `selection`,
  * `viewHistory`, `cursors`, `toast`, `edit(ids, what, fn)`, `group(what,
  * fn)`, which runs `fn` as one edit named `what`, `split(ids, dir,
- * fromKeys)`, `close(ids, fromKeys)`, `newPlot(keys)`, `copy(plots)`,
+ * fromKeys)`, `close(ids, fromKeys)`, `newPlot(keys)`, `trigger(keys)`,
+ * which asks the hub for one capture of each capture of `keys`,
+ * `titleOf(key)`, what the page names the signal of `key`, `copy(plots)`,
  * `copyCheck(plots)`, `copyImage(id)`, `openExport(plots)`, `picker(id,
  * action)`, `renameTab(id)`, `closeTab(tab)`, `dockShown(side)`,
  * `toggleDock(side)`, `exportTabs()` and `importTabs()`.

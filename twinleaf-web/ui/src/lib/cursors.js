@@ -1,10 +1,11 @@
 // A plot's cursors: X1 and X2 along its x axis and Y1 and Y2 along each y
 // axis. They are part of the tab (tabs.js), kept on the plot as `cursors`:
 //
-//   {x: {a, b}, f: {a, b}, y: {<kind>: {<axis key>: {a, b}}}}
+//   {x: {a, b}, f: {a, b}, c: {a, b}, y: {<kind>: {<axis key>: {a, b}}}}
 //
-// `x` is a time plot's X1 and X2, in device time, and `f` a spectrum's, in
-// Hz; `y` holds Y1 and Y2 of each y axis, by the plot's kind and the axis's
+// `x` is a time plot's X1 and X2, in device time, `f` a spectrum's, in Hz,
+// and `c` a capture plot's, in its captures' x units;
+// `y` holds Y1 and Y2 of each y axis, by the plot's kind and the axis's
 // range key (plot.js `rangeKey`), in the units the axis shows. `a` is
 // cursor 1 and `b` cursor 2, a number or null when not placed. A part with
 // nothing placed is left out, and a plot with no cursor has no `cursors`,
@@ -18,8 +19,8 @@
 // back the pause and the cursors it had (viewhistory.svelte.js keeps this);
 // and a tab read from storage or a file has none, but on a time plot kept
 // paused, which loads paused (tabs.js), and loses them once loaded if the
-// hub no longer holds what it shows (`unloaded`). Y cursors and a
-// spectrum's `f` stay as they are.
+// hub no longer holds what it shows (`unloaded`). Y cursors, a spectrum's
+// `f` and a capture plot's `c` stay as they are.
 //
 // The values are never changed in place: each change here gives a new one.
 // CursorEdits is the one writer of a plot's `cursors`: every change is an
@@ -30,9 +31,10 @@
 import { counted } from './menus.js';
 
 const NONE = Object.freeze({ a: null, b: null });
-const KINDS = ['time', 'spectrum'];
-/** The field of X1 and X2 on a plot of `kind`. */
-const xField = (kind) => (kind === 'spectrum' ? 'f' : 'x');
+/** The field of X1 and X2 on a plot of each kind. */
+const X_FIELDS = { time: 'x', spectrum: 'f', capture: 'c' };
+const KINDS = Object.keys(X_FIELDS);
+const xField = (kind) => X_FIELDS[kind] ?? 'x';
 const some = (pair) => pair.a !== null || pair.b !== null;
 
 /** X1 and X2, as {a, b}, of `cursors` on a plot of `kind`. */
@@ -43,7 +45,7 @@ export const yOf = (cursors, kind, key) => cursors?.y?.[kind]?.[key] ?? NONE;
 /** `cursors` with every part that has nothing placed left out, or undefined when that is all of it. */
 function tidy(cursors) {
   const out = {};
-  for (const f of ['x', 'f']) if (cursors[f] && some(cursors[f])) out[f] = cursors[f];
+  for (const f of Object.values(X_FIELDS)) if (cursors[f] && some(cursors[f])) out[f] = cursors[f];
   const y = {};
   for (const kind of KINDS) {
     const axes = Object.entries(cursors.y?.[kind] ?? {}).filter(([, pair]) => some(pair));
@@ -83,7 +85,7 @@ export function cursorsFromJson(v) {
   const pair = (p) => (object(p) ? { a: at(p.a), b: at(p.b) } : NONE);
   const y = {};
   for (const kind of KINDS) if (object(v.y?.[kind])) y[kind] = Object.fromEntries(Object.entries(v.y[kind]).map(([key, p]) => [key, pair(p)]));
-  return tidy({ x: pair(v.x), f: pair(v.f), y });
+  return tidy({ ...Object.fromEntries(Object.values(X_FIELDS).map((f) => [f, pair(v[f])])), y });
 }
 
 export class CursorEdits {

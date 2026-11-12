@@ -7,6 +7,7 @@
   // their names, which says what a drop there does.
   import { colorOf } from './plot.js';
   import { colors } from './colors.svelte.js';
+  import { KINDS } from './constants.js';
 
   let { drags, ws, session } = $props();
   /** The room a card of carried rows takes right of the pointer, in px: its widest and its offset. */
@@ -48,7 +49,7 @@
 {#if drags.moving}
   {@const moving = drags.moving}
   {@const p = ws.plots[moving.plotId]}
-  {@const kind = (q) => (q?.kind === 'spectrum' ? 'Spectrum' : 'Time')}
+  {@const kind = (q) => KINDS.find(([k]) => k === q?.kind)?.[1] ?? 'Time'}
   {@const swatch = (key) => { const t = session.trace(key); return t ? colorOf(t, colors) : 'var(--muted-foreground)'; }}
   <div class="move-ghost" class:stack={moving.group.size > 1} style="left: {moving.x + 18}px; top: {moving.y + 18}px">
     {#if moving.group.size > 1}

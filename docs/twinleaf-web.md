@@ -147,7 +147,8 @@ A capture is a device's one-shot readout of a buffer, such as the ADC
 samples of one FID shot. A device has one capture RPC per kind of capture
 (flagged CAPTURE, or named `*.capture` on a device that does not flag
 it). A capture has no absolute time, and the hub sends none. The page
-draws nothing of this yet: `ui/` neither asks for captures nor reads them.
+lists them in its Signals list and draws them in capture plots, as "A
+capture, to a pixel" says below.
 
 **Listing.** As a device's table loads, the hub lists its capture RPCs and
 reads each one's metadata once, without triggering, for what the device
@@ -271,10 +272,11 @@ canvas and its WebGL layer.
 |---|---|
 | `App.svelte` | the shell: toolbar, the resizable left and right docks, tab strip, tiles, dialogs |
 | `lib/docks.svelte.js`, `Dock.svelte` | the docks' panels: where each is, folded or open, dragged by its header or moved by its menu |
-| `lib/hub.svelte.js` | the socket, the current `Session`, sequence checks, spectra subscription |
-| `lib/session.svelte.js` | one hub's state: `Trace`s, `Detail` windows, `Device`s, the clock |
+| `lib/hub.svelte.js` | the socket, the current `Session`, sequence checks, what the page asks of the hub: spectra, the hold, captures |
+| `lib/session.svelte.js` | one hub's state: `Trace`s, `Detail` windows, `Capture`s, `Device`s, the clock |
 | `lib/loss.svelte.js` | what the page lost and where, since it opened and in the last minute, across hubs |
-| `lib/protocol.js` | the protocol mirror, `signalKey`, `api` |
+| `lib/protocol.js` | the protocol mirror, `signalKey`, `captureKey`, `api` |
+| `lib/shots.js` | a capture's shots: calibration, the newest kept, and what a plot shows of them, the newest, an overlay or a mean |
 | `lib/tabs.js` | what a tab is, the default tab, saving, export and import |
 | `lib/workspace.svelte.js` | the tabs as the page edits them, focus, selection |
 | `lib/views.js` | each time plot's `View`, pruned with its plot |
@@ -329,6 +331,44 @@ canvas and its WebGL layer.
    as the rows come. So a window costs by its width, whatever its span
    (`Hub::window`). A spectrum plot draws the newest spectrum, or the one it
    showed when it paused.
+
+### A capture, to a pixel
+
+1. Each device's `captures` makes a `Capture` in the `Session` for every
+   capture RPC it lists, keyed `capture:<rpc>` after the device's route
+   (`captureKey`), a key no signal has. The Signals list shows them under
+   that device's signals, headed Captures, each by the name its metadata
+   gives, and they are picked, dragged and put on plots as signals are.
+2. A plot shows captures or the signals that stream, never both, as they
+   share no x axis (`tabs.js` `kindWith`): a capture given to an empty
+   plot makes it a plot of kind `capture`, a plot that has signals of the
+   other sort takes none and the page says so, and a capture plot can be
+   switched to no other kind.
+3. The page asks the hub for what its plots show (`Hub.showCaptures`, from
+   `Workspace.captureAsks`): `repeat` for a capture some plot of the open
+   tab shows on Auto, at the shortest delay of those plots, `stop` once
+   none does or none shows it, and `capture` for Trigger. Auto and its
+   delay are the plot's, kept with its tab, so a page loaded again asks at
+   once. The hub drops every ask of a device it loses, so the page forgets
+   what it asked and asks again when the device is alive again.
+4. A capture frame is decoded to its elements as a typed array over the
+   frame's bytes, calibrated once to 32-bit floats (`shots.js`; 32-bit
+   floats of calibration 1 are used as they are), and kept as the newest
+   shot of its `Capture`, 64 at most.
+5. A capture plot is a slice, as a spectrum is, drawn by the same path
+   (`PlotView.drawSlice`): its x axis is the capture's own, `x offset + i ×
+   x stride` in the capture's x units, written with an SI prefix (0 to 750
+   µs), and its axes are linear. What it shows of the shots is the plot's
+   setting (`shots`, `shotCount`): the newest, the newest over the ones
+   before it, the older the fainter, or the mean of the newest alike, value
+   by value. Cursors, peaks, the axis popovers, the legend, Copy data and
+   Copy image are a slice's, so a capture plot has them as a spectrum has.
+   Where its capture stands, and how many shots it shows, is written in the
+   plot's lower left corner.
+
+A spectrum's processing settings, when it has them, belong beside a
+capture's: plot settings set by commands (`captureShots`, `captureCount`),
+listed under Show in the plot's menu.
 
 ### A write to two devices
 

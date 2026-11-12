@@ -63,9 +63,13 @@
   // than any other row.
   /** The table's commands the palette lists, each a row (commands.js `offered`), as it opens. */
   const offered = $derived(open ? commands.offered() : []);
+  /** The signals and the captures the palette puts on plots, the captures after the signals. */
+  const signals = $derived([...session.signals, ...session.captures]);
+  /** The value of the row that does `verb` with signal `t`, which what is typed is matched against: its key, and a capture's name ahead of it. */
+  const valueOf = (verb, t) => (t.title ? `${verb} ${t.title} ${t.key}` : `${verb} ${t.key}`);
   const items = $derived({
-    add: session.signals.map((t) => `add ${t.key}`),
-    newPlot: session.signals.map((t) => `new plot ${t.key}`),
+    add: signals.map((t) => valueOf('add', t)),
+    newPlot: signals.map((t) => valueOf('new plot', t)),
     ...Object.fromEntries(PALETTE.map((group) => [group, offered.filter((c) => c.group === group).map((c) => c.find)])),
   });
   const scoreOf = (value) => computeCommandScore(value, state.query);
@@ -222,15 +226,15 @@
       {#if propertiesFirst}{@render properties()}{/if}
       {#if kept.add}
         <Command.Group heading="Add to the selected plots">
-          {#each session.signals as t (t.key)}
-            {#if keep(`add ${t.key}`)}<Command.Item value={`add ${t.key}`} data-command="addToPlots" onSelect={() => run(() => commands.run('addToPlots', { signals: [t.key], from: 'palette' }))}>{t.key}</Command.Item>{/if}
+          {#each signals as t (t.key)}
+            {#if keep(valueOf('add', t))}<Command.Item value={valueOf('add', t)} data-command="addToPlots" onSelect={() => run(() => commands.run('addToPlots', { signals: [t.key], from: 'palette' }))}>{t.title ?? t.key}</Command.Item>{/if}
           {/each}
         </Command.Group>
       {/if}
       {#if kept.newPlot}
         <Command.Group heading="New plot with">
-          {#each session.signals as t (t.key)}
-            {#if keep(`new plot ${t.key}`)}<Command.Item value={`new plot ${t.key}`} data-command="newPlot" onSelect={() => run(() => commands.run('newPlot', { signals: [t.key], from: 'palette' }))}>{t.key}</Command.Item>{/if}
+          {#each signals as t (t.key)}
+            {#if keep(valueOf('new plot', t))}<Command.Item value={valueOf('new plot', t)} data-command="newPlot" onSelect={() => run(() => commands.run('newPlot', { signals: [t.key], from: 'palette' }))}>{t.title ?? t.key}</Command.Item>{/if}
           {/each}
         </Command.Group>
       {/if}

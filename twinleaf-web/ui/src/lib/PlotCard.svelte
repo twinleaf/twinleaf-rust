@@ -32,7 +32,9 @@
   import RiPeak from '@lucide/svelte/icons/mountain';
   import { PlotView, axisSlots, colorOf, monitorOf, shownUnit } from './plot.js';
   import Swatch from './Swatch.svelte';
-  import { DRAG_START, kindLabel } from './constants.js';
+  import { DRAG_START, isSlice, kindLabel } from './constants.js';
+  import { kindWith } from './tabs.js';
+  import { DEVICE_GONE } from './protocol.js';
   import { stepIn } from './keymap.js';
   import WindowField from './WindowField.svelte';
   import * as clock from './clock.js';
@@ -92,6 +94,38 @@
     return t ? colorOf(t, colors) : 'var(--muted-foreground)';
   };
   const unitsOf = (key) => session.trace(key)?.meta.units ?? '';
+  /** What the plot names signal `key`: a capture's title, once a device lists it, else the key. */
+  const nameOf = (key) => session.trace(key)?.title ?? key;
+  /** The captures the plot shows that a device lists, each a Capture: those of a capture plot's signals. */
+  const captures = $derived(plot.kind === 'capture' ? plot.items.map((i) => session.trace(i.key)).filter((c) => c?.shots) : []);
+  /** Whether the plot is a capture plot on Auto, asking for captures again and again. */
+  const autoRow = $derived(commands.row('captureAuto', { on: plot.id }));
+  const triggerRow = $derived(commands.row('captureNow', { on: plot.id }));
+  /** How long a capture has been under way before the plot says so, in ms: one the device takes at once, as each of a run on Auto, comes and goes unsaid. */
+  const CAPTURING_SHOWN_MS = 300;
+  /** The page time the plot last read at, which it reads on while a capture of its is under way. */
+  let readAt = $state(0);
+  /**
+   * Where capture `c` stands, said in a word or two, or nothing while it is
+   * at rest: what it is doing, or why its last capture failed. A device
+   * that is lost says so whatever the capture last said.
+   */
+  function stateText(c) {
+    const s = c.status;
+    if (session.devices.get(c.route)?.presence === 'lost' || (s.state === 'error' && s.error === DEVICE_GONE)) return 'device gone';
+    if (s.state === 'capturing') return readAt - s.since >= CAPTURING_SHOWN_MS ? 'capturing…' : '';
+    if (s.state === 'reading') return `reading ${s.size > 0 ? Math.floor((100 * s.read) / s.size) : 0}%`;
+    if (s.state === 'busy') return 'busy';
+    if (s.state === 'timeout') return 'timed out';
+    if (s.state === 'error') return `error: ${s.error ?? 'unknown'}`;
+    return '';
+  }
+  /** What the plot says of each capture it shows, beside the plot's corner: its name where there are several, its state, and how many shots the plot shows of it. */
+  const captureLines = $derived(
+    captures
+      .map((c) => ({ key: c.key, name: captures.length > 1 ? c.title : '', state: stateText(c), failed: ['busy', 'timeout', 'error'].includes(c.status.state), note: legend.rows[c.key]?.note ?? '' }))
+      .filter((l) => l.state || l.note),
+  );
   /** An independent plot's axes, {left, right}, each the signal keys from the plot outward. */
   const slots = $derived(plot.mode === 'independent' ? axisSlots(drawnItems().map((i) => i.key), plot.axisSides) : null);
   /** Whether signal `key` has no axis of its own on an independent plot. */
@@ -167,7 +201,7 @@
     axisAt = { x: e.clientX - r.left, y: e.clientY - r.top };
     if (region.kind === 'x') {
       fBoundsError = '';
-      const xd = plot.kind === 'spectrum' ? pv?.xd : null;
+      const xd = isSlice(plot.kind) ? pv?.xd : null;
       fBounds = xd ? { lo: shown(xd[0]), hi: shown(xd[1]) } : { lo: '', hi: '' };
       fBoundsShown = { ...fBounds };
       sampleAt = xd ? middle(xd) : null;
@@ -223,16 +257,18 @@
     }
     return false;
   }
-  // A spectrum's frequency range, typed in its x axis's popover.
+  // A slice's x range, a spectrum's frequencies or a capture plot's x, typed in its x axis's popover.
   let fBounds = $state({ lo: '', hi: '' });
   let fBoundsError = $state('');
-  /** Sets the frequencies typed in, and says why it cannot when they do not make a range. Returns whether they hold. */
+  /** What a capture plot's x axis counts, {name, units}, as its first capture's metadata names it. */
+  const captureX = $derived({ name: captures[0]?.meta.xName || 'X', units: captures[0]?.meta.xUnits ?? '' });
+  /** Sets the range of x typed in, and says why it cannot when it does not make a range. Returns whether it holds. */
   function applyFBounds() {
     if (!edited(fBounds, fBoundsShown)) return true;
     const lo = Number(fBounds.lo), hi = Number(fBounds.hi);
     if (!isFinite(lo) || !isFinite(hi) || fBounds.lo.trim() === '' || fBounds.hi.trim() === '') fBoundsError = 'Enter a number in each';
     else if (lo >= hi) fBoundsError = 'Max must be above min';
-    else if (plot.xScale !== 'linear' && lo <= 0) fBoundsError = 'A log axis starts above zero';
+    else if (plot.kind === 'spectrum' && plot.xScale !== 'linear' && lo <= 0) fBoundsError = 'A log axis starts above zero';
     else {
       fBoundsError = '';
       runHere('fRange', { range: [lo, hi] });
@@ -247,7 +283,8 @@
     if (e.key === 'Enter' && applyBounds()) axisOpen = false;
   }
 
-  // The signals menu: every signal the plot does not show, filtered by a
+  // The signals menu: every signal the plot does not show and can (tabs.js
+  // `kindWith`), a capture plot's the captures, filtered by a
   // substring of its name, and kept open so several can be added at once.
   // Focus stays in the filter, where the arrows move the highlight and Enter
   // adds the highlighted signal; the next one takes its place.
@@ -256,7 +293,7 @@
   let addActive = $state(0);
   const addable = $derived.by(() => {
     const has = new Set(plot.items.map((i) => i.key)), f = signalFilter.trim().toLowerCase();
-    return session.signals.filter((t) => !has.has(t.key) && t.key.toLowerCase().includes(f));
+    return [...session.signals, ...session.captures].filter((t) => !has.has(t.key) && kindWith(plot, t.key) && `${t.key}\n${t.title ?? ''}`.toLowerCase().includes(f));
   });
   /** Adds signal `key` to each plot a command here acts on that does not show it. */
   const addSignal = (key) => commands.run('addToPlots', { on: plot.id, signals: [key], from: 'menu' });
@@ -426,7 +463,11 @@
   onMount(() => {
     // The window read is what the view can show of it, which grows as a hub fills.
     const readWindow = () => (windowSpan = view.windowShown(clock.now()));
-    const poll = clock.every(LEGEND_MS, () => (readWindow(), pv?.legend && (legend = pv.legend)));
+    const poll = clock.every(LEGEND_MS, () => {
+      readWindow();
+      if (pv?.legend) legend = pv.legend;
+      if (captures.some((c) => c.status.state === 'capturing')) readAt = clock.now();
+    });
     pv = new PlotView({
       body,
       overlay,
@@ -445,7 +486,7 @@
       onFrequencies: (lo, hi) => host.setView(plot.id, { fRange: [lo, hi] }),
       onFitY: (key) => runHere('fitYAxis', key),
       viewHistory,
-      config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null, yFormat: plot.yFormat ?? null, xFormat: plot.xFormat ?? null, grid: plot.grid ?? true, xTime: plot.xTime ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
+      config: () => ({ kind: plot.kind, mode: plot.mode, sides: plot.axisSides, keys: drawnItems().map((i) => i.key), floorsHidden: drawnItems().filter((i) => i.floorHidden).map((i) => i.key), xLog: plot.xScale !== 'linear', yLog: plot.yScale !== 'linear', fRange: plot.fRange ?? null, shots: plot.shots, shotCount: plot.shotCount, yFormat: plot.yFormat ?? null, xFormat: plot.xFormat ?? null, grid: plot.grid ?? true, xTime: plot.xTime ?? null, readoutAt: overlayDrag?.place === 'readoutAt' ? null : atOf('readoutAt', READOUT_AT) }),
     });
     registry.add(pv);
     host.pickers.set(plot.id, openPicker);
@@ -526,18 +567,18 @@
   }
   function remove(id) {
     const item = plot.items.find((i) => i.id === id);
-    if (item) onEdit(`Remove ${item.key}`, { items: plot.items.filter((i) => i !== item) });
+    if (item) onEdit(`Remove ${nameOf(item.key)}`, { items: plot.items.filter((i) => i !== item) });
   }
   // A signal the plot keeps but does not draw, as a legend hides a series.
   let menuChip = $state(null); // the signal a right-click on its chip opened the menu for
   let legendMenuOpen = $state(false);
   let legendKey = $state(null); // the signal a right-click on its legend row opened the legend's menu for
-  const toggleHidden = (key) => onEdit(`${plot.items.find((i) => i.key === key)?.hidden ? 'Show' : 'Hide'} ${key}`, { items: plot.items.map((i) => (i.key === key ? { ...i, hidden: !i.hidden } : i)) });
+  const toggleHidden = (key) => onEdit(`${plot.items.find((i) => i.key === key)?.hidden ? 'Show' : 'Hide'} ${nameOf(key)}`, { items: plot.items.map((i) => (i.key === key ? { ...i, hidden: !i.hidden } : i)) });
   // Whether a spectrum draws the signal's noise floor line, which its chip's eye turns on and off.
   const toggleFloor = (key) => onEdit(`${plot.items.find((i) => i.key === key)?.floorHidden ? 'Show' : 'Hide'} ${key}'s noise floor`, { items: plot.items.map((i) => (i.key === key ? { ...i, floorHidden: !i.floorHidden } : i)) });
   /** The unit this plot shows signal `key` in (plot.js `shownUnit`), which every place in it that names the signal's unit names. */
   const unitsShown = (key) => shownUnit({ kind: plot.kind, mode: plot.mode, keys: drawnItems().map((i) => i.key), yFormat: plot.yFormat }, key, unitsOf);
-  const showOnly = (key) => onEdit(`Show only ${key}`, { items: plot.items.map((i) => ({ ...i, hidden: i.key !== key })) });
+  const showOnly = (key) => onEdit(`Show only ${nameOf(key)}`, { items: plot.items.map((i) => ({ ...i, hidden: i.key !== key })) });
   const showAll = () => onEdit('Show every signal', { items: plot.items.map((i) => ({ ...i, hidden: false })) });
   /** Whether `e` happened on the header itself or the empty part of its chips. */
   const empty = (e) => e.target === e.currentTarget || e.target.classList?.contains('trace-zone');
@@ -839,7 +880,7 @@
               {@const r = legend.rows[item.key]}
               <div id="chip-{item.id}" data-key={item.key} class:hidden-signal={item.hidden} class="trace-chip" class:ghost={item[SHADOW]} data-menu-for={signalsOpen && menuChip === item.key ? '' : undefined} class:unscaled={axisless(item.key)} role="option" aria-selected={zoneFocused && i === active} style="--c:{colorFor(item.key)}" title={axisless(item.key) ? 'No axis of its own: drag it beside the plot\'s left or right edge to give it one' : r?.info}>
                 <Swatch key={item.key} />
-                <span class="name">{item.key}</span>
+                <span class="name">{nameOf(item.key)}</span>
                 {#if unitsShown(item.key)}<span class="units" data-unit-of={item.key}>{unitsShown(item.key)}</span>{/if}
                 {#if plot.kind === 'spectrum'}
                   <!-- A spectrum's chip shows its white noise floor, always,
@@ -922,8 +963,8 @@
               onpointerdown={(e) => e.preventDefault()}
               onclick={() => addSignal(t.key)}
             >
-              <span class="signal-option" style="--c:{colorOf(t, colors)}"><i></i>{t.key}<small>{t.meta.units}</small></span>
-              <span class="rate">{t.meta.rate} Hz</span>
+              <span class="signal-option" style="--c:{colorOf(t, colors)}"><i></i>{t.title ?? t.key}<small>{t.meta.units}</small></span>
+              <span class="rate">{t.shots ? 'capture' : `${t.meta.rate} Hz`}</span>
             </div>
           {:else}
             <div class="signal-none">{signalFilter ? 'No signal matches' : 'Every signal is shown'}</div>
@@ -952,6 +993,11 @@
         data-command="legend"
         onclick={() => runHere('legend')}
       />
+      {#if plot.kind === 'capture'}
+        <!-- A capture plot shows a capture until the next it asks for: one now, or on Auto again and again. -->
+        <IconButton icon={triggerRow.icon} label={triggerRow.label} keys={triggerRow.show} tabindex={-1} data-command="captureNow" onclick={() => runHere('captureNow')} />
+        <IconButton icon={autoRow.icon} label={autoRow.label} keys={autoRow.show} class={plot.auto ? 'text-primary' : ''} aria-pressed={!!plot.auto} tabindex={-1} data-command="captureAuto" onclick={() => runHere('captureAuto')} />
+      {:else}
       <IconButton
         icon={streaming ? RiPause : RiPlay}
         label={streaming ? 'Pause' : 'Follow live'}
@@ -961,6 +1007,7 @@
         data-command="pause"
         onclick={() => runHere('pause')}
       />
+      {/if}
       <!-- Back and Forward through the views of the tab's plots (viewhistory.svelte.js). -->
       <IconButton icon={RiBack} label="Back to the view before" class="view-step" disabled={!viewHistory.canBack} tabindex={-1} onclick={() => viewHistory.back()} />
       <IconButton icon={RiForward} label="Forward to the view after" class="view-step" disabled={!viewHistory.canForward} tabindex={-1} onclick={() => viewHistory.forward()} />
@@ -974,7 +1021,7 @@
   <Popover.Root bind:open={xAxisOpen}>
     <Popover.Content customAnchor={axisAnchor} side="top" align="start" class="axis-pop w-auto gap-0 p-1.5">
       <div class="axis-head">
-        {plot.kind === 'time' ? 'Time' : 'Frequency'}<span class="units">{plot.kind === 'time' ? 's' : 'Hz'}</span>
+        {plot.kind === 'time' ? 'Time' : plot.kind === 'capture' ? captureX.name : 'Frequency'}<span class="units">{plot.kind === 'time' ? 's' : plot.kind === 'capture' ? captureX.units : 'Hz'}</span>
         {#if plot.kind === 'time' && host.live}
           <span class="axis-tools">
             <Tip text={view.live ? 'Pause' : 'Follow live'} keys={commandOf('pause').show}>
@@ -989,18 +1036,21 @@
           <WindowField data-command="window" value={windowSpan} onchange={(s, typed) => runHere('window', { s, typed })} widest={widestWindow} />
         </div>
       {:else}
-        <!-- The range as a phrase, low to high, in Hz, with the fit to every bin beside it. -->
-        <div class="axis-range" role="group" aria-label="Frequency range" data-command="fRange">
-          <input aria-label="Lowest frequency shown" type="text" inputmode="decimal" bind:value={fBounds.lo} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
+        <!-- The range as a phrase, low to high, in Hz or a capture's x units, with the fit to all of it beside it. -->
+        {@const what = plot.kind === 'capture' ? 'x' : 'frequency'}
+        <div class="axis-range" role="group" aria-label={plot.kind === 'capture' ? 'X range' : 'Frequency range'} data-command="fRange">
+          <input aria-label="Lowest {what} shown" type="text" inputmode="decimal" bind:value={fBounds.lo} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
           <span>to</span>
-          <input aria-label="Highest frequency shown" type="text" inputmode="decimal" bind:value={fBounds.hi} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
+          <input aria-label="Highest {what} shown" type="text" inputmode="decimal" bind:value={fBounds.hi} onkeydown={(e) => e.key === 'Enter' && applyFBounds() && (xAxisOpen = false)} onblur={applyFBounds} />
           {@render tool('fRange', { range: null })}
         </div>
         {#if fBoundsError}<div class="axis-error">{fBoundsError}</div>{/if}
+        {#if plot.kind === 'spectrum'}
         <div class="axis-row" role="group" aria-label="Frequency scale">
           <span>Scale</span>
           {@render scale('xScale', {}, plot.xScale !== 'linear')}
         </div>
+        {/if}
       {/if}
       <div class="axis-row" role="group" aria-label="X cursors">
         <span>Cursors</span>
@@ -1020,8 +1070,8 @@
           {/each}
         </div>
       {/if}
-      {#if plot.kind === 'spectrum'}
-        <!-- How the frequencies are written: a sample of them, and their notation. -->
+      {#if isSlice(plot.kind)}
+        <!-- How a slice's x is written: a sample of it, and its notation. -->
         {@const set = axisFormat(plot.xFormat)}
         <div class="axis-sep"></div>
         {@render sampleLine('xDigits', {}, set.digits, (plot.xFormat, sampleAt === null ? '—' : pv?.fText()(sampleAt)))}
@@ -1097,6 +1147,14 @@
         <div {...props} class="plot-body" bind:this={body} oncontextmenucapture={(e) => (recountCopy(), contextAt(e))}>
           <canvas bind:this={overlay}></canvas>
           <div class="axis-anchor" bind:this={axisAnchor} style="left: {axisAt.x}px; top: {axisAt.y}px"></div>
+          <!-- Where each capture stands and how many shots the plot shows of it, in the plot's lower left corner; a press goes through it. -->
+          {#if captureLines.length}
+            <div class="capture-state" role="status">
+              {#each captureLines as line (line.key)}
+                <div data-key={line.key} class:failed={line.failed}>{#if line.name}<b>{line.name}</b>{/if}{#if line.state}<span class="state">{line.state}</span>{/if}{#if line.note}<span class="note">{line.note}</span>{/if}</div>
+              {/each}
+            </div>
+          {/if}
           <!-- The legend: each signal and its value, one short row apiece,
                no taller than part of the plot, where it was dragged to. A
                row's menu is its chip's. -->
@@ -1110,7 +1168,7 @@
                       {#each plot.items as item (item.id)}
                         <div class="row" role="listitem" data-key={item.key} style="--c:{colorFor(item.key)}" title={item.key}>
                           <!-- A bare plot's legend names its signals, by the name given them where there is one, as a picture of it holds no values. -->
-                          <Swatch key={item.key} /><span class="name">{item.label || item.key}</span>{#if !host.bare}<span class="val">{legend.rows[item.key]?.value ?? ''}</span>{/if}<span class="units" data-unit-of={item.key}>{unitsShown(item.key)}</span>
+                          <Swatch key={item.key} /><span class="name">{item.label || nameOf(item.key)}</span>{#if !host.bare}<span class="val">{legend.rows[item.key]?.value ?? ''}</span>{/if}<span class="units" data-unit-of={item.key}>{unitsShown(item.key)}</span>
                           {#if !host.bare}
                             <Tip text="Remove from this plot" keys={['Delete']}>
                               {#snippet children(tip)}<button {...tip} class="x" tabindex="-1" aria-label="Remove {item.key}" onclick={() => remove(item.id)}>×</button>{/snippet}
@@ -1168,7 +1226,7 @@
                             {#each plot.items as item (item.id)}
                               {@const r = legend.rows[item.key]}
                               <tr>
-                                <th style="--c:{colorFor(item.key)}"><i></i>{item.key}</th>
+                                <th style="--c:{colorFor(item.key)}"><i></i>{nameOf(item.key)}</th>
                                 <td>{r?.a ?? '—'}</td>
                                 <td>{r?.b ?? '—'}</td>
                                 <td>{r?.d ?? '—'}</td>
@@ -1240,6 +1298,10 @@
       <ContextMenu.Label>Show</ContextMenu.Label>
       <CommandItem id="setKind" on={plot.id} />
       <CommandItem id="setLayout" on={plot.id} />
+      <!-- What a capture plot shows of its shots, and how long Auto waits: a slice's own settings. -->
+      <CommandItem id="captureShots" on={plot.id} />
+      <CommandItem id="captureCount" on={plot.id} />
+      <CommandItem id="captureDelay" on={plot.id} />
       <!-- Where the plot is among the page's plots and tabs, on a page that lays them out. -->
       {#if place}
       <ContextMenu.Label>Arrange</ContextMenu.Label>

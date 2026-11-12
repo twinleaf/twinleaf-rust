@@ -66,4 +66,17 @@ describe('the cursors’ text', () => {
       }),
     );
   });
+
+  it('gives a capture’s x an SI prefix on its own unit, a place and a distance alike', () => {
+    const seconds = cursorText({ unit: 's' });
+    expect([seconds.at(250e-6, 1e-4), seconds.span(1.5e-3), seconds.at(0, 1)]).toEqual(['250.0 µs', '1.500 ms', '0 s']);
+    // A unit the page does not know is written as reported.
+    expect(cursorText({ unit: 'samples' }).at(1200, 10)).toBe('1200 samples');
+    fc.assert(
+      fc.property(fc.double({ min: 1e-9, max: 10, noNaN: true }), (x) => {
+        expect(seconds.at(x, 1)).toMatch(/^\d+(\.\d+)? [nµm]?s$/);
+        expect(seconds.span(x)).toBe(seconds.at(x, 1));
+      }),
+    );
+  });
 });

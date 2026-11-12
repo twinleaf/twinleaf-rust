@@ -1,16 +1,35 @@
 <script module>
-  /** The signals of `signals` with every word of `query` in their key, or as their units. */
+  /** The signals of `signals`, or the captures, with every word of `query` in their key, in a capture's title, or as their units. */
   export function matching(signals, query) {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-    return signals.filter((t) => words.every((w) => t.key.toLowerCase().includes(w) || (t.meta.units ?? '').toLowerCase() === w));
+    return signals.filter((t) => words.every((w) => t.key.toLowerCase().includes(w) || (t.title ?? '').toLowerCase().includes(w) || (t.meta.units ?? '').toLowerCase() === w));
+  }
+
+  /** The device a signal or a capture is of, as its key names it: its route, ahead of the name, and nothing for the root device. */
+  const deviceOf = (t) => t.key.slice(0, t.key.lastIndexOf('/') + 1);
+
+  /**
+   * What the list shows of `session` for what the search holds, `query`,
+   * in its order: the signals that match, by key, and after the last of
+   * each device's its captures that match, the Captures of that device;
+   * then those of a device none of whose signals shows.
+   */
+  export function listed(session, query) {
+    const signals = matching(session.signals, query), captures = matching(session.captures, query);
+    const out = signals.flatMap((t, i) => (signals.slice(i + 1).some((s) => deviceOf(s) === deviceOf(t)) ? [t] : [t, ...captures.filter((c) => deviceOf(c) === deviceOf(t))]));
+    return [...out, ...captures.filter((c) => !out.includes(c))];
   }
 </script>
 
 <script>
   // Every signal the hub has, or those the search matches, to pick, to drag
-  // onto the tiles and to put on the selected plots.
+  // onto the tiles and to put on the selected plots; and under each
+  // device's signals its captures, headed Captures, each by the name its
+  // metadata gives it, which are picked, dragged and put on plots as the
+  // signals are (`listed`).
   //
-  // The search matches every word typed against the signal's key and units.
+  // The search matches every word typed against the signal's key and units,
+  // and a capture's name.
   // Signals are picked as the rows of every list are (selection.svelte.js):
   // a click picks one, Ctrl adds or drops one, Shift picks a run. The
   // arrows move the list's cursor, in the list or from its search, and pick
@@ -55,9 +74,10 @@
   const ON_SIGNAL = COMMANDS.filter((c) => c.place === 'list');
   let palette = $state([]);
   let dragging = false;
-  const refresh = () => (palette = matching(session.signals, query).map((t) => ({ id: `pal:${t.key}`, key: t.key })));
+  const refresh = () => (palette = listed(session, query).map((t) => ({ id: `pal:${t.key}`, key: t.key })));
   $effect(() => {
     session.signals;
+    session.captures.forEach((c) => c.title);
     query;
     if (!dragging) refresh();
   });
@@ -192,12 +212,15 @@
   >
     {#each palette as item, i (item.id)}
       {@const t = session.trace(item.key)}
-      <!-- An option of the list, which takes its keys, so it can hold the colour button. -->
+      {@const capture = !!t?.shots}
+      <!-- An option of the list, which takes its keys, so it can hold the colour button. The first capture after a signal is headed Captures (plot.css). -->
       <!-- svelte-ignore a11y_click_events_have_key_events -->
       <div
         id="pal-{item.id}"
         data-key={item.key}
         class="chip"
+        class:capture
+        class:captures-first={capture && !session.trace(palette[i - 1]?.key)?.shots}
         class:picked={picked.has(item.key)}
         class:chosen={searching && i === active}
         data-menu-for={menuOpen && item.key === menuKey ? '' : undefined}
@@ -209,7 +232,7 @@
         onclick={(e) => (pick(i, e, e.detail), list?.focus())}
         ondblclick={() => commands.run('addToPlots', { signal: item.key, from: 'row' })}
       >
-        <Swatch key={item.key} /><span class="sig-key">{item.key}</span>{#if t?.meta.units}<span class="sig-units">{t.meta.units}</span>{/if}<small>{t?.meta.rate} Hz</small>
+        <Swatch key={item.key} /><span class="sig-key" title={capture ? item.key : undefined}>{t?.title ?? item.key}</span>{#if t?.meta.units}<span class="sig-units">{t.meta.units}</span>{/if}<small>{capture ? 'capture' : `${t?.meta.rate} Hz`}</small>
       </div>
     {/each}
   </div>

@@ -240,7 +240,9 @@ describe('a command', () => {
     expect(offered).not.toContain('addYCursors');
     expect(offered).toContain('splitRight');
     const none = page(['time'], [], null, log);
-    expect([...new Set(none.cmds.offered().map((c) => c.id))]).toEqual(COMMANDS.filter((c) => listed(c) && c.scope !== 'plot').map((c) => c.id));
+    // A command of the page's plots is offered while one of them is of its kinds: a capture plot's are not, with none.
+    expect([...new Set(none.cmds.offered().map((c) => c.id))]).toEqual(COMMANDS.filter((c) => listed(c) && c.scope !== 'plot' && (!c.kinds || c.kinds.includes('time'))).map((c) => c.id));
+    expect(page(['capture'], [], null, log).cmds.offered().map((c) => c.id)).toEqual(expect.arrayContaining(['captureNow', 'captureAuto']));
     // With none selected, Restore is offered while plots are maximized, as F then restores.
     expect(page(['time'], [], null, log, ['a']).cmds.offered()).toContainEqual({ id: 'maximize', how: undefined, label: 'Restore', find: 'plots Restore maximize', group: 'Plots' });
     // A command of choices has a row for each, in its own words, matched with its heading: a tab to go to, a dock to hide or show, an arrangement; a label of text reads the choice after it.
@@ -393,7 +395,8 @@ describe('a command', () => {
  * `tall` high, 1 to 3, on a floor of 0, and in each other slot a bump 0.1
  * high, which stands out by less than the rule asks. A time series's points
  * are a tenth of a second apart from 0, its y axis 0 to 3, so the rule asks
- * 0.3; a spectrum's bins 1 Hz apart from 1 Hz, its amplitude 10 to the
+ * 0.3, and a capture's values are the same along its own x; a spectrum's
+ * bins 1 Hz apart from 1 Hz, its amplitude 10 to the
  * power of half that, so its peaks stand 10 to 30 dB and its bumps 1 dB.
  */
 function bumps(kind, slots, tall) {
@@ -401,8 +404,8 @@ function bumps(kind, slots, tall) {
     const k = Math.floor(i / 10), h = slots.includes(k) ? tall[slots.indexOf(k)] : 0.1;
     return h * Math.max(0, 1 - Math.abs((i % 10) - 5) / 3);
   });
-  const xs = lv.map((_, i) => (kind === 'time' ? i / 10 : i + 1));
-  return { xs, ys: kind === 'time' ? lv : lv.map((v) => 10 ** (v / 2)), at: [...slots].sort((a, b) => a - b).map((k) => xs[k * 10 + 5]) };
+  const xs = lv.map((_, i) => (kind === 'spectrum' ? i + 1 : i / 10));
+  return { xs, ys: kind === 'spectrum' ? lv.map((v) => 10 ** (v / 2)) : lv, at: [...slots].sort((a, b) => a - b).map((k) => xs[k * 10 + 5]) };
 }
 const peakSlots = fc.uniqueArray(fc.nat(19), { maxLength: 6 }).chain((slots) => fc.tuple(fc.constant(slots), fc.array(fc.double({ min: 1, max: 3, noNaN: true }), { minLength: slots.length, maxLength: slots.length })));
 
@@ -428,13 +431,13 @@ function peakPage(specs, selected) {
   for (const { id, kind, g, view } of specs) {
     const t = { key: `${id}.s` }, src = { absStart: 0, absEnd: g.xs.length, xAt: (k) => g.xs[k], yAt: (k) => g.ys[k] };
     const pv = Object.assign(Object.create(PlotView.prototype), {
-      plotId: id, config: () => ({ kind }), spectrum: kind === 'spectrum', logX: false, xd: view, cursors,
+      plotId: id, config: () => ({ kind }), spectrum: kind === 'spectrum', slice: kind === 'time' ? null : {}, logX: false, xd: view, cursors,
       fExtent: [g.xs[0], g.xs.at(-1)], hoverTime: { t: null }, specHover: null, yAxes: [{ plans: [{ t }], range: [0, 3] }],
-      xKind: () => (kind === 'spectrum' ? 'hz' : 'zero'),
+      xKind: () => (kind === 'spectrum' ? 'hz' : kind === 'capture' ? { unit: 's' } : 'zero'),
     });
     Object.defineProperty(pv, 'drawn', {
       get() {
-        if (kind === 'spectrum') return { plans: [{ t, s: { f: g.xs, a: g.ys } }] };
+        if (kind !== 'time') return { plans: [{ t, s: { f: g.xs, a: g.ys } }] };
         const first = g.xs.findIndex((x) => x >= pv.xd[0]), past = g.xs.findIndex((x) => x >= pv.xd[1]);
         return { plans: [{ t, src, a0: Math.max(0, first - 1), a1: past < 0 ? g.xs.length : Math.min(g.xs.length, past + 1) }] };
       },
@@ -468,12 +471,12 @@ const edge = (g, k) => g.xs[Math.min(k * 10, g.xs.length - 1)];
 describe('a peak command', () => {
   it('puts X1 on the peak of the view nearest it, or the middle, then steps right through every peak, past the view’s edge as one view step each, and back left, then does nothing, its row saying so', () => {
     fc.assert(
-      fc.property(fc.constantFrom('time', 'spectrum'), peakSlots, fc.integer({ min: 0, max: 20 }), fc.integer({ min: 0, max: 20 }), fc.option(fc.double({ min: 0, max: 1, noNaN: true })), (kind, [slots, tall], i, j, start) => {
+      fc.property(fc.constantFrom('time', 'spectrum', 'capture'), peakSlots, fc.integer({ min: 0, max: 20 }), fc.integer({ min: 0, max: 20 }), fc.option(fc.double({ min: 0, max: 1, noNaN: true })), (kind, [slots, tall], i, j, start) => {
         const g = bumps(kind, slots, tall), view = [edge(g, Math.min(i, j)), edge(g, Math.max(i, j))];
         fc.pre(view[1] > view[0]);
         const p = peakPage([{ id: 'a', kind, g, view }], ['a']);
         const from = start === null ? (view[0] + view[1]) / 2 : view[0] + start * (view[1] - view[0]);
-        if (start !== null) p.cursors.set('Prepare', new Map([['a', kind === 'time' ? { x: { a: from, b: null } } : { f: { a: from, b: null } }]]));
+        if (start !== null) p.cursors.set('Prepare', new Map([['a', { [{ time: 'x', spectrum: 'f', capture: 'c' }[kind]]: { a: from, b: null } }]]));
         const inView = g.at.filter((x) => x > view[0] && x < view[1]);
         const nearest = inView.reduce((best, x) => (best === null || Math.abs(x - from) < Math.abs(best - from) ? x : best), null);
         /** Runs command `id` from the key, and checks it made one edit and one view step, or with nowhere to go, nothing, its row disabled saying `why`. */
@@ -506,6 +509,8 @@ describe('a peak command', () => {
             else {
               expect(now[1] - now[0]).toBeCloseTo(span, 9);
               expect(want > now[0] && want < now[1], `${want} shown in ${now}`).toBe(true);
+              // A slice's view stays within the x it has values at.
+              if (kind !== 'time') expect(now[0] >= g.xs[0] - 1e-9 && now[1] <= g.xs.at(-1) + 1e-9, `${now} within ${[g.xs[0], g.xs.at(-1)]}`).toBe(true);
             }
           }
           run(id, `No peak to the ${dir > 0 ? 'right' : 'left'}`);

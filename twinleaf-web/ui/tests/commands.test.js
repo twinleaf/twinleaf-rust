@@ -261,8 +261,9 @@ describe('a plot command', () => {
       restore();
       page.dispose();
     }
-    // Each command is reached from somewhere, and from every origin that offers it.
-    for (const c of COMMANDS) {
+    // Each command is reached from somewhere, and from every origin that offers it. A command of plots of a kind this page has none of, as a capture plot's, has no origin here: its buttons, keys and rows are tests/captures.test.js's.
+    const shown = ['time', 'spectrum'];
+    for (const c of COMMANDS.filter((c) => !c.kinds || c.kinds.some((kind) => shown.includes(kind)))) {
       const want = [...offers.get(c.id), ...(keyOf(c) ? ['its key'] : []), ...(c.palette ? ['the palette'] : [])];
       expect(want.length, `${c.id} has an origin on the page`).toBeGreaterThan(0);
       expect([...reached.get(c.id)].sort(), c.id).toEqual(want.sort());

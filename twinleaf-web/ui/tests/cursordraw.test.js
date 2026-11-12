@@ -21,6 +21,8 @@ import fc from 'fast-check';
 import { flushSync } from 'svelte';
 import { commands, page as browser } from 'vitest/browser';
 import { editCursors, feed, frames, leafOf, mountPage, settle, until, wait, withExamples } from './harness/page.js';
+import { asKind } from './harness/captures.js';
+import { withXPair } from '../src/lib/cursors.js';
 import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 
@@ -431,13 +433,13 @@ describe('two X cursors close together', () => {
     const page = await mountPage([SIGNALS], 'grid', 0, SIGNALS);
     feed(page.hub);
     const id = plotIds(page.ws.layout)[0];
-    page.history.group('Prepare', () => page.ws.setPlot(id, { kind, readoutAt: { x: 0.5, y: 0.5 } }));
+    asKind(page, id, kind, { readoutAt: { x: 0.5, y: 0.5 } });
     page.views.get(id).pause(clock.now());
     await wait(300);
     await settle(6);
     const pv = page.pv(id);
     const put = (a, b) => {
-      editCursors(page, id, () => ({ [kind === 'spectrum' ? 'f' : 'x']: { a: pv.dataAt(a), b: pv.dataAt(b) } }));
+      editCursors(page, id, () => withXPair(undefined, kind, { a: pv.dataAt(a), b: pv.dataAt(b) }));
       flushSync();
       pv.draw(clock.now());
       const tags = pv.pressable.filter((p) => p.part === 'tag' && p.kind === 'x');
@@ -453,7 +455,7 @@ describe('two X cursors close together', () => {
   const side = (tag, at) => (tag.x + tag.w <= at + 1 ? 'left' : tag.x >= at - 1 ? 'right' : 'on');
   /** The cursor on the left and the one on the right, X1 the left one where they meet. */
   const ordered = ({ a, b }) => (a.at <= b.at ? [a, b] : [b, a]);
-  const KINDS = ['time', 'spectrum'];
+  const KINDS = ['time', 'spectrum', 'capture'];
 
   it('have their tags on their outer sides, each against its own line and clear of the other, at every separation and in either order', async () => {
     const count = { apart: 0, together: 0, namesApart: 0 };

@@ -387,6 +387,9 @@ mod tests {
         expected.extend_from_slice(&[1, 0, 0xfe, 0xff, 3, 0]);
         assert_eq!(frame, expected);
         assert_eq!((frame.len() - 6) % 8, 0, "the elements start on 8 bytes");
+        // The page's tests decode these bytes from a file, and encode them.
+        let kept = include_bytes!("../ui/tests/fixtures/capture-frame.bin");
+        assert_eq!(frame, &kept[..], "the frame the page's tests keep");
     }
 
     #[test]

@@ -10,7 +10,7 @@
 
 import { dock, dockOuter, leaf, rects, restrict } from './layout.js';
 import { OUTER_SHARE, cellAt, moveCells, signalCells } from './moves.js';
-import { chip, newPlot } from './tabs.js';
+import { chip, kindWith, newPlot } from './tabs.js';
 import { DRAG_START } from './constants.js';
 import { claim } from './keyrouter.js';
 import * as clock from './clock.js';
@@ -87,6 +87,10 @@ export class Drags {
   traceDragging = false;
   /** Closes plot `id`: set by the page, which also lets go of what the plot holds. */
   closePlot = (id) => this.ws.closePlot(id);
+  /** Told as a plot takes none of a signal dropped on it (tabs.js `kindWith`): set by the page, which says why. */
+  refused = () => {};
+  /** Runs `fn`, a signal's move, which may change a plot's kind, as one view step: set by the page, whose ViewHistory holds a plot's kind with its view. */
+  step = (fn) => fn();
 
   /**
    * `ws` is the Workspace, `changed()` runs when the selection changes, and
@@ -386,7 +390,10 @@ export class Drags {
    * axes; and {plotId, items} joins that plot, at its place in `items`, its
    * chips with it among them, or after the others without them. A chip that
    * came from a plot leaves it, and a plot whose last signal it was closes;
-   * one emptied with × stays, to be filled again.
+   * one emptied with × stays, to be filled again. A plot is of the kind
+   * that shows the signal (tabs.js `kindWith`): a new one beside a plot
+   * takes that plot's where it does, and a plot that shows signals of
+   * the other sort takes none, which moves nothing and tells `refused`.
    */
   moveSignal(item, to) {
     const ws = this.ws;
@@ -397,26 +404,30 @@ export class Drags {
     /** The plot it goes to, the layout changed to hold it. */
     const place = () => {
       if (opens) {
-        const p = newPlot(ws.plots[to.plotId]?.kind ?? 'time', 'overlay', [item.key]);
+        const p = newPlot(kindWith({ kind: ws.plots[to.plotId]?.kind ?? 'time', items: [] }, item.key), 'overlay', [item.key]);
         ws.placePlot(p, to.plotId ? dock(ws.layout, p.id, to.plotId, to.edge) : dockOuter(ws.layout, leaf(p.id), to.edge, OUTER_SHARE));
         return p.id;
       }
       const p = ws.plots[to.plotId];
       if (!p) return null;
+      const kind = kindWith({ kind: p.kind, items: p.items.filter((i) => i.id !== item.id) }, item.key);
+      if (!kind) return this.refused(), null;
       const seen = new Set();
       const items = (to.items ?? [...p.items, item]).map(own).filter((i) => !seen.has(i.key) && seen.add(i.key));
-      ws.setPlot(p.id, to.edge === 'axis' ? { items, axisSides: { ...p.axisSides, [item.key]: to.side } } : { items });
+      ws.setPlot(p.id, to.edge === 'axis' ? { kind, items, axisSides: { ...p.axisSides, [item.key]: to.side } } : { kind, items });
       return p.id;
     };
-    const id = this.group('Move signal', () => {
-      const id = place();
-      if (id && from && from.id !== id) {
-        const left = from.items.filter((i) => i.id !== item.id);
-        if (left.length) ws.setPlot(from.id, { items: left });
-        else this.closePlot(from.id);
-      }
-      return id;
-    });
+    const id = this.step(() =>
+      this.group('Move signal', () => {
+        const id = place();
+        if (id && from && from.id !== id) {
+          const left = from.items.filter((i) => i.id !== item.id);
+          if (left.length) ws.setPlot(from.id, { items: left });
+          else this.closePlot(from.id);
+        }
+        return id;
+      }),
+    );
     if (id && opens) this.flash([id]);
     return id;
   }

@@ -3,7 +3,7 @@ import fc from 'fast-check';
 import { Detail, Points, Trace } from './session.svelte.js';
 import { scaleLinear, scaleLog } from 'd3-scale';
 import { axisSlots, blurred, F_AUTO, laneTicks, onPixelGrid, pickLevel, pickSource, PlotView, rowCounts, tickTexts, timeAxis, View, Y_AUTO } from './plot.js';
-import { axisFormat, formOf, numberText, si } from './units.js';
+import { axisFormat, formOf, numberText, si, tickText } from './units.js';
 import { Colors } from './colors.svelte.js';
 
 const meta = { id: 0, route: '/', stream: 'sine', column: 'sine', units: 'V', rate: 1000 };
@@ -301,8 +301,14 @@ describe('an axis’s numbers', () => {
     // Ticks 0.01 apart about 100, which two figures would write alike, take as many as tell them apart.
     expect(tickTexts([100, 100.01, 100.02], { digits: 2, notation: 'plain' }, String)).toEqual(['100.00', '100.01', '100.02']);
     expect(tickTexts([0, 0.5, 1], { digits: 3, notation: 'auto' }, String)).toEqual(['0.00', '0.50', '1.00']);
-    expect(tickTexts([500, 1000, 1500], { digits: 2, notation: 'auto' }, String, { hz: true })).toEqual(['500 Hz', '1.0 kHz', '1.5 kHz']);
-    expect(tickTexts([500, 1000, 1500], { digits: null, notation: 'plain' }, String, { hz: true })).toEqual(['500 Hz', '1000 Hz', '1500 Hz']);
+    expect(tickTexts([500, 1000, 1500], { digits: 2, notation: 'auto' }, String, { x: 'Hz' })).toEqual(['500 Hz', '1.0 kHz', '1.5 kHz']);
+    expect(tickTexts([500, 1000, 1500], { digits: null, notation: 'plain' }, String, { x: 'Hz' })).toEqual(['500 Hz', '1000 Hz', '1500 Hz']);
+    // A capture's x axis, in the capture's x units: on Auto each tick with the SI prefix its size gives it and as few digits as it needs; else as its settings say.
+    expect([0, 250e-6, 500e-6, 1e-3, 1.5e-3].map((v) => tickText(v, 's'))).toEqual(['0 s', '250 µs', '500 µs', '1 ms', '1.5 ms']);
+    expect([0, 400, 1200].map((v) => tickText(v, 'samples'))).toEqual(['0 samples', '400 samples', '1200 samples']);
+    expect(tickText(0.5, '')).toBe('0.5');
+    expect(tickTexts([2e-4, 4e-4], { digits: null, notation: 'exp' }, String, { x: 's' })).toEqual(['2e-4 s', '4e-4 s']);
+    expect(tickTexts([250e-6, 500e-6], { digits: 3, notation: 'auto' }, String, { x: 's' })).toEqual(['250 µs', '500 µs']);
   });
 });
 
@@ -499,10 +505,38 @@ describe('A plot’s view', () => {
   });
   it('holds the spectrum a paused spectrum shows, so a plot drawn again with it shows that one', () => {
     const view = new View({ now: () => 0 }), t = { spectrum: 'first' };
-    expect(plot({ kind: 'spectrum' }, view).spectrumOf(t)).toBe('first');
+    expect(plot({ kind: 'spectrum' }, view).sliceOf(t)).toBe('first');
     view.pause(0);
     t.spectrum = 'second';
-    expect(plot({ kind: 'spectrum' }, view).spectrumOf(t)).toBe('first');
+    expect(plot({ kind: 'spectrum' }, view).sliceOf(t)).toBe('first');
+  });
+  it('shows of a capture what its settings say of its shots, the same slice until a shot comes or a setting changes, and holds it while paused', () => {
+    const shot = (number) => ({ number, n: 3, x0: 1, dx: 0.5, y: Float32Array.of(number, 2 * number, 3 * number) });
+    const view = new View({ now: () => 0 }), c = { key: 'capture:fid.capture', shots: [] }, cfg = { kind: 'capture' }, pv = plot(cfg, view);
+    expect(pv.sliceOf(c)).toBe(null);
+    c.shots.push(shot(1), shot(2), shot(3));
+    const latest = pv.sliceOf(c);
+    expect([[...latest.f], [...latest.a], latest.under, latest.note, latest.number, latest.floor]).toEqual([[1, 1.5, 2], [3, 6, 9], [], '', 3, null]);
+    expect(pv.sliceOf(c)).toBe(latest);
+    // An overlay: the newest over the two before it, each with its own values; an average: their mean.
+    cfg.shots = 'overlay';
+    cfg.shotCount = 4;
+    const overlay = pv.sliceOf(c);
+    expect([[...overlay.a], overlay.under.map((u) => [u.shot.number, ...u.a]), overlay.note]).toEqual([[3, 6, 9], [[1, 1, 2, 3], [2, 2, 4, 6]], 'last 3 of 4']);
+    cfg.shots = 'average';
+    expect([[...pv.sliceOf(c).a], pv.sliceOf(c).note]).toEqual([[2, 4, 6], 'avg 3 of 4']);
+    // Paused, as a copy of the plot is, it holds what it showed, whatever comes after.
+    const held = pv.sliceOf(c);
+    view.pause(0);
+    c.shots.push(shot(4));
+    cfg.shots = 'latest';
+    expect(plot(cfg, view).sliceOf(c)).toBe(held);
+  });
+  it('draws of its signals those its kind shows: a capture plot the captures, any other the signals that stream', () => {
+    const stream = { key: 'sine.sine' }, capture = { key: 'capture:fid.capture', shots: [] };
+    const hub = { session: { byKey: new Map([[stream.key, stream], [capture.key, capture]]) } };
+    const of = (kind) => Object.assign(plot({ kind, keys: [stream.key, capture.key, 'gone.signal'] }, null), { hub }).traces();
+    expect([of('time'), of('spectrum'), of('capture')]).toEqual([[stream], [stream], [capture]]);
   });
   it('fits a time plot’s y at once to what its last frame showed, so a fit is a change made then', () => {
     const view = new View({ now: () => 0 }), pv = plot({ kind: 'time' }, view);
