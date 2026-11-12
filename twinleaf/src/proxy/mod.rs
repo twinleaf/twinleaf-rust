@@ -90,7 +90,7 @@
 //! batch of each stream that lost batches carries a
 //! [`Loss`](crate::data::Loss). The
 //! state the proxy sends goes into the connection's store, whose presence,
-//! metadata, RPC table and settings hold only their latest value, so a slow
+//! link, metadata, RPC table and settings hold only their latest value, so a slow
 //! reader sees the newest and misses none it needs. Announced settings
 //! queue in order, and a reader that falls behind them hears how many it
 //! missed. So a sample can be lost in the proxy's outbox, in the pump's
@@ -143,7 +143,9 @@
 //!   other update may overtake the device's packets, and keeps its order
 //!   among the watch's updates of its kind.
 //!   An update is the device's presence, which is connecting, alive in a
-//!   session, or lost some milliseconds before the update went out, one
+//!   session, or lost some milliseconds before the update went out, the
+//!   link that serves it, as the link's URL and why the proxy last lost the
+//!   device, which goes out ahead of the presence it explains, one
 //!   setting it announced, its complete metadata as its own metadata
 //!   packets, that it has no `dev.metadata`, its RPC table as the hash, the
 //!   session and each entry's name and metadata word, why the table did not
@@ -216,7 +218,9 @@
 //! # Logging
 //!
 //! The proxy logs through the `log` crate. Each device's events are logged
-//! under the target `proxy::<url>`. The device's own log packets are logged
+//! under the target `proxy::<url>`, but for those that say a link status the
+//! proxy's clients also hear, which are under `status::<url>`. The device's
+//! own log packets are logged
 //! under `device::<route>` at the level the device gave them. The traffic
 //! [`HostOptions::dump`] asks for is logged at info level.
 

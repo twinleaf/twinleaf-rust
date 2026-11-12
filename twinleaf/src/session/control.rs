@@ -5,7 +5,9 @@
 //! [`handshake`] make requests as a client.
 
 use super::rpc::{CallError, RpcRegistry, RpcRegistryError};
-use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
+use super::state::{
+    LinkState, LostCause, MetadataState, Presence, RegistryState, SettingChange, Settings,
+};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, SessionId, TCP_DEFAULT_PORT};
@@ -294,6 +296,11 @@ pub(crate) enum Update {
     /// the setting before.
     #[n(7)]
     Recorded(#[n(0)] Option<WireEntries>),
+    /// The link that serves the device, as its URL and the code of why the
+    /// proxy last lost the device, if it has. It goes out ahead of the
+    /// presence it explains.
+    #[n(8)]
+    Link(#[n(0)] String, #[n(1)] Option<u8>),
 }
 
 impl Update {
@@ -307,6 +314,11 @@ impl Update {
                 Err(Some(u64::try_from(ago.as_millis()).unwrap_or(u64::MAX)))
             }
         })
+    }
+
+    /// Returns the update of the link that serves a device.
+    pub(crate) fn link(link: &LinkState) -> Update {
+        Update::Link(link.url.clone(), link.lost.map(LostCause::code))
     }
 
     /// Returns the update of a device's metadata, or `None` if a record
@@ -1179,5 +1191,35 @@ mod tests {
         assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
         let again = Update::presence(Presence::Lost { since });
         assert_eq!(again, Update::Presence(Err(Some(1500))));
+    }
+
+    /// A client keeps what an update says of a device's link, its URL and
+    /// each cause of a loss, and an update made of what it keeps says the
+    /// same again. A cause this build does not know is kept as none.
+    #[test]
+    fn a_link_update_carries_the_url_and_each_cause_of_a_loss() {
+        use crate::session::store::LINK;
+        let (mut store, mut parser) = (Store::new(false), PacketParser::new(false));
+        let route = DeviceRoute::root();
+        assert_eq!(store.value(route, LINK), None);
+        let causes = [
+            LostCause::Disconnected,
+            LostCause::Stopped,
+            LostCause::FailedToConnect,
+            LostCause::FailedToReconnect,
+            LostCause::Quiet,
+        ];
+        for lost in causes.map(Some).into_iter().chain([None]) {
+            let url = "tcp://device".to_string();
+            let link = LinkState { url, lost };
+            let update = Update::link(&link);
+            store.apply(route, update.clone(), &mut parser);
+            assert_eq!(store.value(route, LINK), Some(link.clone()));
+            let wire = decode::<Update>(&encode(&update)).expect("an update decodes");
+            assert_eq!(wire, update);
+        }
+        let unknown = Update::Link("tcp://device".to_string(), Some(200));
+        store.apply(route, unknown, &mut parser);
+        assert_eq!(store.value(route, LINK).and_then(|link| link.lost), None);
     }
 }

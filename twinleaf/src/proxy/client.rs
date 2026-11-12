@@ -23,9 +23,9 @@ use crate::proto::{DeviceRoute, PacketType, SessionId, TCP_DEFAULT_PORT};
 use crate::rt::{finish, BoxFuture};
 use crate::session::{answer, encode, Introduction, AUTO, PROXY_KEEPALIVE};
 use crate::session::{Layout, Scope};
+use crate::session::{LinkState, Store, CHANGES, LINK, PRESENCE, REGISTRY, SETTINGS};
 use crate::session::{Purpose, Refusal, Request, Update, Watch};
 use crate::session::{Receiver, RecvError, SettingChange};
-use crate::session::{Store, CHANGES, PRESENCE, REGISTRY, SETTINGS};
 use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{self, is_local_tcp, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
 use futures_util::future;
@@ -757,15 +757,29 @@ impl Binding {
     }
 }
 
-/// Returns the updates of the presence and announced settings of the device
-/// at `route` that `store` holds, each setting after the table it was
-/// recorded under.
+/// Returns the updates of the presence, link and announced settings of the
+/// device at `route` that `store` holds, each setting after the table it
+/// was recorded under. What the link says goes out ahead of a presence when
+/// it is not what the watch last sent, so a lost presence follows its cause.
 pub(super) fn device_updates(
     store: &Mutex<Store>,
     route: DeviceRoute,
 ) -> BoxStream<'static, Update> {
     let mut store = lock(store);
-    let presence = values(store.follow(route, PRESENCE)).map(Update::presence);
+    let link = store.follow(route, LINK);
+    let mut sent: Option<LinkState> = None;
+    let presence = values(store.follow(route, PRESENCE)).flat_map(move |presence| {
+        let mut newest = None;
+        while let Ok(Some(link)) = link.try_recv() {
+            newest = Some(link);
+        }
+        let link = newest.filter(|link| sent.as_ref() != Some(link));
+        if link.is_some() {
+            sent.clone_from(&link);
+        }
+        let link = link.as_ref().map(Update::link);
+        stream::iter(link.into_iter().chain([Update::presence(presence)]))
+    });
     let changes = announced(store.follow(route, CHANGES));
     stream::select_all([presence.boxed(), changes]).boxed()
 }
@@ -1612,6 +1626,43 @@ mod tests {
         }
 
         assert_eq!(ready(&mut updates), [Update::Presence(Ok(Some(999)))]);
+    }
+
+    /// A watch says what a device's link says ahead of the presence it
+    /// explains, once, and again only when the link says something new.
+    #[test]
+    fn a_watch_says_why_a_device_was_lost_ahead_of_its_lost_presence() {
+        use crate::session::{LostCause, Presence};
+        let store = Mutex::new(Store::new(true));
+        let route = DeviceRoute::root();
+        let mut updates = device_updates(&store, route);
+        assert_eq!(ready(&mut updates), [Update::Presence(Err(None))]);
+        let link = |lost| LinkState {
+            url: "tcp://device".to_string(),
+            lost,
+        };
+        let set = |lost, presence| {
+            let mut store = lock(&store);
+            store.set(route, LINK, link(lost));
+            store.set(route, PRESENCE, presence);
+        };
+        set(None, Presence::Alive { session: None });
+        assert_eq!(
+            ready(&mut updates),
+            [Update::link(&link(None)), Update::Presence(Ok(None))]
+        );
+        let since = std::time::Instant::now();
+        set(Some(LostCause::Disconnected), Presence::Lost { since });
+        let said = ready(&mut updates);
+        assert_eq!(said[0], Update::link(&link(Some(LostCause::Disconnected))));
+        assert!(
+            matches!(said[1], Update::Presence(Err(Some(_)))),
+            "{said:?}"
+        );
+        assert_eq!(said.len(), 2);
+        // The presence alone changes: the link's word is not said again.
+        lock(&store).set(route, PRESENCE, Presence::Connecting);
+        assert_eq!(ready(&mut updates), [Update::Presence(Err(None))]);
     }
 
     /// A watch that falls behind the device's announcements says how many

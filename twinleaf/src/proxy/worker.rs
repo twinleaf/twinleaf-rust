@@ -38,9 +38,11 @@
 //! with an RPC error. Control packets a port sends go to the proxy and never
 //! reach the device.
 //!
-//! The worker logs its device's events under the target `proxy::<url>`, the
-//! device's own log packets under `device::<route>` at their own level, and
-//! the traffic [`DumpFlags`] asks for.
+//! The worker logs its device's events under the target `proxy::<url>`, and
+//! those that say a link status it also announces to the engine, which the
+//! proxy's clients hear as a device lost or back, under `status::<url>`. It
+//! logs the device's own log packets under `device::<route>` at their own
+//! level, and the traffic [`DumpFlags`] asks for.
 
 use super::engine::Mount;
 use super::DumpFlags;
@@ -684,6 +686,8 @@ struct Worker {
     command_queue: mpsc::Receiver<OpenPort>,
     /// The target the worker logs under, `proxy::<url>`.
     log_target: String,
+    /// The target it logs a link status it announces under, `status::<url>`.
+    status_target: String,
     /// The traffic to log.
     dump: DumpFlags,
     /// The worker's readiness, which the link watches.
@@ -773,6 +777,7 @@ impl Worker {
         inputs.insert(ENGINE, from_engine);
         Worker {
             log_target: format!("proxy::{url}"),
+            status_target: format!("status::{url}"),
             url,
             reconnect_timeout,
             command_queue,
@@ -843,7 +848,7 @@ impl Worker {
             self.reconnect_deadline = self.reconnect_timeout.map(|timeout| now + timeout);
         }
         if device.seen_since_connect {
-            log::warn!(target: &self.log_target, "Sensor disconnected");
+            log::warn!(target: &self.status_target, "Sensor disconnected");
             self.status_to_engine(packet::LinkStatus::SensorDisconnected);
         } else {
             log::debug!("lost {} before it answered", self.url);
@@ -1044,7 +1049,7 @@ impl Worker {
                 if first_packet {
                     self.reconnect_deadline = None;
                     if self.ever_connected {
-                        log::info!(target: &self.log_target, "Sensor reconnected");
+                        log::info!(target: &self.status_target, "Sensor reconnected");
                         self.status_to_engine(packet::LinkStatus::SensorReconnected);
                     } else {
                         // Initial connect needs no wire status.
@@ -1401,7 +1406,7 @@ impl Worker {
             .is_some_and(|deadline| now >= deadline)
         {
             log::error!(
-                target: &self.log_target,
+                target: &self.status_target,
                 "Stopping reconnection attempts due to timeout"
             );
             self.status_to_engine(packet::LinkStatus::FailedToReconnect);

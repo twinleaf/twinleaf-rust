@@ -751,6 +751,56 @@ async fn a_quiet_loss_and_its_moment_follow_the_paused_clock() {
     assert_eq!(lost, Update::Presence(Err(Some(60_000))));
 }
 
+/// A device heard has its link's URL with no cause of a loss. Once its link
+/// says it disconnected, the link says so ahead of the lost presence, and a
+/// device lost for its silence has that as the cause.
+#[tokio::test(start_paused = true)]
+async fn a_lost_device_has_its_links_url_and_the_cause_of_its_loss() {
+    use crate::session::{LinkState, LostCause, LINK};
+    let tasks = Supervisor::current();
+    let (store, proxy) = engine_on(&tasks);
+    let (root, device) = (DeviceRoute::root(), route("/1"));
+    let followed = presence(&store, root);
+    let quiet = presence(&store, device);
+    let link = |lost| {
+        Some(LinkState {
+            url: "tcp://device".to_string(),
+            lost,
+        })
+    };
+    proxy.send(Packet::heartbeat(root));
+    proxy.send(Packet::heartbeat(device));
+    while !followed.recv_async().await.as_ref().is_ok_and(alive) {}
+    assert_eq!(lock(&store).value(root, LINK), link(None));
+
+    // The device at /1 goes silent while the root keeps sending.
+    while !quiet.recv_async().await.as_ref().is_ok_and(alive) {}
+    let beating = async {
+        loop {
+            proxy.send(Packet::heartbeat(root));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    tokio::select! {
+        () = beating => unreachable!(),
+        now = quiet.recv_async() => assert!(now.as_ref().is_ok_and(lost), "{now:?}"),
+    }
+    assert_eq!(
+        lock(&store).value(device, LINK),
+        link(Some(LostCause::Quiet))
+    );
+
+    proxy.send(Packet::link(LinkStatus::SensorDisconnected));
+    while !followed.recv_async().await.as_ref().is_ok_and(lost) {}
+    let disconnected = link(Some(LostCause::Disconnected));
+    assert_eq!(lock(&store).value(root, LINK), disconnected);
+    assert_eq!(
+        lock(&store).value(device, LINK),
+        link(Some(LostCause::Quiet)),
+        "a device already lost keeps the cause of its loss"
+    );
+}
+
 /// A device's metadata is pending until it is complete, and pending
 /// again once its link drops it.
 #[test]

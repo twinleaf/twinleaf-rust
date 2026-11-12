@@ -7,10 +7,10 @@ use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
 use crate::rt::Supervisor;
 use crate::session::rpc::{CallError, PendingReply, RpcMeta, RpcRegistry, RpcRegistryError};
-use crate::session::{Field, CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
+use crate::session::{Field, CHANGES, LINK, METADATA, PRESENCE, REGISTRY, SETTINGS};
 use crate::session::{Handle, Session};
 use crate::session::{Layout, ProxyAddress, Purpose, Receiver, RecvError, Scope};
-use crate::session::{MetadataState, Presence, RegistryState, SettingChange, Settings};
+use crate::session::{LinkState, MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::tio;
 use crate::tio::rpc::{RpcArgs, RpcReply};
 use crate::tio::transport::is_local_tcp;
@@ -727,6 +727,16 @@ impl Device {
     /// behind skips to the newest.
     pub fn presence_updates(&self) -> Receiver<Presence> {
         self.state(PRESENCE)
+    }
+
+    /// Subscribes to what the proxy says of the link that serves this
+    /// device. The receiver yields the link's URL, with why the proxy last
+    /// lost the device if it has, once the proxy has heard the device, then
+    /// each change. A loss of the device reaches
+    /// [`presence_updates`](Self::presence_updates) after its cause is here.
+    /// A reader that falls behind skips to the newest.
+    pub fn link_updates(&self) -> Receiver<LinkState> {
+        self.state(LINK)
     }
 
     /// Collects this device's complete metadata, waiting up to 10 s.
