@@ -1,7 +1,8 @@
 <script>
   // Exporting plots, as they were when the dialog opened: their data, every
-  // raw sample of their signals as the hub writes it (CSV or HDF5), or an
-  // image of each, PNG or JPEG. Each plot exported is a paused copy of the
+  // raw sample of their signals as the hub writes it (CSV or HDF5) and the
+  // shots of their captures as the page writes them (CSV), or an image of
+  // each, PNG or JPEG. Each plot exported is a paused copy of the
   // page's (PlotHost `copy`), drawn by the plot's own code on a stage
   // (PlotStage.svelte) and edited by its own commands, so the figure is the
   // plot and what is done to it here leaves the page's as it was.
@@ -24,6 +25,7 @@
   import { IMAGE_FORMATS, LEAST_SIDE, SHAPES, UNITS, bandsOf, canvasFits, devicesText, fileSafe, pictureSize, stampText } from './figure.js';
   import { xOf } from './cursors.js';
   import { timeAxis, titleOf } from './plot.js';
+  import { shotCount, shotMode, shotsCsv, shown } from './shots.js';
   import { prefs } from './prefs.svelte.js';
   import { api } from './protocol.js';
   import { bytesEstimate, bytesText, spanText } from './units.js';
@@ -94,6 +96,8 @@
       const { a, b } = xOf(plot.cursors, 'time');
       return [{
         id, copy, cid, traces, kind: plot.kind, on: true, title: '', yRanges: {},
+        captures: traces.filter((t) => t.shots).map((c) => ({ c, shots: c.shots.slice() })),
+        shotMode: shotMode(plot.shots), shotCount: shotCount(plot.shotCount),
         thumb: pv?.drawnOn ? thumbOf(id, pv.drawnOn) : null,
         screen: pv?.drawnOn ? { w: Math.round(pv.drawnOn.w), h: Math.round(pv.drawnOn.h) } : { w: 640, h: 300 },
         shows: plot.kind === 'time' ? copy.view(cid).range(openedAt) : null,
@@ -160,8 +164,8 @@
   function deviceOf(e) {
     const devices = hub.session.devices;
     return devicesText(e.traces.map((t) => {
-      const d = devices?.get(t.meta.route);
-      return d?.name ? [d.name, d.serial].filter(Boolean).join(' ') : t.meta.route;
+      const route = t.meta.route ?? t.route, d = devices?.get(route);
+      return d?.name ? [d.name, d.serial].filter(Boolean).join(' ') : route;
     }));
   }
   /** Plot `e`'s figure: its title, the x label and the caption, as the image's settings ask. */
@@ -241,18 +245,37 @@
   /** Whether trace `t` is a signal that streams, whose samples the hub holds and writes to a file: a capture is none. */
   const streams = (t) => !t.shots;
 
+  /** Whether a capture plot is among the plots ticked, whose data the page writes from its shots, as CSV alone. */
+  const capturesChosen = $derived(chosen.some((e) => e.captures.length));
+  /** The data format the files are made in: the one picked, or CSV with a capture among them, as no HDF5 file holds a capture. */
+  const formatUsed = $derived(capturesChosen ? 'csv' : format);
+
   /**
-   * The data files the choices make, each {name, request, samples, holds}:
-   * one of every signal of the plots ticked over the time they span, or one
-   * each. One file of them is the request the hub always had for them: each
-   * signal once, from the earliest to the latest time the plots show, or the
-   * whole capture with no time plot among them. A plot of captures has no
-   * part in them, as the hub holds no capture.
+   * The data files the choices make. Of the hub's history, each {name,
+   * request, samples, holds}: one of every signal of the plots ticked over
+   * the time they span, or one each. One file of them is the request the
+   * hub always had for them: each signal once, from the earliest to the
+   * latest time the plots show, or the whole capture with no time plot
+   * among them. And of each capture a capture plot ticked shows, as the hub
+   * holds no capture, {name, capture, samples, holds}: the CSV the page
+   * writes of the shots it held as the dialog opened, as the plot shows
+   * them (shots.js `shotsCsv`), a file each.
    */
   const dataFiles = $derived.by(() => {
+    const stamp = exportStamp(new Date(openedWall));
+    const captures = chosen.flatMap((e) =>
+      e.captures.filter(({ shots }) => shots.length).map(({ c, shots }) => {
+        const s = shown(shots, e.shotMode, e.shotCount);
+        return { name: `twinleaf-${stamp}-${fileSafe(c.key)}.csv`, capture: { c, shots, mode: e.shotMode, count: e.shotCount, device: deviceOf(e) }, samples: s.line.n * (e.shotMode === 'overlay' ? s.count : 1), holds: c.title };
+      }),
+    );
+    return unique([...historyFiles(stamp), ...captures]);
+  });
+  /** The data files of the hub's history the choices make (`dataFiles`). */
+  function historyFiles(stamp) {
     const held = chosen.filter((e) => e.traces.some(streams));
     if (!held.length) return [];
-    const stamp = exportStamp(new Date(openedWall)), ext = FORMATS[format].ext;
+    const ext = FORMATS[formatUsed].ext;
     const ask = (es) => {
       const traces = [...new Map(es.flatMap((e) => e.traces.filter(streams)).map((t) => [t.key, t])).values()];
       const spans = es.map((e) => stretchOf(e, range, true)).filter(Boolean);
@@ -261,9 +284,9 @@
       const samples = es.reduce((n, e) => (n === null || countOf(e, ...(stretchOf(e, range, true) ?? whole)) === null ? null : n + countOf(e, ...(stretchOf(e, range, true) ?? whole))), 0);
       return { request: { hub: hub.session.id, ids: traces.map((t) => t.meta.id), t0, t1 }, samples, holds: traces.length === 1 ? traces[0].key : `${traces.length} signals`, keys: traces.map((t) => t.key) };
     };
-    if (files === 'one' || held.length === 1) return [{ name: exportName(format, new Date(openedWall)), ...ask(held) }];
-    return unique(held.map((e) => ({ name: `twinleaf-${stamp}-${fileSafe(e.traces.map((t) => t.key).join('+'))}.${ext}`, ...ask([e]) })));
-  });
+    if (files === 'one' || held.length === 1) return [{ name: exportName(formatUsed, new Date(openedWall)), ...ask(held) }];
+    return held.map((e) => ({ name: `twinleaf-${stamp}-${fileSafe(e.traces.map((t) => t.key).join('+'))}.${ext}`, ...ask([e]) }));
+  }
   /** The image files the choices make, each {name, holds, entries}: one image of the plots ticked, one above another, or one each. */
   const imageFiles = $derived.by(() => {
     if (!chosen.length) return [];
@@ -282,7 +305,7 @@
     });
   }
   const filesShown = $derived(tab === 'image' ? imageFiles : dataFiles);
-  const sizeOf = (f) => (tab === 'image' ? sized.pixels[0] * sized.pixels[1] * f.entries.length * PIXEL_BYTES[imageFormat] : f.samples === null ? null : f.samples * SAMPLE_BYTES[format]);
+  const sizeOf = (f) => (tab === 'image' ? sized.pixels[0] * sized.pixels[1] * f.entries.length * PIXEL_BYTES[imageFormat] : f.samples === null ? null : f.samples * SAMPLE_BYTES[formatUsed]);
 
   /** The span the figure's plot shows, as the inspector reads it. */
   const span = $derived.by(() => {
@@ -315,7 +338,7 @@
    */
   async function save() {
     const tabNow = tab, saving = tabNow === 'image' ? imageFiles : dataFiles;
-    const type = tabNow === 'image' ? IMAGE_FORMATS[imageFormat] : FORMATS[format];
+    const type = tabNow === 'image' ? IMAGE_FORMATS[imageFormat] : FORMATS[formatUsed];
     let where;
     try {
       where = await askWhere(saving.map((f) => ({ name: f.name, type })));
@@ -341,12 +364,20 @@
     }
   }
 
-  /** Fetches each data file of `list` from the hub, the bar following the bytes against the size each is about. */
+  /** Makes each data file of `list`: one of a capture as the page writes it, any other fetched from the hub, the bar following the bytes against the size each is about. */
   async function makeData(list, job) {
-    const type = FORMATS[format], made = [], about = list.reduce((n, f) => n + Math.max(1, sizeOf(f) ?? 1), 0);
+    const type = FORMATS[formatUsed], made = [], about = list.reduce((n, f) => n + Math.max(1, sizeOf(f) ?? 1), 0);
     let before = 0;
     for (const f of list) {
-      const blob = await fetchExport(f.request, format, f.name, {
+      if (f.capture) {
+        const { c, shots, mode, count, device } = f.capture;
+        const blob = new Blob([shotsCsv(c, shots, mode, count, device)], { type: FORMATS.csv.mime });
+        before += blob.size;
+        progress = { busy: Math.min(0.97, before / about), said: bytesText(before) };
+        made.push({ name: f.name, blob, type: FORMATS.csv });
+        continue;
+      }
+      const blob = await fetchExport(f.request, formatUsed, f.name, {
         signal: job.signal,
         progress: (bytes) => !job.signal.aborted && (progress = { busy: Math.min(0.97, (before + bytes) / about), said: bytesText(before + bytes) }),
       });
@@ -500,7 +531,7 @@
                   <td class="n">{sizeOf(f) === null ? '…' : bytesEstimate(sizeOf(f))}</td>
                 </tr>
               {:else}
-                <tr><td class="c" colspan="4">{chosen.length ? 'No data file of a capture: copy its data from the plot.' : 'Nothing: tick a plot at the side.'}</td></tr>
+                <tr><td class="c" colspan="4">{chosen.length ? 'Nothing yet: no capture has come.' : 'Nothing: tick a plot at the side.'}</td></tr>
               {/each}
             </tbody>
           </table>
@@ -521,13 +552,14 @@
         {/snippet}
         {#if tab === 'data'}
           <div class="grp">{several ? `All ${chosen.length} plots` : 'The file'}</div>
-          {@render rangeSection()}
+          <!-- The time matters to the hub's history alone: a capture's file holds its shots. -->
+          {#if chosen.some((e) => e.traces.some(streams))}{@render rangeSection()}{/if}
           <div class="sec">
             <h3>File</h3>
             <div class="r">
-              <span>Format <button class="info" aria-label="About the formats" title="HDF5 keeps the devices' details. CSV is a plain table.">i</button></span>
-              <select aria-label="Format" bind:value={format}>
-                <option value="h5">HDF5</option>
+              <span>Format <button class="info" aria-label="About the formats" title="HDF5 keeps the devices' details. CSV is a plain table. A capture, which the page writes from the shots its plot holds, is CSV alone.">i</button></span>
+              <select aria-label="Format" value={formatUsed} onchange={(e) => (format = e.currentTarget.value)}>
+                <option value="h5" disabled={capturesChosen}>{capturesChosen ? 'HDF5: not of a capture' : 'HDF5'}</option>
                 <option value="csv">CSV</option>
               </select>
             </div>

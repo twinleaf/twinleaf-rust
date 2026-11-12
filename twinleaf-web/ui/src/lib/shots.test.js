@@ -2,7 +2,7 @@
 // plot shows of them, each against a rule worked out apart from the module.
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { SHOTS_KEPT, SHOT_COUNT, SHOT_COUNTS, alike, calibrated, keep, mean, run, shotCount, shotMode, shotOf, shown, shownText, xsOf } from './shots.js';
+import { SHOTS_KEPT, SHOT_COUNT, SHOT_COUNTS, alike, calibrated, keep, mean, run, shotCount, shotMode, shotOf, shotsCsv, shown, shownText, xsOf } from './shots.js';
 
 /** A shot numbered `number` of shape `shape`, [n, x0, dx], its values `number` + i. */
 const shot = (number, [n, x0, dx]) => ({ number, n, x0, dx, y: Float32Array.from({ length: n }, (_, i) => number + i) });
@@ -35,10 +35,10 @@ describe('a capture’s elements', () => {
     expect(calibrated(Float64Array.of(1, 2), 1)).toBeInstanceOf(Float32Array);
   });
 
-  it('make a shot: the frame’s number, its length, where its x starts and steps, and its values', () => {
-    const frame = { number: 7, x0: 1, dx: 0.25, calibration: 0.5, elements: Int16Array.of(1, -2, 3) };
-    expect(shotOf(frame)).toEqual({ number: 7, n: 3, x0: 1, dx: 0.25, y: Float32Array.of(0.5, -1, 1.5) });
-    expect([...xsOf(shotOf(frame))]).toEqual([1, 1.25, 1.5]);
+  it('make a shot: the frame’s number, its length, where its x starts and steps, its values, its element type and when it was received', () => {
+    const frame = { number: 7, x0: 1, dx: 0.25, calibration: 0.5, type: 0x21, elements: Int16Array.of(1, -2, 3) };
+    expect(shotOf(frame, 1234)).toEqual({ number: 7, n: 3, x0: 1, dx: 0.25, y: Float32Array.of(0.5, -1, 1.5), type: 0x21, received: 1234 });
+    expect([...xsOf(shotOf(frame, 0))]).toEqual([1, 1.25, 1.5]);
   });
 });
 
@@ -118,6 +118,38 @@ describe('what a plot shows of a capture’s shots', () => {
     expect(shownText('average', { count: 16, of: 16 })).toBe('avg 16 of 16');
     expect(shownText('overlay', { count: 3, of: 4 })).toBe('last 3 of 4');
     expect(shownText('latest', { count: 1, of: 1 })).toBe('');
+  });
+
+  it('is written as CSV: a header of what it is, then its x and a column per shot shown, as the plot shows them', () => {
+    const fidShot = (number) => ({ ...shot(number, [3, 1e-6, 0.5e-6]), type: 0x21, received: Date.UTC(2026, 10, 12, 14, 5, number) });
+    const capture = { title: 'FID', rpc: 'fid.capture', meta: { units: 'V', xName: 'Time', xUnits: 's' } };
+    const held = [1, 2, 3].map(fidShot);
+    const lines = (mode, n = 4, c = capture, h = held) => shotsCsv(c, h, mode, n, 'test 12 (/)').trimEnd().split('\n');
+    expect(lines('latest')).toEqual([
+      '# FID, capture RPC fid.capture of test 12 (/)',
+      '# 3 samples of i16, in V, sample rate 2000000 Hz',
+      '# shows the newest shot',
+      '# shot 3 received 2026-11-12T14:05:03.000Z',
+      'time (s),FID shot 3 (V)',
+      '0.000001,3', '0.0000015,4', '0.000002,5',
+    ]);
+    expect(lines('overlay').slice(2, 7)).toEqual([
+      '# shows the last 3 shots of 4, overlaid',
+      '# shot 1 received 2026-11-12T14:05:01.000Z', '# shot 2 received 2026-11-12T14:05:02.000Z', '# shot 3 received 2026-11-12T14:05:03.000Z',
+      'time (s),FID shot 1 (V),FID shot 2 (V),FID shot 3 (V)',
+    ]);
+    expect(lines('overlay').slice(7)).toEqual(['0.000001,1,2,3', '0.0000015,2,3,4', '0.000002,3,4,5']);
+    // An average names how many it took, and when each was received.
+    expect(lines('average', 2).slice(2)).toEqual([
+      '# shows the average of the last 2 shots alike of 2',
+      '# shot 2 received 2026-11-12T14:05:02.000Z', '# shot 3 received 2026-11-12T14:05:03.000Z',
+      'time (s),FID average of 2 (V)',
+      '0.000001,2.5', '0.0000015,3.5', '0.000002,4.5',
+    ]);
+    // An x in µs is written in seconds; an x that is no time in its own units, with no sample rate.
+    expect(lines('latest', 4, { ...capture, meta: { ...capture.meta, xUnits: 'µs' } }, [{ ...fidShot(1), x0: 2, dx: 0.5 }]).slice(1, 6)).toEqual(['# 3 samples of i16, in V, sample rate 2000000 Hz', '# shows the newest shot', '# shot 1 received 2026-11-12T14:05:01.000Z', 'time (s),FID shot 1 (V)', '0.000002,1']);
+    expect(lines('latest', 4, { title: 'phase, wrapped', rpc: 'phase.capture', meta: { units: '', xName: 'Angle', xUnits: 'rad' } }).slice(1, 6)).toEqual(['# 3 samples of i16', '# shows the newest shot', '# shot 3 received 2026-11-12T14:05:03.000Z', 'Angle (rad),"phase, wrapped shot 3"', '0.000001,3']);
+    expect(shotsCsv(capture, [], 'latest', 4, '')).toBe(null);
   });
 
   it('takes a plot’s settings: a mode and a count it offers, or Latest and the count it starts at', () => {

@@ -13,7 +13,7 @@ export const MAX_COPY_ROWS = 100_000;
  * A sample's value as text: nine significant digits, which give back a
  * 32-bit float exactly, without the digits widening it to 64 bits invents.
  */
-const value = (v) => +v.toPrecision(9);
+export const value = (v) => +v.toPrecision(9);
 
 /**
  * One plot's table: a header of the time and each signal with its units,

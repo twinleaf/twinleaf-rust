@@ -507,12 +507,13 @@ export class Session {
    * Applies one decoded binary frame. Returns false when it names a trace
    * this session never heard of, a gap the page fills with a new snapshot.
    * `perfMs` is the page time it arrived. A capture is the newest shot of
-   * its Capture, and one of a capture no device lists is dropped.
+   * its Capture, received at the wall time now, and one of a capture no
+   * device lists is dropped.
    */
   apply(frame, perfMs = clock.now()) {
     if (frame.kind === 'capture') {
       const c = this.byKey.get(captureKey(frame));
-      if (c) keep(c.shots, shotOf(frame));
+      if (c) keep(c.shots, shotOf(frame, clock.wall()));
       return true;
     }
     if (frame.kind === 'spectra') {

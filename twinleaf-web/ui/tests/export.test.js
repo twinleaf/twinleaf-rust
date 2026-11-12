@@ -29,6 +29,7 @@ import fc from 'fast-check';
 import { flushSync } from 'svelte';
 import { centre, clickOn, closeAll, focusPage, frames, holdHistory, leafOf, mountPage, pickItem, plotMenu, pressKey, settle, until, wait } from './harness/page.js';
 import * as clock from '../src/lib/clock.js';
+import { fid, keyOf } from './harness/captures.js';
 import { plotIds } from '../src/lib/layout.js';
 import { SAVE_KEY } from '../src/lib/tabs.js';
 import { colors } from '../src/lib/colors.svelte.js';
@@ -742,6 +743,73 @@ describe('the export dialog', { timeout: 120_000 }, () => {
     expect(await until(() => downloads.length === 2), 'a download a file').toBe(true);
     expect(await until(() => !document.querySelector('.export-dialog')), 'closed').toBe(true);
     expect(downloads.every((n) => /^twinleaf-\d{8}-\d{6}-.+\.csv$/.test(n)), `each named: ${downloads}`).toBe(true);
+  });
+
+  it('writes a capture plot’s shots, as the plot showed them as the dialog opened, as CSV alone, and saves its image', async () => {
+    const FID = { rpc: 'fid.capture', label: { name: 'FID', units: 'V', x_name: 'Time', x_units: 's' }, shot: fid() };
+    page = await mountPage([[keyOf('fid.capture')], [SIGNALS[0]]], 'columns', 0, SIGNALS, [], { captures: [FID] });
+    holdHistory(page, { history: 600 });
+    const [id, time] = plotIds(page.ws.layout), cmds = page.plots.commands, shots = () => page.hub.session.byKey.get(keyOf('fid.capture')).shots;
+    /** Takes `n` captures, one after another, each once the last has come. */
+    const take = async (n) => {
+      for (let i = 0; i < n; i++) {
+        const had = shots().length;
+        cmds.run('captureNow', { on: id });
+        expect(await until(() => shots().length > had), `capture ${i + 1} of ${n} come`).toBe(true);
+      }
+      await settle();
+    };
+    cmds.run('captureShots', { on: id, how: { to: 'overlay' } });
+    cmds.run('captureCount', { on: id, how: { to: 4 } });
+    // The page asks for what its plots show once it has mounted them.
+    await settle();
+    await take(3);
+    expect(shots().length, 'three shots').toBe(3);
+    await focusPage();
+    const saved = catchSaves();
+    const rowsOf = async (file) => (await file.blob.text()).trimEnd().split('\n');
+    // Overlay: a column a shot, oldest first, each value as the plot holds it, its x in seconds.
+    await openExport([id]);
+    expect([...dialog().querySelectorAll('.will tbody tr')].map((r) => [r.querySelector('td').title, r.querySelector('td.c').textContent]), 'a CSV file of the capture').toEqual([[expect.stringMatching(/^twinleaf-\d{8}-\d{6}-capture_fid\.capture\.csv$/), 'FID']]);
+    const h5 = [...control('Format').options].find((o) => o.value === 'h5');
+    expect([control('Format').value, h5.disabled, h5.textContent], 'CSV alone, HDF5 refused with the reason').toEqual(['csv', true, 'HDF5: not of a capture']);
+    expect(control('Time'), 'no time to pick of a capture alone').toBe(null);
+    await shot('export-capture-data');
+    // A shot that comes while the dialog is open is not in the file: it holds the plot as it was.
+    await take(1);
+    const [overlay] = await saveAll(saved);
+    const lines = await rowsOf(overlay), held = shots().slice(0, 3);
+    expect(lines[0], 'what it is of').toMatch(/^# FID, capture RPC fid\.capture of /);
+    expect(lines[1]).toBe('# 1500 samples of i16, in V, sample rate 2000000 Hz');
+    expect(lines.slice(2, 6)).toEqual(['# shows the last 3 shots of 4, overlaid', ...held.map((s) => `# shot ${s.number} received ${new Date(s.received).toISOString()}`)]);
+    expect(lines[6]).toBe('time (s),FID shot 1 (V),FID shot 2 (V),FID shot 3 (V)');
+    const body = lines.slice(7).map((l) => l.split(',').map(Number));
+    expect(body.length).toBe(1500);
+    for (const i of [0, 1, 777, 1499]) expect(body[i], `row ${i}`).toEqual([+(i * Math.fround(5e-7)).toPrecision(9), ...held.map((s) => +s.y[i].toPrecision(9))]);
+    // Average: the mean of the shots alike, and how many it took.
+    cmds.run('captureShots', { on: id, how: { to: 'average' } });
+    await settle();
+    await openExport([id]);
+    const avg = await rowsOf((await saveAll(saved))[0]), last = shots().slice(-4);
+    expect([avg[2], avg[7]]).toEqual(['# shows the average of the last 4 shots alike of 4', 'time (s),FID average of 4 (V)']);
+    expect(+avg[8 + 10].split(',')[1]).toBeCloseTo(last.reduce((n, s) => n + s.y[10], 0) / 4, 6);
+    // With a time plot ticked too, the files are CSV, the hub's as well; with the capture unticked, HDF5 again.
+    const asked = catchExports();
+    await openExport([id, time]);
+    expect([control('Format').value, !!control('Time')], 'CSV, and the time plot’s time').toEqual(['csv', true]);
+    const [captureThumb] = dialog().querySelectorAll('.thumb');
+    await clickOn(captureThumb.querySelector('input'));
+    await settle();
+    await choose('Format', 'h5');
+    expect([control('Format').value, [...control('Format').options].find((o) => o.value === 'h5').disabled]).toEqual(['h5', false]);
+    await saveAll(saved);
+    expect(asked.at(-1).format, 'the time plot’s, as HDF5').toBe('h5');
+    // Its image, the figure the plot draws.
+    await openExport([id]);
+    await press('Image');
+    const [image] = await saveAll(saved);
+    const img = await decoded(image.blob);
+    expect(img.width * img.height, 'an image of the capture plot').toBeGreaterThan(100 * 100);
   });
 
   it('closes at Escape, leaving nothing of its copies, with focus back on the plot', async () => {

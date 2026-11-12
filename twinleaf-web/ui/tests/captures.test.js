@@ -600,9 +600,9 @@ describe('a capture plot', () => {
       expect(await until(copied)).toBe(true);
       await wait(500);
       await settle(6);
-      // A capture is in no data file, which the dialog says, and its image is one.
-      expect(dialog().querySelector('.will tbody').textContent).toMatch(/No data file of a capture/);
-      expect(dialog().querySelector('button.go').disabled).toBe(true);
+      // A capture's data is a CSV file the page writes, and its image is one.
+      expect([...dialog().querySelectorAll('.will tbody tr')].map((r) => r.querySelector('td.c').textContent)).toEqual(['FID']);
+      expect(dialog().querySelector('button.go').disabled).toBe(false);
       await shoot('export', dialog());
       await clickOn([...dialog().querySelectorAll('button')].find((b) => b.textContent.trim() === 'Image'));
       await wait(500);

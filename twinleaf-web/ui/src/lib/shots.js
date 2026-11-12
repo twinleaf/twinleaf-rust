@@ -1,14 +1,20 @@
 // A capture's shots, and what a plot shows of them.
 //
-// A shot is one capture the hub read, {number, n, x0, dx, y}: the hub's
-// number of it, its `n` values `y`, calibrated, in the capture's units, and
-// value i at `x0 + i * dx` in its x units. A capture keeps its newest
+// A shot is one capture the hub read, {number, n, x0, dx, y, type,
+// received}: the hub's number of it, its `n` values `y`, calibrated, in the
+// capture's units, value i at `x0 + i * dx` in its x units, the protocol's
+// code of the device's element type, and the wall time in ms the page
+// received it, as the capture carries no time. A capture keeps its newest
 // SHOTS_KEPT shots, oldest first. A plot shows them one of three ways
 // (SHOT_MODES): the newest alone; the newest over the `count` - 1 before
 // it, the older the fainter; or the mean of the newest `count`, value by
 // value. A mean is of shots alike, as many values at the same x: it takes
 // the run of them that ends at the newest, so a shot that differs from the
 // one before starts the mean again.
+
+import { value } from './copy.js';
+import { ELEMENT_NAMES } from './protocol.js';
+import { unitOf } from './units.js';
 
 /** How a plot shows a capture's shots, and their names. */
 export const SHOT_MODES = [['latest', 'Latest'], ['overlay', 'Overlay'], ['average', 'Average']];
@@ -37,8 +43,8 @@ export function calibrated(elements, calibration) {
   return y;
 }
 
-/** The shot of a decoded capture frame (protocol.js `decodeFrame`). */
-export const shotOf = (frame) => ({ number: frame.number, n: frame.elements.length, x0: frame.x0, dx: frame.dx, y: calibrated(frame.elements, frame.calibration) });
+/** The shot of a decoded capture frame (protocol.js `decodeFrame`), which the page received at wall time `received`, in ms. */
+export const shotOf = (frame, received) => ({ number: frame.number, n: frame.elements.length, x0: frame.x0, dx: frame.dx, y: calibrated(frame.elements, frame.calibration), type: frame.type, received });
 
 /** Adds `shot` to `shots` as the newest, and drops the oldest past SHOTS_KEPT. */
 export function keep(shots, shot) {
@@ -91,6 +97,50 @@ export function shown(shots, mode, count) {
 
 /** What a plot says of what `shown` gave it, beside the capture's state: "avg 5 of 16", "last 5 of 16", or nothing of one shot alone. */
 export const shownText = (mode, { count, of }) => (mode === 'average' ? `avg ${count} of ${of}` : mode === 'overlay' ? `last ${count} of ${of}` : '');
+
+/**
+ * How many seconds one of x units `units` is, where they are seconds with
+ * an SI prefix or none (units.js `unitOf`), as 1e-6 of µs; else null, for
+ * an x that is no time.
+ */
+export function secondsPer(units) {
+  const u = unitOf(units);
+  return u && u.base === 's' && !u.per ? 10 ** u.e : null;
+}
+
+/**
+ * The CSV of what a plot in `mode` of `count` shows of `shots`, the shots
+ * of capture `capture` ({title, rpc, meta}) of the device named `device`;
+ * null with no shot. A header of lines after '#' says what it is of: the
+ * capture, its RPC and its device; its sample count, its element type, its
+ * units and, where its x is time, its sample rate, one over its x step;
+ * how the plot shows its shots; and when the page received each shot it
+ * holds. Then a row per value: its x, in seconds where the capture's x is
+ * time (`secondsPer`), else in its x units, and a column per shot shown,
+ * oldest first, as the plot draws them: the newest alone, each of an
+ * overlay, or their mean, in the capture's units.
+ */
+export function shotsCsv(capture, shots, mode, count, device) {
+  const s = shown(shots, mode, count);
+  if (!s) return null;
+  const { title, rpc, meta } = capture, newest = s.line, seconds = secondsPer(meta.xUnits);
+  const took = mode === 'average' ? run(shots, count) : mode === 'overlay' ? [...s.under.map((u) => u.shot), newest] : [newest];
+  const columns = mode === 'average' ? [{ name: `${title} average of ${took.length}`, y: newest.y }] : took.map((shot) => ({ name: `${title} shot ${shot.number}`, y: shot.y }));
+  const shows = { latest: 'the newest shot', overlay: `the last ${took.length} shots of ${count}, overlaid`, average: `the average of the last ${took.length} shots alike of ${count}` }[mode];
+  const units = meta.units ? ` (${meta.units})` : '';
+  const head = [
+    `# ${title}, capture RPC ${rpc}${device ? ` of ${device}` : ''}`,
+    `# ${newest.n} samples of ${ELEMENT_NAMES[newest.type] ?? 'unknown type'}${meta.units ? `, in ${meta.units}` : ''}${seconds ? `, sample rate ${+(1 / (newest.dx * seconds)).toPrecision(6)} Hz` : ''}`,
+    `# shows ${shows}`,
+    ...took.map((shot) => `# shot ${shot.number} received ${new Date(shot.received).toISOString()}`),
+    [seconds ? 'time (s)' : `${meta.xName || 'x'}${meta.xUnits ? ` (${meta.xUnits})` : ''}`, ...columns.map((c) => `${c.name}${units}`)].map(field).join(','),
+  ];
+  const rows = Array.from({ length: newest.n }, (_, i) => [value((newest.x0 + i * newest.dx) * (seconds ?? 1)), ...columns.map((c) => value(c.y[i]))].join(','));
+  return [...head, ...rows].join('\n') + '\n';
+}
+
+/** `text` as a CSV field: quoted where it holds a comma, a quote or a line break. */
+const field = (text) => (/[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text);
 
 const xs = new WeakMap();
 /** The x of each value of `shot`, as 32-bit floats, made once a shot. */

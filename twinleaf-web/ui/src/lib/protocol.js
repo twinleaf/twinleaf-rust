@@ -108,6 +108,8 @@ export const DEVICE_GONE = 'the device is gone';
 
 /** The typed array of each element type a capture frame carries, by the protocol's code. */
 const ELEMENTS = { 0x10: Uint8Array, 0x11: Int8Array, 0x20: Uint16Array, 0x21: Int16Array, 0x40: Uint32Array, 0x41: Int32Array, 0x42: Float32Array, 0x80: BigUint64Array, 0x81: BigInt64Array, 0x82: Float64Array };
+/** The name of each element type a capture frame carries, by the protocol's code, as the hub's wire format names them (twinleaf-web/src/wire.rs). */
+export const ELEMENT_NAMES = { 0x10: 'u8', 0x11: 'i8', 0x20: 'u16', 0x21: 'i16', 0x40: 'u32', 0x41: 'i32', 0x42: 'f32', 0x80: 'u64', 0x81: 'i64', 0x82: 'f64' };
 /** The bytes of a capture frame before its strings. */
 const CAPTURE_HEAD = HEADER + 48;
 
