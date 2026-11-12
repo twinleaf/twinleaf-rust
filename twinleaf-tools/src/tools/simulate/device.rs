@@ -28,7 +28,8 @@ use super::{unix_duration, GaussianRng};
 use crate::{SimulateCli, UploadKind};
 
 const DEVICE_NAME: &str = "tio-test";
-const DEVICE_DESC: &str = "Twinleaf tio-test R1 ((null)) [2026-06-08/000001-DEV]";
+/// The description before the build, which `--build` gives in brackets.
+const DEVICE_DESC: &str = "Twinleaf tio-test R1 ((null))";
 /// The description a firmware upgrade leaves, so a re-read shows a new build.
 const UPGRADED_DESC: &str = "Twinleaf tio-test R1 ((null)) [2026-06-08/000002]";
 pub(super) const DEVICE_SERIAL: &str = "SIM0001";
@@ -474,7 +475,8 @@ impl SimDevice {
             0 => DEVICE_SERIAL.to_string(),
             _ => format!("SIM{:04}", index + 1),
         };
-        let identity = Identity::new(DEVICE_NAME, DEVICE_DESC, &serial, DEVICE_FIRMWARE)
+        let desc = format!("{DEVICE_DESC} [{}]", cli.build);
+        let identity = Identity::new(DEVICE_NAME, &desc, &serial, DEVICE_FIRMWARE)
             .expect("the simulator's identity fits");
         let mut sim = Sim::new(
             identity,

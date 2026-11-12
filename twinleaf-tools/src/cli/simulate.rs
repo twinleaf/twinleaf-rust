@@ -76,6 +76,26 @@ pub struct SimulateCli {
     /// The kind of firmware the devices take, as a real device of that kind does
     #[arg(long = "upload", value_enum, default_value_t = UploadKind::Image)]
     pub(crate) upload: UploadKind,
+
+    /// The build the devices report in `dev.desc`, as DATE/BUILD. A build that contains DEV is a development build
+    #[arg(
+        long = "build",
+        value_name = "DATE/BUILD",
+        default_value = "2026-06-08/000001-DEV",
+        value_parser = build
+    )]
+    pub(crate) build: String,
+}
+
+/// The longest build `dev.desc` holds beside the rest of the description.
+const BUILD_MAX: usize = 64;
+
+/// Parses a build of at most [`BUILD_MAX`] bytes.
+fn build(text: &str) -> Result<String, String> {
+    match text.len() <= BUILD_MAX {
+        true => Ok(text.to_string()),
+        false => Err(format!("a build is at most {BUILD_MAX} bytes")),
+    }
 }
 
 /// What kind of firmware image a simulated device takes.
