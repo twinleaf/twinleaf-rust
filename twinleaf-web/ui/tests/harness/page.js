@@ -164,9 +164,10 @@ const typed = (text) => (text === 'true' ? true : text === 'false' ? false : tex
  *
  * It keeps a log and counts what was lost as the server does
  * (`twinleaf-web/src/logbook.rs`, `loss.rs`): `line(level, text, {route,
- * source, time, loss})` sends a line, numbered the next, of the device at
- * `route`, or of none with null, said by the device unless `source` is
- * 'proxy', its time the newest sample's unless given, and its time of day
+ * source, part, time, loss})` sends a line, numbered the next, of the
+ * device at `route`, or of none with null, said by the device unless
+ * `source` is 'proxy', then by the proxy's `part`, the hub unless given,
+ * its time the newest sample's unless given, and its time of day
  * the page's clock's. `linkDown(route)` drops a device's link and
  * `linkBack(route, seconds)` brings it back after that long, and
  * `lose(route, stream, {skipped, proxy, hub})` loses samples of a stream,
@@ -191,9 +192,9 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
   hub.names = new Map();
   hub.presence = (route, presence) => hub.text({ type: 'device', seq: hub.seq + 1, route, name: hub.names.get(route) ?? 'test', serial: route, firmware: '1', presence });
   let lines = 0;
-  hub.line = (level, text, { route = '/', source = 'device', time, loss } = {}) => {
+  hub.line = (level, text, { route = '/', source = 'device', part = 'hub', time, loss } = {}) => {
     const newest = route !== null && isFinite(hub.session.latest) ? hub.session.latest : null;
-    hub.text({ type: 'log', seq: hub.seq + 1, n: ++lines, wall: clock.wall() / 1000, time: time === undefined ? newest : time, level, source, route, text, ...(loss && { loss }) });
+    hub.text({ type: 'log', seq: hub.seq + 1, n: ++lines, wall: clock.wall() / 1000, time: time === undefined ? newest : time, level, source, ...(source === 'proxy' && { part }), route, text, ...(loss && { loss }) });
   };
   const lost = new Map();
   const lostOf = (route) => lost.get(route) ?? lost.set(route, { times: 0, seconds: 0, streams: {} }).get(route);

@@ -28,7 +28,9 @@
 // of the newest sample the hub had taken of its device then, on the clock
 // that device's points are on, or null; `level` error, warn, info or debug;
 // `source` device, for a line the device at `route` said, or proxy, for
-// one the hub says of the device at `route`, or of none with null; and
+// one the proxy says of the device at `route`, or of none with null, with
+// `part` the part of the proxy that said it, `hub` for the hub's own and
+// else the source the proxy's console names; and
 // `loss`, on a line of a loss alone, what was lost: {cause: 'link',
 // seconds}, null as the link drops and how long it was down as it is back,
 // or {cause, stream, samples} with `cause` skipped, proxy or hub. A line

@@ -159,7 +159,7 @@ break.
 
 ### The log
 
-`log {n, wall, time, level, source, route, text, loss?}` is one line of the
+`log {n, wall, time, level, source, part?, route, text, loss?}` is one line of the
 log (`logbook.rs`):
 
 | Field | What it is |
@@ -168,7 +168,8 @@ log (`logbook.rs`):
 | `wall` | The host's clock as the hub took the line, in Unix seconds, to a millisecond. |
 | `time` | The time of the newest sample the hub had taken of the line's device as it took the line, on the clock that device's points are on; `null` for a device no sample was taken of yet, and for a line of no device. |
 | `level` | `error`, `warn`, `info` or `debug`. |
-| `source` | `device`, a line the device said in a log packet, or `proxy`, a line of the hub's own. |
+| `source` | `device`, a line the device said in a log packet, or `proxy`. |
+| `part` | Only on a proxy's line: the part of the proxy that said it, `hub` for the hub's own lines, and for a line of the proxy's console the source the console names (`server`, `link`, `client`, a link's URL). |
 | `route` | The device the line is of, as `/` or `/0`: the one that said it, or the one the proxy says it of; `null` for a line of no device. The device's name is its `device` message's. |
 | `text` | The line's words. |
 | `loss` | Only on a line of a loss: what was lost, as data (below). |
@@ -189,9 +190,10 @@ Where the lines come from:
   is a proxy line of no device too, when the proxy serves the page: its
   logger (`twinleaf-tools/src/logging.rs`) hands each record it writes to
   `twinleaf_web::console(level, source, text)`, after the console's own
-  filter, so what the terminal shows is what the log holds. `text` is
-  `source: text` as the console prints them, `source` the last part of the
-  record's target (`server`, `mdns`, a device's URL). Error, warn and info
+  filter, so what the terminal shows is what the log holds. `text` is the
+  record's text and `part` its `source`, the last part of the record's
+  target as the console prints it (`server`, `mdns`, a link's URL). Error,
+  warn and info
   keep their level, and debug and trace are `debug`. Three things are left
   out: a record of target `device::<route>`, which is a device's log packet
   the proxy echoes and the hub already takes from the packet itself, a
@@ -245,8 +247,11 @@ open, under `tl-log-v1`. It keeps the newest 1000 rows, a row being one
 line or several in a row that say the same (losses of one cause of one
 stream of one device sum their samples). Its bar chooses the rows shown:
 a toggle per level with its count of lines (Debug off to start), one for
-the lines of a loss, the source (the proxy's own lines, or every line of
-one device, whoever said it) and a filter of words. Follow keeps the
+the lines of a loss, the source (every line of one device, whoever said
+it, or the lines of one part of the proxy, the list made of the devices
+and of the parts the rows were said by, each under its heading) and a
+filter of words. A row's source column names its device, or the part of
+the proxy that said it. Follow keeps the
 newest row in view until the list is scrolled up. The row of a link's drop
 is followed by a divider, the outage, which says how long it lasted once
 the `link` line with `seconds` comes. A row's button runs `x1At` with the

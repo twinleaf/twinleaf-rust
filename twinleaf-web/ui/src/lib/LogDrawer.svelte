@@ -4,7 +4,7 @@
   //
   // Its bar holds what chooses the lines shown: a toggle for each level
   // with how many lines the log holds of it, one that leaves only the lines
-  // of lost data, the source, the proxy's own lines or those of one device,
+  // of lost data, the source, one device's lines or one part of the proxy's,
   // and a filter of the words a line holds; then Follow and Copy. The
   // frame's button closes the drawer, as a dock's hides it.
   //
@@ -28,7 +28,7 @@
   import { getContext, onDestroy, tick } from 'svelte';
   import { claim } from './keyrouter.js';
   import { escapeTyped } from './keys.js';
-  import { LEVELS, matches } from './log.svelte.js';
+  import { LEVELS, PART, matches } from './log.svelte.js';
   import { timeAxis } from './plot.js';
   import { byRoute } from './properties.js';
   import { toast } from './toast.svelte.js';
@@ -65,15 +65,19 @@
   /** What a row says, which the filter's words are looked for in. */
   const said = (row) => `${words.LEVEL_NAMES[row.level]} ${sourceOf(row)} ${messageOf(row)}`;
 
-  const sources = $derived([
-    [ALL, words.LOG_ALL],
-    ['proxy', words.LOG_PROXY],
-    ...[...new Set([...session.devices.keys(), ...(log.source && log.source !== 'proxy' ? [log.source] : [])])].sort((a, b) => byRoute({ route: a }, { route: b })).map((route) => [route, named(route)]),
-  ]);
-  const sourceName = $derived(sources.find(([value]) => value === (log.source || ALL))?.[1] ?? words.LOG_ALL);
+  // The sources the filter lists, each [value, name]: the hub's devices and
+  // those the rows are of, by route, and the parts of the proxy the rows
+  // were said by, by name; with the one chosen, while no row is of it.
+  const chosenPart = $derived(log.source.startsWith(PART) ? [log.source.slice(PART.length)] : []);
+  const chosenRoute = $derived(log.source && !chosenPart.length ? [log.source] : []);
+  const devices = $derived(
+    [...new Set([...session.devices.keys(), ...log.rows.flatMap((row) => (row.route === null ? [] : [row.route])), ...chosenRoute])].sort((a, b) => byRoute({ route: a }, { route: b })).map((route) => [route, named(route)]),
+  );
+  const parts = $derived([...new Set([...log.rows.flatMap((row) => (row.part === null ? [] : [row.part])), ...chosenPart])].sort().map((part) => [PART + part, part]));
+  const sourceName = $derived([...devices, ...parts].find(([value]) => value === log.source)?.[1] ?? words.LOG_ALL);
 
-  /** Whether row `row`, the drop of a link, has its outage's divider under the source chosen. */
-  const cutShows = (row) => row.loss?.cause === 'link' && row.loss.seconds == null && (!log.source || log.source === 'proxy' || row.route === log.source);
+  /** Whether row `row`, the drop of a link, has its outage's divider under the source chosen: its device, or the part that said it. */
+  const cutShows = (row) => row.loss?.cause === 'link' && row.loss.seconds == null && (!log.source || row.route === log.source || PART + row.part === log.source);
   /** What the list draws, in order, each {row, line, cut}: whether the row itself shows, and whether its outage's divider does. */
   const items = $derived.by(() => {
     const filter = { levels: log.levels, lossOnly: log.lossOnly, source: log.source, query: log.query };
@@ -184,7 +188,15 @@
     <Select.Root type="single" value={log.source || ALL} onValueChange={(value) => log.setSource(value === ALL ? '' : value)}>
       <Select.Trigger size="sm" class="log-source text-xs" aria-label="Source">{sourceName}</Select.Trigger>
       <Select.Content>
-        {#each sources as [value, label] (value)}<Select.Item {value} {label} />{/each}
+        <Select.Item value={ALL} label={words.LOG_ALL} />
+        {#each [[words.LOG_DEVICES, devices], [words.LOG_PARTS, parts]] as [heading, group] (heading)}
+          {#if group.length}
+            <Select.Group>
+              <Select.Label>{heading}</Select.Label>
+              {#each group as [value, label] (value)}<Select.Item {value} {label} />{/each}
+            </Select.Group>
+          {/if}
+        {/each}
       </Select.Content>
     </Select.Root>
     <Input class="log-filter h-6 flex-1 text-xs" type="search" placeholder="Filter" aria-label="Filter the lines by the words they hold" bind:value={() => log.query, (value) => log.setQuery(value)} onkeydown={filterKey} />

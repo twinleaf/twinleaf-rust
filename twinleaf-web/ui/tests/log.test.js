@@ -96,12 +96,15 @@ async function open() {
 
 /** Lines of every level, a repeat, an outage that ended, samples lost in a row, and a line longer than a narrow drawer. */
 function story(hub) {
+  hub.line('info', 'Proxy hosted by tio proxy (pid 4242) at tcp://127.0.0.1:7855', { source: 'proxy', part: 'server', route: null });
+  hub.line('info', 'Opening udp://192.168.1.40', { source: 'proxy', part: 'link', route: null });
   hub.line('info', 'Found VMR 0412, serial S1, firmware 1.4.2', { source: 'proxy' });
   hub.line('info', 'field lock acquired');
   for (let i = 0; i < 3; i++) hub.line('debug', 'pll phase error 0.0021 rad');
   hub.line('warn', 'field lock lost, reacquiring');
   hub.line('info', 'field lock acquired');
   hub.line('info', 'calibration loaded from flash', { route: '/0' });
+  hub.line('warn', 'Sensor disconnected', { source: 'proxy', part: 'udp://192.168.1.41', route: null });
   hub.linkDown('/0');
   hub.line('error', 'heater current over limit, output held');
   hub.linkBack('/0', 11);
@@ -127,7 +130,7 @@ function lossWords({ cause, stream, samples, seconds }) {
 function modelRows(lines) {
   const out = [];
   for (const l of lines) {
-    const same = l.loss?.cause === 'link' ? null : l.loss ? `${l.route} ${l.loss.cause} ${l.loss.stream}` : `${l.level} ${l.source} ${l.route} ${l.text}`;
+    const same = l.loss?.cause === 'link' ? null : l.loss ? `${l.route} ${l.loss.cause} ${l.loss.stream}` : `${l.level} ${l.source} ${l.part} ${l.route} ${l.text}`;
     const last = out.at(-1);
     if (last && same !== null && last.same === same) {
       last.count++;
@@ -139,13 +142,13 @@ function modelRows(lines) {
 /** What a model row reads as: [level, source, message, count]. */
 function modelRead(r) {
   const said = r.loss ? lossWords(r.loss) : r.text;
-  return [r.level.toUpperCase(), r.source === 'proxy' ? 'proxy' : NAMES[r.route], r.source === 'proxy' && r.route !== null ? `${NAMES[r.route]}: ${said}` : said, r.count > 1 ? `×${r.count}` : ''];
+  return [r.level.toUpperCase(), r.source === 'proxy' ? r.part : NAMES[r.route], r.source === 'proxy' && r.route !== null ? `${NAMES[r.route]}: ${said}` : said, r.count > 1 ? `×${r.count}` : ''];
 }
 /** The rows of `lines` that show under `filter`, {levels, lossOnly, source, query}, as they read. */
 function modelShown(lines, { levels, lossOnly, source, query }) {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   return modelRows(lines)
-    .filter((r) => levels[r.level] && (!lossOnly || r.loss) && (!source || (source === 'proxy' ? r.source === 'proxy' : r.route === source)))
+    .filter((r) => levels[r.level] && (!lossOnly || r.loss) && (!source || (source.startsWith('part:') ? r.part === source.slice(5) : r.route === source)))
     .map(modelRead)
     .filter((read) => words.every((w) => `${read[0]} ${read[1]} ${read[2]}`.toLowerCase().includes(w)));
 }
@@ -154,7 +157,7 @@ function modelShown(lines, { levels, lossOnly, source, query }) {
 async function setFilter({ levels, lossOnly, source, query }) {
   for (const [level, on] of Object.entries(levels)) if (pressed(levelToggle(level)) !== on) await clickOn(levelToggle(level));
   if (pressed(lossToggle()) !== lossOnly) await clickOn(lossToggle());
-  const name = source === '' ? 'All sources' : source === 'proxy' ? 'proxy' : NAMES[source];
+  const name = source === '' ? 'All sources' : source.startsWith('part:') ? source.slice(5) : NAMES[source];
   if (sourceSelect().textContent.trim() !== name) {
     await clickOn(sourceSelect());
     const option = () => [...document.querySelectorAll('[role=option]')].find((o) => o.textContent.trim() === name);
@@ -212,7 +215,7 @@ describe('the log drawer', () => {
     story(page.hub);
     await open();
     expect(rows()).toEqual(modelShown(page.sent, START));
-    expect(rows()).toContainEqual(['WARN', 'proxy', 'VMR 0412: hub dropped 2.1 k samples of sine', '×2']);
+    expect(rows()).toContainEqual(['WARN', 'hub', 'VMR 0412: hub dropped 2.1 k samples of sine', '×2']);
     await clickOn(levelToggle('debug'));
     await settle();
     expect(rows()).toEqual(modelShown(page.sent, { ...START, levels: EVERY }));
@@ -228,6 +231,40 @@ describe('the log drawer', () => {
     expect(rows()).toEqual(modelShown(page.sent, START));
   });
 
+  it('lists as sources the devices and the parts of the proxy its lines were said by, each under its heading, names each row by its source in a column of one width, and doubles no source in a row’s words', async () => {
+    page = await twoDevices();
+    story(page.hub);
+    await open();
+    await clickOn(levelToggle('debug'));
+    await settle();
+    // The sources the rows show, found on the page: the proxy's parts are those no device is named.
+    const shown = new Set(rowEls().map((row) => cell(row, 'src')));
+    const partsShown = [...shown].filter((name) => !Object.values(NAMES).includes(name)).sort();
+    expect(partsShown).toEqual(['hub', 'link', 'server', 'udp://192.168.1.41']);
+    await clickOn(sourceSelect());
+    expect(await until(() => document.querySelector('[data-slot=select-content]')), 'the list opens').toBe(true);
+    const listed = [...document.querySelectorAll('[data-slot=select-content] :is([role=option], [data-slot=select-label])')].map((el) => (el.matches('[role=option]') ? el.textContent.trim() : `# ${el.textContent.trim()}`));
+    expect(listed).toEqual(['All sources', '# Devices', ...Object.values(NAMES), '# Proxy', ...partsShown]);
+    await closeAll();
+    for (const row of rowEls()) {
+      const src = cell(row, 'src'), msg = cell(row, 'msg');
+      expect(msg.startsWith(`${src}:`), `${src} | ${msg}`).toBe(false);
+      expect(row.querySelector('.src').title).toBe(src);
+    }
+    // The column is as wide whatever it names, and stays so as a longer name comes.
+    const widths = () => new Set(rowEls().map((row) => `${row.querySelector('.src').getBoundingClientRect().left} ${row.querySelector('.src').getBoundingClientRect().width} ${row.querySelector('.msg').getBoundingClientRect().left}`));
+    const before = [...widths()];
+    expect(before).toHaveLength(1);
+    page.hub.line('info', 'a part with a long name', { source: 'proxy', part: 'tcp://a-very-long-host-name.example:7855', route: null });
+    await settle();
+    expect([...widths()]).toEqual(before);
+    // A part no line was said by is not listed, and one comes to be listed with its first line.
+    await clickOn(sourceSelect());
+    await until(() => document.querySelector('[data-slot=select-content]'));
+    expect([...document.querySelectorAll('[role=option]')].map((o) => o.textContent.trim())).toContain('tcp://a-very-long-host-name.example:7855');
+    await closeAll();
+  });
+
   it('shows the rows its toggles, its source and its filter say, for any setting of them', async () => {
     page = await twoDevices();
     story(page.hub);
@@ -238,7 +275,7 @@ describe('the log drawer', () => {
         fc.record({
           levels: fc.record({ error: fc.boolean(), warn: fc.boolean(), info: fc.boolean(), debug: fc.boolean() }),
           lossOnly: fc.boolean(),
-          source: fc.constantFrom('', '', 'proxy', '/', '/0'),
+          source: fc.constantFrom('', '', 'part:hub', 'part:server', 'part:link', 'part:udp://192.168.1.41', '/', '/0'),
           query: fc.constantFrom('', '', 'lock', 'LINK down', 'omg', 'sine dropped', 'warn', 'no such words'),
         }),
         async (filter) => {
@@ -259,7 +296,10 @@ describe('the log drawer', () => {
         [{ ...START, levels: { error: false, warn: false, info: true, debug: false } }],
         [{ ...START, levels: { error: false, warn: false, info: false, debug: true } }],
         [{ ...START, levels: EVERY, lossOnly: true }],
-        [{ ...START, levels: EVERY, source: 'proxy' }],
+        [{ ...START, levels: EVERY, source: 'part:hub' }],
+        [{ ...START, levels: EVERY, source: 'part:server' }],
+        [{ ...START, levels: EVERY, source: 'part:link' }],
+        [{ ...START, levels: EVERY, source: 'part:udp://192.168.1.41' }],
         [{ ...START, levels: EVERY, source: '/0' }],
         [{ ...START, levels: EVERY, source: '/' }],
         [{ ...START, levels: EVERY, query: 'lock' }],
@@ -346,7 +386,7 @@ describe('the log drawer', () => {
     await open();
     page.hub.line('warn', 'in view', { time: 14.5 });
     page.hub.line('warn', 'before the view', { time: 2.25 });
-    page.hub.line('info', 'of no device', { source: 'proxy', route: null });
+    page.hub.line('info', 'of no device', { source: 'proxy', part: 'server', route: null });
     await settle();
     const go = (i) => rowEls()[i].querySelector('.go');
     const x1 = () => ids.map((id) => page.ws.plots[id].cursors?.x?.a ?? null);
@@ -608,9 +648,14 @@ describe('the log, to look at', () => {
         await shot(`rows-hover-focus-${theme}-${w}x${h}`);
         await clickOn(lossToggle());
         await settle();
-        expect(rows().every((r) => r[1] === 'proxy')).toBe(true);
+        expect(rows().every((r) => r[1] === 'hub')).toBe(true);
         await shot(`loss-only-${theme}-${w}x${h}`);
         await clickOn(lossToggle());
+        await clickOn(sourceSelect());
+        expect(await until(() => document.querySelector('[data-slot=select-content]')), 'the sources open').toBe(true);
+        await settle();
+        await shot(`sources-open-${theme}-${w}x${h}`);
+        await closeAll();
         await clickOn(bar().querySelector('.history'));
         expect(await until(() => document.querySelector('[data-slot=popover-content]')), 'the History popover opens').toBe(true);
         await settle();

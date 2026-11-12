@@ -63,9 +63,10 @@ export function lossTip(down, totals, since) {
 export const LEVEL_NAMES = { error: 'Error', warn: 'Warn', info: 'Info', debug: 'Debug' };
 /** The drawer's toggle that leaves only the lines of a loss. */
 export const LOG_LOSS = 'Data loss';
-/** The drawer's choice of every source, and the proxy's name among them. */
+/** The drawer's choice of every source, and the headings its list of sources has: the devices, and the parts of the proxy. */
 export const LOG_ALL = 'All sources';
-export const LOG_PROXY = 'proxy';
+export const LOG_DEVICES = 'Devices';
+export const LOG_PARTS = 'Proxy';
 /** What the drawer says in place of its rows when none shows: with only the lines of a loss showing, or under any other filter. */
 export const logEmpty = (lossOnly, any) => (lossOnly ? 'No data has been lost' : any ? 'Nothing matches' : 'No lines yet');
 /** What a line of a loss says, of `loss` {cause, stream, samples, seconds} (protocol.js), in the page's words. */
@@ -75,8 +76,8 @@ export function lossLine({ cause, stream, samples, seconds }) {
   if (cause === 'skipped') return `${n} of ${stream} skipped`;
   return `${cause} dropped ${n} of ${stream}`;
 }
-/** Who said log row `row`, as its source column reads: the proxy, or its device as `named(route)` names it. */
-export const logSource = (row, named) => (row.source === 'proxy' ? LOG_PROXY : named(row.route));
+/** Who said log row `row`, as its source column reads: the part of the proxy that said it, or its device as `named(route)` names it. */
+export const logSource = (row, named) => (row.source === 'proxy' ? row.part : named(row.route));
 /** What log row `row` says, as its message column reads: a loss in `lossLine`'s words, any other line in its own, and the proxy's line of a device after that device's name. */
 export function logMessage(row, named) {
   const said = row.loss ? lossLine(row.loss) : row.text;

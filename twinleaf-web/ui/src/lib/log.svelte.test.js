@@ -6,7 +6,7 @@ import { lossLine, logMessage, logSource, outageText } from './words.js';
 
 let n = 0;
 /** A `log` message, numbered the next unless `n` is given. */
-const line = (level, text, { route = '/', source = 'device', time = 1, loss, n: number } = {}) => ({ type: 'log', n: number ?? ++n, wall: 1000 + n, time, level, source, route, text, ...(loss && { loss }) });
+const line = (level, text, { route = '/', source = 'device', part = 'hub', time = 1, loss, n: number } = {}) => ({ type: 'log', n: number ?? ++n, wall: 1000 + n, time, level, source, ...(source === 'proxy' && { part }), route, text, ...(loss && { loss }) });
 /** A line of a loss the proxy says of the device at `route`. */
 const lost = (route, loss, level = 'warn') => line(level, 'as the hub words it', { route, source: 'proxy', loss });
 /** A log on a hub new to it, the drawer closed. */
@@ -28,6 +28,13 @@ describe('the log’s rows', () => {
     log.take(line('warn', 'lock lost', { route: '/1' }), false);
     log.take(line('error', 'lock lost'), false);
     log.take(line('info', 'up'), false);
+    // The same words from two parts of the proxy are two rows.
+    log.take(line('info', 'up', { source: 'proxy', part: 'server', route: null }), false);
+    log.take(line('info', 'up', { source: 'proxy', part: 'link', route: null }), false);
+    log.take(line('info', 'up', { source: 'proxy', part: 'link', route: null }), false);
+    expect(log.rows.slice(5).map((r) => [r.part, r.count])).toEqual([['server', 1], ['link', 2]]);
+    expect(log.rows[0].part).toBe(null);
+    log.rows = log.rows.slice(0, 5);
     expect(said(log)).toEqual([['info', 'up', 1], ['warn', 'lock lost', 2], ['warn', 'lock lost', 1], ['error', 'lock lost', 1], ['info', 'up', 1]]);
     expect(log.rows[1]).toMatchObject({ id: 2, n: 3, time: 7, wall: 1003, route: '/' });
     expect(log.counts).toEqual({ error: 1, warn: 3, info: 2, debug: 0, loss: 0 });
@@ -161,10 +168,11 @@ describe('a row shows', () => {
     expect(matches(row(), { ...all, levels: { ...all.levels, info: false } }, text)).toBe(false);
     expect(matches(row(), { ...all, lossOnly: true }, text)).toBe(false);
     expect(matches(row({ loss: { cause: 'hub' } }), { ...all, lossOnly: true }, text)).toBe(true);
-    // The proxy's lines, or those of a device, whoever said them.
-    expect(matches(row(), { ...all, source: 'proxy' }, text)).toBe(false);
-    expect(matches(row({ source: 'proxy' }), { ...all, source: 'proxy' }, text)).toBe(true);
-    expect(matches(row({ source: 'proxy' }), { ...all, source: '/' }, text)).toBe(true);
+    // The lines one part of the proxy said, or those of a device, whoever said them.
+    expect(matches(row(), { ...all, source: 'part:hub' }, text)).toBe(false);
+    expect(matches(row({ source: 'proxy', part: 'hub' }), { ...all, source: 'part:hub' }, text)).toBe(true);
+    expect(matches(row({ source: 'proxy', part: 'server' }), { ...all, source: 'part:hub' }, text)).toBe(false);
+    expect(matches(row({ source: 'proxy', part: 'hub' }), { ...all, source: '/' }, text)).toBe(true);
     expect(matches(row(), { ...all, source: '/1' }, text)).toBe(false);
     expect(matches(row({ source: 'proxy', route: null }), { ...all, source: '/' }, text)).toBe(false);
     // Every word, in any case, anywhere in what the row says.
@@ -178,7 +186,8 @@ describe('the words of a row', () => {
   const named = (route) => ({ '/': 'VMR', '/0': 'OMG (/0)' })[route];
   it('are the line’s own, a loss in the page’s words, and the proxy’s line of a device after the device’s name', () => {
     expect(logSource({ source: 'device', route: '/0' }, named)).toBe('OMG (/0)');
-    expect(logSource({ source: 'proxy', route: '/0' }, named)).toBe('proxy');
+    expect(logSource({ source: 'proxy', part: 'hub', route: '/0' }, named)).toBe('hub');
+    expect(logSource({ source: 'proxy', part: 'server', route: null }, named)).toBe('server');
     expect(logMessage({ source: 'device', route: '/', text: 'lock lost' }, named)).toBe('lock lost');
     expect(logMessage({ source: 'proxy', route: '/', text: 'Found VMR' }, named)).toBe('VMR: Found VMR');
     expect(logMessage({ source: 'proxy', route: null, text: 'The log fell behind' }, named)).toBe('The log fell behind');

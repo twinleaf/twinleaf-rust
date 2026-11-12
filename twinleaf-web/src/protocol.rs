@@ -180,14 +180,18 @@ pub(crate) enum Message {
     /// are on, or `null` for a device no sample was taken of and for a line
     /// of no device. `source` says who said it, and `route` names the
     /// device it is of, the device that said it or the one the proxy says
-    /// it of, or `null` for none. `loss` is what the line says was lost,
-    /// and a line of no loss has none.
+    /// it of, or `null` for none. `part` is the part of the proxy that said
+    /// a proxy's line, `hub` for the hub's own and else the source its
+    /// console names, and a device's line has none. `loss` is what the line
+    /// says was lost, and a line of no loss has none.
     Log {
         n: u64,
         wall: f64,
         time: Option<f64>,
         level: Level,
         source: Source,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        part: Option<String>,
         route: Option<String>,
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]

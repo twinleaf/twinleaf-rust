@@ -42,8 +42,8 @@ use twinleaf::proxy::Foreign;
 
 /// Takes a record the process that hosts the proxy printed on its console,
 /// at `level`, from `source` as the console names it, saying `text`, as a
-/// line of the page's log. The line is the proxy's, of no device, and reads
-/// `source` then `text`. A record that comes while no hub lives waits, the
+/// line of the page's log. The line is the proxy's, of no device, said by
+/// the part `source`. A record that comes while no hub lives waits, the
 /// newest 200 of them, and is in the log of the next hub. A device's own
 /// log record is not for this, as the hub reads the device's log packets.
 pub fn console(level: log::Level, source: &str, text: &str) {

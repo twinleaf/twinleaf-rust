@@ -34,19 +34,23 @@ export const SIZE = { default: 30, min: 15, max: 70 };
 function sameAs(line) {
   if (line.loss?.cause === 'link') return null;
   if (line.loss) return `loss ${line.route} ${line.loss.cause} ${line.loss.stream}`;
-  return `${line.level} ${line.source} ${line.route} ${line.text}`;
+  return `${line.level} ${line.source} ${line.part} ${line.route} ${line.text}`;
 }
+
+/** What marks a part of the proxy among the sources a filter may name, ahead of the part's name: no device's route starts so. */
+export const PART = 'part:';
 
 /**
  * Whether `row` shows under `filter`, {levels, lossOnly, source, query}:
  * its level is on, it is of a loss when only those show, it is of the
- * source chosen ('' for every source, 'proxy' for the proxy's own lines,
- * or a device's route for the lines of that device, whoever said them),
- * and `text(row)`, what the drawer writes of it, holds every word typed.
+ * source chosen ('' for every source, a device's route for the lines of
+ * that device, whoever said them, or PART and a part of the proxy for the
+ * lines that part said), and `text(row)`, what the drawer writes of it,
+ * holds every word typed.
  */
 export function matches(row, { levels, lossOnly, source, query }, text) {
   if (!levels[row.level] || (lossOnly && !row.loss)) return false;
-  if (source && (source === 'proxy' ? row.source !== 'proxy' : row.route !== source)) return false;
+  if (source && (source.startsWith(PART) ? row.part !== source.slice(PART.length) : row.route !== source)) return false;
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) return true;
   const said = text(row).toLowerCase();
@@ -56,9 +60,9 @@ export function matches(row, { levels, lossOnly, source, query }, text) {
 export class Log {
   /**
    * The rows kept, oldest first, each {id, n, count, wall, time, level,
-   * source, route, text, loss, back}: `id` names the row, `n` is its
+   * source, part, route, text, loss, back}: `id` names the row, `n` is its
    * newest line's number and `count` how many lines it stands for; `wall`,
-   * `time`, `level`, `source`, `route` and `text` are its newest line's,
+   * `time`, `level`, `source`, `part`, `route` and `text` are its newest line's,
    * `loss` what it says was lost, its samples summed, or undefined; and
    * `back`, on the row of a link's drop, the seconds the link was down
    * once it is back.
@@ -72,7 +76,7 @@ export class Log {
   levels = $state({ error: true, warn: true, info: true, debug: false });
   /** Whether the drawer shows only the lines of a loss. */
   lossOnly = $state(false);
-  /** The source whose lines the drawer shows: '' for all, 'proxy', or a device's route. */
+  /** The source whose lines the drawer shows: '' for all, a device's route, or PART and a part of the proxy. */
   source = $state('');
   /** What the drawer's filter holds. */
   query = $state('');
@@ -126,7 +130,7 @@ export class Log {
   take(msg, inSnapshot) {
     if (!(msg.n > this.#last)) return;
     this.#last = msg.n;
-    const { n, wall, time = null, level, source, route = null, text, loss } = msg;
+    const { n, wall, time = null, level, source, part = null, route = null, text, loss } = msg;
     if (level in this.unseen && !this.open && !(inSnapshot && this.#fresh)) this.unseen = { ...this.unseen, [level]: this.unseen[level] + 1 };
     const rows = this.rows.slice(), last = rows.at(-1), key = sameAs(msg);
     if (loss?.cause === 'link' && loss.seconds != null) {
@@ -136,7 +140,7 @@ export class Log {
     if (last && key !== null && last.key === key) {
       const summed = loss ? { ...loss, samples: last.loss.samples + loss.samples } : undefined;
       rows[rows.length - 1] = { ...last, n, count: last.count + 1, wall, time, text, loss: summed };
-    } else rows.push({ id: n, key, n, count: 1, wall, time, level, source, route, text, loss });
+    } else rows.push({ id: n, key, n, count: 1, wall, time, level, source, part, route, text, loss });
     this.rows = rows.length > KEPT ? rows.slice(rows.length - KEPT) : rows;
   }
 
@@ -164,7 +168,7 @@ export class Log {
     this.lossOnly = on;
   }
 
-  /** Shows the lines of `source`: '' for every source, 'proxy', or a device's route. */
+  /** Shows the lines of `source`: '' for every source, a device's route, or PART and a part of the proxy. */
   setSource(source) {
     this.source = source;
   }

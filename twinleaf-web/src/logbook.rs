@@ -11,8 +11,8 @@
 //! The proxy's lines are also what the process that hosts the proxy writes
 //! on its console. Its logger hands each record it prints to [`Console`],
 //! which gives it to the log of the hub there is, as a line of no device
-//! whose words are the record's source and text as the console prints
-//! them. With no hub yet, or between two, the console keeps the newest
+//! said by the part of the proxy the console names as the record's source.
+//! The hub's own lines are said by the part [`HUB`]. With no hub yet, or between two, the console keeps the newest
 //! [`HELD`] records and the next hub's log takes them, each with the time
 //! it was said, so the lines of the proxy's start are in the log. What the
 //! log's own owners write on the console of a line they also say here is
@@ -45,6 +45,9 @@ use twinleaf::{DeviceRoute, Receiver, RecvError};
 
 /// How many of the newest lines the hub keeps for a page's snapshot.
 pub(crate) const KEPT: usize = 500;
+
+/// The part of the proxy that says the hub's own lines.
+pub(crate) const HUB: &str = "hub";
 
 /// How many of the newest records of the console wait for a hub's log.
 pub(crate) const HELD: usize = 200;
@@ -86,8 +89,8 @@ impl Logbook {
         self.state.lock().unwrap().newest.insert(route, time);
     }
 
-    /// Takes a line the proxy says at `level`, of the device at `route` or
-    /// of none, with what it says was lost, if it is of a loss.
+    /// Takes a line the proxy's hub says at `level`, of the device at
+    /// `route` or of none, with what it says was lost, if it is of a loss.
     pub(crate) fn proxy(
         &self,
         level: Level,
@@ -95,20 +98,29 @@ impl Logbook {
         text: String,
         loss: Option<LossLine>,
     ) {
-        self.line(Source::Proxy, level, route, text, loss, wall());
+        let said = (Source::Proxy, Some(HUB.to_string()));
+        self.line(said, level, route, text, loss, wall());
     }
 
     /// Takes a line the device at `route` said at `level`.
     pub(crate) fn device(&self, route: DeviceRoute, level: Level, text: String) {
-        self.line(Source::Device, level, Some(route), text, None, wall());
+        self.line(
+            (Source::Device, None),
+            level,
+            Some(route),
+            text,
+            None,
+            wall(),
+        );
     }
 
-    /// Numbers a line said at the host's time `wall`, stamps it, sends it
-    /// and keeps it. The lock is held until it is sent, so the lines go out
-    /// in the order of their numbers.
+    /// Numbers a line said at the host's time `wall` by `said`, a source
+    /// and for the proxy its part, stamps it, sends it and keeps it. The
+    /// lock is held until it is sent, so the lines go out in the order of
+    /// their numbers.
     fn line(
         &self,
-        source: Source,
+        (source, part): (Source, Option<String>),
         level: Level,
         route: Option<DeviceRoute>,
         text: String,
@@ -123,6 +135,7 @@ impl Logbook {
             time: route.and_then(|route| state.newest.get(&route).copied()),
             level,
             source,
+            part,
             route: route.map(|route| route.to_string()),
             text,
             loss,
@@ -148,10 +161,11 @@ pub(crate) struct Console {
 }
 
 /// The log the records go to, while its hub lives, and those that wait for
-/// one, oldest first, each with its level, its words and when it was said.
+/// one, oldest first, each with its level, the part that said it, its text
+/// and when it was said.
 struct Waiting {
     log: Weak<Logbook>,
-    held: VecDeque<(Level, String, f64)>,
+    held: VecDeque<(Level, String, String, f64)>,
 }
 
 /// The console of this process.
@@ -183,8 +197,8 @@ impl Console {
     }
 
     /// Takes a record the console printed at `level`, from `source` as the
-    /// console names it, saying `text`. It is a line of the hub's log at
-    /// once, or waits for a hub, the oldest of more than [`HELD`] going. A
+    /// console names it, saying `text`. It is a line of the hub's log, said
+    /// by the part `source`, at once, or waits for a hub, the oldest of more than [`HELD`] going. A
     /// record logged inside [`unheard`], or by what this sets off, is not
     /// taken.
     pub(crate) fn take(&self, level: log::Level, source: &str, text: &str) {
@@ -197,16 +211,16 @@ impl Console {
             log::Level::Info => Level::Info,
             log::Level::Debug | log::Level::Trace => Level::Debug,
         };
-        let text = format!("{source}: {text}");
+        let (part, text) = (source.to_string(), text.to_string());
         unheard(|| {
             let mut state = self.state.lock().unwrap();
             match state.log.upgrade() {
-                Some(log) => log.line(Source::Proxy, level, None, text, None, wall()),
+                Some(log) => log.line((Source::Proxy, Some(part)), level, None, text, None, wall()),
                 None => {
                     if state.held.len() == HELD {
                         state.held.pop_front();
                     }
-                    state.held.push_back((level, text, wall()));
+                    state.held.push_back((level, part, text, wall()));
                 }
             }
         });
@@ -218,8 +232,8 @@ impl Console {
         unheard(|| {
             let mut state = self.state.lock().unwrap();
             state.log = Arc::downgrade(log);
-            for (level, text, wall) in std::mem::take(&mut state.held) {
-                log.line(Source::Proxy, level, None, text, None, wall);
+            for (level, part, text, wall) in std::mem::take(&mut state.held) {
+                log.line((Source::Proxy, Some(part)), level, None, text, None, wall);
             }
         });
     }
@@ -302,6 +316,8 @@ pub(crate) mod tests {
         assert_eq!(sent[0]["time"], serde_json::Value::Null);
         assert_eq!(sent[0]["level"], "warn");
         assert_eq!(sent[0]["source"], "device");
+        assert!(sent[0].get("part").is_none(), "a device's line has no part");
+        assert_eq!(sent[2]["part"], "hub");
         assert_eq!(sent[0]["route"], "/");
         assert_eq!(sent[0]["text"], "early");
         assert!(sent[0].get("loss").is_none(), "a line of no loss has none");
@@ -364,18 +380,18 @@ pub(crate) mod tests {
         console.take(log::Level::Error, "server", "client 3 ended");
         let said = heard(&mut rx);
         let read = |line: &serde_json::Value| {
-            let text = line["text"].as_str().unwrap().to_string();
-            (line["level"].as_str().unwrap().to_string(), text)
+            let of = |field: &str| line[field].as_str().unwrap().to_string();
+            (of("level"), of("part"), of("text"))
+        };
+        let own = |level: &str, part: &str, text: &str| {
+            (level.to_string(), part.to_string(), text.to_string())
         };
         assert_eq!(
             said.iter().map(read).collect::<Vec<_>>(),
             [
-                (
-                    "warn".to_string(),
-                    "udp://127.0.0.1: Sensor disconnected".to_string()
-                ),
-                ("debug".to_string(), "worker: Port 3 opened".to_string()),
-                ("error".to_string(), "server: client 3 ended".to_string()),
+                own("warn", "udp://127.0.0.1", "Sensor disconnected"),
+                own("debug", "worker", "Port 3 opened"),
+                own("error", "server", "client 3 ended"),
             ]
         );
         for line in &said {
@@ -395,7 +411,8 @@ pub(crate) mod tests {
         console.attach(&next);
         let said = heard(&mut rx);
         assert_eq!(said.len(), 1, "{said:?}");
-        assert_eq!(said[0]["text"], "server: between two hubs");
+        assert_eq!(said[0]["text"], "between two hubs");
+        assert_eq!(said[0]["part"], "server");
         assert_eq!(said[0]["n"], 1);
     }
 
@@ -413,7 +430,7 @@ pub(crate) mod tests {
         let Frame::Text(first) = &kept[0] else {
             panic!("a line is a message")
         };
-        assert!(first.contains("server: record 5\""), "{first}");
+        assert!(first.contains("\"text\":\"record 5\""), "{first}");
     }
 
     /// A record logged inside `unheard` is not taken, on this thread, and

@@ -2122,9 +2122,10 @@ mod tests {
         let held = next_message(again.clone(), &mut later, "log", same).await;
         assert_eq!(held["text"], line["text"]);
         assert!(held.get("seq").is_none(), "a snapshot's line has no number");
-        let found = |held: &serde_json::Value| held["source"] == "proxy";
+        let found = |held: &serde_json::Value| held["part"] == "hub";
         let named = next_message(again, &mut later, "log", found).await;
         assert_eq!(named["route"], "/");
+        assert_eq!(named["part"], "hub");
         assert!(named["text"].as_str().unwrap().starts_with("Found "));
     }
 
@@ -2138,15 +2139,17 @@ mod tests {
         let fed = Fed::start();
         console.attach(&fed.live.log);
         let (snapshot, mut changes) = fed.live.snapshot(0).await.unwrap();
-        let before = |line: &serde_json::Value| line["text"] == "mdns: said before the hub";
+        let before = |line: &serde_json::Value| line["text"] == "said before the hub";
         let held = next_message(snapshot, &mut changes, "log", before).await;
         assert_eq!(held["level"], "warn");
         assert_eq!(held["source"], "proxy");
+        assert_eq!(held["part"], "mdns");
         assert_eq!(held["route"], serde_json::Value::Null);
         console.take(log::Level::Error, "server", "said after");
-        let after = |line: &serde_json::Value| line["text"] == "server: said after";
+        let after = |line: &serde_json::Value| line["text"] == "said after";
         let line = next_message(Vec::new(), &mut changes, "log", after).await;
         assert_eq!(line["level"], "error");
+        assert_eq!(line["part"], "server");
         assert!(line["seq"].as_u64().is_some(), "a change every page hears");
     }
 
