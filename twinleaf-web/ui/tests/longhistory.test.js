@@ -19,7 +19,7 @@
 //   oldest time held, live or paused, by the window set, a double-click,
 //   End, Back, Forward or the wheel, and a live plot regains a window wider
 //   than the hub held once the hub holds it.
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { commands } from 'vitest/browser';
 import { flushSync } from 'svelte';
 import fc from 'fast-check';
@@ -34,6 +34,8 @@ const SIGNALS = ['sine.sine', 'aux.triangle'];
 const HISTORIES = [600, 3600, 6 * 3600, 86400];
 /** Wheel turns of 400 px that take any view to the widest or the narrowest: each is a factor of e^0.6, and a day is e^17.6 of the narrowest. */
 const ALL_THE_WAY = 40;
+/** Random cases tried beyond the examples by the property that sweeps the wheel from the narrowest view to the widest and back. */
+const SWEEPS = 4;
 
 /**
  * What a hub holds as a plot looks at it: its History setting, how much of
@@ -53,14 +55,18 @@ const held = ({ history, fill, behind, now }) => ({ history, now, behind, ...(fi
 const EACH = HISTORIES.flatMap((history) => [[{ history, fill: { full: true }, behind: 0.3, now: 100_000 }], [{ history, fill: { full: false, share: 0.25 }, behind: 0, now: 100_000 }]]);
 
 describe('a plot on a hub that holds hours', () => {
+  // A page each, so what one test leaves, or a property still running as
+  // it times out, is not on the next one's page.
   let page, id, view;
-  beforeAll(async () => {
+  beforeEach(async () => {
     page = await mountPage([SIGNALS], 'columns', 0, SIGNALS);
     id = plotIds(page.ws.layout)[0];
     view = page.views.of(id);
   });
-  afterAll(() => page.dispose());
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    page.dispose();
+  });
 
   /** The plot live, at its first window, on a hub holding `h`, drawn: what the hub holds. */
   async function live(h) {
@@ -199,7 +205,8 @@ describe('a plot on a hub that holds hours', () => {
         press('Back');
         expect(shows()).toEqual(narrowest);
       }),
-      withExamples(EACH.map(([h]) => [h, 0.3])),
+      // Each case turns the wheel all the way out and in three times, so few random ones beside the examples.
+      { examples: EACH.map(([h]) => [h, 0.3]), numRuns: EACH.length + Math.min(SWEEPS, fc.readConfigureGlobal().numRuns) },
     );
   }, 60_000);
 
