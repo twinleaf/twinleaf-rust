@@ -160,7 +160,7 @@ fn host_options(cli: &ProxyCli, name: &str) -> HostOptions {
 /// Whether `tio proxy` serves the web page on its own port. A build with the
 /// `web` feature serves it on the default port. The page reads through the
 /// proxy on the default port, so a proxy on another port serves no page.
-fn serves_page(cli: &ProxyCli) -> bool {
+pub(crate) fn serves_page(cli: &ProxyCli) -> bool {
     cfg!(feature = "web") && cli.port == twinleaf::proto::TCP_DEFAULT_PORT
 }
 

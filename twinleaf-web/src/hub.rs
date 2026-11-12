@@ -288,6 +288,7 @@ impl Live {
         });
         let losses = hub.losses.clone();
         let log = hub.log.clone();
+        logbook::CONSOLE.attach(&log);
         crate::devices::watch(
             &connection,
             mounts,
@@ -2125,6 +2126,28 @@ mod tests {
         let named = next_message(again, &mut later, "log", found).await;
         assert_eq!(named["route"], "/");
         assert!(named["text"].as_str().unwrap().starts_with("Found "));
+    }
+
+    /// A record of the proxy's console said before the hub is in the
+    /// snapshot of a page of it, and one said after is a change the page
+    /// hears, each a line of the proxy's with the record's level.
+    #[tokio::test]
+    async fn a_console_record_is_a_line_the_pages_of_the_hub_hear() {
+        let console = logbook::Console::new();
+        console.take(log::Level::Warn, "mdns", "said before the hub");
+        let fed = Fed::start();
+        console.attach(&fed.live.log);
+        let (snapshot, mut changes) = fed.live.snapshot(0).await.unwrap();
+        let before = |line: &serde_json::Value| line["text"] == "mdns: said before the hub";
+        let held = next_message(snapshot, &mut changes, "log", before).await;
+        assert_eq!(held["level"], "warn");
+        assert_eq!(held["source"], "proxy");
+        assert_eq!(held["route"], serde_json::Value::Null);
+        console.take(log::Level::Error, "server", "said after");
+        let after = |line: &serde_json::Value| line["text"] == "server: said after";
+        let line = next_message(Vec::new(), &mut changes, "log", after).await;
+        assert_eq!(line["level"], "error");
+        assert!(line["seq"].as_u64().is_some(), "a change every page hears");
     }
 
     #[test]

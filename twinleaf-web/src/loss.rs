@@ -31,7 +31,7 @@
 //! the link's own lines stand for.
 
 use crate::feed::Feed;
-use crate::logbook::Logbook;
+use crate::logbook::{self, Logbook};
 use crate::protocol::{Frame, Level, Link, LossLine, Lost, Message};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -161,7 +161,10 @@ impl Losses {
             device.sent = counts;
         }
         if dropped > 0 {
-            log::warn!("The web page's hub fell behind and dropped {dropped} samples");
+            // The lines above say it in the log.
+            logbook::unheard(|| {
+                log::warn!("The web page's hub fell behind and dropped {dropped} samples");
+            });
         }
     }
 

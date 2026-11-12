@@ -8,6 +8,16 @@
 //! A line of a loss carries what was lost as data, a [`LossLine`], so no
 //! page reads it out of the words.
 //!
+//! The proxy's lines are also what the process that hosts the proxy writes
+//! on its console. Its logger hands each record it prints to [`Console`],
+//! which gives it to the log of the hub there is, as a line of no device
+//! whose words are the record's source and text as the console prints
+//! them. With no hub yet, or between two, the console keeps the newest
+//! [`HELD`] records and the next hub's log takes them, each with the time
+//! it was said, so the lines of the proxy's start are in the log. What the
+//! log's own owners write on the console of a line they also say here is
+//! written inside [`unheard`], so it is in the log once.
+//!
 //! Every line has two times. `wall` is the host's clock as the hub took
 //! the line, in Unix seconds. `time` is on the clock the plots use, the
 //! time of the newest sample the hub had taken of the line's device as it
@@ -24,8 +34,9 @@
 
 use crate::feed::Feed;
 use crate::protocol::{Frame, Level, LossLine, Message, Source};
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use twinleaf::proto::log::LogLevel;
 use twinleaf::tio::packet::Payload;
@@ -34,6 +45,16 @@ use twinleaf::{DeviceRoute, Receiver, RecvError};
 
 /// How many of the newest lines the hub keeps for a page's snapshot.
 pub(crate) const KEPT: usize = 500;
+
+/// How many of the newest records of the console wait for a hub's log.
+pub(crate) const HELD: usize = 200;
+
+/// The host's clock now, in Unix seconds.
+fn wall() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64())
+}
 
 /// The lines kept, and the feed each goes out on.
 pub(crate) struct Logbook {
@@ -74,16 +95,17 @@ impl Logbook {
         text: String,
         loss: Option<LossLine>,
     ) {
-        self.line(Source::Proxy, level, route, text, loss);
+        self.line(Source::Proxy, level, route, text, loss, wall());
     }
 
     /// Takes a line the device at `route` said at `level`.
     pub(crate) fn device(&self, route: DeviceRoute, level: Level, text: String) {
-        self.line(Source::Device, level, Some(route), text, None);
+        self.line(Source::Device, level, Some(route), text, None, wall());
     }
 
-    /// Numbers a line, stamps it, sends it and keeps it. The lock is held
-    /// until it is sent, so the lines go out in the order of their numbers.
+    /// Numbers a line said at the host's time `wall`, stamps it, sends it
+    /// and keeps it. The lock is held until it is sent, so the lines go out
+    /// in the order of their numbers.
     fn line(
         &self,
         source: Source,
@@ -91,10 +113,8 @@ impl Logbook {
         route: Option<DeviceRoute>,
         text: String,
         loss: Option<LossLine>,
+        wall: f64,
     ) {
-        let wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0.0, |since| since.as_secs_f64());
         let mut state = self.state.lock().unwrap();
         state.last += 1;
         let message = Message::Log {
@@ -118,6 +138,90 @@ impl Logbook {
     pub(crate) fn snapshot(&self) -> Vec<Frame> {
         let state = self.state.lock().unwrap();
         state.lines.iter().map(Message::frame).collect()
+    }
+}
+
+/// The records the hosting process writes on its console, on their way to
+/// the log of the hub there is.
+pub(crate) struct Console {
+    state: Mutex<Waiting>,
+}
+
+/// The log the records go to, while its hub lives, and those that wait for
+/// one, oldest first, each with its level, its words and when it was said.
+struct Waiting {
+    log: Weak<Logbook>,
+    held: VecDeque<(Level, String, f64)>,
+}
+
+/// The console of this process.
+pub(crate) static CONSOLE: Console = Console::new();
+
+thread_local! {
+    /// Whether this thread is inside [`unheard`] or inside the console's
+    /// own taking of a record.
+    static UNHEARD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `said`, which writes on the console what the log already holds a
+/// line of. No console takes a record this thread logs meanwhile.
+pub(crate) fn unheard<T>(said: impl FnOnce() -> T) -> T {
+    let was = UNHEARD.replace(true);
+    let out = said();
+    UNHEARD.set(was);
+    out
+}
+
+impl Console {
+    pub(crate) const fn new() -> Console {
+        Console {
+            state: Mutex::new(Waiting {
+                log: Weak::new(),
+                held: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// Takes a record the console printed at `level`, from `source` as the
+    /// console names it, saying `text`. It is a line of the hub's log at
+    /// once, or waits for a hub, the oldest of more than [`HELD`] going. A
+    /// record logged inside [`unheard`], or by what this sets off, is not
+    /// taken.
+    pub(crate) fn take(&self, level: log::Level, source: &str, text: &str) {
+        if UNHEARD.get() {
+            return;
+        }
+        let level = match level {
+            log::Level::Error => Level::Error,
+            log::Level::Warn => Level::Warn,
+            log::Level::Info => Level::Info,
+            log::Level::Debug | log::Level::Trace => Level::Debug,
+        };
+        let text = format!("{source}: {text}");
+        unheard(|| {
+            let mut state = self.state.lock().unwrap();
+            match state.log.upgrade() {
+                Some(log) => log.line(Source::Proxy, level, None, text, None, wall()),
+                None => {
+                    if state.held.len() == HELD {
+                        state.held.pop_front();
+                    }
+                    state.held.push_back((level, text, wall()));
+                }
+            }
+        });
+    }
+
+    /// Makes `log` the log the records go to, for as long as its hub
+    /// lives, and gives it those that waited, in the order they were said.
+    pub(crate) fn attach(&self, log: &Arc<Logbook>) {
+        unheard(|| {
+            let mut state = self.state.lock().unwrap();
+            state.log = Arc::downgrade(log);
+            for (level, text, wall) in std::mem::take(&mut state.held) {
+                log.line(Source::Proxy, level, None, text, None, wall);
+            }
+        });
     }
 }
 
@@ -239,6 +343,90 @@ pub(crate) mod tests {
         assert_eq!(kept[0]["text"], "line 7");
         assert_eq!(kept[KEPT - 1]["n"], (KEPT + 7) as u64);
         assert!(kept[0].get("seq").is_none(), "a snapshot's has no number");
+    }
+
+    /// A console record said before any hub waits, and is a line of the
+    /// first log attached, with the time it was said, its level, and its
+    /// source and text as its words. One said after goes to that log at
+    /// once. Once that hub is gone the records wait again, for the next.
+    #[test]
+    fn a_console_record_waits_for_a_hubs_log_and_then_is_a_line_of_it() {
+        let console = Console::new();
+        let before = wall();
+        console.take(log::Level::Warn, "udp://127.0.0.1", "Sensor disconnected");
+        console.take(log::Level::Trace, "worker", "Port 3 opened");
+        let feed = Feed::new();
+        let mut rx = feed.subscribe().1;
+        let log = Logbook::new(feed);
+        assert!(heard(&mut rx).is_empty(), "no hub has taken them yet");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        console.attach(&log);
+        console.take(log::Level::Error, "server", "client 3 ended");
+        let said = heard(&mut rx);
+        let read = |line: &serde_json::Value| {
+            let text = line["text"].as_str().unwrap().to_string();
+            (line["level"].as_str().unwrap().to_string(), text)
+        };
+        assert_eq!(
+            said.iter().map(read).collect::<Vec<_>>(),
+            [
+                (
+                    "warn".to_string(),
+                    "udp://127.0.0.1: Sensor disconnected".to_string()
+                ),
+                ("debug".to_string(), "worker: Port 3 opened".to_string()),
+                ("error".to_string(), "server: client 3 ended".to_string()),
+            ]
+        );
+        for line in &said {
+            assert_eq!(line["source"], "proxy");
+            assert_eq!(line["route"], serde_json::Value::Null);
+            assert_eq!(line["time"], serde_json::Value::Null);
+        }
+        let waited = said[0]["wall"].as_f64().unwrap();
+        assert!(waited >= before - 0.001 && waited < said[2]["wall"].as_f64().unwrap() - 0.01);
+        assert_eq!(log.snapshot().len(), 3, "each is in the log once");
+
+        drop(log);
+        console.take(log::Level::Info, "server", "between two hubs");
+        let feed = Feed::new();
+        let mut rx = feed.subscribe().1;
+        let next = Logbook::new(feed);
+        console.attach(&next);
+        let said = heard(&mut rx);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0]["text"], "server: between two hubs");
+        assert_eq!(said[0]["n"], 1);
+    }
+
+    /// The console keeps the newest HELD records that wait, and no older.
+    #[test]
+    fn the_console_keeps_the_newest_records_that_wait_up_to_its_bound() {
+        let console = Console::new();
+        for i in 0..HELD + 5 {
+            console.take(log::Level::Info, "server", &format!("record {i}"));
+        }
+        let log = Logbook::new(Feed::new());
+        console.attach(&log);
+        let kept = log.snapshot();
+        assert_eq!(kept.len(), HELD);
+        let Frame::Text(first) = &kept[0] else {
+            panic!("a line is a message")
+        };
+        assert!(first.contains("server: record 5\""), "{first}");
+    }
+
+    /// A record logged inside `unheard` is not taken, on this thread, and
+    /// one after it is.
+    #[test]
+    fn a_record_the_logs_owner_writes_of_its_own_line_is_not_taken() {
+        let console = Console::new();
+        let log = Logbook::new(Feed::new());
+        console.attach(&log);
+        unheard(|| console.take(log::Level::Warn, "loss", "said in the log already"));
+        assert!(log.snapshot().is_empty());
+        console.take(log::Level::Warn, "loss", "said on the console alone");
+        assert_eq!(log.snapshot().len(), 1);
     }
 
     /// A device's critical line reads as an error, and a level the protocol

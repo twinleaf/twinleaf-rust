@@ -184,9 +184,22 @@ Where the lines come from:
   or names it anew (`info`), a device's RPC table that did not load
   (`warn`), the device lines missed when the hub's reader of packets fell
   behind its queue of 8192 (`warn`, of no device), and each loss as
-  `loss.rs` counts it. What the proxy process writes through the `log`
-  crate to its console is not among them: the hub is a client of the
-  proxy and hears none of it.
+  `loss.rs` counts it.
+- **The proxy's console.** Every record `tio proxy` prints on its console
+  is a proxy line of no device too, when the proxy serves the page: its
+  logger (`twinleaf-tools/src/logging.rs`) hands each record it writes to
+  `twinleaf_web::console(level, source, text)`, after the console's own
+  filter, so what the terminal shows is what the log holds. `text` is
+  `source: text` as the console prints them, `source` the last part of the
+  record's target (`server`, `mdns`, a device's URL). Error, warn and info
+  keep their level, and debug and trace are `debug`. Three things are left
+  out: a record of target `device::<route>`, which is a device's log packet
+  the proxy echoes and the hub already takes from the packet itself, a
+  record the log's own owner writes of a line it says in the log (`loss.rs`
+  "fell behind", inside `logbook::unheard`), and what the proxy prints
+  without the `log` crate, as its "Plots:" line. A record that comes with
+  no hub alive, as at start-up, waits, the newest 200 (`logbook::HELD`),
+  and is in the next hub's log with the time it was said.
 
 A line of a loss has `loss`, by `cause`, so nothing reads a loss out of
 `text`:
