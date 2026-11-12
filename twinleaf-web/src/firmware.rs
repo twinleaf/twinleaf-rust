@@ -1891,4 +1891,65 @@ pub(crate) mod tests {
         ));
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    /// Serves the page to a browser as `tio proxy` does, over simulated
+    /// devices, on a port of the test's own, so the page and the hub are
+    /// driven together without the port `tio proxy` serves it on. The
+    /// port is `TL_SERVE_PORT` on loopback, the simulator's arguments
+    /// `TL_SERVE_SIM`, split at spaces, and it serves for
+    /// `TL_SERVE_SECONDS`. The hub's catalog is the directory
+    /// `TWINLEAF_FIRMWARE_DIR` names. What this process logs at info and
+    /// above goes to the page's log, as what `tio proxy` prints on its
+    /// console does. Run with `--ignored`.
+    #[tokio::test]
+    #[ignore = "a server for a browser to drive"]
+    async fn the_page_is_served_over_simulated_devices() {
+        /// Hands each record to the page's log, as the console of `tio proxy` does.
+        struct ToPage;
+        impl log::Log for ToPage {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.level() <= log::Level::Info
+            }
+            fn log(&self, record: &log::Record) {
+                // A device's own records reach the log as its log packets do.
+                if self.enabled(record.metadata()) && !record.target().starts_with("device") {
+                    crate::console(record.level(), record.target(), &record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        log::set_logger(&ToPage).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        let variable = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+        let port: u16 = variable("TL_SERVE_PORT").parse().unwrap();
+        let seconds: u64 = variable("TL_SERVE_SECONDS").parse().unwrap();
+        let sim = std::env::var("TL_SERVE_SIM").unwrap_or_default();
+        let args: Vec<&str> = ["--no-drop"]
+            .into_iter()
+            .chain(sim.split_whitespace())
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let url = twinleaf_tools::tools::simulate::serve(&args, stop.clone());
+        let root = DeviceRoute::root();
+        // The hub the page's first request starts finds its proxy by this.
+        std::env::set_var("TWINLEAF_PROXY", format!("tcp://127.0.0.1:{port}"));
+        let proxy = Proxy::host(HostOptions {
+            port,
+            name: "a test".to_string(),
+            default: Some(Layout {
+                mounts: vec![Mount {
+                    url,
+                    source: root,
+                    prefix: root,
+                }],
+            }),
+            foreign: Some(crate::handler()),
+            ..HostOptions::default()
+        })
+        .unwrap();
+        println!("serving http://127.0.0.1:{port} for {seconds} s");
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        stop.store(true, Ordering::Relaxed);
+        proxy.shutdown();
+    }
 }
