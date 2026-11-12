@@ -138,10 +138,17 @@ function catchExports(body = () => new Response('time (s),sine.sine (V)\n1,2\n')
   restore.push(() => (window.fetch = fetched));
   return asked;
 }
-/** Presses Save and waits until `n` files are saved and the dialog has closed. */
+/**
+ * Presses Save and waits until `n` files are saved and the dialog has
+ * closed. Files made after the browser stopped asking where, as a slow
+ * machine makes them, wait for Save file…, which it presses then.
+ */
 async function saveAll(saved, n = 1) {
   const before = saved.length;
   await press(control('Save image…') ? 'Save image…' : 'Save data…');
+  const later = () => dialog() && control('Save file…');
+  expect(await until(() => saved.length >= before + n || later(), 20000), `${n} files saved, or made and waiting for Save file…`).toBe(true);
+  if (saved.length < before + n) await press('Save file…');
   expect(await until(() => saved.length >= before + n, 20000), `${n} files saved`).toBe(true);
   expect(await until(() => !document.querySelector('.export-dialog')), 'the dialog closed once saved').toBe(true);
   await settle();
