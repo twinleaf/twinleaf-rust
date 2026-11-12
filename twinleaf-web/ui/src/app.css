@@ -41,6 +41,13 @@
 	   them; yellow, a dark plot's cursor, all but vanishes on white. */
 	--cursor-a: #882255;
 	--cursor-b: #004488;
+	/* A log line's level, each a colour the page has: the error's, the
+	   warning's, which is the first cursor's, the second cursor's, and the
+	   quiet text's. */
+	--log-error: var(--destructive);
+	--log-warn: var(--cursor-a);
+	--log-info: var(--cursor-b);
+	--log-debug: var(--muted-foreground);
 
 	/* The traces, slot for slot the dark theme's hues (colors.svelte.js
 	   names them: cyan, magenta, lime, amber, violet, rose, teal, orange),
@@ -107,6 +114,10 @@
 	--plot-seek-edge: oklch(1 0 0 / 70%);
 	--cursor-a: #ffd166;
 	--cursor-b: #06d6a0;
+	--log-error: var(--destructive);
+	--log-warn: var(--cursor-a);
+	--log-info: var(--cursor-b);
+	--log-debug: var(--muted-foreground);
 
 	--trace-1: #4cc9f0;
 	--trace-2: #f72585;

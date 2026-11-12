@@ -12,6 +12,10 @@
 // And the History popover's: the question lowering a limit asks before it
 // drops history the hub holds, what a paused plot keeps, and what its
 // waterline reads as to a screen reader.
+//
+// And what the page says of lost data and of the hub's log: the status
+// bar's loss mark and its tooltip, and the log drawer's rows, a loss in the
+// page's own words from what the hub says was lost.
 
 import { switchOf } from './properties.js';
 import { bytesEstimate, bytesText, spanText } from './units.js';
@@ -32,25 +36,63 @@ export function lossWords({ kind, n, seconds }) {
   if (kind === 'dropped') return ['hub dropped ', count];
   return ['page behind ', times];
 }
-/** What the status bar's loss item says while its popover is open and the last minute lost nothing. */
-export const LOSS_NONE_RECENT = 'nothing lost in the last minute';
-/** The loss item's tooltip. */
-export const LOSS_TIP = 'Lost in the last minute. Click for the counts since the page opened';
-/** The heading of each count in the loss popover, and what it counts. */
-export const LOSS_COUNTS = {
-  link: { head: 'Link dropped', tip: 'The link to the device went down: how many times, and for how long in all' },
-  skipped: { head: 'Skipped', tip: 'Samples the device did not send, or its link lost while it stayed up' },
-  dropped: { head: 'Hub dropped', tip: 'Samples the proxy and its hub dropped because the hub fell behind' },
-  behind: { head: 'Page behind', tip: 'Times this page fell too far behind the hub and was sent everything again' },
+/** The status bar's one word for the cause of loss that stands for the most data. */
+export const LOSS_CAUSE = { link: 'link', skipped: 'skipped', dropped: 'dropped', behind: 'page' };
+/** A share of the data, from 0 to 1, as the status bar's loss mark reads it, in whole percents and never as nothing: "<1%", "18%". */
+export const shareText = (share) => (share < 0.005 ? '<1%' : `${Math.round(share * 100)}%`);
+/** What the mark says while a device's link is down, before how long. */
+export const LINK_DOWN = 'link down';
+/** A time of day, `ms` since 1970, to the minute, as "14:02". */
+const minuteText = (ms) => {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 };
-/** The loss popover's title: since when it counts, the counts `reset` or not. */
-export const lossSince = (reset) => (reset ? 'Lost since the counts were reset' : 'Lost since the page opened');
-/** The button that sets the loss popover's counts to nothing. */
-export const LOSS_RESET = 'Reset';
-/** What the loss popover says in place of its devices when none lost anything. */
-export const LOSS_NO_DEVICE = 'No device lost anything';
-/** How the loss popover counts a link's drops: "4×, 11 s", or "0×". */
-export const linkCount = (drops, seconds) => (drops || seconds ? `${drops}×, ${spanText(seconds)}` : '0×');
+/**
+ * The loss mark's tooltip, one line: the device whose link is down now,
+ * `down` as `device` names it, or null for none; then what the page counts
+ * lost since it opened at `since`, `totals` as loss.svelte.js gives them,
+ * each cause in `lossWords`; and what a press does.
+ */
+export function lossTip(down, totals, since) {
+  const phrases = totals.map((cause) => lossWords(cause).map((part) => part.num ?? part).join(''));
+  const counted = phrases.length ? `${since === null ? 'Lost' : `Since ${minuteText(since)}`}: ${phrases.join(' · ')}. ` : '';
+  return `${down ? `The link to ${down} is down. ` : ''}${counted}Click for the log`;
+}
+
+/** Each level of the log as the drawer names it. */
+export const LEVEL_NAMES = { error: 'Error', warn: 'Warn', info: 'Info', debug: 'Debug' };
+/** The drawer's toggle that leaves only the lines of a loss. */
+export const LOG_LOSS = 'Data loss';
+/** The drawer's choice of every source, and the proxy's name among them. */
+export const LOG_ALL = 'All sources';
+export const LOG_PROXY = 'proxy';
+/** What the drawer says in place of its rows when none shows: with only the lines of a loss showing, or under any other filter. */
+export const logEmpty = (lossOnly, any) => (lossOnly ? 'No data has been lost' : any ? 'Nothing matches' : 'No lines yet');
+/** What a line of a loss says, of `loss` {cause, stream, samples, seconds} (protocol.js), in the page's words. */
+export function lossLine({ cause, stream, samples, seconds }) {
+  if (cause === 'link') return seconds == null ? 'link down' : `link back after ${seconds.toFixed(1)} s`;
+  const n = `${countText(samples)} ${samples === 1 ? 'sample' : 'samples'}`;
+  if (cause === 'skipped') return `${n} of ${stream} skipped`;
+  return `${cause} dropped ${n} of ${stream}`;
+}
+/** Who said log row `row`, as its source column reads: the proxy, or its device as `named(route)` names it. */
+export const logSource = (row, named) => (row.source === 'proxy' ? LOG_PROXY : named(row.route));
+/** What log row `row` says, as its message column reads: a loss in `lossLine`'s words, any other line in its own, and the proxy's line of a device after that device's name. */
+export function logMessage(row, named) {
+  const said = row.loss ? lossLine(row.loss) : row.text;
+  return row.source === 'proxy' && row.route !== null ? `${named(row.route)}: ${said}` : said;
+}
+/** The divider of an outage of the link to the device `label` names: how long it lasted, `back` seconds, once the link is back. */
+export const outageText = (label, back) => (back === undefined ? `link to ${label} down` : `link to ${label} down ${back.toFixed(1)} s`);
+/** The drawer's button that keeps the newest line in view, and the one that copies the lines shown. */
+export const FOLLOW = 'Follow';
+export const COPY_LINES = 'Copy the lines shown';
+/** Why a row has no moment to show on the plots. */
+export const NO_MOMENT = 'No samples of this device had arrived';
+/** What Show on plots says on a tab with no time plot. */
+export const NO_TIME_PLOT = 'No time plot on this tab to show it on';
+/** The notice of a copy of `n` lines. */
+export const copiedLines = (n) => `Copied ${n.toLocaleString()} ${n === 1 ? 'line' : 'lines'}`;
 
 /** `items` joined as a sentence lists them: "a", "a and b", "a, b and c", the rest past `most` counted. */
 export function list(items, most = 3) {

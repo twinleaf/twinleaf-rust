@@ -21,6 +21,13 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .app.moving, .app.moving * { cursor: grabbing !important; user-select: none; }
 /* The sidebar and the tiles, two PaneForge panes, the sidebar's edge between them. */
 .layout { flex: 1 1 0; min-height: 0; height: auto; padding: 8px 12px; }
+/* The docks and the tiles above, and under them, while it is open, the log
+   drawer in a pane of its own, the handle between them as far from each as
+   a dock's is from the tiles: the drawer's frame keeps the page's margins,
+   and what is above it gives up its foot's. */
+.page-split { flex: 1 1 0; min-height: 0; height: auto; }
+.page-split.with-log .layout { padding-bottom: 0; }
+.log-pane { padding: 0 12px 8px; }
 
 /* Scrollbars: thin, in the theme's colours, over a clear track. */
 * { scrollbar-width: thin; scrollbar-color: color-mix(in oklch, var(--muted-foreground) 40%, transparent) transparent; }
@@ -166,6 +173,40 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
    clear of what it holds. The panels scroll below the row, not under it,
    and no panel's fold moves it. */
 .dock-top { flex: none; display: flex; align-items: center; height: 28px; margin-bottom: 6px; padding-right: 26px; }
+/* The log drawer's frame is a dock's, and its bar a dock's top row
+   (LogDrawer.svelte): the drawer's name, in a panel header's type, then its
+   controls, each as tall as a toolbar's, 6 px apart; in a window too
+   narrow for one row they wrap. */
+.log-frame { cursor: default; }
+.log-bar { gap: 6px; height: auto; min-height: 28px; flex-wrap: wrap; }
+.log-title { padding: 0 2px; color: var(--muted-foreground); font: 600 12px var(--font-ui); }
+.log-bar .seg button { display: inline-flex; align-items: center; gap: 4px; }
+/* A level that is off dims its colour too, as a hidden signal's chip does. */
+.log-bar .seg button:not(.on) i { opacity: 0.45; }
+.log-bar .log-source { max-width: 14rem; }
+.log-bar .log-filter { min-width: 5rem; }
+.status-bar .log svg { width: 12px; height: 12px; }
+/* The log's rows, in the data face at a property row's height: a strip of
+   the level's colour at the row's edge and the level in that colour, then
+   who said it and what, the count of the lines it stands for, and its
+   button, shown as a property's star is. A row answers the pointer, and
+   the one the arrows are on is marked, as a property row is. */
+.log-rows { flex: 1 1 0; min-height: 0; font: 12px/18px var(--font-data); }
+.log-list { min-height: 100%; outline: none; }
+.log-row { --lv: var(--log-debug); display: grid; grid-template-columns: 12ch 5ch minmax(5ch, 14ch) minmax(0, 1fr) auto 14px; align-items: center; column-gap: 8px; padding: 2px 4px 2px 9px; box-shadow: inset 3px 0 0 var(--lv); white-space: nowrap; cursor: default; }
+.log-row[data-level=error] { --lv: var(--log-error); }
+.log-row[data-level=warn] { --lv: var(--log-warn); }
+.log-row[data-level=info] { --lv: var(--log-info); }
+.log-row:hover { background: color-mix(in oklab, var(--muted) 50%, transparent); }
+.log-row[aria-selected=true] { background: var(--muted); }
+.log-row .t, .log-row .src, .log-row .n { color: var(--muted-foreground); }
+.log-row .t { font-variant-numeric: tabular-nums; }
+.log-row .lv { color: var(--lv); }
+.log-row .src, .log-row .msg { overflow: hidden; text-overflow: ellipsis; }
+.log-row .msg { color: var(--foreground); }
+/* An outage of a device's link: what it was, in the error's colour, a rule to either side, as a menu's caption has one after it. */
+.log-cut { display: flex; align-items: center; gap: 8px; padding: 2px 4px 2px 9px; color: var(--log-error); font-size: 11px; white-space: nowrap; }
+.log-cut::before, .log-cut::after { content: ''; flex: 1; min-width: 12px; height: 1px; background: color-mix(in oklch, var(--log-error) 50%, transparent); }
 /* A dock with nothing for a top row has none. Its button shares the first
    panel header's row, centred in it as in a top row, so it is at one height
    in every dock; that header, whichever panel is first, open or folded, and
@@ -225,33 +266,26 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .status-bar .item { display: inline-flex; align-items: center; gap: 5px; padding: 0 6px; height: 20px; border-radius: 4px; }
 .status-bar .item + .item { border-left: 1px solid var(--border); border-radius: 0; }
 .status-bar .spacer { flex: 1; }
-/* A number in the bar keeps one width, `--digits` wide, four unless it says, and a count keeps room for its plural's s, so what follows stays put as they change. */
-.status-bar .num { display: inline-block; min-width: calc(var(--digits, 4) * 1ch); text-align: right; font-variant-numeric: tabular-nums; }
-.status-bar .plural.one { visibility: hidden; }
+/* What an item of the bar says keeps one width, that of the longest it says, `data-room`, each line of it one thing it may say, and a pixel over for how a run of text rounds: it is set from its start, its words close up to its numbers, and the room left over comes after it, so what follows stays put as it changes. */
+.status-bar .fit { display: inline-grid; justify-items: start; font-variant-numeric: tabular-nums; }
+.status-bar .fit::before { content: attr(data-room); grid-area: 1 / 1; height: 0; padding-right: 1px; overflow: hidden; white-space: pre; visibility: hidden; }
+.status-bar .fit > * { grid-area: 1 / 1; }
+/* A count of the log's bar, which ends its button, keeps one width, `--digits` wide, four unless it says, set from its start. */
+.log-bar .num { display: inline-block; min-width: calc(var(--digits, 4) * 1ch); text-align: left; font-variant-numeric: tabular-nums; }
 .status-bar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--destructive); }
 .status-bar .dot.on { background: var(--primary); }
 .status-bar .warn { display: inline-flex; align-items: center; gap: 3px; color: var(--cursor-a); }
-.status-bar .warn svg, .status-bar .keys svg { width: 12px; height: 12px; }
+.status-bar .warn svg, .status-bar .keys svg, .status-bar .loss svg { width: 12px; height: 12px; }
 .status-bar .meter { display: inline-block; width: 48px; height: 4px; border-radius: 2px; background: var(--secondary); overflow: hidden; }
 .status-bar .meter span { display: block; height: 100%; background: var(--primary); }
-.status-bar .keys, .status-bar .history, .status-bar .loss { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
-.status-bar .keys:hover, .status-bar .history:hover, .status-bar .loss:hover { color: var(--foreground); background: var(--secondary); }
-/* What was lost in the last minute, in the warning's colour, each cause's numbers as wide as they grow. */
-.status-bar .loss { color: var(--cursor-a); }
-.status-bar .loss svg { width: 12px; height: 12px; }
-/* The loss popover (LossCounts.svelte): its title and Reset, a row a device
-   with its three counts, numbers at the trailing edge, and the page's own
-   count under a rule. */
-.loss-counts { display: flex; flex-direction: column; gap: 8px; font-size: 12px; line-height: 16px; }
-.loss-head, .loss-page { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.loss-head { color: var(--foreground); font-weight: 600; }
-.loss-counts table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-.loss-counts th { padding: 0 0 4px 12px; color: var(--muted-foreground); font: 600 11px/16px var(--font-ui); text-align: right; white-space: nowrap; cursor: help; }
-.loss-counts td { padding: 2px 0 2px 12px; color: var(--foreground); text-align: right; white-space: nowrap; }
-.loss-counts th:first-child, .loss-counts td:first-child { padding-left: 0; text-align: left; cursor: default; overflow: hidden; text-overflow: ellipsis; max-width: 9rem; }
-.loss-counts td.none { color: var(--muted-foreground); text-align: left; }
-.loss-page { padding-top: 8px; border-top: 1px solid var(--border); color: var(--muted-foreground); cursor: help; font-variant-numeric: tabular-nums; }
-.loss-page span:last-child { color: var(--foreground); }
+.status-bar .keys, .status-bar .history, .status-bar .loss, .status-bar .log { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.status-bar .keys:hover, .status-bar .history:hover, .status-bar .loss:hover, .status-bar .log:hover, .status-bar .log.on { color: var(--foreground); background: var(--secondary); }
+/* The Log item's count of what arrived unseen, in the warning's colour, or the error's while an error is among it. */
+.status-bar .log .num { color: var(--log-warn); }
+.status-bar .log .num.error { color: var(--log-error); }
+/* The loss mark: what is missing of the last minute, in the warning's colour, or a link down now, in the error's. */
+.status-bar .loss { color: var(--log-warn); }
+.status-bar .loss.down { color: var(--log-error); }
 /* A grouped form, as the settings popover and HistorySettings.svelte lay
    theirs out: sections split by one rule, each a heading over rows of a
    label and its control. The labels take one column, as wide in every
@@ -577,12 +611,12 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .axis-row { display: flex; align-items: center; gap: 4px; padding: 0 4px 4px; color: var(--muted-foreground); font-size: 12px; }
 .axis-row > span:first-child { flex: 1; min-width: 56px; }
 .axis-row .unit { font: 11px var(--font-data); }
-/* A choice of a few, as one strip of buttons, the chosen one lit. */
-.axis-row .seg { display: flex; border: 1px solid var(--input); border-radius: var(--radius); overflow: hidden; }
-.axis-row .seg button { min-width: 26px; height: 22px; padding: 0 6px; border: 0; border-left: 1px solid var(--input); background: none; color: var(--muted-foreground); font: 11px var(--font-data); cursor: pointer; }
-.axis-row .seg button:first-child { border-left: 0; }
-.axis-row .seg button:hover { color: var(--foreground); }
-.axis-row .seg button.on { background: var(--secondary); color: var(--foreground); }
+/* A choice of a few, as one strip of buttons, the chosen one lit; in the log's bar, each button a toggle of its own. */
+:is(.axis-row, .log-bar) .seg { display: flex; border: 1px solid var(--input); border-radius: var(--radius); overflow: hidden; }
+:is(.axis-row, .log-bar) .seg button { min-width: 26px; height: 22px; padding: 0 6px; border: 0; border-left: 1px solid var(--input); background: none; color: var(--muted-foreground); font: 11px var(--font-data); cursor: pointer; }
+:is(.axis-row, .log-bar) .seg button:first-child { border-left: 0; }
+:is(.axis-row, .log-bar) .seg button:hover { color: var(--foreground); }
+:is(.axis-row, .log-bar) .seg button.on { background: var(--secondary); color: var(--foreground); }
 .axis-sep { height: 1px; margin: 4px 0; background: var(--border); }
 /* A row whose choice fills it: its label in a column of its own, then the
    strip's buttons, each as wide as the others, or the dropdown. */
@@ -645,7 +679,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .picker-sample { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 1px solid var(--input); border-radius: var(--radius); background: none; color: var(--muted-foreground); cursor: pointer; }
 .picker-sample:hover { background: var(--secondary); color: var(--foreground); }
 .picker-sample svg { width: 13px; height: 13px; }
-.signal-option i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; }
+.signal-option i, .log-bar .seg i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; }
 .signal-option small { color: var(--muted-foreground); }
 .signal-none { padding: 2px 8px 4px; color: var(--muted-foreground); font-size: 12px; }
 
@@ -712,10 +746,14 @@ label > [data-slot=checkbox]::after { content: none; }
 .props-table tr { border-bottom: 0; }
 .props-table tr.picked { background: color-mix(in oklch, var(--primary) 12%, transparent); }
 .props-wrap { display: contents; }
-/* A property's star: shown on its row's hover, and always once starred. */
-.props-table .star { display: inline-grid; place-items: center; width: 14px; height: 14px; margin-right: 4px; padding: 0; border: 0; background: none; color: var(--muted-foreground); vertical-align: -2px; cursor: pointer; opacity: 0; }
-.props-table .star svg { width: 12px; height: 12px; }
-.props-table tr:hover .star, .props-table .star.on { opacity: 1; }
+/* A property's star: shown on its row's hover, and always once starred. A log row's button is drawn the same, and shows on the row the arrows are on too. */
+.props-table .star, .log-row .go { display: inline-grid; place-items: center; width: 14px; height: 14px; margin-right: 4px; padding: 0; border: 0; background: none; color: var(--muted-foreground); vertical-align: -2px; cursor: pointer; opacity: 0; }
+.props-table .star svg, .log-row .go svg { width: 12px; height: 12px; }
+.props-table tr:hover .star, .props-table .star.on, .log-row:hover .go, .log-row[aria-selected=true] .go { opacity: 1; }
+.log-row .go { margin-right: 0; }
+.log-row .go:hover:not(:disabled) { color: var(--foreground); }
+.log-row .go:disabled { cursor: default; }
+.log-row:hover .go:disabled, .log-row[aria-selected=true] .go:disabled { opacity: 0.35; }
 .props-table .star.on { color: var(--cursor-a); }
 .props-table .star.on svg { fill: currentColor; }
 .props-table .cell { font-variant-numeric: tabular-nums; }

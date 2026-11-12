@@ -5,9 +5,9 @@
 // snapshot of the socket opened in its place fills it, the one way the page
 // comes to hold a hub's state (see protocol.js). The plots' views, which
 // outlive any hub, read the time through `now`. The devices' RPCs go
-// through `call` and `read`. What the page lost (loss.svelte.js) outlives
-// the sessions too: every snapshot and every `loss` message is handed to
-// it.
+// through `call` and `read`. What the page lost (loss.svelte.js) and the
+// hub's log (log.svelte.js) outlive the sessions too: every snapshot and
+// every `loss` and `log` message is handed to them.
 //
 // The page asks the hub for what its plots show, and says so again to each
 // hub it reaches: the spectra (`showSpectra`), whether a plot is held
@@ -16,6 +16,7 @@
 
 import { Session } from './session.svelte.js';
 import { Losses } from './loss.svelte.js';
+import { Log } from './log.svelte.js';
 import { DEVICE_GONE, api, captureKey, captureMessage, decodeFrame, holdMessage, spectraMessage } from './protocol.js';
 import { WINDOW_LIMITS } from './window.js';
 import * as clock from './clock.js';
@@ -31,7 +32,9 @@ export class Hub {
   /** Whether the socket reached a hub and is open. */
   connected = $state(false);
   /** What the page lost of its data, and where, since it opened. */
-  loss = new Losses();
+  loss = new Losses(clock.wall());
+  /** The hub's log, and the drawer that shows it. */
+  log = new Log(typeof localStorage === 'undefined' ? null : localStorage);
   /** Bytes of binary frames received, for the page's rate readout. */
   bytes = 0;
   /** Whether the page holds a plot paused, for which the hub keeps a capture of its history. */
@@ -56,6 +59,7 @@ export class Hub {
       this.session.clearAllWindows();
       this.session = new Session(msg.id);
       this.loss.snapshot(msg.id, msg.behind ?? 0, clock.now());
+      this.log.snapshot(msg.id);
       this.connected = true;
       this.seq = msg.seq;
       this.sentSpectra = null;
@@ -66,6 +70,7 @@ export class Hub {
     }
     if (msg.seq !== undefined && !this.next(msg.seq)) return this.resync();
     if (msg.type === 'loss') return this.loss.apply(msg, msg.seq === undefined, (stream) => this.session.rateOf(msg.route, stream), clock.now());
+    if (msg.type === 'log') return this.log.take(msg, msg.seq === undefined);
     this.session.text(msg);
     if (msg.type === 'trace') this.sendSpectra();
     // The hub drops every page's ask of a capture as it loses the device.

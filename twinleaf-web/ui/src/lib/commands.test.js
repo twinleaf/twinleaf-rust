@@ -38,7 +38,7 @@ describe('the command table', () => {
       // A command of a tab or the page acts on no plot, so runs with none.
       if (PLOTLESS.includes(c.scope)) expect(c.empty && !c.kinds, c.id).toBe(true);
       expect(c.kinds === undefined || c.kinds.every((k) => kinds.includes(k)), c.id).toBe(true);
-      expect((c.needs ?? []).every((n) => [...HOSTED, 'axis', 'signals'].includes(n)), c.id).toBe(true);
+      expect((c.needs ?? []).every((n) => [...HOSTED, ...ORIGIN].includes(n)), c.id).toBe(true);
       expect([undefined, 'page', 'list', 'tabs'], c.id).toContain(c.place);
       expect(typeof c.run, c.id).toBe('function');
       // A key is shown and named; a row has an icon to go with its label.
@@ -113,6 +113,7 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     arrange: (name) => void log.push(`arrange ${name}`),
     reset: () => void log.push('reset'),
     setView: (id) => void log.push(`setView ${id}`),
+    timeIds: () => shown.filter((id, i) => kinds[i] === 'time'),
     movePlotToTab: (id, tab) => void log.push(`movePlotToTab ${id} ${tab}`),
   };
   const ws = new Proxy(view, {
@@ -146,6 +147,8 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     closeTab: (t) => void log.push(`closeTab ${t.id}`),
     dockShown: (side) => side === 'left',
     toggleDock: (side) => void log.push(`toggleDock ${side}`),
+    logShown: () => log.includes('toggleLog'),
+    toggleLog: () => void log.push('toggleLog'),
     exportTabs: () => void log.push('exportTabs'),
     importTabs: () => void log.push('importTabs'),
   };
@@ -257,6 +260,41 @@ describe('a command', () => {
     expect(none.cmds.row('arrange', { how: { to: 'grid' } })).toMatchObject({ label: 'Grid', value: null });
     expect(none.cmds.row('exportTabs')).toMatchObject({ label: 'Export every tab…', value: '2 tabs' });
     expect(none.cmds.offered().find((c) => c.id === 'exportTabs')).toMatchObject({ label: 'Export every tab…', group: 'View' });
+  });
+
+  it('Show the log opens the drawer, and reads Hide the log while it is open, from its key, the palette and a button', () => {
+    const log = [];
+    const p = page(['time'], [], null, log);
+    expect(actionFor('page', { key: '`' })).toBe('showLog');
+    expect(p.cmds.row('showLog')).toMatchObject({ label: 'Show the log', show: ['`'], offered: true });
+    const closed = p.cmds.row('showLog').icon;
+    expect(p.cmds.offered().find((c) => c.id === 'showLog')).toEqual({ id: 'showLog', how: undefined, label: 'Show the log', find: 'docks Show the log showLog', group: 'Docks' });
+    expect(p.cmds.run('showLog', { from: 'key' })).toBe(true);
+    expect(log).toEqual(['toggleLog']);
+    expect(p.cmds.row('showLog').label).toBe('Hide the log');
+    expect(p.cmds.row('showLog').icon, 'open, it shows the picture of closing').not.toBe(closed);
+  });
+
+  it('X1 at a moment puts X1 there on every time plot of the tab, selected or not, as one view step and one edit: a plot that shows the moment paused, one that does not moved to centre it; with no time plot or no moment it does nothing', () => {
+    const log = [];
+    const p = page(['time', 'spectrum', 'time'], ['b'], 'b', log);
+    const shows = { a: [0, 10], b: [1, 50], c: [100, 110] };
+    const plain = p.svc.plotOf;
+    p.svc.plotOf = (id) => {
+      const t = plain(id);
+      return { ...t, view: { pause: () => log.push(`pause ${id}`), show: (t0, t1) => log.push(`show ${id} ${t0} ${t1}`) }, pv: { plotId: id, xd: shows[id], placed: id === 'c' ? { x: { a: 101, b: 102 } } : undefined } };
+    };
+    p.svc.viewHistory.step = (fn) => (log.push('step'), fn());
+    p.svc.cursors.set = (what, byId) => log.push(what, Object.fromEntries(byId));
+    expect(p.cmds.run('x1At', { from: 'button', how: { t: 4 } })).toBe(true);
+    expect(log).toEqual(['step', 'pause a', 'show c -1 9', 'X1 at a log line', { a: { x: { a: 4, b: null } }, c: { x: { a: 4, b: 102 } } }]);
+    log.length = 0;
+    expect(p.cmds.run('x1At', { from: 'button', how: { t: null } })).toBe(false);
+    expect(page(['spectrum'], [], null, log).cmds.run('x1At', { from: 'button', how: { t: 4 } })).toBe(false);
+    expect(log).toEqual([]);
+    // It is made on a line, so the palette has none of it; its button reads as the table says.
+    expect(page(['time'], [], null, log).cmds.offered().some((c) => c.id === 'x1At')).toBe(false);
+    expect(p.cmds.row('x1At')).toMatchObject({ label: 'Show on plots', offered: true });
   });
 
   it('reads the same, one label and one icon, from every origin', () => {

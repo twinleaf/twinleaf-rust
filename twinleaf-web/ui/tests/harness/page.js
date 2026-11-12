@@ -158,8 +158,20 @@ const typed = (text) => (text === 'true' ? true : text === 'false' ? false : tex
  * announces announces it. While `slow`, each reply waits for `release()`,
  * which answers the oldest call waiting. `announce(route, values)` has a
  * device announce new values, as another client's write would, and
- * `presence(route, state)` changes a device's presence. Each change it
- * sends is numbered the next after the last the hub applied.
+ * `presence(route, state)` changes a device's presence, the device named
+ * as `names` has it by route, or 'test'. Each change it sends is numbered
+ * the next after the last the hub applied.
+ *
+ * It keeps a log and counts what was lost as the server does
+ * (`twinleaf-web/src/logbook.rs`, `loss.rs`): `line(level, text, {route,
+ * source, time, loss})` sends a line, numbered the next, of the device at
+ * `route`, or of none with null, said by the device unless `source` is
+ * 'proxy', its time the newest sample's unless given, and its time of day
+ * the page's clock's. `linkDown(route)` drops a device's link and
+ * `linkBack(route, seconds)` brings it back after that long, and
+ * `lose(route, stream, {skipped, proxy, hub})` loses samples of a stream,
+ * each as the server says it: the device's presence, the lines of the
+ * loss, and the device's `loss` counts.
  */
 export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
   const hub = new Hub();
@@ -176,7 +188,37 @@ export function stubHub(signals = [], rpcs = [], routes = ['/'], units = {}) {
     Object.assign(values.get(route), patch);
     hub.text({ type: 'settings', seq: hub.seq + 1, route, values: { ...values.get(route) } });
   };
-  hub.presence = (route, presence) => hub.text({ type: 'device', seq: hub.seq + 1, route, name: 'test', serial: route, firmware: '1', presence });
+  hub.names = new Map();
+  hub.presence = (route, presence) => hub.text({ type: 'device', seq: hub.seq + 1, route, name: hub.names.get(route) ?? 'test', serial: route, firmware: '1', presence });
+  let lines = 0;
+  hub.line = (level, text, { route = '/', source = 'device', time, loss } = {}) => {
+    const newest = route !== null && isFinite(hub.session.latest) ? hub.session.latest : null;
+    hub.text({ type: 'log', seq: hub.seq + 1, n: ++lines, wall: clock.wall() / 1000, time: time === undefined ? newest : time, level, source, route, text, ...(loss && { loss }) });
+  };
+  const lost = new Map();
+  const lostOf = (route) => lost.get(route) ?? lost.set(route, { times: 0, seconds: 0, streams: {} }).get(route);
+  const tellLost = (route) => hub.text({ type: 'loss', seq: hub.seq + 1, route, link: { times: lostOf(route).times, seconds: lostOf(route).seconds }, streams: structuredClone(lostOf(route).streams) });
+  hub.linkDown = (route) => {
+    lostOf(route).times++;
+    hub.presence(route, 'lost');
+    hub.line('error', 'The link is down', { route, source: 'proxy', loss: { cause: 'link', seconds: null } });
+    tellLost(route);
+  };
+  hub.linkBack = (route, seconds) => {
+    lostOf(route).seconds += seconds;
+    hub.presence(route, 'alive');
+    hub.line('info', `The link is back after ${seconds.toFixed(1)} s`, { route, source: 'proxy', loss: { cause: 'link', seconds } });
+    tellLost(route);
+  };
+  hub.lose = (route, stream, samples) => {
+    const counts = (lostOf(route).streams[stream] ??= { skipped: 0, link: 0, proxy: 0, hub: 0 });
+    for (const cause of ['skipped', 'proxy', 'hub']) {
+      if (!samples[cause]) continue;
+      counts[cause] += samples[cause];
+      hub.line('warn', `${samples[cause]} samples of ${stream} lost`, { route, source: 'proxy', loss: { cause, stream, samples: samples[cause] } });
+    }
+    tellLost(route);
+  };
   if (rpcs.length) {
     hub.text({ type: 'routes', seq: hub.seq + 1, mounts: {}, routes });
     for (const route of routes) {

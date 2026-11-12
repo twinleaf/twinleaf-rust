@@ -14,6 +14,7 @@
 //     signals     a plot's signals
 //     list        the Signals list, and its search field
 //     properties  a table of property rows
+//     log         the log drawer's lines
 //     window      the window field's arrows
 //     kind        a plot's kind and layout dropdowns, while one is open
 //   The element with focus
@@ -80,6 +81,7 @@ export const ORDER = [
   { id: 'signals', place: 'signals' },
   { id: 'list', place: 'list' },
   { id: 'properties', place: 'properties' },
+  { id: 'log', place: 'log' },
   { id: 'window', place: 'window' },
   { id: 'kind', place: 'kind' },
   { id: ELEMENT },

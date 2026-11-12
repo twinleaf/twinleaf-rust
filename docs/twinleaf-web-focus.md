@@ -18,7 +18,10 @@ page
 │  └─ plot …      kind · layout · signals · legend · pause · split right ·
 │                 split down · maximize · close
 ├─ right dock     (as the left)
-└─ status bar     History · Keys
+├─ log            while open: level toggles · Data loss · Source · Filter ·
+│                 Follow · Copy · lines (one stop; ↑ ↓ move between
+│                 them, Enter shows one on the plots) · hide button
+└─ status bar     History · the loss mark · Log · Keys
 ```
 
 Splitters are not in the tree. The command palette resizes the docks.

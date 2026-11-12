@@ -54,6 +54,8 @@
   import WindowField from './lib/WindowField.svelte';
   import { WINDOW_LIMITS } from './lib/window.js';
   import StatusBar from './lib/StatusBar.svelte';
+  import LogDrawer from './lib/LogDrawer.svelte';
+  import { SIZE as LOG_SIZE } from './lib/log.svelte.js';
   import HistorySettings from './lib/HistorySettings.svelte';
   import CommandPalette from './lib/CommandPalette.svelte';
   import IconButton from './lib/IconButton.svelte';
@@ -174,6 +176,8 @@
     closeTab: (t) => closeTab(t),
     dockShown: (side) => docks.shown(side),
     toggleDock: (side) => docks.hide(side, docks.shown(side)),
+    logShown: () => log.open,
+    toggleLog: () => toggleLog(),
     exportTabs,
     importTabs: () => importInput.click(),
     viewChanged,
@@ -315,6 +319,21 @@
             : [],
       );
 
+  // The log drawer, under the docks and the tiles while it is open
+  // (log.svelte.js): a pane of its own below theirs, its height a share of
+  // the two, dragged at its edge or moved with the arrows there, and kept
+  // for the next visit with whether it is open. A double-click puts the
+  // height back.
+  const log = hub.log;
+  let logPane = $state(null);
+  /** Opens the drawer on every line, or closes it: focus that was in it goes to the status bar's Log item. */
+  function toggleLog() {
+    if (!log.open) return log.show();
+    const had = !!document.activeElement?.closest?.('.log-frame');
+    log.hide();
+    if (had) tick().then(() => document.querySelector('.status-bar .log')?.focus());
+  }
+
   // Each dock's width, a share of the page, dragged at its edge or moved
   // with the arrows there, and kept for the next visit. A double-click puts
   // it back.
@@ -362,6 +381,8 @@
       localStorage.setItem(DOCK.keys[side], String(size));
     } catch {}
   }
+  /** A handle between panes: clear at rest, a line in the accent while the pointer is on it, and 3 px from each pane. */
+  const HANDLE = 'mx-[3px] bg-transparent transition-colors after:w-3 hover:bg-primary/60 data-[direction=vertical]:mx-0 data-[direction=vertical]:my-[3px] data-[direction=vertical]:after:h-3';
   /** Each dock's handle, the element. */
   const dockHandles = $state({ left: null, right: null });
   /**
@@ -868,6 +889,7 @@
         undo: () => undo(false),
         redo: () => undo(true),
         copyData: (e) => plotKey('copyData', e),
+        showLog: (e) => plotKey('showLog', e),
         // Every plot of the tab, not the page's text.
         selectAll: () => void selection.only(ws.shownIds(), null),
         goToPlot(e) {
@@ -942,7 +964,7 @@
     data-dock-empty={docks[side].length ? undefined : ''}
     aria-label="{side === 'left' ? 'Left' : 'Right'} dock width"
     title={prefs.hints ? 'Drag to resize; double-click resets' : undefined}
-    class="mx-[3px] bg-transparent transition-colors after:w-3 hover:bg-primary/60 data-[direction=vertical]:mx-0 data-[direction=vertical]:my-[3px] data-[direction=vertical]:after:h-3"
+    class={HANDLE}
     ondblclick={() => resetDock(side)}
     onmousedown={(e) => (handlePress = e)}
     onDraggingChange={(dragging) => dockDragging(side, dragging)}
@@ -1074,6 +1096,8 @@
       </Popover.Root>
     </header>
 
+    <Resizable.PaneGroup direction="vertical" class="page-split {log.open ? 'with-log' : ''}">
+    <Resizable.Pane id="page-main" order={1} class="flex min-h-0 min-w-0">
     {#key narrow.current}
     <div class="docked" class:narrow={narrow.current}>
     <Resizable.PaneGroup direction={narrow.current ? 'vertical' : 'horizontal'} class="layout" bind:ref={dockGroup} onLayoutChange={docksResized}>
@@ -1104,6 +1128,19 @@
     </Resizable.PaneGroup>
     </div>
     {/key}
+    </Resizable.Pane>
+    {#if log.open}
+      <Resizable.Handle
+        aria-label="Log height"
+        title={prefs.hints ? 'Drag to resize; double-click resets' : undefined}
+        class="{HANDLE} log-handle"
+        ondblclick={() => logPane?.resize(LOG_SIZE.default)}
+      />
+      <Resizable.Pane id="log" order={2} bind:this={logPane} defaultSize={log.size} minSize={LOG_SIZE.min} maxSize={LOG_SIZE.max} onResize={(size) => log.resize(size)} class="log-pane flex min-h-0 min-w-0">
+        <LogDrawer {log} session={hub.session} />
+      </Resizable.Pane>
+    {/if}
+    </Resizable.PaneGroup>
 
     <StatusBar {hub} {hud} onKeys={() => (keysOpen = true)} />
   </div>

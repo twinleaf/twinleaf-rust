@@ -119,7 +119,21 @@ const ON_PAGE = {
     return menu;
   },
   'the palette’s rows': async () => (await pressKey('Control+k'), await settle(), document.querySelector('[data-slot=command-list]')),
+  'the status bar': async () => document.querySelector('.status-bar'),
+  // The drawer, opened with a line that has a moment: its rows' buttons and its own. `closeDrawer` closes it before any other origin opens.
+  'the log drawer': async (page) => {
+    if (!page.hub.log.rows.length) page.hub.line('info', 'a line', { time: 15 });
+    page.hub.log.show();
+    await settle();
+    return document.querySelector('.log-frame');
+  },
 };
+/** Closes the log drawer of `page`, which an origin left open, so the plots have the room every other origin finds them in. */
+async function closeDrawer(page) {
+  if (!page.hub.log.open) return;
+  page.hub.log.hide();
+  await settle();
+}
 
 /** Every origin a control is found at, by name. */
 const ORIGINS = { ...ON_PLOT, ...ON_TAB, ...ON_PAGE };
@@ -186,6 +200,7 @@ describe('a plot command', () => {
           for (const c of open.length > 2 ? COMMANDS : [null]) {
             await closeAll();
             expect(await closePalette(), 'the palette gone').toBe(true);
+            await closeDrawer(page);
             const el = await open(page, page.ids[k], c?.id);
             expect(el, `${name} opens`).toBeTruthy();
             for (const row of el.querySelectorAll('[data-command]')) named.add(row.dataset.command);
@@ -210,6 +225,7 @@ describe('a plot command', () => {
             await closeAll();
             // The palette, left open or closed, fades out over the page, and takes every press until it has gone.
             expect(await closePalette(), `the palette gone before ${id} from ${origin}`).toBe(true);
+            await closeDrawer(page);
             await focusPage();
             page.ws.selection.only(picked);
             document.activeElement?.blur();
@@ -276,18 +292,25 @@ describe('a plot command', () => {
     try {
       page.ws.selection.only([page.ids[0]]);
       await settle();
-      /** Each place a command shows, as [command, label, icon or null, where it was found], the label as it reads there. */
+      /** What the table reads of command `id` made at `where`, as [label, icon]: a submenu's trigger, or a command of no choices, with none; any other with each of its choices. */
+      const tableReads = (id, where, sub) => {
+        const c = COMMANDS.find((x) => x.id === id);
+        const hows = sub || !c.choices ? [undefined] : c.choices(cmds.context(id, where)).map(([to]) => ({ to }));
+        return hows.map((how) => cmds.row(id, { ...where, how })).map((r) => [r.label, iconName(r.icon)]);
+      };
+      /** Each place a command shows, as {id, label, icon or null, at, table}: the label as it reads there, and what the table read of it then, as the page was. */
       const shown = [];
       for (const [name, open] of Object.entries(ORIGINS)) {
         for (const k of ON_PLOT[name] ? [0, 3] : [0]) {
           await closeAll();
           expect(await closePalette(), 'the palette gone').toBe(true);
+          await closeDrawer(page);
           const el = await open(page, page.ids[k]);
           expect(el, `${name} opens`).toBeTruthy();
           const where = ON_PLOT[name] ? { on: page.ids[k] } : ON_TAB[name] ? { tab: lastTab().dataset.tab } : {};
           for (const d of el.querySelectorAll('[data-command]')) {
             const read = reading(d);
-            if (read) shown.push({ id: d.dataset.command, ...read, at: `${name} of ${k}`, where });
+            if (read) shown.push({ id: d.dataset.command, ...read, at: `${name} of ${k}`, table: tableReads(d.dataset.command, where, read.sub) });
           }
         }
       }
@@ -297,17 +320,15 @@ describe('a plot command', () => {
       const byId = Map.groupBy(shown, (s) => s.id);
       for (const [id, places] of byId) {
         const c = COMMANDS.find((x) => x.id === id);
-        // What the table reads, made where each was found: a submenu's trigger, or a command of no choices, with none; any other with each of its choices.
+        // Each place reads what the table read, made where it was found, as the page was then.
         for (const s of places) {
-          const hows = s.sub || !c.choices ? [undefined] : c.choices(cmds.context(id, s.where)).map(([to]) => ({ to }));
-          const reads = hows.map((how) => cmds.row(id, { ...s.where, how })).map((r) => [r.label, iconName(r.icon)]);
-          expect(reads.map(([label]) => label), `${id} in ${s.at}`).toContainEqual(s.label);
-          if (s.icon) expect(reads, `${id} in ${s.at}`).toContainEqual([s.label, s.icon]);
+          expect(s.table.map(([label]) => label), `${id} in ${s.at}`).toContainEqual(s.label);
+          if (s.icon) expect(s.table, `${id} in ${s.at}`).toContainEqual([s.label, s.icon]);
         }
         // Every place that shows it with the same words shows the same picture.
         for (const label of new Set(places.map((s) => s.label))) expect(new Set(places.filter((s) => s.label === label && s.icon).map((s) => s.icon)).size, `${id} as ${label}`).toBeLessThanOrEqual(1);
-        // A command of no choices reads one way everywhere.
-        if (!c.choices) expect([...new Set(places.map((s) => s.label))], `${id}: ${places.map((s) => s.at).join(', ')}`).toHaveLength(1);
+        // A command of no choices reads one way everywhere, but one whose words say what it would do now, as Show the log does, where the page was not the same.
+        if (!c.choices) expect(new Set(places.map((s) => s.label)).size, `${id}: ${places.map((s) => s.at).join(', ')}`).toBe(new Set(places.map((s) => s.table[0][0])).size);
       }
       // The cursor commands show in a menu and in a popover or the toolbar both.
       for (const id of ['clearCursors', 'clearXCursors', 'clearYCursors', 'addXCursors', 'addYCursors', 'zoomToCursors']) {

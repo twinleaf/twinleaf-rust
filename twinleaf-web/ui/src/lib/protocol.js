@@ -7,10 +7,12 @@
 // page fell too far behind: `hub` {id, seq, behind}, `behind` the changes
 // it stands in place of, then `trace` for each trace,
 // one points frame of history, `config`, and each device's newest `routes`,
-// `device`, `table`, `settings` and `loss`. The page replaces everything it held
+// `device`, `table`, `settings` and `loss`, and the newest lines of the log,
+// a `log` each. The page replaces everything it held
 // with it (`Hub.text`). Then come changes, each numbered `seq` one more than
 // the last: points and spectrum frames, `trace` for a new column, device
-// messages, and on a decimation change `clear`, the history and `config`.
+// messages, `log` for a line, and on a decimation change `clear`, the
+// history and `config`.
 // A message of a snapshot has no `seq`, and a binary frame of one has 0.
 //
 // `loss` {route, link: {times, seconds}, streams: {name: {skipped, link,
@@ -19,6 +21,19 @@
 // the samples of each stream its device skipped, its link's outages lost,
 // the proxy dropped and the hub dropped. The page's own counts are made of
 // what each adds to the last (loss.svelte.js).
+//
+// `log` {n, wall, time, level, source, route, text, loss} is one line of
+// the hub's log: `n` its number, from 1 since the hub started; `wall` the
+// host's time of day as the hub took it, in Unix seconds; `time` the time
+// of the newest sample the hub had taken of its device then, on the clock
+// that device's points are on, or null; `level` error, warn, info or debug;
+// `source` device, for a line the device at `route` said, or proxy, for
+// one the hub says of the device at `route`, or of none with null; and
+// `loss`, on a line of a loss alone, what was lost: {cause: 'link',
+// seconds}, null as the link drops and how long it was down as it is back,
+// or {cause, stream, samples} with `cause` skipped, proxy or hub. A line
+// may come in a snapshot and again as a change; the page keeps it once, by
+// `n` (log.svelte.js).
 //
 // A gap, a change numbered other than the next or a trace id the snapshot
 // did not name, sends the page back for a snapshot: it closes the socket

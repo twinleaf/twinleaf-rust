@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 import { CAUSES, Losses, RECENT_MS } from './loss.svelte.js';
 import { Hub } from './hub.svelte.js';
-import { lossWords } from './words.js';
+import { lossTip, lossWords, shareText } from './words.js';
 
 /** A `loss` message of the device at `route`: its link's drops and seconds, and its streams' counts. */
 const loss = (route, times, seconds, streams = {}) => ({
@@ -23,13 +23,12 @@ describe('what the page counts lost', () => {
     losses.apply(loss('/', 3, 20, { sine: [100, 5, 7] }), true, kHz, 0);
     expect(counts(losses), 'what the hub lost before the page heard it').toBe(null);
     expect(losses.recent).toEqual([]);
-    expect(losses.any).toBe(false);
+    expect([losses.missing, losses.totals]).toEqual([null, []]);
 
     losses.apply(loss('/', 4, 22.5, { sine: [130, 6, 9] }), false, kHz, 1000);
     expect(counts(losses)).toEqual({ drops: 1, seconds: 2.5, skipped: 30, dropped: 3 });
     losses.apply(loss('/', 4, 22.5, { sine: [130, 6, 9] }), false, kHz, 2000);
     expect(counts(losses), 'the same counts again add nothing').toEqual({ drops: 1, seconds: 2.5, skipped: 30, dropped: 3 });
-    expect(losses.any).toBe(true);
   });
 
   it('counts from nothing a device whose first loss comes as a change, or in a later snapshot of the same hub', () => {
@@ -63,14 +62,56 @@ describe('what the page counts lost', () => {
     expect(counts(losses)).toEqual({ drops: 1, seconds: 4, skipped: 1, dropped: 320 });
   });
 
-  it('resets to nothing, and counts on from the counts it heard last', () => {
+  it('totals every device’s counts and its own falling behind, each cause that lost anything, since the time of day it was made at', () => {
+    const losses = new Losses(1234);
+    expect(losses.since).toBe(1234);
+    losses.snapshot('a', 0, 0);
+    losses.apply(loss('/', 1, 4, { sine: [50, 2, 3] }), false, kHz, 0);
+    losses.apply(loss('/1', 2, 6.5, { sine: [7] }), false, kHz, 0);
+    expect(losses.totals).toEqual([
+      { kind: 'link', n: 3, seconds: 10.5 },
+      { kind: 'dropped', n: 5, seconds: 0 },
+      { kind: 'skipped', n: 57, seconds: 0 },
+    ]);
+    losses.snapshot('a', 4000, 10);
+    expect(losses.totals.at(-1)).toEqual({ kind: 'behind', n: 1, seconds: 0 });
+    // The totals outlast the minute.
+    losses.tick(10 + RECENT_MS);
+    expect([losses.recent, losses.totals.map((cause) => cause.kind)]).toEqual([[], ['link', 'dropped', 'skipped', 'behind']]);
+  });
+});
+
+describe('the share of the last minute that is missing', () => {
+  it('is that of the device that lost the most: its link’s outage and its worst stream’s samples, with what the page fell behind, over the minute', () => {
     const losses = new Losses();
-    losses.snapshot('a', 4000, 0);
-    losses.apply(loss('/', 1, 4, { sine: [50] }), false, kHz, 0);
-    losses.reset();
-    expect([losses.any, losses.behind, losses.recent, counts(losses)]).toEqual([false, 0, [], null]);
-    losses.apply(loss('/', 1, 4, { sine: [53] }), false, kHz, 10);
-    expect(counts(losses)).toEqual({ drops: 0, seconds: 0, skipped: 3, dropped: 0 });
+    losses.snapshot('a', 0, 0);
+    expect(losses.missing).toBe(null);
+    const rateOf = (stream) => ({ slow: 10, fast: 1000 })[stream];
+    // 3 s of the slow stream and 1.5 s of the fast one: the slow stream's hole is the device's.
+    losses.apply(loss('/', 0, 0, { slow: [30], fast: [1000, 500] }), false, rateOf, 0);
+    expect(losses.missing).toBeCloseTo(3 / 60, 10);
+    // A 6 s outage of the device's link is missing of its every stream.
+    losses.apply(loss('/', 1, 6, { slow: [30], fast: [1000, 500] }), false, rateOf, 1000);
+    expect(losses.missing).toBeCloseTo(9 / 60, 10);
+    // Another device that lost less changes nothing; one that lost more is the share.
+    losses.apply(loss('/1', 1, 8, {}), false, rateOf, 2000);
+    expect(losses.missing).toBeCloseTo(9 / 60, 10);
+    losses.apply(loss('/1', 1, 12, {}), false, rateOf, 3000);
+    expect(losses.missing).toBeCloseTo(12 / 60, 10);
+    // 125 changes behind are 2 s, missing of every device.
+    losses.snapshot('a', 125, 4000);
+    expect(losses.missing).toBeCloseTo(14 / 60, 10);
+  });
+
+  it('is never more than all of it, and nothing once the minute has passed', () => {
+    const losses = new Losses();
+    losses.snapshot('a', 0, 0);
+    losses.apply(loss('/', 1, 500, {}), false, kHz, 0);
+    expect(losses.missing).toBe(1);
+    losses.tick(RECENT_MS - 1);
+    expect([losses.missing, losses.now]).toEqual([1, RECENT_MS - 1]);
+    losses.tick(RECENT_MS);
+    expect([losses.missing, losses.now]).toEqual([null, RECENT_MS]);
   });
 });
 
@@ -100,10 +141,11 @@ describe('what was lost in the last minute', () => {
     // 50 samples of a 10 Hz stream are 5 s, 5000 of a 10 kHz stream half a second.
     losses.apply(loss('/', 0, 0, { slow: [50], fast: [0, 5000], unseen: [0, 0, 0] }), false, rateOf, 0);
     expect(losses.recent.map((cause) => cause.kind)).toEqual(['skipped', 'dropped']);
-    losses.reset();
-    losses.apply(loss('/', 0, 0, { slow: [50], fast: [0, 5000], unseen: [900_000] }), false, rateOf, 0);
-    losses.apply(loss('/', 0, 0, { slow: [50], fast: [0, 5001], unseen: [900_000] }), false, rateOf, 0);
-    expect(losses.recent, 'a stream of no known rate stands for no time').toEqual([
+    const others = new Losses();
+    others.snapshot('a', 0, 0);
+    others.apply(loss('/', 0, 0, { fast: [0, 5000] }), true, rateOf, 0);
+    others.apply(loss('/', 0, 0, { fast: [0, 5001], unseen: [900_000] }), false, rateOf, 0);
+    expect(others.recent, 'a stream of no known rate stands for no time').toEqual([
       { kind: 'dropped', n: 1, seconds: 0 },
       { kind: 'skipped', n: 900_000, seconds: 0 },
     ]);
@@ -144,6 +186,24 @@ describe('what was lost in the last minute', () => {
         expect(counts(losses) ?? { drops: 0, seconds: 0, skipped: 0, dropped: 0 }).toEqual({ drops: total.times, seconds: total.seconds, skipped: total.skipped, dropped: total.proxy + total.hub });
       }),
     );
+  });
+});
+
+describe('the loss mark’s words', () => {
+  it('read a share in whole percents, never as nothing, in no more characters than all of it', () => {
+    const shares = [[0, '<1%'], [0.0049, '<1%'], [0.005, '1%'], [0.052, '5%'], [0.184, '18%'], [0.995, '100%'], [1, '100%']];
+    expect(shares.map(([share]) => shareText(share))).toEqual(shares.map(([, text]) => text));
+    fc.assert(fc.property(fc.double({ min: 0, max: 1, noNaN: true }), (share) => void expect(shareText(share)).toMatch(/^(<1|[1-9]\d?|100)%$/)));
+  });
+
+  it('say in one line what the page counts lost since it opened, after the link that is down now, and what a press does', () => {
+    const since = new Date(2026, 0, 1, 14, 2, 30).getTime();
+    const totals = [{ kind: 'link', n: 4, seconds: 12 }, { kind: 'dropped', n: 2100, seconds: 0 }, { kind: 'skipped', n: 1, seconds: 0 }, { kind: 'behind', n: 1, seconds: 0 }];
+    expect(lossTip(null, totals, since)).toBe('Since 14:02: link dropped 4×, 12 s · hub dropped 2.1 k · 1 sample skipped · page behind 1×. Click for the log');
+    expect(lossTip('VMR 0412', totals.slice(0, 1), since)).toBe('The link to VMR 0412 is down. Since 14:02: link dropped 4×, 12 s. Click for the log');
+    // A link down since before the page heard its hub has dropped nothing the page counts.
+    expect(lossTip('OMG 0077 (/0)', [], since)).toBe('The link to OMG 0077 (/0) is down. Click for the log');
+    expect(lossTip(null, totals.slice(2, 3), null)).toBe('Lost: 1 sample skipped. Click for the log');
   });
 });
 

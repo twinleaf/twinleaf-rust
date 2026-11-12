@@ -24,6 +24,7 @@
 //   dialogs; 'live', a plot that can follow the newest samples. Where a
 //   host has not what a command needs, the command does not run and has no
 //   row. Of its origin: 'axis', an axis it is made on, a y axis by the key
+//   its `how` names; 'line', a line of the log it is made on, by the moment
 //   its `how` names;
 //   'signals', the signals of the Signals list it puts on the plots or
 //   takes off them. Made on a signal's row, from its menu, its keys or a
@@ -55,7 +56,7 @@
 //   marks none. A row made with a value, `how.to`, is that choice's own:
 //   a label of text reads the choice's name after it (`labelOf`).
 // - The command palette lists every command that has a label and needs
-//   nothing of where it is made (ORIGIN): no axis, no signal. A command on
+//   nothing of where it is made (ORIGIN): no axis, no signal, no line. A command on
 //   plots is listed while it has plots to act on, the selected ones; one of
 //   choices once for each. `palette` is the heading it is listed under
 //   (PALETTE), which every listed command has and no other.
@@ -125,6 +126,8 @@ import RiTab from '@lucide/svelte/icons/app-window';
 import RiRename from '@lucide/svelte/icons/pencil';
 import RiDuplicate from '@lucide/svelte/icons/copy';
 import RiDock from '@lucide/svelte/icons/panel-left';
+import RiLog from '@lucide/svelte/icons/panel-bottom';
+import RiLogHide from '@lucide/svelte/icons/panel-bottom-close';
 import RiArrange from '@lucide/svelte/icons/layout-grid';
 import RiRows from '@lucide/svelte/icons/rows-3';
 import RiColumns from '@lucide/svelte/icons/columns-3';
@@ -884,6 +887,32 @@ export const COMMANDS = [
   },
   // The page's own commands.
   {
+    // The log drawer under the plots, opened on every line, or closed while it is open.
+    id: 'showLog', scope: 'page', needs: ['workspace'], palette: 'Docks', place: 'page', show: ['`'], keys: ['`'], what: 'Log', empty: true,
+    icon: RiLog, active: (ctx) => ctx.svc.logShown(), activeIcon: RiLogHide,
+    label: (ctx) => (ctx.svc.logShown() ? 'Hide the log' : 'Show the log'),
+    run: (ctx) => void ctx.svc.toggleLog(),
+  },
+  {
+    // X1 at time `how.t`, on its samples' clock, on every time plot of the open tab, as a line of the log places it:
+    // one view step, each plot paused, as it holds the moment the cursor marks, and moved, as wide as it is, to centre a moment it does not show.
+    id: 'x1At', scope: 'page', needs: ['workspace', 'line'], empty: true,
+    icon: RiXCursors, label: 'Show on plots',
+    run: (ctx, how) => {
+      const plots = ctx.svc.ws.timeIds().map(ctx.svc.plotOf).filter((t) => t.pv?.xd);
+      if (!plots.length || !Number.isFinite(how?.t)) return false;
+      ctx.svc.viewHistory.step(() => {
+        const perf = clock.now();
+        for (const { view, pv } of plots) {
+          const [lo, hi] = pv.xd;
+          if (how.t >= lo && how.t <= hi) view.pause(perf);
+          else view.show(how.t - (hi - lo) / 2, how.t + (hi - lo) / 2, perf);
+        }
+        ctx.svc.cursors.set('X1 at a log line', new Map(plots.map(({ id, pv }) => [id, withX(pv.placed, 'time', 'a', how.t)])));
+      });
+    },
+  },
+  {
     // Hides dock `how.to`, 'left' or 'right', or shows it while it is hidden: the palette's row for each.
     id: 'dock', scope: 'page', needs: ['workspace'], palette: 'Docks', empty: true,
     icon: RiDock, label: (ctx, how) => `${ctx.svc.dockShown(how?.to) ? 'Hide' : 'Show'} the ${how?.to} dock`,
@@ -939,7 +968,7 @@ export const PLOTLESS = ['tab', 'page'];
 /** What a command may need of where its plots are (`needs`). */
 export const HOSTED = ['workspace', 'live'];
 /** What a command may need of where it is made (`needs`): a command that needs one is not in the palette. */
-export const ORIGIN = ['axis', 'signals'];
+export const ORIGIN = ['axis', 'signals', 'line'];
 /** Whether the command palette lists command `c`: it shows somewhere, by its label, and needs nothing of where it is made. */
 export const listed = (c) => !!c.label && !c.needs?.some((n) => ORIGIN.includes(n));
 
@@ -958,7 +987,8 @@ export const listed = (c) => !!c.label && !c.needs?.some((n) => ORIGIN.includes(
  * `titleOf(key)`, what the page names the signal of `key`, `copy(plots)`,
  * `copyCheck(plots)`, `copyImage(id)`, `openExport(plots)`, `picker(id,
  * action)`, `renameTab(id)`, `closeTab(tab)`, `dockShown(side)`,
- * `toggleDock(side)`, `exportTabs()` and `importTabs()`.
+ * `toggleDock(side)`, `logShown()`, `toggleLog()`, `exportTabs()` and
+ * `importTabs()`.
  *
  * Where a command is made is {on, signal, signals, tab, from}: `on` the
  * plot it is made on, or null for the page; `signal` the signal whose row

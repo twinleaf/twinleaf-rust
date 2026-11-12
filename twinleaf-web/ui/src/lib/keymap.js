@@ -42,6 +42,7 @@ export const KEYMAP = [
       { show: ['Ctrl', 'Z'], keys: ['z'], ctrl: true, shift: false, action: 'undo', what: 'Undo' },
       { show: ['Ctrl', 'Y'], keys: ['y', 'z'], ctrl: true, action: 'redo', what: 'Redo; or Ctrl Shift Z' },
       { show: ['Ctrl', 'K'], keys: ['k'], ctrl: true, action: 'palette', what: 'Commands' },
+      keysOf(commandOf('showLog')),
       { show: ['?'], keys: ['?'], action: 'help', what: 'This sheet' },
     ],
   },
@@ -131,6 +132,15 @@ export const KEYMAP = [
       { show: ['Enter'], keys: ['Enter'], action: 'enter', what: 'Run, switch or edit the picked rows' },
       { show: ['Ctrl', 'Click'], on: 'action', what: 'Pick it to run with others' },
       { show: ['☆'], what: 'Add to Favorites' },
+    ],
+  },
+  {
+    place: 'log',
+    title: 'Log',
+    entries: [
+      { show: ['↑', '↓'], keys: ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'], action: 'move', what: 'Move through the lines; Home, End, Page Up, Page Down' },
+      { show: ['Enter'], keys: ['Enter'], action: 'show', what: 'Show the line on the plots' },
+      { show: ['Click'], on: 'the loss mark', what: 'The lines of lost data' },
     ],
   },
   // What the sheet does not list: a panel's header, the window field, a

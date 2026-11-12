@@ -297,6 +297,8 @@ export class Device {
   firmware = $state(null);
   /** connecting, alive or lost. */
   presence = $state('connecting');
+  /** The page time its presence turned lost, in ms, or null while it is not. */
+  lostAt = $state(null);
   /** How many times its presence turned alive: one more each time it reconnects. */
   connections = $state(0);
   /** {rpcs} once its RPC table loaded, {error, rpcs: []} if it did not, or null before. */
@@ -473,6 +475,8 @@ export class Session {
         const d = this.devices.get(msg.route);
         if (!d) return;
         if (msg.presence === 'alive' && d.presence !== 'alive') d.connections++;
+        if (msg.presence !== 'lost') d.lostAt = null;
+        else if (d.presence !== 'lost') d.lostAt = clock.now();
         return void Object.assign(d, { name: msg.name, serial: msg.serial, firmware: msg.firmware, presence: msg.presence });
       }
       case 'table': {

@@ -116,6 +116,8 @@ export class PlotHost {
       closeTab: (tab) => this.#page.closeTab(tab),
       dockShown: (side) => this.#page.dockShown(side),
       toggleDock: (side) => this.#page.toggleDock(side),
+      logShown: () => this.#page.logShown(),
+      toggleLog: () => this.#page.toggleLog(),
       exportTabs: () => this.#page.exportTabs(),
       importTabs: () => this.#page.importTabs(),
     });
@@ -126,7 +128,8 @@ export class PlotHost {
    * need a workspace run through, {split(ids, dir, fromKeys), close(ids,
    * fromKeys), newPlot(keys), copy(plots), copyCheck(plots), copyImage(id),
    * openExport(plots), renameTab(id), closeTab(tab), dockShown(side),
-   * toggleDock(side), exportTabs(), importTabs()}, with `viewChanged(id)`,
+   * toggleDock(side), logShown(), toggleLog(), exportTabs(),
+   * importTabs()}, with `viewChanged(id)`,
    * told as plot `id`'s view moves, and `place`, as the top of this file
    * lists it.
    */

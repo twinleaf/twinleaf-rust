@@ -103,7 +103,12 @@ const OWNED = [
   {
     what: 'what the page counts lost',
     owner: 'lib/loss.svelte.js',
-    writes: /\.(behind|recent|resets)\s*(=[^=>]|\+\+)|\bloss\.devices\.(set|delete|clear)\(/,
+    writes: /\.(behind|recent|missing)\s*(=[^=>]|\+\+)|\bloss\.devices\.(set|delete|clear)\(/,
+  },
+  {
+    what: 'the log’s rows, what of them is unseen, and the drawer’s state',
+    owner: 'lib/log.svelte.js',
+    writes: /\blog\.(rows|unseen|open|levels|lossOnly|source|query|size)\b[\w.[\]]*\s*(=[^=>]|\+\+)/,
   },
   {
     what: 'what the page serves its plots',

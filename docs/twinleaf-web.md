@@ -130,14 +130,28 @@ skipped. A device that restarts while its link is down sends rows that
 say no count, so `link.times` says what `streams` cannot.
 
 The page keeps its own counts from these (`lib/loss.svelte.js`), by
-device, since it opened or since they were reset there: what each `loss`
-adds to the one before, so what a hub had lost before the page first heard
-it is not the page's. It shows four: a link's drops and their seconds, the
-samples skipped, the samples dropped (the proxy's and the hub's together)
-and the times the page fell behind. While the last minute lost anything,
-the status bar says each cause in its own phrase, the one that stands for
-the most seconds of data first, and its popover lists the counts by
-device with a Reset. A plot marks each place its trace is missing samples
+device, since it opened: what each `loss` adds to the one before, so what
+a hub had lost before the page first heard it is not the page's. It counts
+four: a link's drops and their seconds, the samples skipped, the samples
+dropped (the proxy's and the hub's together) and the times the page fell
+behind.
+
+The status bar has a loss mark only while something is missing, after
+History, so nothing moves as it comes and goes:
+
+- While a device's link is down: `link down 3 s`, in the error's colour,
+  for the device longest down, counted from when the page heard it lost.
+- Else, while the last minute lost anything: `18% missing · link`, in the
+  warning's colour. The share is that of the device that lost the most:
+  the seconds its link was down and, of its stream that lost the most
+  samples, the seconds they stand for at the stream's rate, with the
+  seconds the page fell behind (each change a 16 ms flush), over the 60 s.
+  The word is the cause that stands for the most seconds of data: `link`,
+  `skipped`, `dropped` or `page`.
+- Its tooltip is one line of the page's counts since it opened, and a
+  press opens the log drawer on the lines of lost data.
+
+A plot marks each place its trace is missing samples
 with a dashed line, and a gap wide enough to see, as a link's outage is,
 with a band from the last point before it to the first after: it tells
 the two apart by the gap's width, which is all a points frame says of a
@@ -207,6 +221,26 @@ numbered change as it is taken, and a snapshot's lines carry no `seq`. A
 line may reach a page in a snapshot and again as a change after it, as the
 snapshot's lines are read after the page subscribes: the page keeps a line
 only when its `n` is past the last it holds of that hub.
+
+**On the page** (`lib/log.svelte.js`, `lib/LogDrawer.svelte`). The status
+bar's Log item counts the warnings and errors that arrived while the
+drawer was closed; those of a hub's first snapshot were never unseen.
+The drawer opens under the docks and the plots, by the item, by `` ` ``
+(`showLog` in the command table) or by the loss mark, in a pane of its
+own whose height is dragged at its edge and kept, with whether it is
+open, under `tl-log-v1`. It keeps the newest 1000 rows, a row being one
+line or several in a row that say the same (losses of one cause of one
+stream of one device sum their samples). Its bar chooses the rows shown:
+a toggle per level with its count of lines (Debug off to start), one for
+the lines of a loss, the source (the proxy's own lines, or every line of
+one device, whoever said it) and a filter of words. Follow keeps the
+newest row in view until the list is scrolled up. The row of a link's drop
+is followed by a divider, the outage, which says how long it lasted once
+the `link` line with `seconds` comes. A row's button runs `x1At` with the
+line's `time`: X1 at that moment on every time plot of the open tab, each
+paused and moved to show it, as one edit and one view step. The page
+writes a loss row from `loss`, in its own words, and never reads `text`
+for it.
 
 ### Captures
 
