@@ -44,12 +44,29 @@ const task = () =>
     port2.postMessage(null);
   });
 
+/** How long, in ms of real time, a wait of the harness waits for the browser's next frame before it fails. */
+const FRAME_WAIT_MS = 10_000;
+
 /**
  * One frame of the browser's own, `step` run in it where a page's frame
  * callbacks run, and then a task: what the frame's timers resolved, as a
- * hub's reply, has reached the page before the test goes on.
+ * hub's reply, has reached the page before the test goes on. It fails with
+ * what `step` threw, or, when no frame comes within FRAME_WAIT_MS, with
+ * what the page was like as it waited.
  */
-const turn = (step) => new Promise((done) => requestAnimationFrame(() => (step?.(), task().then(done))));
+const turn = (step) =>
+  new Promise((done, fail) => {
+    const late = setTimeout(() => fail(new Error(`no frame of the browser's in ${FRAME_WAIT_MS} ms: the page ${document.visibilityState}, ${document.hasFocus() ? 'focused' : 'unfocused'}`)), FRAME_WAIT_MS);
+    requestAnimationFrame(() => {
+      clearTimeout(late);
+      try {
+        step?.();
+      } catch (error) {
+        return fail(error);
+      }
+      task().then(done);
+    });
+  });
 
 /**
  * Lets `n` frames pass. On the virtual clock each is one frame of the

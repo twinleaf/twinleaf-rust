@@ -9,7 +9,8 @@
  * and ['let go', key] for a keyboard key held meanwhile, as Playwright
  * names it; or ['wait', ms], of real time, for what a library times: the
  * page's own clock does not move in it (page.js). The wheel is not here:
- * a turn is dispatched (page.js turnWheel).
+ * a turn is dispatched (page.js turnWheel). A step the browser has not
+ * taken within STEP_MS fails, naming it.
  */
 export async function mouse(ctx, steps) {
   const frame = await ctx.frame();
@@ -18,13 +19,26 @@ export async function mouse(ctx, steps) {
   const inner = await frame.evaluate(() => window.innerWidth);
   const scale = box.width / inner;
   const at = (x, y) => [box.x + x * scale, box.y + y * scale];
-  for (const [type, x, y] of steps) {
-    if (type === 'move') await ctx.page.mouse.move(...at(x, y));
-    else if (type === 'down') await ctx.page.mouse.down({ button: x ?? 'left' });
-    else if (type === 'up') await ctx.page.mouse.up({ button: x ?? 'left' });
-    else if (type === 'dblclick') await ctx.page.mouse.dblclick(...at(x, y));
-    else if (type === 'hold') await ctx.page.keyboard.down(x);
-    else if (type === 'let go') await ctx.page.keyboard.up(x);
-    else if (type === 'wait') await new Promise((done) => setTimeout(done, x));
+  for (const step of steps) {
+    const [type, x, y] = step;
+    let take;
+    if (type === 'move') take = () => ctx.page.mouse.move(...at(x, y));
+    else if (type === 'down') take = () => ctx.page.mouse.down({ button: x ?? 'left' });
+    else if (type === 'up') take = () => ctx.page.mouse.up({ button: x ?? 'left' });
+    else if (type === 'dblclick') take = () => ctx.page.mouse.dblclick(...at(x, y));
+    else if (type === 'hold') take = () => ctx.page.keyboard.down(x);
+    else if (type === 'let go') take = () => ctx.page.keyboard.up(x);
+    else if (type === 'wait') take = () => new Promise((done) => setTimeout(done, x));
+    await within(take(), STEP_MS + (type === 'wait' ? x : 0), `the mouse step ${JSON.stringify(step)}`);
   }
+}
+
+/** How long, in ms, a step of the mouse may take the browser. */
+const STEP_MS = 10_000;
+
+/** What `promise` gives, or a failure naming `what` once `ms` have passed without it. */
+function within(promise, ms, what) {
+  let late;
+  const timeout = new Promise((_, fail) => (late = setTimeout(() => fail(new Error(`${what} not taken in ${ms} ms`)), ms)));
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(late));
 }
