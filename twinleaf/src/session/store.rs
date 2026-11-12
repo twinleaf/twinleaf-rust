@@ -1,7 +1,7 @@
 //! The [`Store`] of the state of every device in one tree.
 //!
-//! It holds each device's latest presence, metadata, RPC table and settings,
-//! and the routes heard, and sends each new value to the receivers that
+//! It holds each device's latest presence, link, metadata, RPC table and
+//! settings, and the routes heard, and sends each new value to the receivers that
 //! follow it. A receiver that follows a value already held gets it at once,
 //! on a latest-value lane, so one that falls behind skips to the newest.
 //! Setting changes are the one ordered stream, queued in full for each
@@ -23,7 +23,9 @@
 
 use super::control::{Update, Watch, CHANGED, TIMED_OUT, UNANSWERED};
 use super::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
-use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
+use super::state::{
+    LinkState, LostCause, MetadataState, Presence, RegistryState, SettingChange, Settings,
+};
 use super::subscription::{End, Lane, Receiver, Scope, Sink};
 use crate::chan::Notify;
 use crate::data::PacketParser;
@@ -81,6 +83,7 @@ impl<T: Clone> Slot<T> {
 /// The state of one device.
 pub(crate) struct Entry {
     presence: Slot<Presence>,
+    link: Slot<LinkState>,
     metadata: Slot<MetadataState>,
     registry: Slot<RegistryState>,
     settings: Slot<Arc<Settings>>,
@@ -169,6 +172,10 @@ macro_rules! each_slot {
                 let $sinks = &mut entry.changes.sinks;
                 $body
             },
+            {
+                let $sinks = &mut entry.link.sinks;
+                $body
+            },
         ]
     }};
 }
@@ -176,6 +183,7 @@ macro_rules! each_slot {
 /// Picks one value of a device's state.
 pub(crate) type Field<T> = fn(&mut Entry) -> &mut Slot<T>;
 pub(crate) const PRESENCE: Field<Presence> = |entry| &mut entry.presence;
+pub(crate) const LINK: Field<LinkState> = |entry| &mut entry.link;
 pub(crate) const METADATA: Field<MetadataState> = |entry| &mut entry.metadata;
 pub(crate) const REGISTRY: Field<RegistryState> = |entry| &mut entry.registry;
 pub(crate) const SETTINGS: Field<Arc<Settings>> = |entry| &mut entry.settings;
@@ -212,6 +220,7 @@ impl Store {
         let proxy = self.proxy;
         self.devices.entry(route).or_insert_with(|| Entry {
             presence: Slot::new(proxy.then_some(Presence::Connecting), false),
+            link: Slot::new(None, false),
             metadata: Slot::new(proxy.then_some(MetadataState::Pending), false),
             registry: Slot::new(None, false),
             settings: Slot::new(None, false),
@@ -412,10 +421,10 @@ impl Store {
         });
         let client = !self.proxy;
         let devices = self.devices.iter_mut().flat_map(move |(route, entry)| {
-            let [presence, metadata, registry, settings, changes] =
+            let [presence, metadata, registry, settings, changes, link] =
                 each_slot!(entry, |sinks| !sinks.is_empty());
             [
-                (presence || metadata || changes, false),
+                (presence || metadata || changes || link, false),
                 (registry || settings || (client && changes), true),
             ]
             .into_iter()
@@ -464,6 +473,7 @@ impl Store {
                 true => (entry.registry.value, entry.settings.value) = (None, None),
                 false => {
                     (entry.presence.value, entry.metadata.value) = (None, None);
+                    entry.link.value = None;
                     entry.named = None;
                 }
             }
@@ -521,6 +531,10 @@ impl Store {
                     }
                 };
                 self.set(route, PRESENCE, presence);
+            }
+            Update::Link(url, lost) => {
+                let lost = lost.and_then(LostCause::from_code);
+                self.set(route, LINK, LinkState { url, lost });
             }
             Update::Metadata(None) => self.set(route, METADATA, MetadataState::Unsupported),
             Update::Metadata(Some(records)) if records.is_empty() => {

@@ -49,9 +49,9 @@ use crate::proto::{DeviceRoute, RouteError};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::session::rpc::{PendingReply, RpcRegistry};
 use crate::session::Queued;
-use crate::session::{pruned, rpc_hash, Store, METADATA, PRESENCE};
+use crate::session::{pruned, rpc_hash, Store, LINK, METADATA, PRESENCE};
 use crate::session::{Handle, Inlet, RawCallResult, Received, Session, Update, Watch};
-use crate::session::{MetadataState, Presence, Settings};
+use crate::session::{LinkState, LostCause, MetadataState, Presence, Settings};
 use crate::tio::packet::{self, LinkStatus, Packet};
 use metadata::{Completed, MetadataSchedule};
 use settings::{CacheAction, DeviceEvent, SettingsCache};
@@ -229,6 +229,15 @@ impl Mount {
 }
 
 impl Mounts {
+    /// Returns what the link says of a device it serves, which the proxy
+    /// last lost for `lost`, or has not lost.
+    fn link(&self, lost: Option<LostCause>) -> LinkState {
+        LinkState {
+            url: self.url.clone(),
+            lost,
+        }
+    }
+
     /// Creates the mounts of the link to `url`, none yet.
     pub(super) fn new(url: &str) -> Arc<Mounts> {
         Arc::new(Mounts {
@@ -503,6 +512,9 @@ impl Engine {
             packet::Payload::Heartbeat(beat) => beat.session().or(held.flatten()),
             _ => held.flatten(),
         };
+        if store.value(route, LINK).is_none() {
+            store.set(route, LINK, self.mounts.link(None));
+        }
         if held != Some(session) {
             store.set(route, PRESENCE, Presence::Alive { session });
         }
@@ -542,18 +554,24 @@ impl Engine {
         self.publish_metadata(route);
     }
 
-    /// Applies a link's status to the subtree it concerns. A device it sets
-    /// connecting is lost unless it speaks within [`QUIET`].
+    /// Applies a link's status to the subtree it concerns. A device it loses
+    /// has the status as the cause its link says, set ahead of its presence.
+    /// A device it sets connecting is lost unless it speaks within
+    /// [`QUIET`].
     fn apply_status(&mut self, subtree: DeviceRoute, status: LinkStatus) {
-        let presence = match status {
-            LinkStatus::SensorDisconnected
-            | LinkStatus::Stopped
-            | LinkStatus::FailedToConnect
-            | LinkStatus::FailedToReconnect => Presence::Lost {
+        let cause = match status {
+            LinkStatus::SensorDisconnected => Some(LostCause::Disconnected),
+            LinkStatus::Stopped => Some(LostCause::Stopped),
+            LinkStatus::FailedToConnect => Some(LostCause::FailedToConnect),
+            LinkStatus::FailedToReconnect => Some(LostCause::FailedToReconnect),
+            LinkStatus::SensorReconnected => None,
+            LinkStatus::Unknown(_) => return,
+        };
+        let presence = match cause {
+            Some(_) => Presence::Lost {
                 since: Instant::now().into_std(),
             },
-            LinkStatus::SensorReconnected => Presence::Connecting,
-            LinkStatus::Unknown(_) => return,
+            None => Presence::Connecting,
         };
         self.heard.retain(|route, _| !route.starts_with(&subtree));
         let forget = matches!(status, LinkStatus::SensorDisconnected | LinkStatus::Stopped);
@@ -580,6 +598,9 @@ impl Engine {
             // A loss keeps the moment of the first.
             let lost = matches!(store.value(route, PRESENCE), Some(Presence::Lost { .. }));
             if presence == Presence::Connecting || !lost {
+                if cause.is_some() {
+                    store.set(route, LINK, self.mounts.link(cause));
+                }
                 store.set(route, PRESENCE, presence);
             }
             if forget {
@@ -606,14 +627,17 @@ impl Engine {
         self.tell(route, DeviceEvent::NewHash(None));
     }
 
-    /// Loses each device silent for [`QUIET`].
+    /// Loses each device silent for [`QUIET`], with that as the cause its
+    /// link says, set ahead of its presence.
     fn lose_quiet(&mut self) {
         let now = Instant::now();
         let mut store = lock(&self.store);
+        let quiet = self.mounts.link(Some(LostCause::Quiet));
         self.heard.retain(|route, at| {
             let heard = *at + QUIET > now;
             if !heard {
                 let since = now.into_std();
+                store.set(*route, LINK, quiet.clone());
                 store.set(*route, PRESENCE, Presence::Lost { since });
             }
             heard

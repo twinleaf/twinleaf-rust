@@ -113,7 +113,8 @@ pub(crate) mod tests;
 pub use crate::proto::RouteError;
 pub use crate::session::rpc;
 pub use crate::session::{
-    MetadataState, Presence, RegistryState, SettingChange, SettingValueError, Settings,
+    LinkState, LostCause, MetadataState, Presence, RegistryState, SettingChange, SettingValueError,
+    Settings,
 };
 pub use crate::session::{Receiver, RecvError};
 pub use connection::{Connection, Device, DeviceTree, MetadataError, NamedRoute};

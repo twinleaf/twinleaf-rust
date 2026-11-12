@@ -50,12 +50,13 @@ pub(crate) use control::{
 };
 pub use control::{Layout, Mount};
 pub use state::{
-    MetadataState, Presence, RegistryState, SettingChange, SettingValueError, Settings,
+    LinkState, LostCause, MetadataState, Presence, RegistryState, SettingChange, SettingValueError,
+    Settings,
 };
 #[cfg(test)]
 pub(crate) use store::CHANGE_QUEUE_LEN;
 pub(crate) use store::{
-    end_sinks, prune, pruned, rpc_hash, Field, Store, CHANGES, METADATA, PRESENCE, REGISTRY,
+    end_sinks, prune, pruned, rpc_hash, Field, Store, CHANGES, LINK, METADATA, PRESENCE, REGISTRY,
     SETTINGS,
 };
 pub(crate) use subscription::{BatchLane, End, Lane, Queued, Scope, Sink};

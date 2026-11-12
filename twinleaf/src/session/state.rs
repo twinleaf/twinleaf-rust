@@ -34,6 +34,57 @@ pub enum Presence {
     },
 }
 
+/// Why the proxy lost a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LostCause {
+    /// The device went quiet on its link, or the link's transport closed.
+    Disconnected,
+    /// The proxy stopped.
+    Stopped,
+    /// The link's transport did not open.
+    FailedToConnect,
+    /// The proxy gave up reconnecting the link.
+    FailedToReconnect,
+    /// The device was silent for 3 s while its link stayed up.
+    Quiet,
+}
+
+impl LostCause {
+    /// The cause as a watch's update carries it.
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            LostCause::Disconnected => 0,
+            LostCause::Stopped => 1,
+            LostCause::FailedToConnect => 2,
+            LostCause::FailedToReconnect => 3,
+            LostCause::Quiet => 4,
+        }
+    }
+
+    /// The cause a watch's update carries as `code`, or `None` for a code
+    /// this build does not know.
+    pub(crate) fn from_code(code: u8) -> Option<LostCause> {
+        let known = [
+            LostCause::Disconnected,
+            LostCause::Stopped,
+            LostCause::FailedToConnect,
+            LostCause::FailedToReconnect,
+            LostCause::Quiet,
+        ];
+        known.into_iter().find(|cause| cause.code() == code)
+    }
+}
+
+/// The link that serves a device, as the proxy says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkState {
+    /// The URL the proxy opened the link at.
+    pub url: String,
+    /// Why the proxy last lost the device, or `None` if it has not.
+    pub lost: Option<LostCause>,
+}
+
 /// How far a device's metadata has been collected.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
