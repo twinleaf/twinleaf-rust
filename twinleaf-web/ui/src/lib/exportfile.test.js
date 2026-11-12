@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { exportName, exportUrl } from './exportfile.js';
+import { exportName, exportUrl, filesText } from './exportfile.js';
 
 describe('An export', () => {
   it('is named for when it was made, with its format as the extension', () => {
@@ -10,5 +10,8 @@ describe('An export', () => {
     const url = new URL(exportUrl({ hub: 'h1', ids: [0, 2], t0: 1.5, t1: 9 }, 'csv', 'x.csv'), 'http://host');
     expect(url.pathname).toBe('/api/export');
     expect(Object.fromEntries(url.searchParams)).toEqual({ hub: 'h1', ids: '0,2', t0: '1.5', t1: '9', format: 'csv', name: 'x.csv' });
+  });
+  it('counts its files as a sentence does', () => {
+    expect([1, 2, 12].map(filesText)).toEqual(['1 file', '2 files', '12 files']);
   });
 });

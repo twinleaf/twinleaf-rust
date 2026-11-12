@@ -13,8 +13,11 @@
 // - An image file is width × height × resolution pixels, and is the figure
 //   shown, finer: scaled to the figure's size the two are alike.
 // - Data asks the hub what the export always asked for the same choices.
-// - Save shows a bar while the files are made, Cancel stops it, and a file
-//   made after the browser stops asking where waits for Save file….
+// - Save asks where at the press, then shows a bar while the files are
+//   made, however long that takes, and writes them whole into the place
+//   picked with no second press; a window closed with nothing picked makes
+//   nothing, and Cancel or a failure leaves the place picked as it was.
+//   Where the browser has no save window, each file downloads.
 // - Escape closes it, leaving nothing of its copies; focus goes back to the
 //   plot. It fits a 900 × 600 window, scrolling inside itself, and every
 //   control is reached by Tab.
@@ -24,7 +27,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { commands, page as browser, userEvent } from 'vitest/browser';
 import fc from 'fast-check';
 import { flushSync } from 'svelte';
-import { centre, clickOn, closeAll, focusPage, frames, holdHistory, leafOf, mountPage, pickItem, plotMenu, pressKey, settle, until } from './harness/page.js';
+import { centre, clickOn, closeAll, focusPage, frames, holdHistory, leafOf, mountPage, pickItem, plotMenu, pressKey, settle, until, wait } from './harness/page.js';
+import * as clock from '../src/lib/clock.js';
 import { plotIds } from '../src/lib/layout.js';
 import { SAVE_KEY } from '../src/lib/tabs.js';
 import { colors } from '../src/lib/colors.svelte.js';
@@ -117,15 +121,53 @@ async function openExport(ids) {
 /** Waits until the figure shows the picked plot drawn: its copy's plot on the stage, its windows read. */
 const drawn = (copy) => until(() => copy.pv(copy.id)?.drawn && !page.hub.session.reading(copy.id)).then(() => settle(4));
 
-/** Has the browser's save and folder windows hand over what is saved, in place of a file, and returns it: each {name, blob}. */
-function catchSaves() {
+/** How long after a press, in ms, a browser opens its save windows (Chromium's transient activation), on the page's clock here. */
+const ACTIVATION_MS = 5000;
+/**
+ * Has the browser's save and folder windows hand over what is saved, in
+ * place of a file, and returns it: each {name, blob}, as each file is
+ * written whole. As a browser does, a window opens only within
+ * ACTIVATION_MS of the page's time of a press, and refuses later. Beside
+ * it: `picks`, each window opened, with `note()` as it opened; `made`, the
+ * names of the files the windows and the folders hold, an empty one from
+ * the moment its save window picks it, as Chromium makes it, and gone once
+ * its handle removes it; and `answer`, 'pick' or 'close', which the windows
+ * do.
+ */
+function catchSaves({ note = () => null } = {}) {
   const saved = [], kept = [window.showSaveFilePicker, window.showDirectoryPicker];
-  const file = (name) => ({ name, createWritable: async () => ({ write: async (blob) => void saved.push({ name, blob }), close: async () => {} }) });
-  window.showSaveFilePicker = vi.fn(async ({ suggestedName }) => file(suggestedName));
-  window.showDirectoryPicker = vi.fn(async () => ({ getFileHandle: async (name) => file(name) }));
-  restore.push(() => ([window.showSaveFilePicker, window.showDirectoryPicker] = kept));
+  saved.picks = [];
+  saved.made = new Set();
+  saved.answer = 'pick';
+  let pressed = -Infinity;
+  const onPress = () => (pressed = clock.now());
+  document.addEventListener('pointerdown', onPress, true);
+  document.addEventListener('keydown', onPress, true);
+  const opened = (kind) => {
+    if (clock.now() - pressed > ACTIVATION_MS) throw new DOMException('Must be handling a user gesture to show a file picker.', 'SecurityError');
+    saved.picks.push({ kind, noted: note() });
+    if (saved.answer === 'close') throw new DOMException('The user aborted a request.', 'AbortError');
+  };
+  const file = (name) => ({
+    name,
+    createWritable: async () => ({ write: async (blob) => void (saved.made.add(name), saved.push({ name, blob })), close: async () => {} }),
+    remove: async () => void saved.made.delete(name),
+  });
+  window.showSaveFilePicker = vi.fn(async ({ suggestedName }) => {
+    opened('file');
+    saved.made.add(suggestedName);
+    return file(suggestedName);
+  });
+  window.showDirectoryPicker = vi.fn(async () => (opened('folder'), { getFileHandle: async (name) => file(name) }));
+  restore.push(() => {
+    [window.showSaveFilePicker, window.showDirectoryPicker] = kept;
+    document.removeEventListener('pointerdown', onPress, true);
+    document.removeEventListener('keydown', onPress, true);
+  });
   return saved;
 }
+/** `n` files, as a message counts them. */
+const filesOf = (n) => (n === 1 ? '1 file' : `${n} files`);
 /** Has the page's asks of the hub for an export answered with `body`, noted as each comes: their queries. */
 function catchExports(body = () => new Response('time (s),sine.sine (V)\n1,2\n')) {
   const asked = [], fetched = window.fetch;
@@ -138,18 +180,11 @@ function catchExports(body = () => new Response('time (s),sine.sine (V)\n1,2\n')
   restore.push(() => (window.fetch = fetched));
   return asked;
 }
-/**
- * Presses Save and waits until `n` files are saved and the dialog has
- * closed. Files made after the browser stopped asking where, as a slow
- * machine makes them, wait for Save file…, which it presses then.
- */
+/** Presses Save and waits until `n` files are saved and the dialog has closed. */
 async function saveAll(saved, n = 1) {
   const before = saved.length;
   await press(control('Save image…') ? 'Save image…' : 'Save data…');
-  const later = () => dialog() && control('Save file…');
-  expect(await until(() => saved.length >= before + n || later(), 20000), `${n} files saved, or made and waiting for Save file…`).toBe(true);
-  if (saved.length < before + n) await press('Save file…');
-  expect(await until(() => saved.length >= before + n, 20000), `${n} files saved`).toBe(true);
+  expect(await until(() => saved.length >= before + n, 20000), `${filesOf(n)} saved`).toBe(true);
   expect(await until(() => !document.querySelector('.export-dialog')), 'the dialog closed once saved').toBe(true);
   await settle();
   return saved.slice(before);
@@ -592,45 +627,121 @@ describe('the export dialog', { timeout: 120_000 }, () => {
     expect(asked.slice(n).map((q) => q.ids), 'a file a plot').toEqual(ids.map((i) => page.ws.plots[i].items.map((it) => String(session.byKey.get(it.key).meta.id)).join(',')));
   });
 
-  it('shows a bar while the file is made, stops at Cancel, and waits for Save file… once the browser stops asking where', async () => {
-    const [id] = await exportPage();
-    const saved = catchSaves();
-    let feed = null;
+  /** Has the hub answer each export ask with a body fed by hand: `feeds`, each ask's stream controller, and `asked`, the queries. */
+  function slowExports() {
+    const feeds = [];
     const asked = catchExports((init) => {
+      let feed;
       const body = new ReadableStream({ start: (c) => (feed = c) });
+      feeds.push(feed);
       init?.signal?.addEventListener('abort', () => feed.error(new DOMException('aborted', 'AbortError')));
       return new Response(body);
     });
+    return { asked, feeds };
+  }
+  const bar = () => dialog()?.querySelector('[role=progressbar]') ?? null;
+  const notices = () => [...document.querySelectorAll('[data-sonner-toast]')].map((t) => t.textContent.trim());
+
+  it('asks where at the press, then shows a bar while the file is made, longer than a press lets a browser ask, and saves it with no second press', async () => {
+    const [id] = await exportPage();
+    let asked = [];
+    const saved = catchSaves({ note: () => asked.length });
+    const slow = slowExports();
+    asked = slow.asked;
     await openExport([id]);
     await press('Save data…');
-    expect(await until(() => asked.length === 1 && feed), 'asked of the hub').toBe(true);
-    const bar = () => dialog().querySelector('[role=progressbar]');
+    expect(saved.picks, 'the save window, at the press, before the hub was asked').toEqual([{ kind: 'file', noted: 0 }]);
+    expect(await until(() => slow.asked.length === 1 && slow.feeds[0]), 'asked of the hub').toBe(true);
     expect(bar(), 'the bar').toBeTruthy();
-    feed.enqueue(new Uint8Array(200_000));
+    slow.feeds[0].enqueue(new Uint8Array(200_000));
     await settle();
     expect(await until(() => +bar()?.getAttribute('aria-valuenow') > 0), 'the bar moves as bytes come').toBe(true);
     expect(bar().parentElement.textContent, 'the bytes so far').toContain('kB');
+    expect(saved.length, 'nothing written before the file is whole').toBe(0);
     await shot('export-progress');
+    // Longer than a press lets the browser open a save window.
+    await wait(ACTIVATION_MS + 1500);
+    expect(bar(), 'still making').toBeTruthy();
+    slow.feeds[0].enqueue(new TextEncoder().encode('time,v\n1,2\n'));
+    slow.feeds[0].close();
+    expect(await until(() => saved.length === 1), 'saved with no second press').toBe(true);
+    expect(saved.picks.length, 'one save window').toBe(1);
+    expect((await saved[0].blob.arrayBuffer()).byteLength, 'the file, whole').toBe(200_000 + 11);
+    expect(await until(() => !document.querySelector('.export-dialog')), 'closed').toBe(true);
+    expect(await until(() => notices().some((t) => t.startsWith(`Saved ${saved[0].name}, `))), `a notice naming the file, among ${JSON.stringify(notices())}`).toBe(true);
+  });
+
+  it('makes nothing when the save window closes with nothing picked, and leaves no file when the making stops or fails', async () => {
+    const ids = await exportPage([SIGNALS.slice(0, 2), [SIGNALS[2]]]);
+    const saved = catchSaves(), { asked, feeds } = slowExports();
+    await openExport([ids[0]]);
+    // Closed with nothing picked: nothing made, the dialog as it was.
+    saved.answer = 'close';
+    await press('Save data…');
+    await settle(4);
+    expect(saved.picks.length, 'the save window opened').toBe(1);
+    expect(asked.length, 'nothing asked of the hub').toBe(0);
+    expect(bar(), 'no bar').toBe(null);
+    expect(control('Save data…'), 'Save as it was').toBeTruthy();
+    expect(notices(), 'no notice').toEqual([]);
+    // Picked, then Cancel while it is made: the file picked goes, nothing written.
+    saved.answer = 'pick';
+    await press('Save data…');
+    expect(await until(() => asked.length === 1 && feeds[0]), 'asked of the hub').toBe(true);
+    expect([...saved.made], 'the file the save window made, empty').toHaveLength(1);
+    feeds[0].enqueue(new Uint8Array(1000));
+    await settle();
     await press('Cancel');
+    expect(await until(() => saved.made.size === 0), `no file left behind: ${[...saved.made]}`).toBe(true);
+    expect(saved.length, 'nothing written').toBe(0);
     expect(bar(), 'no bar once cancelled').toBe(null);
     expect(dialog(), 'the dialog stays').toBeTruthy();
-    expect(control('Save data…'), 'Save again').toBeTruthy();
-    expect(window.showSaveFilePicker, 'no save window').not.toHaveBeenCalled();
-
-    // Made after the browser has stopped asking where: Save file… asks.
-    Object.defineProperty(navigator, 'userActivation', { value: { isActive: false }, configurable: true });
-    restore.push(() => delete navigator.userActivation);
+    // Picked, then the hub fails partway: the file picked goes, nothing written, and the failure is told.
     await press('Save data…');
-    expect(await until(() => asked.length === 2 && feed), 'asked again').toBe(true);
-    feed.enqueue(new TextEncoder().encode('time,v\n1,2\n'));
-    feed.close();
-    expect(await until(() => control('Save file…')), 'Save file…').toBe(true);
-    expect(window.showSaveFilePicker, 'no save window before it').not.toHaveBeenCalled();
-    await shot('export-save-file');
-    await press('Save file…');
-    expect(await until(() => saved.length === 1), 'saved').toBe(true);
-    expect(await saved[0].blob.text(), 'the file').toBe('time,v\n1,2\n');
+    expect(await until(() => asked.length === 2 && feeds[1]), 'asked again').toBe(true);
+    feeds[1].enqueue(new Uint8Array(1000));
+    await settle();
+    feeds[1].error(new Error('the hub went away'));
+    expect(await until(() => saved.made.size === 0 && !bar()), 'no file left behind').toBe(true);
+    expect(saved.length, 'nothing written').toBe(0);
+    expect(await until(() => notices().some((t) => t.includes('the hub went away'))), 'the failure told').toBe(true);
+    await pressKey('Escape');
     expect(await until(() => !document.querySelector('.export-dialog')), 'closed').toBe(true);
+    // Several files into a folder, the making stopped: no file in it.
+    await openExport(ids);
+    await press('Save data…');
+    expect(saved.picks.at(-1).kind, 'the folder window').toBe('folder');
+    expect(await until(() => asked.length === 3 && feeds[2]), 'asked of the hub').toBe(true);
+    await press('Cancel');
+    await settle(4);
+    expect([...saved.made], 'nothing in the folder').toEqual([]);
+    // Several files saved: told as files.
+    feeds.length = 0;
+    const done = saveAll(saved, 2);
+    for (let i = 0; i < 2; i++) {
+      expect(await until(() => feeds[i]), `file ${i + 1} asked`).toBe(true);
+      feeds[i].enqueue(new TextEncoder().encode('t,v\n'));
+      feeds[i].close();
+    }
+    await done;
+    expect(await until(() => notices().some((t) => t.startsWith('Saved 2 files, '))), `a notice of 2 files, among ${JSON.stringify(notices())}`).toBe(true);
+  });
+
+  it('downloads each file where the browser has no save window', async () => {
+    const ids = await exportPage([SIGNALS.slice(0, 2), [SIGNALS[2]]]);
+    const kept = [window.showSaveFilePicker, window.showDirectoryPicker];
+    [window.showSaveFilePicker, window.showDirectoryPicker] = [undefined, undefined];
+    restore.push(() => ([window.showSaveFilePicker, window.showDirectoryPicker] = kept));
+    const downloads = [];
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function () {
+      downloads.push(this.download);
+    });
+    catchExports();
+    await openExport(ids);
+    await press('Save data…');
+    expect(await until(() => downloads.length === 2), 'a download a file').toBe(true);
+    expect(await until(() => !document.querySelector('.export-dialog')), 'closed').toBe(true);
+    expect(downloads.every((n) => /^twinleaf-\d{8}-\d{6}-.+\.csv$/.test(n)), `each named: ${downloads}`).toBe(true);
   });
 
   it('closes at Escape, leaving nothing of its copies, with focus back on the plot', async () => {

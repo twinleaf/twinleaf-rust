@@ -12,15 +12,15 @@
   // Data tab, the time and the file; on the Image tab, what every image
   // shares (All: the time, the size, the x axis, what shows and how the
   // files are saved) and what belongs to the plot picked (Plot,
-  // ExportPlotPane.svelte). Save makes the files, a bar showing how far,
-  // with Cancel, and then asks where to put them; a browser asks only
-  // shortly after a press, so a file made after that waits for Save file….
+  // ExportPlotPane.svelte). Save asks where the files go at the press, as a
+  // browser asks only shortly after one, then makes them, a bar showing how
+  // far, with Cancel, and writes each there once it is whole.
   import { getContext, untrack } from 'svelte';
   import * as Dialog from '$lib/components/ui/dialog/index.js';
   import * as Tooltip from '$lib/components/ui/tooltip/index.js';
   import PlotStage from './PlotStage.svelte';
   import ExportPlotPane from './ExportPlotPane.svelte';
-  import { FORMATS, exportName, exportStamp, fetchExport, mayAskWhere, saveFiles } from './exportfile.js';
+  import { FORMATS, exportName, exportStamp, fetchExport, filesText, askWhere, giveUp, putFiles } from './exportfile.js';
   import { IMAGE_FORMATS, LEAST_SIDE, SHAPES, UNITS, bandsOf, canvasFits, devicesText, fileSafe, pictureSize, stampText } from './figure.js';
   import { xOf } from './cursors.js';
   import { timeAxis, titleOf } from './plot.js';
@@ -294,11 +294,10 @@
   const madeAt = $derived(openedWall ? timeAxis('unix').readout(openedWall / 1000).slice(0, 8) : '');
 
   // Saving: {busy} while the files are made, `busy` how far, 0 to 1, with
-  // `said` what is being made; {ready} once made, while the browser no
-  // longer asks where.
+  // `said` what is being made.
   let progress = $state({ busy: null });
   let abort = null;
-  /** Stops an export under way; the files made so far go. */
+  /** Stops an export under way; the files made so far go, and the place picked for them is left as it was. */
   function stop() {
     abort?.abort();
     abort = null;
@@ -307,30 +306,39 @@
   /** Waits for the next frame. */
   const nextFrame = () => new Promise((done) => clock.frame(done));
 
-  /** Makes the files and saves them, called by the press, as a save window needs. */
+  /**
+   * Saves the files the choices make, called by the press: it asks where
+   * first, while the press lets the browser ask, then makes them, the bar
+   * showing how far, and writes each there once it is whole, then closes.
+   * Nothing is made when nothing is picked; when the making stops or fails,
+   * the place picked is left as it was.
+   */
   async function save() {
-    const job = (abort = new AbortController()), saving = tab === 'image' ? imageFiles : dataFiles;
+    const tabNow = tab, saving = tabNow === 'image' ? imageFiles : dataFiles;
+    const type = tabNow === 'image' ? IMAGE_FORMATS[imageFormat] : FORMATS[format];
+    let where;
+    try {
+      where = await askWhere(saving.map((f) => ({ name: f.name, type })));
+    } catch (error) {
+      return void toast.error(`Could not save: ${error.message}`);
+    }
+    if (!where) return;
+    const job = (abort = new AbortController());
     progress = { busy: 0, said: '' };
     try {
-      const made = tab === 'image' ? await makeImages(saving, job) : await makeData(saving, job);
-      if (job.signal.aborted) return;
-      if (!mayAskWhere()) return void (progress = { busy: null, ready: made });
-      await place(made);
+      const made = tabNow === 'image' ? await makeImages(saving, job) : await makeData(saving, job);
+      if (job.signal.aborted) return void (await giveUp(where));
+      const saved = await putFiles(where, made);
+      progress = { busy: null };
+      what = null;
+      const bytes = saved.reduce((n, f) => n + f.bytes, 0);
+      toast.success(`Saved ${saved.length === 1 ? saved[0].name : filesText(saved.length)}, ${bytesText(bytes)}`);
     } catch (error) {
+      await giveUp(where);
       if (job.signal.aborted) return;
       progress = { busy: null };
       toast.error(`Could not export: ${error.message}`);
     }
-  }
-  /** Asks where `made` go and saves them there, then closes. */
-  async function place(made) {
-    progress = { busy: null, ready: made };
-    const saved = await saveFiles(made).catch((error) => (toast.error(`Could not save: ${error.message}`), null));
-    if (!saved) return;
-    progress = { busy: null };
-    what = null;
-    const bytes = saved.reduce((n, f) => n + f.bytes, 0);
-    toast.success(saved.length === 1 ? `Saved ${saved[0].name}, ${bytesText(bytes)}` : `Saved ${saved.length} files, ${bytesText(bytes)}`);
   }
 
   /** Fetches each data file of `list` from the hub, the bar following the bytes against the size each is about. */
@@ -611,9 +619,6 @@
           {#if progress.said}<span>{progress.said}</span>{/if}
         </div>
         <button class="btn" onclick={stop}>Cancel</button>
-      {:else if progress.ready}
-        <button class="btn" onclick={close}>Cancel</button>
-        <button class="btn go" onclick={() => place(progress.ready)}>Save file…</button>
       {:else}
         <button class="btn" onclick={close}>Cancel</button>
         <button class="btn go" disabled={!filesShown.length || (tab === 'image' && !!refused)} onclick={save}>{saveLabel}</button>

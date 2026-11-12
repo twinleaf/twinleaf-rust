@@ -1,10 +1,12 @@
 // Saving an export: the hub's raw history of signals, as the hub writes it,
-// or an image of a plot, as the page draws it. A file is made whole first,
-// its progress told as it goes, and then saved: where the browser has a
-// save window (showSaveFilePicker), or a folder window for several files
-// (showDirectoryPicker), the files are named and placed there; elsewhere
-// each downloads as any file does. A browser opens those windows only
-// shortly after a press, so whoever saves says whether one is still near.
+// an image of a plot, as the page draws it, or a table the page writes. A
+// browser opens its save window only shortly after a press, so where it has
+// one (showSaveFilePicker for one file, showDirectoryPicker for a folder of
+// several) the place is asked first, at the press (`askWhere`), the files
+// are made after, and each is written there once it is whole (`putFiles`);
+// a place given up before then is left as it was found (`giveUp`). Where
+// the browser has no such window, the files are made and each downloads
+// as any file does.
 
 import * as clock from './clock.js';
 
@@ -50,46 +52,71 @@ export async function fetchExport(request, format, name, { signal, progress = ()
   return new Blob(chunks, { type: FORMATS[format].mime });
 }
 
+/** `n` files, as a sentence counts them: 1 file, 2 files. */
+export const filesText = (n) => (n === 1 ? '1 file' : `${n} files`);
+
 /**
- * Saves `files`, each {name, blob, type}, `type` {description, mime, ext}:
- * one through the save window, several into a folder picked in the folder
- * window, or else each downloaded. Resolves to the files saved, each
- * {name, bytes}, or to null when the window was closed with nothing picked.
+ * Where `files`, each {name, type}, `type` {description, mime, ext}, will
+ * go, asked before any is made; called within a press, as a save window
+ * needs. One goes to a file picked in the save window, several into a
+ * folder picked in the folder window, each {file} or {folder} of the
+ * handle picked; where the browser has no such window, {download}. Resolves
+ * to null when the window was closed with nothing picked.
  */
-export async function saveFiles(files) {
-  const picks = files.length === 1 ? 'showSaveFilePicker' in window : 'showDirectoryPicker' in window;
-  if (!picks) {
-    for (const f of files) {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(f.blob);
-      a.download = f.name;
-      a.click();
-      clock.after(0, () => URL.revokeObjectURL(a.href));
-    }
-    return files.map((f) => ({ name: f.name, bytes: f.blob.size }));
-  }
+export async function askWhere(files) {
+  const one = files.length === 1;
+  if (typeof (one ? window.showSaveFilePicker : window.showDirectoryPicker) !== 'function') return { download: true };
   try {
-    if (files.length === 1) {
+    if (one) {
       const [f] = files;
-      const handle = await window.showSaveFilePicker({ suggestedName: f.name, types: [{ description: f.type.description, accept: { [f.type.mime]: [`.${f.type.ext}`] } }] });
-      await write(handle, f.blob);
-      return [{ name: handle.name, bytes: f.blob.size }];
+      return { file: await window.showSaveFilePicker({ suggestedName: f.name, types: [{ description: f.type.description, accept: { [f.type.mime]: [`.${f.type.ext}`] } }] }) };
     }
-    const folder = await window.showDirectoryPicker({ mode: 'readwrite' });
-    for (const f of files) await write(await folder.getFileHandle(f.name, { create: true }), f.blob);
-    return files.map((f) => ({ name: f.name, bytes: f.blob.size }));
+    return { folder: await window.showDirectoryPicker({ mode: 'readwrite' }) };
   } catch (error) {
     if (error.name === 'AbortError') return null;
     throw error;
   }
 }
 
-/** Writes `blob` to the file `handle` names. */
+/**
+ * Writes `made`, each {name, blob}, whole, to `where` as `askWhere` gave
+ * it: the one into the file picked, each by its name into the folder
+ * picked, or each downloaded. Resolves to the files saved, each {name, bytes}.
+ */
+export async function putFiles(where, made) {
+  if (where.file) {
+    await write(where.file, made[0].blob);
+    return [{ name: where.file.name, bytes: made[0].blob.size }];
+  }
+  for (const f of made) {
+    if (where.folder) await write(await where.folder.getFileHandle(f.name, { create: true }), f.blob);
+    else download(f);
+  }
+  return made.map((f) => ({ name: f.name, bytes: f.blob.size }));
+}
+
+/**
+ * Leaves `where`, as `askWhere` gave it, as it was before it was picked,
+ * when nothing will be written there: the save window makes the file it
+ * picks, empty, which goes where the handle can remove it. A folder gains
+ * a file only as `putFiles` writes it, so it needs nothing.
+ */
+export async function giveUp(where) {
+  await where?.file?.remove?.().catch(() => {});
+}
+
+/** Writes `blob` to the file `handle` names, in one go. */
 async function write(handle, blob) {
   const out = await handle.createWritable();
   await out.write(blob);
   await out.close();
 }
 
-/** Whether the browser would still open a save window now: a press is near enough (navigator.userActivation), as where it does not say. */
-export const mayAskWhere = () => navigator.userActivation?.isActive ?? true;
+/** Has the browser download `f`, {name, blob}, as any file does. */
+function download(f) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(f.blob);
+  a.download = f.name;
+  a.click();
+  clock.after(0, () => URL.revokeObjectURL(a.href));
+}
