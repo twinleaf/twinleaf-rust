@@ -12,10 +12,11 @@
 //!   holds. Then come a [`Message::Trace`] for every trace, one points frame
 //!   of every point the hub has sent, a [`Message::Config`], and the newest
 //!   [`Message::Routes`], [`Message::Device`], [`Message::Table`],
-//!   [`Message::Settings`], [`Message::Captures`] and [`Message::Capture`]
-//!   of every device, the newest [`Message::Loss`] of every device that
-//!   lost anything, and the newest lines of the log, a [`Message::Log`]
-//!   each. The page replaces all it holds of any hub with it.
+//!   [`Message::Settings`], [`Message::Captures`], [`Message::Capture`],
+//!   [`Message::Firmware`] and [`Message::Upgrade`] of every device, the
+//!   newest [`Message::Loss`] of every device that lost anything, and the
+//!   newest lines of the log, a [`Message::Log`] each. The page replaces
+//!   all it holds of any hub with it.
 //! - A change comes after it, numbered one more than the change before. It
 //!   is a points frame as each flush has new points, a spectrum frame per
 //!   trace as each is estimated, a [`Message::Trace`] as a new column
@@ -33,10 +34,11 @@
 //! the page connects again to the hub that takes its place. Every way to the
 //! page's state is that one path.
 //!
-//! The page sends one message on the socket, [`PageMessage::Spectra`], which
-//! names the traces it shows as spectra, after each snapshot and whenever the
-//! set changes. The hub estimates the spectra of only the traces some page
-//! names, and sends each to every page.
+//! The page sends [`PageMessage::Spectra`] on the socket, which names the
+//! traces it shows as spectra, after each snapshot and whenever the set
+//! changes. The hub estimates the spectra of only the traces some page
+//! names, and sends each to every page. The page also holds the history,
+//! asks for captures and for firmware upgrades on the socket, as below.
 //!
 //! A device's presence, metadata, RPC table and settings are each the newest
 //! value, as the proxy keeps them, so the hub keeps the newest of each and a
@@ -92,6 +94,33 @@
 //! from 1, and the frame and the RPC's state carry the number. A page that
 //! reads slowly is kept only the newest capture of each RPC, so the
 //! numbers it is sent may skip.
+//!
+//! # Firmware
+//!
+//! The hub reads what each device runs from its `dev.desc` as its RPC table
+//! loads and after an upgrade, and looks it up in the catalog of published
+//! firmware only when a page sends [`PageMessage::Check`]. What a device
+//! runs and what the catalog holds for it is its [`Message::Firmware`], a
+//! newest value every page hears and a snapshot holds. Once a device runs
+//! other firmware the hub compares it with the releases it holds, without
+//! the catalog.
+//!
+//! [`PageMessage::Upgrade`] asks for an upgrade of one device from an
+//! [`ImageSource`], the newest release the last check listed, one of its
+//! releases, or a file, whose bytes follow in binary frames on the same
+//! socket. An image is neither empty nor more than 16 MiB. A text message
+//! or the socket closing before every byte came drops the image, and more
+//! bytes than it named refuse it. [`PageMessage::Cancel`] takes back an
+//! upgrade that waits or downloads, and nothing is sent to the device, and
+//! clears one that is done or failed. [`PageMessage::Retry`] runs a failed
+//! one again from its source. One upgrade runs at a time across the hub, in
+//! the order asked, and the others wait.
+//!
+//! Where a device's upgrade stands is its [`Message::Upgrade`], every page
+//! hears it and a snapshot holds the newest, once a page asked an upgrade
+//! of the device. An ask the hub cannot take is answered to the page that
+//! asked alone, as [`Message::Refused`], which is no numbered change and in
+//! no snapshot. A failed upgrade is a state, and no refusal.
 //!
 //! # The requests
 //!
@@ -227,6 +256,154 @@ pub(crate) enum Message {
         number: u64,
         repeat: Option<f64>,
     },
+    /// The firmware one device runs, `None` until it answered `dev.desc`,
+    /// and what the catalog holds for it.
+    Firmware {
+        route: String,
+        installed: Option<Installed>,
+        catalog: CatalogState,
+    },
+    /// Where the upgrade of one device stands, once a page asked one of it.
+    Upgrade {
+        route: String,
+        #[serde(flatten)]
+        state: UpgradeState,
+    },
+    /// The hub refused what the page asked, which only the page that asked
+    /// hears. It is no numbered change and no snapshot holds it.
+    Refused {
+        ask: Ask,
+        route: String,
+        error: String,
+    },
+}
+
+/// The firmware a device runs, as its `dev.desc` says. `name` and
+/// `revision` are empty for a description of another form, and `date`
+/// (`YYYY-MM-DD`), `build` and `serial` are `None` where it gives none.
+/// `development` marks a development build, which the catalog offers no
+/// release for.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub(crate) struct Installed {
+    pub(crate) name: String,
+    pub(crate) revision: String,
+    pub(crate) date: Option<String>,
+    pub(crate) build: Option<String>,
+    pub(crate) serial: Option<String>,
+    pub(crate) development: bool,
+}
+
+/// What the catalog of published firmware holds for a device.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub(crate) enum CatalogState {
+    /// No page has asked the hub to look the device up.
+    Unchecked,
+    /// The hub is looking it up.
+    Checking,
+    /// The catalog could not be listed, as `error` says.
+    Unreachable { error: String },
+    /// How the installed firmware compares with the newest release, and
+    /// every release for the device, newest first.
+    Checked {
+        status: UpdateStatus,
+        releases: Vec<ReleaseInfo>,
+    },
+}
+
+/// How a device's firmware compares with the newest release.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum UpdateStatus {
+    /// A newer release is published.
+    Update,
+    /// The device runs the newest release, or a build at least as new.
+    Current,
+    /// No firmware is published for the device, or its `dev.desc` names no
+    /// sensor and revision to look it up by.
+    None,
+    /// The device runs a development build.
+    Development,
+    /// The device's build date is unknown, and so is whether the newest
+    /// release is newer.
+    Unknown,
+}
+
+/// One published release, its build `date` and `build` and the `file` an
+/// upgrade names it by.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub(crate) struct ReleaseInfo {
+    pub(crate) date: String,
+    pub(crate) build: String,
+    pub(crate) file: String,
+}
+
+/// Where an image comes from, the newest release, a release the page
+/// chose, or a file the page sent.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SourceKind {
+    Latest,
+    Release,
+    File,
+}
+
+/// The step an upgrade failed at. `check` is an image the device cannot
+/// take, or a failure before anything was stopped or sent.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Step {
+    Check,
+    Download,
+    Upload,
+    Finalize,
+}
+
+/// Where an upgrade stands. Every state but `idle` names its `source` and
+/// its `target`, the release as `<date> <build>` or the file's name.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub(crate) enum UpgradeState {
+    /// No upgrade is asked of the device.
+    Idle,
+    /// It waits for the upgrades asked before it.
+    Queued { source: SourceKind, target: String },
+    /// The hub is downloading the release.
+    Downloading { source: SourceKind, target: String },
+    /// The hub is uploading the image, `sent` of its `size` bytes so far.
+    Uploading {
+        source: SourceKind,
+        target: String,
+        sent: u64,
+        size: u64,
+    },
+    /// The device commits the image and writes it.
+    Finalizing { source: SourceKind, target: String },
+    /// The device restarts into the image, and the hub reads its `dev.desc`.
+    Restarting { source: SourceKind, target: String },
+    /// The upgrade is done, and the device runs `installed`, or did not say
+    /// what it runs in time.
+    Done {
+        source: SourceKind,
+        target: String,
+        installed: Option<Installed>,
+    },
+    /// The upgrade failed at `step`, as `error` says.
+    Failed {
+        source: SourceKind,
+        target: String,
+        step: Step,
+        error: String,
+    },
+}
+
+/// What a page asked that the hub refused.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Ask {
+    Upgrade,
+    Cancel,
+    Retry,
 }
 
 impl Message {
@@ -410,6 +587,25 @@ pub(crate) enum PageMessage {
     },
     /// Takes back what the page asked of `rpc`.
     Stop { route: String, rpc: String },
+    /// Looks every device whose firmware the hub knows up in the catalog.
+    Check,
+    /// Asks for an upgrade of the device at `route` from `source`.
+    Upgrade { route: String, source: ImageSource },
+    /// Takes back an upgrade that waits or downloads, or clears one that
+    /// is done or failed.
+    Cancel { route: String },
+    /// Runs a failed upgrade again from its source.
+    Retry { route: String },
+}
+
+/// The image an upgrade asks for. `file` is followed by binary frames whose
+/// lengths sum to `size`, the bytes of the file named `name`.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub(crate) enum ImageSource {
+    Latest,
+    Release { file: String },
+    File { name: String, size: u64 },
 }
 
 /// A trace as the page names it.
@@ -888,6 +1084,213 @@ mod tests {
                     "label": {"name": "FID", "units": "V", "x_name": "Time", "x_units": "s"}},
                 {"rpc": "old.capture", "label": null},
             ]})
+        );
+    }
+
+    #[test]
+    fn a_device_says_what_it_runs_and_what_the_catalog_holds() {
+        let installed = Installed {
+            name: "tio-test".into(),
+            revision: "R1".into(),
+            date: Some("2026-06-08".into()),
+            build: Some("000002".into()),
+            serial: None,
+            development: false,
+        };
+        let of = |installed: Option<Installed>, catalog: CatalogState| {
+            json_of(&Message::Firmware {
+                route: "/".into(),
+                installed,
+                catalog,
+            })
+        };
+        assert_eq!(
+            of(None, CatalogState::Unchecked),
+            json!({"type": "firmware", "route": "/", "installed": null,
+                "catalog": {"state": "unchecked"}})
+        );
+        let checked = CatalogState::Checked {
+            status: UpdateStatus::Update,
+            releases: vec![ReleaseInfo {
+                date: "2026-07-01".into(),
+                build: "5d1494".into(),
+                file: "tio-test-R1-firmware-2026-07-01-5d1494.bin".into(),
+            }],
+        };
+        assert_eq!(
+            of(Some(installed), checked),
+            json!({"type": "firmware", "route": "/",
+                "installed": {"name": "tio-test", "revision": "R1", "date": "2026-06-08",
+                    "build": "000002", "serial": null, "development": false},
+                "catalog": {"state": "checked", "status": "update", "releases": [
+                    {"date": "2026-07-01", "build": "5d1494",
+                        "file": "tio-test-R1-firmware-2026-07-01-5d1494.bin"}]}})
+        );
+        let unreachable = CatalogState::Unreachable {
+            error: "offline".into(),
+        };
+        assert_eq!(
+            of(None, unreachable)["catalog"],
+            json!({"state": "unreachable", "error": "offline"})
+        );
+        assert_eq!(
+            of(None, CatalogState::Checking)["catalog"],
+            json!({"state": "checking"})
+        );
+        for (status, name) in [
+            (UpdateStatus::Current, "current"),
+            (UpdateStatus::None, "none"),
+            (UpdateStatus::Development, "development"),
+            (UpdateStatus::Unknown, "unknown"),
+        ] {
+            let checked = CatalogState::Checked {
+                status,
+                releases: vec![],
+            };
+            assert_eq!(of(None, checked)["catalog"]["status"], name);
+        }
+    }
+
+    #[test]
+    fn an_upgrade_says_where_it_stands() {
+        let of = |state: UpgradeState| {
+            json_of(&Message::Upgrade {
+                route: "/".into(),
+                state,
+            })
+        };
+        assert_eq!(
+            of(UpgradeState::Idle),
+            json!({"type": "upgrade", "route": "/", "state": "idle"})
+        );
+        assert_eq!(
+            of(UpgradeState::Uploading {
+                source: SourceKind::File,
+                target: "image.bin".into(),
+                sent: 28800,
+                size: 412000
+            }),
+            json!({"type": "upgrade", "route": "/", "state": "uploading", "source": "file",
+                "target": "image.bin", "sent": 28800, "size": 412000})
+        );
+        assert_eq!(
+            of(UpgradeState::Done {
+                source: SourceKind::Latest,
+                target: "2026-07-01 5d1494".into(),
+                installed: None
+            }),
+            json!({"type": "upgrade", "route": "/", "state": "done", "source": "latest",
+                "target": "2026-07-01 5d1494", "installed": null})
+        );
+        assert_eq!(
+            of(UpgradeState::Failed {
+                source: SourceKind::Release,
+                target: "2026-03-17 aaaaaa".into(),
+                step: Step::Finalize,
+                error: "device RPC failed: timed out".into()
+            }),
+            json!({"type": "upgrade", "route": "/", "state": "failed", "source": "release",
+                "target": "2026-03-17 aaaaaa", "step": "finalize",
+                "error": "device RPC failed: timed out"})
+        );
+        let (source, target) = (SourceKind::Latest, "t".to_string());
+        for (state, name) in [
+            (
+                UpgradeState::Queued {
+                    source,
+                    target: target.clone(),
+                },
+                "queued",
+            ),
+            (
+                UpgradeState::Downloading {
+                    source,
+                    target: target.clone(),
+                },
+                "downloading",
+            ),
+            (
+                UpgradeState::Finalizing {
+                    source,
+                    target: target.clone(),
+                },
+                "finalizing",
+            ),
+            (UpgradeState::Restarting { source, target }, "restarting"),
+        ] {
+            let told = of(state);
+            assert_eq!(
+                (&told["state"], &told["source"], &told["target"]),
+                (&json!(name), &json!("latest"), &json!("t"))
+            );
+        }
+        for (step, name) in [
+            (Step::Check, "check"),
+            (Step::Download, "download"),
+            (Step::Upload, "upload"),
+        ] {
+            let failed = UpgradeState::Failed {
+                source,
+                target: "t".into(),
+                step,
+                error: String::new(),
+            };
+            assert_eq!(of(failed)["step"], name);
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_the_ask_and_carries_no_number() {
+        let refused = Message::Refused {
+            ask: Ask::Cancel,
+            route: "/".into(),
+            error: "the upgrade of / is uploading and cannot be cancelled".into(),
+        };
+        assert_eq!(
+            json_of(&refused),
+            json!({"type": "refused", "ask": "cancel", "route": "/",
+                "error": "the upgrade of / is uploading and cannot be cancelled"})
+        );
+        for (ask, name) in [(Ask::Upgrade, "upgrade"), (Ask::Retry, "retry")] {
+            assert_eq!(serde_json::to_value(ask).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn a_page_asks_for_checks_and_upgrades() {
+        let asks = [
+            r#"{"type": "check"}"#,
+            r#"{"type": "upgrade", "route": "/", "source": {"kind": "latest"}}"#,
+            r#"{"type": "upgrade", "route": "/0", "source": {"kind": "release", "file": "a.bin"}}"#,
+            r#"{"type": "upgrade", "route": "/", "source": {"kind": "file", "name": "x.bin", "size": 12345}}"#,
+            r#"{"type": "cancel", "route": "/"}"#,
+            r#"{"type": "retry", "route": "/1"}"#,
+        ]
+        .map(|text| serde_json::from_str::<PageMessage>(text).unwrap());
+        assert_eq!(
+            asks,
+            [
+                PageMessage::Check,
+                PageMessage::Upgrade {
+                    route: "/".into(),
+                    source: ImageSource::Latest
+                },
+                PageMessage::Upgrade {
+                    route: "/0".into(),
+                    source: ImageSource::Release {
+                        file: "a.bin".into()
+                    }
+                },
+                PageMessage::Upgrade {
+                    route: "/".into(),
+                    source: ImageSource::File {
+                        name: "x.bin".into(),
+                        size: 12345
+                    }
+                },
+                PageMessage::Cancel { route: "/".into() },
+                PageMessage::Retry { route: "/1".into() },
+            ]
         );
     }
 

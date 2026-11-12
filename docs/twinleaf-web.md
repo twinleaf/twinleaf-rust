@@ -54,6 +54,7 @@ The server sends no CORS headers, and hyper's `header_read_timeout` is set.
 | `devices` | each device's newest identity, RPC table, settings and captures; calls and reads |
 | `loss` | what was lost of each device and stream before the hub's history held it, by where |
 | `captures` | the captures pages ask for: the task that takes each capture RPC's, and each page's outbox |
+| `firmware` | what each device runs, the catalog of published firmware, and the upgrades pages ask for, one at a time |
 | `routes` | the routes, which hub is current, mount order |
 | `discover` | the device picker's scan |
 | `guard`, `assets` | the checks above, and the built page |
@@ -72,15 +73,18 @@ snapshot:
 1. **Snapshot**, as a socket opens and whenever a page fell more than 1024
    changes behind (`Lagged`): `hub {id, seq, behind}`, a `trace` per trace, one
    points frame of all history sent so far, `config`, `memory`, `routes`, then each
-   listed device's newest `device`, `table`, `settings`, `captures` and a
-   `capture` per capture RPC the hub has taken, a `loss` per device
-   that lost anything, and the newest 500 lines of the log, a `log` each.
+   listed device's newest `device`, `table`, `settings`, `captures`, a
+   `capture` per capture RPC the hub has taken, `firmware` once the hub
+   read what it runs and `upgrade` once a page asked an upgrade of it, a
+   `loss` per device that lost anything, and the newest 500 lines of the
+   log, a `log` each.
    The page drops
    everything of any hub and builds a new `Session` from it. `behind` is
    how many changes the page fell behind, 0 as a socket opens.
 2. **Changes**, each numbered `seq` one more than the last (`feed.rs`):
    points frames (every 16 ms), one spectra frame per round (every 100 ms),
-   `trace` for a new column, device messages, `memory` when what the buffer
+   `trace` for a new column, device messages (`firmware` and `upgrade`
+   among them), `memory` when what the buffer
    holds or may hold changed (checked each second: `bytes` of `budget`, the
    `seconds` held of `max_age`, and the bytes per second `rate`), `loss`
    when a device lost more (checked each second), `log` as a line of
@@ -100,7 +104,8 @@ The page sends `spectra {traces}`, naming the trace ids its
 open tab shows as spectra, after each snapshot and when that set changes.
 The hub estimates and sends only the spectra some page names; a page's
 names go when its socket does. It sends `hold {on}` while it holds a plot
-paused, and the three capture messages below.
+paused, the three capture messages below, and the four firmware messages
+under Firmware.
 
 ### What was lost
 
@@ -382,6 +387,147 @@ at once and then after waits that double from 2 ms to 100 ms, metadata,
 then each block in turn), so the stream and other RPCs share the link with
 at most one capture call in flight per capture RPC.
 
+### Firmware
+
+The hub reads what each device runs, and installs firmware the page asks
+for, as `tio upgrade` does: it calls `twinleaf::firmware`
+(`query_installed`, `check_for_update`, `download_cached`, `flash`,
+`reread_installed`) and copies none of it. Each call blocks, so each runs
+on tokio's blocking threads, on the device `DeviceTree::device` gives.
+
+**What a device runs.** The hub reads a device's `dev.desc` once each
+time its RPC table loads (beside listing its captures) and again after an
+upgrade. A read that fails leaves what the hub knew. Once a read succeeds
+the device has a `firmware` message, latest-value as a device's other
+messages are:
+
+```json
+{"type": "firmware", "seq": 41, "route": "/",
+ "installed": {"name": "tio-test", "revision": "R1", "date": "2026-06-08",
+               "build": "000002", "serial": null, "development": false},
+ "catalog": {"state": "unchecked"}}
+```
+
+`installed` is `twinleaf::firmware::InstalledFirmware` field for field
+(`build_date` as `date`, `YYYY-MM-DD`, `hash` as `build`, `is_development`
+as `development`). `name` and `revision` are `""` and `date`, `build` and
+`serial` are `null` where `dev.desc` gives none (the simulator's `(null)`
+serial is `null`). It is `null` only before the device answered.
+
+**The catalog** is consulted only when a page asks, never on a timer or
+as the hub starts: `tio` has no background policy, and `tio upgrade` looks
+the catalog up when it is run. The hub keeps what it found per device.
+
+| `catalog.state` | Means |
+|---|---|
+| `unchecked` | no page has asked since the hub started, or the device now runs a build the last check listed nothing for |
+| `checking` | the hub is looking it up |
+| `unreachable` | the catalog could not be listed; `error` is the `FirmwareError` text |
+| `checked` | `status` and `releases`, every release for the device's name and revision, newest first (`[{date, build, file}]`) |
+
+`status` is `update` (a newer release), `current` (the newest, or a build
+at least as new, or the same build), `none` (nothing published, or a
+`dev.desc` that names no sensor and revision), `development` (a
+development build: `releases` is `[]` and the catalog was not asked) or
+`unknown` (no build date to compare). Once a device runs other firmware,
+after an upgrade or a restart, the hub finds its status again from the
+releases it holds, without the network (`check_for_update` over a
+catalog of those releases).
+
+The catalog is the published repository on GitHub (`GithubCatalog::twinleaf`),
+its downloads cached where `tio upgrade` caches them
+(`default_cache_dir`), unless `TWINLEAF_FIRMWARE_DIR` names a directory.
+That directory is then the catalog, read from disk with no cache, laid out
+as the repository is:
+`{name}/{revision}/{name}-{revision}-firmware-{YYYY-MM-DD}-{hash}.bin`
+(for the simulator, `tio-test/R1/tio-test-R1-firmware-2026-07-01-5d1494.bin`).
+A name and revision with no folder have no release; a root that is no
+directory is `unreachable`.
+
+**Asking.** Four messages from the page:
+
+```json
+{"type": "check"}
+{"type": "upgrade", "route": "/", "source": {"kind": "latest"}}
+{"type": "upgrade", "route": "/", "source": {"kind": "release", "file": "tio-test-R1-firmware-2026-03-17-5d1494.bin"}}
+{"type": "upgrade", "route": "/", "source": {"kind": "file", "name": "image.bin", "size": 412000}}
+{"type": "cancel", "route": "/"}
+{"type": "retry", "route": "/"}
+```
+
+- `check` looks every listed device whose `installed` the hub knows up in
+  the catalog: `checking`, then the result. A check while one runs does
+  nothing more.
+- `upgrade` with `latest` installs the first release the device's last
+  check listed, and `release` the one of that `file`. A `file` is followed
+  by binary frames on the same socket whose lengths sum to `size`, in any
+  chunking; the upgrade starts once `size` bytes came. Any text message,
+  or the socket closing, before then drops the partial image and starts
+  nothing. Binary frames with no image awaited are ignored. An image is at
+  most 16 MiB (`MAX_IMAGE`, 16 777 216 bytes) and not empty.
+- `cancel` takes back an upgrade that is `queued` or `downloading` (it
+  stands `idle` at once; a download in flight is discarded when it returns
+  and nothing reaches the device), and clears one that is `done` or
+  `failed` to `idle`. It is refused while `uploading`, `finalizing` or
+  `restarting`, and does nothing while idle.
+- `retry` runs a `failed` upgrade again from the same source: the same
+  release, or the file's bytes, which the hub keeps until the upgrade is
+  done, so any page can retry.
+
+**State.** Every page hears where each device's upgrade stands, and a
+snapshot holds the newest. A device nobody asked an upgrade of has none.
+
+```json
+{"type": "upgrade", "seq": 57, "route": "/", "state": "uploading",
+ "source": "file", "target": "image.bin", "sent": 28800, "size": 412000}
+```
+
+Every state but `idle` carries `source` (`latest`, `release`, `file`) and
+`target`, the release as `"<date> <build>"` or the file's name.
+
+| `state` | Means |
+|---|---|
+| `idle` | no upgrade asked, or one taken back or cleared |
+| `queued` | waits for the upgrades asked before it |
+| `downloading` | the release is being downloaded (`download_cached`, or the catalog's `download` with no cache) |
+| `uploading` | the image is on its way: `sent` of `size` bytes (`size × chunk / chunks`), from 0 as `flash` starts, at most every 100 ms and the last |
+| `finalizing` | from `FlashEvent::Committing`, through the 5 s settle |
+| `restarting` | `flash` returned; the hub re-reads `dev.desc` (`reread_installed`, 6 reads 1.5 s apart) |
+| `done` | with `installed`, as in `firmware`, or `null` if the device did not answer in time, which is no failure |
+| `failed` | with `step` and `error`, the error's text |
+
+`step` is `check` for an image the device cannot take (`FirmwareError::Refused`,
+a signed package to a device that takes images or the other way round) or
+any failure before `flash` stopped the device, `download`, `upload` (after
+`dev.stop`), or `finalize` (from the commit on). After `done` the device's
+`firmware` goes out anew, with the new `installed` and its status found
+again.
+
+**Refusals.** An ask the hub cannot take is answered to the asking page
+alone, as an unnumbered text frame in no snapshot:
+
+```json
+{"type": "refused", "ask": "upgrade", "route": "/7", "error": "there is no device at /7"}
+```
+
+| `ask` | `error` |
+|---|---|
+| any | `there is no device at <route>` (no such device listed) |
+| `upgrade` | `an upgrade of <route> is already running` (queued or running) |
+| `upgrade` | `the catalog lists no such firmware for <route>` (`latest` or `release` without a checked catalog that lists it) |
+| `upgrade` | `the image <name> is empty`, `the image <name> is <size> bytes, more than the 16777216 an upgrade takes`, `more than the <size> bytes the upgrade of <route> named came` |
+| `cancel` | `the upgrade of <route> is uploading and cannot be cancelled` (likewise `finalizing`, `restarting`) |
+| `retry` | `no upgrade of <route> has failed` |
+
+**One at a time.** One upgrade runs at a time across the hub, in the order
+asked; the others wait `queued`. This is how the page's "Upgrade all" runs
+devices one after another, as `tio upgrade --all` does: one `upgrade` with
+`latest` per device. One device's failure does not stop the rest.
+`POST /api/mount` is refused with 409 `{"error": "a firmware upgrade is
+running"}` while any upgrade waits or runs, as mounting retires the hub
+and its connection. The hub logs each upgrade's start, each step and its
+result with `log::info!` and `log::warn!`, naming the route and target.
+
 Every `/api` route takes the request type `protocol.rs` declares and
 answers its reply type. A request the server cannot serve answers a non-2xx
 status with `{"error": "..."}` (`Refusal`), which `protocol.js` throws as
@@ -393,12 +539,14 @@ an Error. What a device made of a call is data in the reply, not a refusal.
 | `POST /api/call` | one RPC, one argument, several devices: an `Outcome` per route |
 | `POST /api/read` | entries of one device no announcement keeps |
 | `GET /api/discover` | a 3 s scan for devices, mDNS optional |
-| `POST /api/mount` | opens devices in place of the hub's |
+| `POST /api/mount` | opens devices in place of the hub's; 409 while a firmware upgrade waits or runs |
 | `POST /api/pps` | the decimation every page shares |
 | `POST /api/history` | the raw history the hub keeps: `{seconds, bytes}`, a span of each stream's time and a budget across every stream |
 | `GET /api/window` | one trace of a named hub between two times, at about two points a pixel of `width`, for a paused plot |
 
 ## The page (`twinleaf-web/ui/src`)
+
+<!-- page: firmware -->
 
 Svelte 5 and shadcn-svelte components (`lib/components/ui`, generated by
 the shadcn-svelte CLI, style "nova"). Custom drawing is only the plot

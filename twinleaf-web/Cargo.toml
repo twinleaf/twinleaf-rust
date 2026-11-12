@@ -15,7 +15,7 @@ include = ["src/**", "ui/dist/**", "Cargo.toml"]
 self_named_module_files = "deny"
 
 [dependencies]
-twinleaf = { version = "2.0", path = "../twinleaf", default-features = false, features = ["host", "json", "processing"] }
+twinleaf = { version = "2.0", path = "../twinleaf", default-features = false, features = ["host", "json", "processing", "firmware-update"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio", "service"] }

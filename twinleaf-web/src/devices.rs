@@ -5,10 +5,12 @@
 //! metadata, RPC table and announced settings, and sends each to every page
 //! as it changes. None of that asks the device anything. As a table loads,
 //! the watcher lists the device's capture RPCs, and asks the device once
-//! what each is a capture of. Each message is the newest value of its kind,
+//! what each is a capture of, and `firmware` reads the device's `dev.desc`
+//! once. Each message is the newest value of its kind,
 //! as the proxy keeps it, so [`Devices`] keeps the newest of each for a
 //! page's snapshot, and sends nothing that changes nothing. `captures`
-//! keeps where each capture RPC stands here too. A device as its metadata
+//! keeps where each capture RPC stands here too, and `firmware` what each
+//! device runs and where its upgrade stands. A device as its metadata
 //! first names it, or names it anew, and a table that did not load are
 //! each a line of the log.
 //!
@@ -20,6 +22,7 @@
 
 use crate::captures::is_capture;
 use crate::feed::Feed;
+use crate::firmware::Firmware;
 use crate::logbook::Logbook;
 use crate::loss::Losses;
 use crate::protocol::{
@@ -52,6 +55,10 @@ pub(crate) enum Kind {
     Captures,
     /// Where the capture RPC of this name stands.
     Capture(String),
+    /// The firmware it runs, and what the catalog holds for it.
+    Firmware,
+    /// Where its upgrade stands.
+    Upgrade,
 }
 
 /// The newest of what the watchers sent, and the feed it goes out on.
@@ -178,6 +185,11 @@ impl Devices {
         }
     }
 
+    /// The devices the routes list.
+    pub(crate) fn listed(&self) -> BTreeSet<DeviceRoute> {
+        self.latest.lock().unwrap().listed.clone()
+    }
+
     /// The RPC table of the device at `route` as last loaded.
     pub(crate) fn table(&self, route: DeviceRoute) -> Option<Arc<RpcRegistry>> {
         self.tables.lock().unwrap().get(&route).cloned()
@@ -191,13 +203,15 @@ impl Devices {
 /// Starts the watchers of every device `connection` sees, on `runtime`, for
 /// as long as the connection lasts. `mounts` is what the hub mounted, or
 /// `None` for the proxy's default. Each drop of a device's link is counted
-/// in `losses`, and `log` takes the watchers' lines.
+/// in `losses`, `log` takes the watchers' lines, and `firmware` reads what a
+/// device runs as its table loads.
 pub(crate) fn watch(
     connection: &Connection,
     mounts: Option<Vec<MountInfo>>,
     devices: Arc<Devices>,
     losses: Arc<Losses>,
     log: Arc<Logbook>,
+    firmware: Arc<Firmware>,
     runtime: &tokio::runtime::Handle,
 ) {
     let tree = connection.tree(DeviceRoute::root());
@@ -216,7 +230,8 @@ pub(crate) fn watch(
                 if watched.insert(route) {
                     let device = tree.device(route).expect("a route the tree heard is in it");
                     let (devices, losses) = (devices.clone(), losses.clone());
-                    spawner.spawn(watch_device(device, route, devices, losses, log.clone()));
+                    let (log, firmware) = (log.clone(), firmware.clone());
+                    spawner.spawn(watch_device(device, route, devices, losses, log, firmware));
                 }
             }
         }
@@ -234,13 +249,15 @@ struct Identity {
 
 /// Sends what the proxy keeps of `device` as it changes, until the
 /// connection ends, counts each drop of its link in `losses`, and says in
-/// `log` what its metadata names it and that a table did not load.
+/// `log` what its metadata names it and that a table did not load. Each
+/// table that loads has `firmware` read what the device runs.
 async fn watch_device(
     device: Device,
     route: DeviceRoute,
     devices: Arc<Devices>,
     losses: Arc<Losses>,
     log: Arc<Logbook>,
+    firmware: Arc<Firmware>,
 ) {
     let presence = device.presence_updates();
     let link = device.link_updates();
@@ -317,6 +334,7 @@ async fn watch_device(
                         devices.set_table(route, registry.clone());
                         loads += 1;
                         tokio::spawn(list_captures(device.clone(), route, registry.clone(), devices.clone(), loads));
+                        firmware.read_installed(device.clone(), route);
                         let rpcs = registry.iter().filter(|desc| shown(desc)).map(describe).collect();
                         TableState::Loaded(TableInfo { rpcs })
                     }

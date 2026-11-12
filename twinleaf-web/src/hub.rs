@@ -53,6 +53,7 @@ use crate::captures::{Captures, Outbox, Want};
 use crate::devices::Devices;
 use crate::export::ExportTrace;
 use crate::feed::Feed;
+use crate::firmware::{Catalog, Firmware, Wanted};
 use crate::logbook::{self, Logbook};
 use crate::loss::Losses;
 use crate::protocol::{self, Frame, Message, MountInfo, Rows, TraceInfo, Window, WindowChunk};
@@ -219,6 +220,8 @@ pub(crate) struct Live {
     pub(crate) tree: DeviceTree,
     /// The captures the pages ask for.
     captures: Arc<Captures>,
+    /// The devices' firmware, and the upgrades the pages ask for.
+    firmware: Arc<Firmware>,
     /// The number the next page to connect is known by.
     next_page: AtomicU64,
     end: End,
@@ -264,11 +267,24 @@ impl Live {
     }
 
     /// Starts a hub over `connection`, which opened `layout`, or the
-    /// proxy's default for `None`.
+    /// proxy's default for `None`, with the firmware catalog the
+    /// environment names.
     pub(crate) fn over(
         connection: Connection,
         layout: Option<&Layout>,
         runtime: &tokio::runtime::Handle,
+    ) -> std::io::Result<Live> {
+        Live::with_catalog(connection, layout, runtime, Catalog::from_env())
+    }
+
+    /// Starts a hub over `connection`, which opened `layout`, or the
+    /// proxy's default for `None`, whose upgrades look firmware up in
+    /// `catalog`.
+    pub(crate) fn with_catalog(
+        connection: Connection,
+        layout: Option<&Layout>,
+        runtime: &tokio::runtime::Handle,
+        catalog: Catalog,
     ) -> std::io::Result<Live> {
         let tree = connection.tree(DeviceRoute::root());
         let (mailbox, mail) = flume::unbounded();
@@ -289,12 +305,14 @@ impl Live {
         let losses = hub.losses.clone();
         let log = hub.log.clone();
         logbook::CONSOLE.attach(&log);
+        let firmware = Firmware::new(devices.clone(), &tree, runtime, catalog);
         crate::devices::watch(
             &connection,
             mounts,
             devices.clone(),
             losses.clone(),
             log.clone(),
+            firmware.clone(),
             runtime,
         );
         runtime.spawn(logbook::read(connection.packets(), log.clone()));
@@ -323,6 +341,7 @@ impl Live {
             log,
             tree,
             captures,
+            firmware,
             next_page: AtomicU64::new(0),
             end,
         })
@@ -410,6 +429,12 @@ impl Live {
     ) -> Result<Vec<ExportTrace>, Ended> {
         self.ask("export", move |hub| hub.export(&ids, t0, t1))
             .await
+    }
+
+    /// Whether a firmware upgrade waits or runs, which another hub taking
+    /// this one's place would cut short.
+    pub(crate) fn upgrading(&self) -> bool {
+        self.firmware.upgrading()
     }
 
     /// Whether the hub has ended, so another must take its place.
@@ -517,6 +542,32 @@ impl Page {
     /// it, the newest of each RPC.
     pub(crate) async fn captures(&self) -> Vec<Arc<Frame>> {
         self.outbox.take().await
+    }
+
+    /// Looks the devices' firmware up in the catalog.
+    pub(crate) fn check(&self) {
+        self.live.firmware.check();
+    }
+
+    /// Whether an upgrade may be asked of the device at `route` now, before
+    /// the page sends the file it installs.
+    pub(crate) fn may_upgrade(&self, route: &str) -> Result<(), String> {
+        self.live.firmware.may_upgrade(route)
+    }
+
+    /// Asks for an upgrade of the device at `route` that installs `wanted`.
+    pub(crate) fn upgrade(&self, route: &str, wanted: Wanted) -> Result<(), String> {
+        self.live.firmware.upgrade(route, wanted)
+    }
+
+    /// Takes back or clears the upgrade of the device at `route`.
+    pub(crate) fn cancel(&self, route: &str) -> Result<(), String> {
+        self.live.firmware.cancel(route)
+    }
+
+    /// Runs the failed upgrade of the device at `route` again.
+    pub(crate) fn retry(&self, route: &str) -> Result<(), String> {
+        self.live.firmware.retry(route)
     }
 }
 
