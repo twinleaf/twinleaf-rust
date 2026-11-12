@@ -767,12 +767,13 @@ header over them while hovered or focused.
 
 - `npm run build` in `twinleaf-web/ui` writes `ui/dist`, which a release
   build embeds and a debug build reads from disk on each request.
-- A release build of a checkout without `ui/dist` builds it
-  (`twinleaf-web/build.rs` runs `npm ci` and `npm run build`), so `cargo
-  install --git` serves the page where Node and npm are installed. Without
-  them the build warns and goes on, and `/` says how to build the page, as
-  it does for a debug build without `ui/dist`. `TWINLEAF_WEB_NO_UI_BUILD`
-  skips the page's build.
+- A release build of a checkout whose `ui/dist` is missing or older than
+  the page's sources builds it (`twinleaf-web/build.rs` runs `npm run
+  build`, after `npm ci` without `ui/node_modules`), so `cargo install`
+  serves the page as the checkout has it where Node and npm are installed.
+  Without them the build warns and goes on with `ui/dist` as it was, and
+  with none `/` says how to build the page, as it does for a debug build
+  without `ui/dist`. `TWINLEAF_WEB_NO_UI_BUILD` skips the page's build.
 - `npm test` runs the page's vitest suite (`ui/test`).
 - `cargo test -p twinleaf-web` and `cargo clippy -p twinleaf-web
   --all-targets`.
