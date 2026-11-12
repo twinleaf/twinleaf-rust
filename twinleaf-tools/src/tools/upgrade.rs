@@ -499,9 +499,6 @@ fn flash_with_progress(device: &Device, firmware_data: &[u8]) -> eyre::Result<()
 /// Re-reads `dev.desc` after a flash, retrying while the device reboots, and
 /// prints the firmware now running. Prints a warning if it cannot be read.
 fn verify_new_firmware(device: &Device) {
-    const ATTEMPTS: usize = 6;
-    const INTERVAL: Duration = Duration::from_millis(1500);
-
     let spinner = crate::logging::multi_progress().add(ProgressBar::new_spinner());
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -511,16 +508,7 @@ fn verify_new_firmware(device: &Device) {
     spinner.set_message("Verifying new firmware (re-reading dev.desc)...");
     spinner.enable_steady_tick(Duration::from_millis(100));
 
-    let mut installed = None;
-    for attempt in 0..ATTEMPTS {
-        if attempt > 0 {
-            std::thread::sleep(INTERVAL);
-        }
-        if let Ok(fw) = firmware::query_installed(device) {
-            installed = Some(fw);
-            break;
-        }
-    }
+    let installed = firmware::reread_installed(device);
     spinner.finish_and_clear();
 
     let label = |s: &str| style(format!("{:11}", s)).bold().cyan();

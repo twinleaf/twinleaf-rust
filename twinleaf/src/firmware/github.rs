@@ -1,7 +1,7 @@
 //! A [`FirmwareCatalog`] backed by GitHub, enabled by the `firmware-update`
 //! feature.
 
-use super::{FirmwareCatalog, FirmwareDate, FirmwareError, FirmwareRelease};
+use super::{FirmwareCatalog, FirmwareError, FirmwareRelease};
 
 /// The user agent of every request.
 const HTTP_USER_AGENT: &str = concat!("twinleaf/", env!("CARGO_PKG_VERSION"));
@@ -25,30 +25,6 @@ impl GithubCatalog {
             repo: "twinleaf-firmware-updates".into(),
         }
     }
-}
-
-/// Parses `{name}-{revision}-firmware-{YYYY-MM-DD}-{hash}.bin` into a
-/// release. Returns `None` if `filename` does not have that form.
-fn parse_release(name: &str, revision: &str, filename: &str, url: &str) -> Option<FirmwareRelease> {
-    let stem = filename.strip_suffix(".bin")?;
-    let after = stem.split_once("firmware-")?.1; // "2026-03-17-5d1494"
-    let mut parts = after.splitn(4, '-');
-    let year = parts.next()?;
-    let month = parts.next()?;
-    let day = parts.next()?;
-    let hash = parts.next()?;
-    if hash.is_empty() {
-        return None;
-    }
-    let date = FirmwareDate::parse(&format!("{year}-{month}-{day}"))?;
-    Some(FirmwareRelease {
-        name: name.to_string(),
-        revision: revision.to_string(),
-        date,
-        short_hash: hash.to_string(),
-        filename: filename.to_string(),
-        url: url.to_string(),
-    })
 }
 
 impl FirmwareCatalog for GithubCatalog {
@@ -96,7 +72,7 @@ impl FirmwareCatalog for GithubCatalog {
             let Some(url) = entry.get("download_url").and_then(|v| v.as_str()) else {
                 continue;
             };
-            if let Some(release) = parse_release(name, revision, filename, url) {
+            if let Some(release) = FirmwareRelease::parse_filename(name, revision, filename, url) {
                 releases.push(release);
             }
         }
@@ -120,28 +96,6 @@ impl FirmwareCatalog for GithubCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_release_filename() {
-        let r = parse_release(
-            "ASM",
-            "R6",
-            "ASM-R6-firmware-2026-03-17-5d1494.bin",
-            "https://x/f.bin",
-        )
-        .unwrap();
-        assert_eq!(r.date, FirmwareDate::parse("2026-03-17").unwrap());
-        assert_eq!(r.short_hash, "5d1494");
-        assert_eq!(r.filename, "ASM-R6-firmware-2026-03-17-5d1494.bin");
-        assert_eq!(r.url, "https://x/f.bin");
-    }
-
-    #[test]
-    fn rejects_non_firmware_names() {
-        assert!(parse_release("ASM", "R6", "README.md", "u").is_none());
-        // Missing hash component.
-        assert!(parse_release("ASM", "R6", "ASM-R6-firmware-2026-03-17.bin", "u").is_none());
-    }
 
     /// Live end-to-end check against the public firmware repo. Network-gated,
     /// so it is ignored by default. Run with `cargo test -- --ignored`.

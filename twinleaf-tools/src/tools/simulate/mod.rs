@@ -923,6 +923,27 @@ mod tests {
         }
     }
 
+    /// A device reports the build `--build` names, a development build by
+    /// default, and a build too long for `dev.desc` is refused.
+    #[test]
+    fn a_device_reports_the_build_it_was_given() {
+        let desc = |args: &[&str]| {
+            let (mut simulator, host) = start_simulator(args);
+            let desc = call(&mut simulator, &host, "dev.desc", &[], "/").unwrap();
+            String::from_utf8(desc).unwrap()
+        };
+        assert_eq!(
+            desc(&[]),
+            "Twinleaf tio-test R1 ((null)) [2026-06-08/000001-DEV]"
+        );
+        assert_eq!(
+            desc(&["--build", "2026-01-10/aaaaaa"]),
+            "Twinleaf tio-test R1 ((null)) [2026-01-10/aaaaaa]"
+        );
+        let long = "x".repeat(65);
+        assert!(SimulateCli::try_parse_from(["tio-simulate", "--build", &long]).is_err());
+    }
+
     /// An upload counts the image bytes of each chunk, and an upgrade reboots
     /// into a new build.
     #[test]

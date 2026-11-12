@@ -43,6 +43,15 @@ const MAX_STALLS: u32 = 3;
 const COMMIT_SETTLE_TIME: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const COMMIT_SETTLE_TIME: Duration = Duration::from_millis(10);
+/// How many times [`reread_installed`] reads `dev.desc` while the device
+/// reboots after an upgrade.
+pub const REREAD_ATTEMPTS: usize = 6;
+/// How long [`reread_installed`] waits between two reads.
+#[cfg(not(test))]
+pub const REREAD_INTERVAL: Duration = Duration::from_millis(1500);
+/// How long [`reread_installed`] waits between two reads.
+#[cfg(test)]
+pub const REREAD_INTERVAL: Duration = Duration::from_millis(10);
 
 /// A firmware build date (UTC calendar date). Ordered chronologically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -119,6 +128,34 @@ pub struct FirmwareRelease {
     pub filename: String,
     /// Catalog-specific locator used by [`FirmwareCatalog::download`].
     pub url: String,
+}
+
+impl FirmwareRelease {
+    /// Parses a catalog's `filename`, of the form
+    /// `{name}-{revision}-firmware-{YYYY-MM-DD}-{hash}.bin`, into the release
+    /// of sensor `name` and hardware `revision` that `url` locates. Returns
+    /// `None` if `filename` does not have that form.
+    pub fn parse_filename(name: &str, revision: &str, filename: &str, url: &str) -> Option<Self> {
+        let stem = filename.strip_suffix(".bin")?;
+        let after = stem.split_once("firmware-")?.1;
+        let mut parts = after.splitn(4, '-');
+        let year = parts.next()?;
+        let month = parts.next()?;
+        let day = parts.next()?;
+        let hash = parts.next()?;
+        if hash.is_empty() {
+            return None;
+        }
+        let date = FirmwareDate::parse(&format!("{year}-{month}-{day}"))?;
+        Some(Self {
+            name: name.to_string(),
+            revision: revision.to_string(),
+            date,
+            short_hash: hash.to_string(),
+            filename: filename.to_string(),
+            url: url.to_string(),
+        })
+    }
 }
 
 /// The result of comparing installed firmware with the latest published
@@ -331,6 +368,22 @@ fn parse_installed(desc: &str) -> InstalledFirmware {
 pub fn query_installed(device: &Device) -> Result<InstalledFirmware, FirmwareError> {
     let desc: String = device.get("dev.desc")?;
     Ok(parse_installed(&desc))
+}
+
+/// Reads the firmware `device` runs after an upgrade, while it reboots. It
+/// reads `dev.desc` up to [`REREAD_ATTEMPTS`] times, at once and then
+/// [`REREAD_INTERVAL`] apart, and returns the first answer, or `None` if
+/// the device answered none.
+pub fn reread_installed(device: &Device) -> Option<InstalledFirmware> {
+    for attempt in 0..REREAD_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(REREAD_INTERVAL);
+        }
+        if let Ok(installed) = query_installed(device) {
+            return Some(installed);
+        }
+    }
+    None
 }
 
 /// Returns whether `latest` is newer than the `installed` firmware.
@@ -774,6 +827,34 @@ mod tests {
         );
         assert_eq!(FirmwareDate::parse("not-a-date"), None);
         assert_eq!(FirmwareDate::parse("2026-03"), None);
+    }
+
+    #[test]
+    fn parses_release_filename() {
+        let r = FirmwareRelease::parse_filename(
+            "ASM",
+            "R6",
+            "ASM-R6-firmware-2026-03-17-5d1494.bin",
+            "https://x/f.bin",
+        )
+        .unwrap();
+        assert_eq!(r.date, FirmwareDate::parse("2026-03-17").unwrap());
+        assert_eq!(r.short_hash, "5d1494");
+        assert_eq!(r.filename, "ASM-R6-firmware-2026-03-17-5d1494.bin");
+        assert_eq!(r.url, "https://x/f.bin");
+    }
+
+    #[test]
+    fn rejects_non_firmware_names() {
+        assert!(FirmwareRelease::parse_filename("ASM", "R6", "README.md", "u").is_none());
+        // Missing hash component.
+        assert!(FirmwareRelease::parse_filename(
+            "ASM",
+            "R6",
+            "ASM-R6-firmware-2026-03-17.bin",
+            "u"
+        )
+        .is_none());
     }
 
     #[test]
@@ -1303,6 +1384,47 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("takes images"), "unexpected error: {err}");
         assert!(events.is_empty() && sent.is_empty());
+    }
+
+    /// Runs [`reread_installed`] against a fake device that refuses the
+    /// first `refusals` reads of `dev.desc` and answers every one after.
+    /// Returns what it read and how many reads the device saw.
+    fn reread_against(refusals: usize) -> (Option<InstalledFirmware>, usize) {
+        let (device, proxy) = crate::device::Device::test_pair();
+        let responder = std::thread::spawn(move || {
+            let mut reads = 0;
+            while let Ok(request) = proxy.sent.recv_timeout(Duration::from_secs(5)) {
+                let route = request.route();
+                let crate::tio::packet::Payload::RpcRequest(request) = request.payload() else {
+                    panic!("a reread only makes RPC calls");
+                };
+                let id = request.id.value();
+                reads += 1;
+                match reads <= refusals {
+                    true => proxy.refuse(id, wire_rpc::RpcError::State, route),
+                    false => {
+                        proxy.reply(id, b"Twinleaf ASM R6 ((null)) [2026-06-04/022547]", route)
+                    }
+                }
+            }
+            reads
+        });
+        let installed = reread_installed(&device);
+        drop(device);
+        (installed, responder.join().unwrap())
+    }
+
+    /// A reread answers with the first read that succeeds, after reads that
+    /// fail while the device reboots, and gives up after the last attempt.
+    #[test]
+    fn a_reread_retries_while_the_device_reboots() {
+        let (installed, reads) = reread_against(REREAD_ATTEMPTS - 1);
+        assert_eq!(installed.unwrap().hash.as_deref(), Some("022547"));
+        assert_eq!(reads, REREAD_ATTEMPTS);
+
+        let (installed, reads) = reread_against(REREAD_ATTEMPTS);
+        assert!(installed.is_none());
+        assert_eq!(reads, REREAD_ATTEMPTS);
     }
 
     #[test]
