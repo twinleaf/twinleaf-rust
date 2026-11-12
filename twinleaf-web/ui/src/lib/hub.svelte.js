@@ -5,9 +5,12 @@
 // snapshot of the socket opened in its place fills it, the one way the page
 // comes to hold a hub's state (see protocol.js). The plots' views, which
 // outlive any hub, read the time through `now`. The devices' RPCs go
-// through `call` and `read`.
+// through `call` and `read`. What the page lost (loss.svelte.js) outlives
+// the sessions too: every snapshot and every `loss` message is handed to
+// it.
 
 import { Session } from './session.svelte.js';
+import { Losses } from './loss.svelte.js';
 import { api, decodeFrame, holdMessage, spectraMessage } from './protocol.js';
 import { WINDOW_LIMITS } from './window.js';
 import * as clock from './clock.js';
@@ -20,6 +23,8 @@ export class Hub {
   session = $state.raw(new Session());
   /** Whether the socket reached a hub and is open. */
   connected = $state(false);
+  /** What the page lost of its data, and where, since it opened. */
+  loss = new Losses();
   /** Bytes of binary frames received, for the page's rate readout. */
   bytes = 0;
   /** Whether the page holds a plot paused, for which the hub keeps a capture of its history. */
@@ -39,6 +44,7 @@ export class Hub {
     if (msg.type === 'hub') {
       this.session.clearAllWindows();
       this.session = new Session(msg.id);
+      this.loss.snapshot(msg.id, msg.behind ?? 0, clock.now());
       this.connected = true;
       this.seq = msg.seq;
       this.sentSpectra = null;
@@ -47,6 +53,7 @@ export class Hub {
       return;
     }
     if (msg.seq !== undefined && !this.next(msg.seq)) return this.resync();
+    if (msg.type === 'loss') return this.loss.apply(msg, msg.seq === undefined, (stream) => this.session.rateOf(msg.route, stream), clock.now());
     this.session.text(msg);
     if (msg.type === 'trace') this.sendSpectra();
   }

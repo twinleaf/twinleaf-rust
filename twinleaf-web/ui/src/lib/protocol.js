@@ -4,13 +4,21 @@
 //
 // The page holds one hub's state and comes to hold it one way, from a
 // snapshot. The socket, /ws, sends a snapshot as it opens and whenever the
-// page fell too far behind: `hub` {id, seq}, then `trace` for each trace,
+// page fell too far behind: `hub` {id, seq, behind}, `behind` the changes
+// it stands in place of, then `trace` for each trace,
 // one points frame of history, `config`, and each device's newest `routes`,
-// `device`, `table` and `settings`. The page replaces everything it held
+// `device`, `table`, `settings` and `loss`. The page replaces everything it held
 // with it (`Hub.text`). Then come changes, each numbered `seq` one more than
 // the last: points and spectrum frames, `trace` for a new column, device
 // messages, and on a decimation change `clear`, the history and `config`.
 // A message of a snapshot has no `seq`, and a binary frame of one has 0.
+//
+// `loss` {route, link: {times, seconds}, streams: {name: {skipped, link,
+// proxy, hub}}} counts what was lost of one device before the hub held it,
+// since the hub started: how often its link dropped and for how long, and
+// the samples of each stream its device skipped, its link's outages lost,
+// the proxy dropped and the hub dropped. The page's own counts are made of
+// what each adds to the last (loss.svelte.js).
 //
 // A gap, a change numbered other than the next or a trace id the snapshot
 // did not name, sends the page back for a snapshot: it closes the socket

@@ -1,11 +1,19 @@
 <script>
   // The page's status along its foot: whether it reaches the hub, its
-  // devices and how many are lost, what streams in, the raw history the hub
-  // holds, and the frame rate. The keys and mouse gestures are a click away.
+  // devices and how many are lost, what streams in, what of it was lost in
+  // the last minute, the raw history the hub holds, and the frame rate. The
+  // keys and mouse gestures are a click away.
+  //
+  // The loss item shows only while the last minute lost something, or its
+  // popover is open: each cause apart, the one that stands for the most
+  // data first (loss.svelte.js `recent`), in words.js's `lossWords`. Its
+  // popover counts what was lost since the page opened (LossCounts.svelte).
   import RiKeys from '@lucide/svelte/icons/keyboard';
   import RiWarn from '@lucide/svelte/icons/triangle-alert';
   import Tip from './Tip.svelte';
   import HistorySettings from './HistorySettings.svelte';
+  import LossCounts from './LossCounts.svelte';
+  import { LOSS_NONE_RECENT, LOSS_TIP, lossWords } from './words.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
   import { bytesText as bytes, spanText as span } from './units.js';
 
@@ -18,6 +26,8 @@
   const memory = $derived(session.memory);
   const full = $derived(memory?.budget ? Math.min(1, memory.bytes / memory.budget) : 0);
   const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const loss = $derived(hub.loss);
+  let lossOpen = $state(false);
 </script>
 
 <footer class="status-bar" data-focus="status" tabindex="-1">
@@ -31,6 +41,30 @@
     {/if}
   </span>
   <span class="item"><span>{plural(session.signals.length, 'signal')} · <span class="num">{hud.rxKBs.toFixed(0)}</span> kB/s</span></span>
+  {#if loss.recent.length || lossOpen}
+    <Popover.Root bind:open={lossOpen}>
+      <Tip text={LOSS_TIP}>
+        {#snippet children(tip)}
+          <Popover.Trigger {...tip}>
+            {#snippet child({ props })}
+              <button {...props} class="item loss">
+                <RiWarn />
+                {#each loss.recent as cause, i (cause.kind)}
+                  {#if i}<span aria-hidden="true">·</span>{/if}
+                  <span class="cause" data-cause={cause.kind}>{#each lossWords(cause) as part}{#if part.num}<span class="num" style:min-width="{part.ch}ch">{part.num}</span>{:else}{part}{/if}{/each}</span>
+                {:else}
+                  <span class="cause">{LOSS_NONE_RECENT}</span>
+                {/each}
+              </button>
+            {/snippet}
+          </Popover.Trigger>
+        {/snippet}
+      </Tip>
+      <Popover.Content class="w-96 p-3" align="start" side="top">
+        <LossCounts {loss} devices={session.devices} />
+      </Popover.Content>
+    </Popover.Root>
+  {/if}
   {#if memory}
     <Popover.Root>
       <Tip text="Raw history: {bytes(memory.bytes)} of {bytes(memory.budget)}, at most {span(memory.maxAge)} of each stream">

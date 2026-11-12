@@ -337,6 +337,12 @@ export class Session {
     this.id = id;
   }
 
+  /** The samples a second of stream `stream` of the device at `route`, as a trace of it says, or undefined when the hub sent none of it. */
+  rateOf(route, stream) {
+    for (const t of this.traces.values()) if (t.meta.route === route && t.meta.stream === stream) return t.meta.rate;
+    return undefined;
+  }
+
   /** The trace of signal `key`, read reactively: a component asks again as traces arrive. */
   trace(key) {
     this.signals;

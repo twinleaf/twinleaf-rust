@@ -638,6 +638,7 @@ export class PlotView {
     this.tagsPlaced = [];
     this.tickLabels = []; // each tick label as last drawn, {text, x, y, w, h}, its box in client px, and a y label's axis, its range key
     this.labelBoxes = []; // each y axis's label as last drawn, {axis, text, x, y, w, h}
+    this.gaps = []; // each gap in a trace as last drawn, {index, x0, x1, band}: the trace's place in the plot, and the px the gap runs from and to, one place unless it is a band
     this.cursorStubs = []; // each cursor line's run past the plot's edge into the axis, {x0, y0, x1, y1}
     this.axisHover = null; // clientX over the x axis, where a drag seeks
     this.phosphor = new Map(); // signal key -> the shares its axis column shows, eased frame to frame
@@ -1379,20 +1380,34 @@ export class PlotView {
     ctx.strokeStyle = T.frame;
     for (const lane of geo.lanes) ctx.strokeRect(lane.x + 0.5, lane.y + 0.5, lane.w - 1, lane.h - 1);
 
-    // Gaps, in the lane of their trace.
+    // Gaps, in the lane of their trace. Where a sample or a few are missing,
+    // a dashed line marks the place. A gap wide enough to see, as when the
+    // link to the device was down, is a band from the last point before it
+    // to the first after, between two such lines.
+    this.gaps = [];
     if (!spectrum) {
       ctx.setLineDash([3, 3]);
-      ctx.strokeStyle = T.gap;
+      ctx.strokeStyle = ctx.fillStyle = T.gap;
       plans.forEach((p) => {
         const lane = geo.lanes[this.laneOf(cfg, p.index)];
-        const breaks = p.src.breaks;
-        for (const b of breaks) {
-          if (b <= p.a0 || b >= p.a1) continue;
-          const px = Math.round(sx(p.src.xAt(b))) + 0.5;
+        const mark = (px) => {
           ctx.beginPath();
           ctx.moveTo(px, lane.y);
           ctx.lineTo(px, lane.y + lane.h);
           ctx.stroke();
+        };
+        for (const b of p.src.breaks) {
+          if (b <= p.a0 || b >= p.a1) continue;
+          const x1 = Math.round(sx(p.src.xAt(b))) + 0.5, from = Math.max(lane.x, Math.round(sx(p.src.xAt(b - 1)))) + 0.5;
+          const band = x1 - from >= GAP_BAND, x0 = band ? from : x1;
+          this.gaps.push({ index: p.index, x0, x1, band });
+          if (band) {
+            ctx.globalAlpha = GAP_BAND_ALPHA;
+            ctx.fillRect(x0, lane.y, x1 - x0, lane.h);
+            ctx.globalAlpha = 1;
+            mark(x0);
+          }
+          mark(x1);
         }
       });
       ctx.setLineDash([]);
@@ -2562,6 +2577,9 @@ export class PlotView {
  * labels that change width as the plot moves do not shift it.
  */
 const GUTTER = { gap: 6, pad: 6, min: 24, bare: 12, slack: 10 };
+/** How wide a gap in a trace is, in px, from which it is drawn as a band, and how strongly the band is filled with the gap's colour: narrower, it is one dashed line. */
+const GAP_BAND = 4;
+const GAP_BAND_ALPHA = 0.3;
 /**
  * The width, in px, of the column at a y axis's outer edge its label runs
  * up in (`axisLabels`), outside the room its numbers take: the axes' 11 px

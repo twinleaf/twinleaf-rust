@@ -101,6 +101,11 @@ const OWNED = [
     writes: /\.renderer\s*=[^=>]/,
   },
   {
+    what: 'what the page counts lost',
+    owner: 'lib/loss.svelte.js',
+    writes: /\.(behind|recent|resets)\s*(=[^=>]|\+\+)|\bloss\.devices\.(set|delete|clear)\(/,
+  },
+  {
     what: 'what the page serves its plots',
     owner: 'App.svelte',
     writes: /\.serve\(/,

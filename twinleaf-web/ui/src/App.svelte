@@ -646,6 +646,7 @@
           gpu: plots.renderer.gpu,
         };
         frames = 0; cpu = 0; upload = 0; last = perf; lastBytes = hub.bytes;
+        hub.loss.tick(perf);
         readWindow();
       }
       raf = clock.frame(loop);

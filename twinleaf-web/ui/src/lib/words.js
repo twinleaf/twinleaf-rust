@@ -16,6 +16,42 @@
 import { switchOf } from './properties.js';
 import { bytesEstimate, bytesText, spanText } from './units.js';
 
+/** `n` things counted, to two figures from a thousand on, as "312", "2.1 k" or "1.5 M". */
+export const countText = (n) => (n >= 1e6 ? `${+(n / 1e6).toPrecision(2)} M` : n >= 1e3 ? `${+(n / 1e3).toPrecision(2)} k` : String(n));
+/**
+ * What the status bar says of one cause of loss in the last minute, {kind,
+ * n, seconds} (loss.svelte.js), as the parts of a phrase, each a string or
+ * {num, ch}, a number and the characters it is given, so it keeps its
+ * width as it grows: "link dropped 4×, 11 s", "312 samples skipped", "hub
+ * dropped 2.1 k", "page behind 3×".
+ */
+export function lossWords({ kind, n, seconds }) {
+  const times = { num: `${n}×`, ch: 3 }, count = { num: countText(n), ch: 5 };
+  if (kind === 'link') return ['link dropped ', times, ', ', { num: spanText(seconds), ch: 6 }];
+  if (kind === 'skipped') return [count, n === 1 ? ' sample skipped' : ' samples skipped'];
+  if (kind === 'dropped') return ['hub dropped ', count];
+  return ['page behind ', times];
+}
+/** What the status bar's loss item says while its popover is open and the last minute lost nothing. */
+export const LOSS_NONE_RECENT = 'nothing lost in the last minute';
+/** The loss item's tooltip. */
+export const LOSS_TIP = 'Lost in the last minute. Click for the counts since the page opened';
+/** The heading of each count in the loss popover, and what it counts. */
+export const LOSS_COUNTS = {
+  link: { head: 'Link dropped', tip: 'The link to the device went down: how many times, and for how long in all' },
+  skipped: { head: 'Skipped', tip: 'Samples the device did not send, or its link lost while it stayed up' },
+  dropped: { head: 'Hub dropped', tip: 'Samples the proxy and its hub dropped because the hub fell behind' },
+  behind: { head: 'Page behind', tip: 'Times this page fell too far behind the hub and was sent everything again' },
+};
+/** The loss popover's title: since when it counts, the counts `reset` or not. */
+export const lossSince = (reset) => (reset ? 'Lost since the counts were reset' : 'Lost since the page opened');
+/** The button that sets the loss popover's counts to nothing. */
+export const LOSS_RESET = 'Reset';
+/** What the loss popover says in place of its devices when none lost anything. */
+export const LOSS_NO_DEVICE = 'No device lost anything';
+/** How the loss popover counts a link's drops: "4×, 11 s", or "0×". */
+export const linkCount = (drops, seconds) => (drops || seconds ? `${drops}×, ${spanText(seconds)}` : '0×');
+
 /** `items` joined as a sentence lists them: "a", "a and b", "a, b and c", the rest past `most` counted. */
 export function list(items, most = 3) {
   const shown = items.length > most ? [...items.slice(0, most - 1), `${items.length - most + 1} more`] : items;

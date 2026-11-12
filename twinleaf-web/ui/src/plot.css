@@ -233,8 +233,24 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .status-bar .warn svg, .status-bar .keys svg { width: 12px; height: 12px; }
 .status-bar .meter { display: inline-block; width: 48px; height: 4px; border-radius: 2px; background: var(--secondary); overflow: hidden; }
 .status-bar .meter span { display: block; height: 100%; background: var(--primary); }
-.status-bar .keys, .status-bar .history { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
-.status-bar .keys:hover, .status-bar .history:hover { color: var(--foreground); background: var(--secondary); }
+.status-bar .keys, .status-bar .history, .status-bar .loss { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.status-bar .keys:hover, .status-bar .history:hover, .status-bar .loss:hover { color: var(--foreground); background: var(--secondary); }
+/* What was lost in the last minute, in the warning's colour, each cause's numbers as wide as they grow. */
+.status-bar .loss { color: var(--cursor-a); }
+.status-bar .loss svg { width: 12px; height: 12px; }
+/* The loss popover (LossCounts.svelte): its title and Reset, a row a device
+   with its three counts, numbers at the trailing edge, and the page's own
+   count under a rule. */
+.loss-counts { display: flex; flex-direction: column; gap: 8px; font-size: 12px; line-height: 16px; }
+.loss-head, .loss-page { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.loss-head { color: var(--foreground); font-weight: 600; }
+.loss-counts table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.loss-counts th { padding: 0 0 4px 12px; color: var(--muted-foreground); font: 600 11px/16px var(--font-ui); text-align: right; white-space: nowrap; cursor: help; }
+.loss-counts td { padding: 2px 0 2px 12px; color: var(--foreground); text-align: right; white-space: nowrap; }
+.loss-counts th:first-child, .loss-counts td:first-child { padding-left: 0; text-align: left; cursor: default; overflow: hidden; text-overflow: ellipsis; max-width: 9rem; }
+.loss-counts td.none { color: var(--muted-foreground); text-align: left; }
+.loss-page { padding-top: 8px; border-top: 1px solid var(--border); color: var(--muted-foreground); cursor: help; font-variant-numeric: tabular-nums; }
+.loss-page span:last-child { color: var(--foreground); }
 /* A grouped form, as the settings popover and HistorySettings.svelte lay
    theirs out: sections split by one rule, each a heading over rows of a
    label and its control. The labels take one column, as wide in every

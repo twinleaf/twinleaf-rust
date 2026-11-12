@@ -127,6 +127,20 @@ proxy's, if the proxy said it dropped packets of that stream; else as
 skipped. A device that restarts while its link is down sends rows that
 say no count, so `link.times` says what `streams` cannot.
 
+The page keeps its own counts from these (`lib/loss.svelte.js`), by
+device, since it opened or since they were reset there: what each `loss`
+adds to the one before, so what a hub had lost before the page first heard
+it is not the page's. It shows four: a link's drops and their seconds, the
+samples skipped, the samples dropped (the proxy's and the hub's together)
+and the times the page fell behind. While the last minute lost anything,
+the status bar says each cause in its own phrase, the one that stands for
+the most seconds of data first, and its popover lists the counts by
+device with a Reset. A plot marks each place its trace is missing samples
+with a dashed line, and a gap wide enough to see, as a link's outage is,
+with a band from the last point before it to the first after: it tells
+the two apart by the gap's width, which is all a points frame says of a
+break.
+
 ### Captures
 
 A capture is a device's one-shot readout of a buffer, such as the ADC
@@ -259,6 +273,7 @@ canvas and its WebGL layer.
 | `lib/docks.svelte.js`, `Dock.svelte` | the docks' panels: where each is, folded or open, dragged by its header or moved by its menu |
 | `lib/hub.svelte.js` | the socket, the current `Session`, sequence checks, spectra subscription |
 | `lib/session.svelte.js` | one hub's state: `Trace`s, `Detail` windows, `Device`s, the clock |
+| `lib/loss.svelte.js` | what the page lost and where, since it opened and in the last minute, across hubs |
 | `lib/protocol.js` | the protocol mirror, `signalKey`, `api` |
 | `lib/tabs.js` | what a tab is, the default tab, saving, export and import |
 | `lib/workspace.svelte.js` | the tabs as the page edits them, focus, selection |
@@ -269,7 +284,7 @@ canvas and its WebGL layer.
 | `lib/drag.svelte.js` | moving plots, dropping signals, the selection box |
 | `lib/keymap.js` | every key, which drives the handlers and the keys dialog |
 | `lib/properties.js`, `Properties.svelte` | the Properties data table (TanStack table-core) |
-| `StatusBar.svelte` | the page's foot: connection, devices and lost ones, data rate, the hub's raw history (`memory`), frame rate, the keys |
+| `StatusBar.svelte`, `LossCounts.svelte` | the page's foot: connection, devices and lost ones, data rate, what was lost in the last minute with a popover of the counts since the page opened, the hub's raw history (`memory`), frame rate, the keys |
 | `PlotCard`, `Devices`, `DevicePicker`, `SignalList`, `TabStrip`, `CommandPalette`, `KeysDialog`, `DragOverlay`, `Tile` | the components |
 
 ### A sample, to a pixel
