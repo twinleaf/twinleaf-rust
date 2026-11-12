@@ -57,7 +57,9 @@ fn hold_selection(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
     let routes = held.tree(DeviceRoute::root()).routes_updates();
     let closer = held.clone();
     ctrlc::set_handler(move || closer.close())?;
-    front.print_startup(&cli);
+    // This process serves no page. A foreground proxy that holds the
+    // selection says its own page's address.
+    front.print_startup(&cli, false);
     println!(
         "Using {} as the default while this runs. Ctrl-C to stop.",
         front.describe(cli.subtree)
@@ -361,7 +363,9 @@ impl FrontDoor {
         }
     }
 
-    fn print_startup(&self, cli: &ProxyCli) {
+    /// Prints what the proxy hosts and how, with the address of the web
+    /// page when `page` says this process serves it.
+    fn print_startup(&self, cli: &ProxyCli, page: bool) {
         let mounts = &self.layout.mounts;
         match self.names.as_slice() {
             [Some(name)] => println!("tio proxy starting (selected {name}):"),
@@ -396,7 +400,7 @@ impl FrontDoor {
             }
         }
         println!("  TCP port: {}", cli.port);
-        if serves_page(cli) {
+        if page {
             println!("  Plots: http://localhost:{}", cli.port);
         }
         println!("  Subtree: {}", cli.subtree);
@@ -428,7 +432,7 @@ fn serve(proxy: Proxy, front: &FrontDoor, cli: &ProxyCli) -> eyre::Result<()> {
     let proxy = Arc::new(proxy);
     stop_on_signals(proxy.clone())?;
 
-    front.print_startup(cli);
+    front.print_startup(cli, serves_page(cli));
     // The advertisement lasts until this returns, then says goodbye.
     #[cfg(feature = "mdns")]
     let _mdns = advertise_mdns(&proxy, cli);
