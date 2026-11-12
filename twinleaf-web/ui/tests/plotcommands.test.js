@@ -369,6 +369,18 @@ describe('the count a plot’s menu shows for a copy', () => {
       fc.record({ t: fc.constant('zoom'), out: fc.boolean() }),
       { weight: 3, arbitrary: fc.record({ t: fc.constant('answer'), k: fc.nat() }) },
     );
+    /**
+     * Runs that end with the menu open: it opens, the plot zooms under it, and
+     * the first count comes back after the second; it opens and its count
+     * comes back; it opens and the plot zooms in; the plot zooms, then the
+     * menu opens and the counts come back out of order.
+     */
+    const OPEN_AT_END = [
+      [[{ t: 'open' }, { t: 'zoom', out: true }, { t: 'answer', k: 1 }, { t: 'answer', k: 0 }], []],
+      [[{ t: 'open' }, { t: 'answer', k: 0 }], []],
+      [[{ t: 'open' }, { t: 'zoom', out: false }, { t: 'answer', k: 0 }], [0]],
+      [[{ t: 'zoom', out: true }, { t: 'open' }, { t: 'answer', k: 2 }, { t: 'answer', k: 0 }], [1]],
+    ];
     let checked = 0;
     await fc.assert(
       fc.asyncProperty(fc.array(step, { minLength: 1, maxLength: 10 }), fc.array(fc.nat(), { maxLength: 10 }), async (steps, order) => {
@@ -418,9 +430,9 @@ describe('the count a plot’s menu shows for a copy', () => {
           vi.restoreAllMocks();
         }
       }),
-        // The menu opens, the plot zooms under it, and the first count comes back after the second.
-        withExamples([[[{ t: 'open' }, { t: 'zoom', out: true }, { t: 'answer', k: 1 }, { t: 'answer', k: 0 }], []]]),
+        withExamples(OPEN_AT_END),
     );
-    expect(checked).toBeGreaterThan(3);
+    // Each example ends with the menu open, so it is checked whatever the random runs do.
+    expect(checked).toBeGreaterThanOrEqual(OPEN_AT_END.length);
   }, 600_000);
 });
