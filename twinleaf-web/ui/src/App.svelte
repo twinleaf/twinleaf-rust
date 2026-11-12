@@ -51,6 +51,7 @@
   import { navigate, remember } from './lib/focus.js';
   import KeysDialog from './lib/KeysDialog.svelte';
   import ExportDialog from './lib/ExportDialog.svelte';
+  import FirmwareDialog from './lib/FirmwareDialog.svelte';
   import WindowField from './lib/WindowField.svelte';
   import { WINDOW_LIMITS } from './lib/window.js';
   import StatusBar from './lib/StatusBar.svelte';
@@ -67,6 +68,7 @@
   import { Checkbox } from '$lib/components/ui/checkbox/index.js';
   import * as Tooltip from '$lib/components/ui/tooltip/index.js';
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
+  import * as ContextMenu from '$lib/components/ui/context-menu/index.js';
   import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
   import * as Popover from '$lib/components/ui/popover/index.js';
   import * as Resizable from '$lib/components/ui/resizable/index.js';
@@ -180,6 +182,7 @@
     toggleLog: () => toggleLog(),
     exportTabs,
     importTabs: () => importInput.click(),
+    openUpgrade: (route) => void (upgrading = route === null ? { all: true } : { route }),
     viewChanged,
     place: {
       startMove: (id, e) => drags.startMove(id, e),
@@ -708,6 +711,10 @@
   let keysOpen = $state(false);
   // The export the dialog offers, or null: the plots it exports.
   let exporting = $state(null);
+  // The upgrade the firmware dialog shows, or null: {route} one device's, {all} that of every device with an update.
+  let upgrading = $state(null);
+  // An ask the hub refused is said as the page's other failures are.
+  hub.onRefused = (refused) => toast.error(`The hub refused: ${refused.error}`);
   /** Offers to export `targets`, plots as commands.js gives them: those that show a signal the hub has. */
   function openExport(targets) {
     const session = hub.session;
@@ -936,6 +943,15 @@
   {/if}
 {/snippet}
 
+{#snippet panelMenu(id)}
+  {#if id === 'devices'}
+    <CommandItem id="upgradeFirmware" />
+    <CommandItem id="upgradeAll" />
+    <CommandItem id="checkFirmware" />
+    <ContextMenu.Separator />
+  {/if}
+{/snippet}
+
 {#snippet dockTop()}
   <Input class="h-7 min-w-0 flex-1 text-xs" type="search" bind:value={propertyFilter} placeholder="Filter properties" aria-label="Filter the properties of every panel by name" data-rows onkeydown={filterKey} />
 {/snippet}
@@ -953,7 +969,7 @@
     style:--content={contentSize[side] !== null ? `${contentSize[side]}px` : null}
     onpointerdown={(e) => drags.startMarquee(e)}
   >
-    <Dock {docks} {side} content={panelBody} top={holdsFilter(side) ? dockTop : undefined} railed={railed[side]} carrying={drags.carrying} />
+    <Dock {docks} {side} content={panelBody} menu={panelMenu} top={holdsFilter(side) ? dockTop : undefined} railed={railed[side]} carrying={drags.carrying} />
   </aside>
 {/snippet}
 
@@ -1151,6 +1167,7 @@
 <Toasts />
 <KeysDialog bind:open={keysOpen} />
 <ExportDialog bind:what={exporting} />
+<FirmwareDialog bind:what={upgrading} />
 <CommandPalette bind:open={paletteOpen} session={hub.session} devices={checked} />
 
 <AlertDialog.Root open={!!closing} onOpenChange={(o) => !o && (closing = null)}>

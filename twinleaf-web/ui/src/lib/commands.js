@@ -141,6 +141,10 @@ import RiTrigger from '@lucide/svelte/icons/zap';
 import RiAuto from '@lucide/svelte/icons/repeat';
 import RiDelay from '@lucide/svelte/icons/timer';
 import RiShots from '@lucide/svelte/icons/copy-plus';
+import RiCheckUpdates from '@lucide/svelte/icons/refresh-cw';
+import RiFirmware from '@lucide/svelte/icons/hard-drive-upload';
+import RiUpgradeAll from '@lucide/svelte/icons/circle-arrow-up';
+import { deviceText, hasUpdate } from './firmware.js';
 import RiCount from '@lucide/svelte/icons/list-ordered';
 
 /** How far an arrow pans, as a share of the span, and zooms, as a factor. */
@@ -945,6 +949,29 @@ export const COMMANDS = [
     icon: RiUpload, label: 'Import tabs…',
     run: (ctx) => void ctx.svc.importTabs(),
   },
+  // The devices' firmware.
+  {
+    // Has the hub look every device up in the catalog of published firmware, which it does only when asked.
+    id: 'checkFirmware', scope: 'page', needs: ['workspace'], palette: 'Devices', empty: true,
+    icon: RiCheckUpdates, label: 'Check for firmware updates',
+    disabled: (ctx) => !ctx.svc.devices().some((d) => d.fw?.installed),
+    run: (ctx) => void ctx.svc.checkFirmware(),
+  },
+  {
+    // Opens the upgrade dialog of the device at route `how.to`: a row for each device.
+    id: 'upgradeFirmware', scope: 'page', needs: ['workspace'], palette: 'Devices', empty: true,
+    icon: RiFirmware, label: 'Upgrade firmware…',
+    choices: (ctx) => ctx.svc.devices().map((d) => [d.route, d.name ? `${d.route} ${deviceText(d)}` : d.route]),
+    disabled: (ctx) => !ctx.svc.devices().length,
+    run: (ctx, how) => void ctx.svc.openUpgrade(how?.to),
+  },
+  {
+    // Offers to upgrade every device a newer release is published for, one after another.
+    id: 'upgradeAll', scope: 'page', needs: ['workspace'], palette: 'Devices', empty: true,
+    icon: RiUpgradeAll, label: (ctx) => `Upgrade all (${ctx.svc.devices().filter(hasUpdate).length})`,
+    disabled: (ctx) => !ctx.svc.devices().some(hasUpdate),
+    run: (ctx) => void ctx.svc.openUpgrade(null),
+  },
 ];
 
 /** The command `id`. */
@@ -962,7 +989,7 @@ function labelOf(c, ctx, how) {
   return `${label} › ${nameIn(c.choices(ctx, how), how.to)}`;
 }
 /** The headings the command palette lists commands under (`palette`), in its order. */
-export const PALETTE = ['Tabs', 'Docks', 'Arrange', 'Plots', 'View'];
+export const PALETTE = ['Tabs', 'Docks', 'Arrange', 'Plots', 'View', 'Devices'];
 /** The scopes of the commands that act on no plot. */
 export const PLOTLESS = ['tab', 'page'];
 /** What a command may need of where its plots are (`needs`). */
@@ -987,8 +1014,11 @@ export const listed = (c) => !!c.label && !c.needs?.some((n) => ORIGIN.includes(
  * `titleOf(key)`, what the page names the signal of `key`, `copy(plots)`,
  * `copyCheck(plots)`, `copyImage(id)`, `openExport(plots)`, `picker(id,
  * action)`, `renameTab(id)`, `closeTab(tab)`, `dockShown(side)`,
- * `toggleDock(side)`, `logShown()`, `toggleLog()`, `exportTabs()` and
- * `importTabs()`.
+ * `toggleDock(side)`, `logShown()`, `toggleLog()`, `exportTabs()`,
+ * `importTabs()`, `devices()`, the hub's devices in the order of their
+ * routes, `checkFirmware()` and `openUpgrade(route)`, which opens the
+ * upgrade dialog of the device at `route`, or with null of every device
+ * that has an update.
  *
  * Where a command is made is {on, signal, signals, tab, from}: `on` the
  * plot it is made on, or null for the page; `signal` the signal whose row

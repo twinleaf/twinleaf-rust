@@ -17,7 +17,7 @@
 import { Session } from './session.svelte.js';
 import { Losses } from './loss.svelte.js';
 import { Log } from './log.svelte.js';
-import { DEVICE_GONE, api, captureKey, captureMessage, decodeFrame, holdMessage, spectraMessage } from './protocol.js';
+import { DEVICE_GONE, api, captureKey, captureMessage, checkMessage, decodeFrame, holdMessage, spectraMessage, upgradeAsk, upgradeMessage } from './protocol.js';
 import { WINDOW_LIMITS } from './window.js';
 import * as clock from './clock.js';
 
@@ -25,6 +25,8 @@ import * as clock from './clock.js';
 const RECONNECT_MS = 1000;
 /** The messages after which what the hub takes of the page's capture asks may differ: a device listed, lost or back, its captures listed, a capture ended. */
 const CAPTURE_NEWS = ['routes', 'device', 'captures', 'capture'];
+/** The most bytes of a firmware image one binary frame carries. */
+const IMAGE_FRAME = 64 * 1024;
 
 export class Hub {
   /** The state of the hub the socket last reached, replaced by every snapshot. */
@@ -52,6 +54,8 @@ export class Hub {
   captureWants = new Map();
   /** The captures the hub holds an ask of from this page, by key, as {repeat}: the delay it was asked to repeat at, or null for one capture alone. */
   asked = new Map();
+  /** Hears each ask of this page's the hub refused, as its `refused` message, {ask, route, error}: the page sets it. */
+  onRefused = null;
 
   /** Applies one text message: a snapshot's `hub`, a snapshot's state, or a change. */
   text(msg) {
@@ -68,6 +72,7 @@ export class Hub {
       this.sendHold();
       return;
     }
+    if (msg.type === 'refused') return void this.onRefused?.(msg);
     if (msg.seq !== undefined && !this.next(msg.seq)) return this.resync();
     if (msg.type === 'loss') return this.loss.apply(msg, msg.seq === undefined, (stream) => this.session.rateOf(msg.route, stream), clock.now());
     if (msg.type === 'log') return this.log.take(msg, msg.seq === undefined);
@@ -167,6 +172,33 @@ export class Hub {
       const c = this.captureWants.has(key) ? this.#asks(key) : null;
       if (c && this.post(captureMessage('capture', c.route, c.rpc)) && !this.asked.has(key)) this.asked.set(key, { repeat: null });
     }
+  }
+
+  /** Asks the hub to look each device up in the catalog of published firmware, which it does only when a page asks. */
+  checkFirmware() {
+    return this.post(checkMessage());
+  }
+
+  /**
+   * Asks the hub to upgrade the device at `route` from `source` (protocol.js
+   * `upgradeMessage`), a file's `bytes`, an ArrayBuffer, after it, in
+   * frames one after another, so no other message comes between. Says
+   * whether it went.
+   */
+  upgrade(route, source, bytes = null) {
+    if (!this.post(upgradeMessage(route, source))) return false;
+    for (let at = 0; bytes && at < bytes.byteLength; at += IMAGE_FRAME) this.post(bytes.slice(at, at + IMAGE_FRAME));
+    return true;
+  }
+
+  /** Takes back the upgrade of the device at `route`, while nothing of it went to the device, or clears one that ended. */
+  cancelUpgrade(route) {
+    return this.post(upgradeAsk('cancel', route));
+  }
+
+  /** Runs the failed upgrade of the device at `route` again, from the source it had. */
+  retryUpgrade(route) {
+    return this.post(upgradeAsk('retry', route));
   }
 
   /**

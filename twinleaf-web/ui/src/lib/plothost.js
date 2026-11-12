@@ -33,6 +33,7 @@
 //   workspace (commands.js `needs`), and its commands that need one do not
 //   run and have no rows.
 
+import { byRoute } from './properties.js';
 import { CursorEdits } from './cursors.js';
 import { ViewHistory } from './viewhistory.svelte.js';
 import { Views } from './views.js';
@@ -120,6 +121,9 @@ export class PlotHost {
       toggleLog: () => this.#page.toggleLog(),
       exportTabs: () => this.#page.exportTabs(),
       importTabs: () => this.#page.importTabs(),
+      devices: () => [...hub.session.devices.values()].sort(byRoute),
+      checkFirmware: () => hub.checkFirmware(),
+      openUpgrade: (route) => this.#page.openUpgrade(route),
     });
   }
 
@@ -129,7 +133,7 @@ export class PlotHost {
    * fromKeys), newPlot(keys), copy(plots), copyCheck(plots), copyImage(id),
    * openExport(plots), renameTab(id), closeTab(tab), dockShown(side),
    * toggleDock(side), logShown(), toggleLog(), exportTabs(),
-   * importTabs()}, with `viewChanged(id)`,
+   * importTabs(), openUpgrade(route)}, with `viewChanged(id)`,
    * told as plot `id`'s view moves, and `place`, as the top of this file
    * lists it.
    */

@@ -28,6 +28,12 @@ import { CursorEdits, xOf } from './cursors.js';
 import { PlotView } from './plot.js';
 
 const IDS = ['a', 'b', 'c', 'd'];
+/** The hub's devices as the services list them: one a newer release is published for, one up to date, and one the hub has not read. */
+const DEVICES = [
+  { route: '/0', name: 'VMR', serial: '0412', upgrade: null, fw: { installed: { date: '2026-01-10', build: 'aaaaaa' }, catalog: { state: 'checked', status: 'update', releases: [{ date: '2026-07-01', build: '5d1494', file: 'f.bin' }] } } },
+  { route: '/1', name: 'OMG', serial: '0077', upgrade: null, fw: { installed: { date: '2026-07-01', build: '5d1494' }, catalog: { state: 'checked', status: 'current', releases: [] } } },
+  { route: '/2', name: null, serial: null, upgrade: null, fw: null },
+];
 
 describe('the command table', () => {
   it('has each command once, each entry of the fields it may have', () => {
@@ -151,9 +157,26 @@ function page(kinds, picked, last, log, maximized = null, signals = ['s'], items
     toggleLog: () => void log.push('toggleLog'),
     exportTabs: () => void log.push('exportTabs'),
     importTabs: () => void log.push('importTabs'),
+    devices: () => DEVICES,
+    checkFirmware: () => void log.push('checkFirmware'),
+    openUpgrade: (route) => void log.push(`openUpgrade ${route}`),
   };
   return { cmds: commands(svc), svc };
 }
+
+describe('the firmware commands', () => {
+  it('offer the upgrade dialog of each device by its route, that of every device with an update, counted, and the catalog’s check', () => {
+    const { cmds } = page([], [], null, []);
+    const rows = cmds.offered().filter((r) => r.group === 'Devices');
+    expect(rows.map((r) => r.label)).toEqual(['Check for firmware updates', 'Upgrade firmware… › /0 VMR 0412', 'Upgrade firmware… › /1 OMG 0077', 'Upgrade firmware… › /2', 'Upgrade all (1)']);
+    const log = [];
+    const { cmds: logged } = page([], [], null, log);
+    expect(logged.run('upgradeFirmware', { how: { to: '/1' } })).toBe(true);
+    expect(logged.run('upgradeAll')).toBe(true);
+    expect(logged.run('checkFirmware')).toBe(true);
+    expect(log).toEqual(['openUpgrade /1', 'openUpgrade null', 'checkFirmware']);
+  });
+});
 
 const runs = [];
 afterEach(() => {

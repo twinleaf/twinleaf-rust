@@ -267,17 +267,17 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .status-bar .item + .item { border-left: 1px solid var(--border); border-radius: 0; }
 .status-bar .spacer { flex: 1; }
 /* What an item of the bar says keeps one width, that of the longest it says, `data-room`, each line of it one thing it may say, and a pixel over for how a run of text rounds: it is set from its start, its words close up to its numbers, and the room left over comes after it, so what follows stays put as it changes. */
-.status-bar .fit { display: inline-grid; justify-items: start; font-variant-numeric: tabular-nums; }
-.status-bar .fit::before { content: attr(data-room); grid-area: 1 / 1; height: 0; padding-right: 1px; overflow: hidden; white-space: pre; visibility: hidden; }
-.status-bar .fit > * { grid-area: 1 / 1; }
+.status-bar .fit, .device .fit, .fw-all .fit { display: inline-grid; justify-items: start; font-variant-numeric: tabular-nums; }
+.status-bar .fit::before, .device .fit::before, .fw-all .fit::before { content: attr(data-room); grid-area: 1 / 1; height: 0; padding-right: 1px; overflow: hidden; white-space: pre; visibility: hidden; }
+.status-bar .fit > *, .device .fit > *, .fw-all .fit > * { grid-area: 1 / 1; }
 /* A count of the log's bar, which ends its button, keeps one width, `--digits` wide, four unless it says, set from its start. */
 .log-bar .num { display: inline-block; min-width: calc(var(--digits, 4) * 1ch); text-align: left; font-variant-numeric: tabular-nums; }
 .status-bar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--destructive); }
 .status-bar .dot.on { background: var(--primary); }
 .status-bar .warn { display: inline-flex; align-items: center; gap: 3px; color: var(--cursor-a); }
 .status-bar .warn svg, .status-bar .keys svg, .status-bar .loss svg { width: 12px; height: 12px; }
-.status-bar .meter { display: inline-block; width: 48px; height: 4px; border-radius: 2px; background: var(--secondary); overflow: hidden; }
-.status-bar .meter span { display: block; height: 100%; background: var(--primary); }
+.status-bar .meter, .device .meter { display: inline-block; width: 48px; height: 4px; border-radius: 2px; background: var(--secondary); overflow: hidden; }
+.status-bar .meter span, .device .meter span { display: block; height: 100%; background: var(--primary); }
 .status-bar .keys, .status-bar .history, .status-bar .loss, .status-bar .log { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
 .status-bar .keys:hover, .status-bar .history:hover, .status-bar .loss:hover, .status-bar .log:hover, .status-bar .log.on { color: var(--foreground); background: var(--secondary); }
 /* The Log item's count of what arrived unseen, in the warning's colour, or the error's while an error is among it. */
@@ -298,7 +298,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
    section's edges, so a heading sits three times as far from the section
    above (12 + 12) as from its own rows (8). Text sits on 16 px lines; a
    row holds a 24 px control. */
-.settings-pop, .history-set { --space-1: 4px; --space-2: 8px; --space-3: 12px; --line: 16px; --row: 24px; }
+.settings-pop, .history-set, .firmware-dialog { --space-1: 4px; --space-2: 8px; --space-3: 12px; --line: 16px; --row: 24px; }
 .settings-pop { font-size: 12px; line-height: var(--line); }
 .settings-pop section { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3); }
 .settings-pop section + section { border-top: 1px solid var(--border); }
@@ -606,6 +606,7 @@ html, body { height: 100%; margin: 0; background: var(--background); color: var(
 .theme-seg svg { width: 14px; height: 14px; }
 /* The export dialog: its choices as an axis popover's rows, then a note. */
 .export-dialog .axis-row { padding: 0; font-size: 13px; }
+.firmware-dialog .axis-row { padding: 0; }
 .export-note { margin: 0; color: var(--muted-foreground); font-size: 12px; line-height: 16px; }
 /* A row of an axis's popover: a label, then its controls. */
 .axis-row { display: flex; align-items: center; gap: 4px; padding: 0 4px 4px; color: var(--muted-foreground); font-size: 12px; }
@@ -733,6 +734,52 @@ label > [data-slot=checkbox]::after { content: none; }
 .presence.connecting { background: var(--cursor-a); }
 .presence.lost { background: var(--destructive); }
 .devices .empty { color: var(--muted-foreground); padding: 4px; }
+.device-buttons { display: flex; gap: 4px; }
+/* A device's firmware, one line under its name in every state, which a
+   row of one line has no room for: the version it runs, and at the right
+   what the catalog has for it, or, in the version's place, where its
+   upgrade is. It never wraps: the version gives way first, then the
+   words, each cut with an ellipsis. What can be pressed there reads as
+   the status bar's pressable items do. An upgrade's item is as wide
+   whatever its step while the line has room, its number always whole and
+   its meter never under 12 px. The line is no wider than the row shows
+   of it, 22 px in for the checkbox, where the row's first line is wider
+   than a narrow dock. */
+.device { container-type: inline-size; }
+.device .firmware { grid-column: 2 / -1; display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; max-width: calc(100cqw - 22px); height: 16px; overflow: hidden; color: var(--muted-foreground); font-size: 11px; line-height: 16px; white-space: nowrap; }
+.device .firmware .version { flex: 0 1000 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.device .firmware .said, .device .offer { flex: 0 1 auto; min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
+.device .offer { height: 16px; padding: 0 2px; border: 0; border-radius: 4px; background: none; color: var(--cursor-a); font: inherit; line-height: 16px; white-space: nowrap; cursor: pointer; }
+.device .offer:hover { color: var(--foreground); background: var(--secondary); }
+.device .offer.progress { display: flex; flex: 0 1 calc(12ch + 63px); align-items: center; justify-content: flex-end; gap: 5px; color: inherit; }
+.device .offer .word { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.device .offer .fit { flex: none; }
+.device .offer .meter { flex: 1 1 48px; min-width: 12px; max-width: 48px; }
+.device .offer.failed { color: var(--destructive); }
+/* The upgrade dialog (FirmwareDialog.svelte): the device and the source as
+   labelled rows, notes as the export dialog's, and the steps of an upgrade,
+   each an icon, its name, the upload's bar, as the export dialog's, and
+   what it says, at a width that holds as its numbers change. */
+.firmware-dialog .fact { font-family: var(--font-data); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.firmware-dialog .fact.file { flex: 1; min-width: 0; color: var(--muted-foreground); }
+.firmware-dialog .set-grid.facts { grid-auto-rows: minmax(var(--line), auto); }
+.firmware-dialog .set-grid > span:nth-child(odd), .firmware-dialog .axis-row { color: var(--muted-foreground); }
+.firmware-dialog .seg button:disabled { opacity: 0.45; cursor: default; }
+.export-note.bad { color: var(--destructive); }
+.export-note.done { color: var(--foreground); }
+.export-note.foot { margin-right: auto; align-self: center; }
+.fw-steps { display: grid; gap: var(--space-1); font-size: 12px; line-height: var(--line); }
+.fw-step { display: grid; grid-template-columns: 14px 6.5rem minmax(0, 1fr) 9.5rem; align-items: center; gap: var(--space-2); min-height: var(--row); color: var(--muted-foreground); }
+.fw-step svg { width: 14px; height: 14px; }
+.fw-step.now, .fw-step.done { color: var(--foreground); }
+.fw-step.done svg { color: var(--primary); }
+.fw-step.failed, .fw-step.failed svg { color: var(--destructive); }
+.fw-step .bar { height: 6px; background: var(--secondary); border-radius: 3px; overflow: hidden; }
+.fw-step .bar i { display: block; height: 100%; background: var(--primary); }
+.fw-all { display: flex; flex-direction: column; gap: 1px; font-size: 12px; }
+.fw-all .row { display: grid; grid-template-columns: 2rem minmax(0, 1fr) auto 7.5rem; gap: 8px; align-items: center; min-height: var(--row); font-family: var(--font-data); }
+.fw-all .route, .fw-all .fact { color: var(--muted-foreground); }
+.fw-all .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .props-head { display: flex; align-items: baseline; gap: 8px; border-top: 1px solid var(--border); padding-top: 8px; flex: none; }
 .props-head .title { font-weight: 600; font-size: 13px; }
 .props-head .cols { color: var(--muted-foreground); font-family: var(--font-data); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

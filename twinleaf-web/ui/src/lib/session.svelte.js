@@ -305,6 +305,10 @@ export class Device {
   table = $state.raw(null);
   /** The values it last announced, by RPC name. */
   values = new SvelteMap();
+  /** Its firmware, {installed, catalog} as the hub's `firmware` message has them, or null before the hub read it. */
+  fw = $state.raw(null);
+  /** Where an upgrade of it stands, the hub's `upgrade` message, or null while none was asked for or it was cleared. */
+  upgrade = $state.raw(null);
 
   constructor(route) {
     this.route = route;
@@ -486,6 +490,16 @@ export class Session {
       }
       case 'settings':
         return this.devices.get(msg.route)?.announce(msg.values);
+      case 'firmware': {
+        const d = this.devices.get(msg.route);
+        if (d) d.fw = { installed: msg.installed ?? null, catalog: msg.catalog ?? { state: 'unchecked' } };
+        return;
+      }
+      case 'upgrade': {
+        const d = this.devices.get(msg.route);
+        if (d) d.upgrade = msg.state === 'idle' ? null : { state: msg.state, source: msg.source, target: msg.target, sent: msg.sent, size: msg.size, step: msg.step, error: msg.error, installed: msg.installed ?? null };
+        return;
+      }
     }
   }
 

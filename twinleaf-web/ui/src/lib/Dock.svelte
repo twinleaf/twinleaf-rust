@@ -59,13 +59,15 @@
   /**
    * `docks` is the page's Docks, `side` this dock's, and `content(id)` draws
    * a panel's body. `top(side)` draws what the dock's top row holds beside
-   * its button; without it the dock has no top row. `railed` draws the rail in the panels' place: the page says
+   * its button; without it the dock has no top row. `menu(id)` draws the
+   * rows a panel's own commands have in its header's menu, above the rows
+   * every panel has. `railed` draws the rail in the panels' place: the page says
    * when, as a dock sliding shut keeps its panels until it has.
    * `carrying` is what the page's Drags carries, property rows or actions,
    * or null: while it is something, the panel that takes rows shows it
    * does, and shows it more while the pointer is on it.
    */
-  let { docks, side, content, top = undefined, railed, carrying = null } = $props();
+  let { docks, side, content, menu = undefined, top = undefined, railed, carrying = null } = $props();
 
   // Panels slide only while one is dragged, so a fold resizes them in place.
   const FLIP_MS = 150;
@@ -208,6 +210,7 @@
           {/snippet}
         </ContextMenu.Trigger>
         <ContextMenu.Content class="menu-icons">
+          {@render menu?.(p.id)}
           <ContextMenu.Item onSelect={() => docks.toggle(p.id)}><RiFold class="menu-icon" />{p.open ? 'Fold' : 'Unfold'}</ContextMenu.Item>
           <ContextMenu.Item disabled={i === 0} onSelect={() => docks.step(p.id, -1)}><RiUp class="menu-icon" />Move up<span class="menu-value">{i + 1} of {items.length}</span></ContextMenu.Item>
           <ContextMenu.Item disabled={i === items.length - 1} onSelect={() => docks.step(p.id, 1)}><RiDown class="menu-icon" />Move down<span class="menu-value">{i + 1} of {items.length}</span></ContextMenu.Item>

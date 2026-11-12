@@ -53,6 +53,22 @@
 // capture the hub read for this page comes as a capture frame, which is no
 // numbered change.
 //
+// Each device's `firmware` {route, installed, catalog} says what it runs,
+// {name, revision, date, build, serial, development}, and what the catalog
+// of published firmware offers it: {state} unchecked, checking, unreachable
+// (with `error`) or checked, with `status` (update, current, none,
+// development, unknown) and `releases` [{date, build, file}], newest first.
+// The hub asks the catalog only when a page sends `check`. A device's
+// `upgrade` {route, state} says where an upgrade of it stands: idle, or
+// with `source` and `target`, queued, downloading, uploading (`sent` of
+// `size` bytes), finalizing, restarting, done (with `installed`) or failed
+// (with `step` and `error`). The page sends `upgrade` {route, source} to
+// start one, the newest release, a release by its file's name, or a file,
+// whose bytes follow in binary frames; `cancel` to take one back before it
+// uploads, or clear one that ended; and `retry` for one that failed. An
+// ask the hub refuses is answered `refused` {ask, route, error}, to this
+// page alone, which is no numbered change.
+//
 // Every /api request answers JSON. One the server cannot serve answers a
 // status other than 2xx with {error}, which `request` throws as an Error.
 
@@ -172,6 +188,17 @@ export const holdMessage = (on) => JSON.stringify({ type: 'hold', on });
  * `delay` seconds after each, or 'stop' to take both back.
  */
 export const captureMessage = (type, route, rpc, delay) => JSON.stringify({ type, route, rpc, ...(type === 'repeat' && { delay }) });
+
+/** The page's ask that the hub look each device up in the catalog of published firmware. */
+export const checkMessage = () => JSON.stringify({ type: 'check' });
+/**
+ * The page's ask to upgrade the device at `route` from `source`: {kind:
+ * 'latest'}, {kind: 'release', file}, or {kind: 'file', name, size}, whose
+ * `size` bytes follow in binary frames with no other message between.
+ */
+export const upgradeMessage = (route, source) => JSON.stringify({ type: 'upgrade', route, source });
+/** The page's ask of the upgrade of the device at `route`: `type` 'cancel' to take it back or clear it, 'retry' to run a failed one again. */
+export const upgradeAsk = (type, route) => JSON.stringify({ type, route });
 
 /**
  * Sends one /api request and returns its reply, or throws the server's
