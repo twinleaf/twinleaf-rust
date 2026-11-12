@@ -1060,6 +1060,13 @@ export class PlotView {
     return { density, unit: density ? 'Hz' : (this.traces()[0]?.meta.xUnits ?? ''), log: { x: density && !!cfg.xLog, y: density && !!cfg.yLog } };
   }
 
+  /** Takes `legend` as what this frame drew, {rows, cursors}, and gives it to `onReadout` when its cursors read otherwise than the last frame's. */
+  showLegend(legend) {
+    const moved = JSON.stringify(legend.cursors) !== JSON.stringify(this.legend?.cursors ?? null);
+    this.legend = legend;
+    if (moved) this.onReadout?.(legend);
+  }
+
   /** Draws a spectrum plot or a capture plot: of each signal the slice it shows (`sliceOf`), over the shots an overlay draws beneath it. */
   drawSlice(cfg, traces, geo, body) {
     const slice = this.sliceAxes(cfg);
@@ -1215,7 +1222,7 @@ export class PlotView {
     ctx.lineWidth = 1;
     const traces = allTraces ?? plans.map((p) => p.t);
     if (!xd || plans.length === 0) {
-      this.legend = { rows: {}, cursors: null };
+      this.showLegend({ rows: {}, cursors: null });
       this.pressable = [];
       ctx.fillStyle = T.axisText;
       const msg = !traces.length ? 'drop signals here' : slice && !spectrum ? 'no capture yet' : 'waiting for data…';
@@ -1690,9 +1697,7 @@ export class PlotView {
       });
     }
     const cursors = xs || ys.length ? { x: xs, ys } : null;
-    const moved = JSON.stringify(cursors) !== JSON.stringify(this.legend?.cursors ?? null);
-    this.legend = { rows, cursors };
-    if (moved) this.onReadout?.(this.legend);
+    this.showLegend({ rows, cursors });
     if (!hold) this.hoverRead = this.hover ? { x: this.hover.x, y: this.hover.y, at: now, reads } : null;
     if (near) {
       const u = near.t.meta.units, key = this.rangeKey(cfg, near.t);

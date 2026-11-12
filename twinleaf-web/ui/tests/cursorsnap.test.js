@@ -17,6 +17,7 @@ import { flushSync } from 'svelte';
 import fc from 'fast-check';
 import { editCursors, feed, frames, leafOf, mountPage, pressKey, settle, wait, withExamples } from './harness/page.js';
 import { oracleSnap, RULE } from './harness/snaporacle.js';
+import { asKind } from './harness/captures.js';
 import * as clock from '../src/lib/clock.js';
 import { withX, withY, xOf, yOf } from '../src/lib/cursors.js';
 import { plotIds } from '../src/lib/layout.js';
@@ -645,9 +646,9 @@ describe('a cursor dragged with Shift held', () => {
     }
   }, 600_000);
 
-  it('is read in the readout as its tag reads it, at every frame of the drag, with Shift or without', async () => {
+  it('is read in the readout as its tag reads it, at every frame of the drag, with Shift or without, on a time plot and a capture plot', async () => {
     const { page, id, pv } = await oneSine(() => [-2.5, 1.2]);
-    const start = page.ws.plots[id].cursors;
+    let start = page.ws.plots[id].cursors;
     /** The text of cursor `name` of `axis`'s value tag as the frame drew it, or null while it is out of view. */
     const tagOf = (axis, name) => pv.pressable.find((p) => p.part === 'tag' && p.kind === axis && p.name === name && !p.edge && !/^[XY][12]$/.test(p.text))?.text ?? null;
     /** What the readout's row of `axis` shows of cursor `name`. */
@@ -658,9 +659,19 @@ describe('a cursor dragged with Shift held', () => {
     const share = fc.double({ min: 0.08, max: 0.92, noNaN: true });
     const drag = fc.record({ axis: fc.constantFrom('x', 'y'), name: fc.constantFrom('a', 'b'), shift: fc.boolean(), path: fc.array(share, { minLength: 1, maxLength: 6 }) });
     try {
+      for (const plot of ['time', 'capture']) {
+      if (plot === 'capture') {
+        // The plot as a capture plot, its cursors at a fifth and four fifths along what it shows.
+        asKind(page, id, 'capture');
+        await settle(6);
+        const kind = page.ws.plots[id].kind;
+        editCursors(page, id, () => withY(withY(withX(withX(undefined, kind, 'a', along(pv, 'x', 0.2)), kind, 'b', along(pv, 'x', 0.8)), kind, 'shared', 'a', along(pv, 'y', 0.2)), kind, 'shared', 'b', along(pv, 'y', 0.8)));
+        await settle();
+        start = page.ws.plots[id].cursors;
+      }
       await fc.assert(
         fc.asyncProperty(drag, async ({ axis, name, shift, path }) => {
-          // Every case from the cursors oneSine places.
+          // Every case from the cursors the plot started with.
           editCursors(page, id, () => start);
           await settle();
           const from = pressOn(pv, axis, name);
@@ -675,7 +686,7 @@ describe('a cursor dragged with Shift held', () => {
               for (let k = 0; k < 3; k++) {
                 await frames(1);
                 const tag = tagOf(axis, name);
-                if (tag !== null) expect(readOf(axis, name), `${shift ? 'Shift+' : ''}${axis.toUpperCase()}${name === 'a' ? 1 : 2} at move ${i + 1}, frame ${k + 1}: the readout as the tag`).toBe(tag);
+                if (tag !== null) expect(readOf(axis, name), `${plot} plot, ${shift ? 'Shift+' : ''}${axis.toUpperCase()}${name === 'a' ? 1 : 2} at move ${i + 1}, frame ${k + 1}: the readout as the tag`).toBe(tag);
               }
             }
           } finally {
@@ -686,6 +697,7 @@ describe('a cursor dragged with Shift held', () => {
         // The case of the report: Y1 dragged with Shift to the trough near the bottom, and X2 dragged without.
         withExamples([[{ axis: 'y', name: 'a', shift: true, path: [0.9, 0.8] }], [{ axis: 'x', name: 'b', shift: false, path: [0.2, 0.6] }]]),
       );
+      }
     } finally {
       await commands.mouse([['up'], ['let go', 'Shift']]);
       page.dispose();
