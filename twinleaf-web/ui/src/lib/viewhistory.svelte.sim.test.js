@@ -138,15 +138,28 @@ const rest = { t: 'idle', ms: 10_000 };
  * one plot zoomed to its narrowest or widest alone, then a burst on it and
  * the next, which goes on while the first stays.
  */
-const EXAMPLES = [0.05, 3].flatMap((f) => [1, 2].map((first) => [[turns(first, 6, f, 0), rest, turns(first | (first << 1), 6, f, 50), rest, rest, rest, rest, rest, { t: 'back' }, { t: 'back' }]]));
+const STOPS = [0.05, 3].flatMap((f) => [1, 2].map((first) => [turns(first, 6, f, 0), rest, turns(first | (first << 1), 6, f, 50), rest, rest, rest, rest, rest, { t: 'back' }, { t: 'back' }]));
+const runs = fc.array(action, { minLength: 10, maxLength: 40 });
+/**
+ * The runs tried first, every time: those of STOPS, and runs drawn once
+ * from the generator by a seed of their own. Each rule is counted over
+ * these alone, so how often each is reached is the same on every run of
+ * the test, whatever the random runs after them do.
+ */
+const EXAMPLES = [...STOPS, ...fc.sample(runs, { seed: 1, numRuns: 100 })].map((actions) => [actions]);
+/** The least number of the examples that reach each rule. */
+const REACHED = 4;
 
 describe('view history, against a model of its rules', () => {
   it('makes one entry of each drag, command and burst of a tab, and Back and Forward show the tab as it was at the entry before and after', () => {
-    // A run is quick, so there are always enough for each rule to be reached; the examples come on top of the random runs.
+    // A run is quick, so the random runs come on top of the examples, a hundred at the least.
     const numRuns = Math.max(100, fc.readConfigureGlobal().numRuns);
-    const count = { entries: 0, joined: 0, cameBack: 0, keptForward: 0, rested: 0, otherKind: 0, oneStopped: 0, several: 0, shown: 0, startup: 0, gone: 0, spectra: 0, frequencies: 0, yRanges: 0, cursorsKept: 0, xTaken: 0, xBack: 0 };
+    const reached = { entries: 0, joined: 0, cameBack: 0, keptForward: 0, rested: 0, otherKind: 0, oneStopped: 0, several: 0, shown: 0, startup: 0, gone: 0, spectra: 0, frequencies: 0, yRanges: 0, cursorsKept: 0, xTaken: 0, xBack: 0 };
+    let tried = 0;
     fc.assert(
-      fc.property(fc.array(action, { minLength: 10, maxLength: 40 }), (actions) => {
+      fc.property(runs, (actions) => {
+        // The examples' counts go to `reached`; a random run's go nowhere.
+        const count = tried++ < EXAMPLES.length ? reached : { ...reached };
         const { ws, views, vh, hub, t, dropped, frame, cursors: edits } = setup();
         const spectrumIds = new Map();
         const ids = (s) => (spectrumIds.has(s) || spectrumIds.set(s, spectrumIds.size), spectrumIds.get(s));
@@ -361,8 +374,7 @@ describe('view history, against a model of its rules', () => {
       }),
       { examples: EXAMPLES, numRuns: EXAMPLES.length + numRuns },
     );
-    // Each rule had cases that reached it, a few in every hundred runs.
-    for (const [rule, n] of Object.entries(count)) expect(n, rule).toBeGreaterThanOrEqual(numRuns / 25);
+    for (const [rule, n] of Object.entries(reached)) expect(n, rule).toBeGreaterThanOrEqual(REACHED);
   }, 120_000);
 });
 
