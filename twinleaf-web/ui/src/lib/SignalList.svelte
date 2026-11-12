@@ -203,7 +203,7 @@
     data-focus-own
     aria-label="Signals: arrows move, Space picks, Enter adds to the selected plots, Shift+Enter makes a new one"
     aria-activedescendant={focused && palette[active] ? `pal-${palette[active].id}` : undefined}
-    use:dndzone={{ items: palette, type: 'trace', flipDurationMs: FLIP_MS, dropFromOthersDisabled: true, dropTargetStyle: {}, delayTouchStart: true, zoneTabIndex: 0, zoneItemTabIndex: -1, autoAriaDisabled: true, transformDraggedElement: lifted }}
+    use:dndzone={{ items: palette, type: 'trace', flipDurationMs: FLIP_MS, dropFromOthersDisabled: true, dropTargetStyle: {}, delayTouchStart: true, zoneTabIndex: 0, zoneItemTabIndex: -1, autoAriaDisabled: true, useCursorForDetection: true, transformDraggedElement: lifted }}
     onconsider={consider}
     onfinalize={finalize}
     bind:this={list}

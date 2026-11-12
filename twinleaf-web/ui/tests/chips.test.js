@@ -369,6 +369,9 @@ describe('the dashes under a row of chips', () => {
         // in the middle of it from the Signals list, and from the next plot.
         [2, 1, null, S, 0, 0, 'legend', Y, { at: 0.5, from: 'list' }],
         [2, 2, null, S, 0, 0, 'legend', Y, { at: 0.5, from: 'plot' }],
+        // A signal from the Signals list held just past the + after one chip: the middle of the chip
+        // carried, which is narrower than the list's row and trails the pointer, lies over that chip.
+        [1, 1, null, L, 0, 0, 'none', Y, { at: 0, from: 'list' }],
       ].map((e) => [...e.slice(0, 8), e[8] ?? { at: 0.5, from: 'list' }])),
     );
     for (const [what, k] of Object.entries(count)) expect(k, what).toBeGreaterThan(0);
