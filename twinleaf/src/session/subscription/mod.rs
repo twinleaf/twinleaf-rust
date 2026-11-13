@@ -390,9 +390,36 @@ struct Carried {
 /// What the batches of one stream that a lane dropped changed and lost.
 struct Pending {
     change: Option<Change>,
-    /// The rows dropped, and the rows the dropped batches said were lost.
+    /// The batches dropped and their rows, and the rows those batches said
+    /// were lost before them.
+    dropped: u64,
+    rows: u64,
+    lost: Lost,
+}
+
+/// The rows the losses of some batches count, in all and at each place a
+/// [`Loss`] tells apart.
+#[derive(Clone, Copy, Default)]
+struct Lost {
     samples: u64,
     dropped: u64,
+    link: u64,
+    proxy: u64,
+}
+
+impl Lost {
+    /// Returns these rows and those `batch` says were lost before it.
+    fn with(self, batch: &SampleBatch) -> Lost {
+        let Some(loss) = batch.boundary().and_then(|b| b.loss.as_ref()) else {
+            return self;
+        };
+        Lost {
+            samples: self.samples + loss.samples,
+            dropped: self.dropped + loss.dropped_samples,
+            link: self.link + loss.link_samples,
+            proxy: self.proxy + loss.proxy_samples,
+        }
+    }
 }
 
 impl BatchLane {
@@ -437,11 +464,13 @@ impl Carried {
     fn miss(&mut self, batch: &SampleBatch) {
         let pending = self.pending.get_or_insert(Pending {
             change: None,
-            samples: 0,
             dropped: 0,
+            rows: 0,
+            lost: Lost::default(),
         });
         pending.dropped += 1;
-        pending.samples += batch.len() as u64 + lost(batch);
+        pending.rows += batch.len() as u64;
+        pending.lost = pending.lost.with(batch);
         let change = batch.boundary().and_then(|b| b.change.clone());
         pending.change = higher(pending.change.take(), change);
     }
@@ -483,21 +512,19 @@ impl Pending {
         let expected = last
             .filter(|_| change.as_ref().is_none_or(Change::is_continuous))
             .map(|&(_, n)| SampleNumber::new(n.value() + 1));
+        let lost = self.lost.with(batch);
         Boundary {
             change,
             loss: Some(Loss {
-                samples: self.samples + lost(batch),
+                samples: self.rows + lost.samples,
                 expected,
                 dropped_batches: self.dropped,
+                dropped_samples: self.rows + lost.dropped,
+                link_samples: lost.link,
+                proxy_samples: lost.proxy,
             }),
         }
     }
-}
-
-/// Returns the rows `batch` says were lost before it.
-fn lost(batch: &SampleBatch) -> u64 {
-    let loss = batch.boundary().and_then(|b| b.loss.as_ref());
-    loss.map_or(0, |loss| loss.samples)
 }
 
 /// Returns the higher ranked of two changes a reader learns of at once. Two

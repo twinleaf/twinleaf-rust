@@ -921,6 +921,9 @@ mod tests {
                 samples,
                 expected: None,
                 dropped_batches: 0,
+                dropped_samples: 0,
+                link_samples: 0,
+                proxy_samples: 0,
             }),
         }
     }

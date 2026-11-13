@@ -22,6 +22,7 @@ use crate::tio::packet::Packet;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UdpSocket;
@@ -121,6 +122,9 @@ pub(super) struct Task {
     half_close: Option<Duration>,
     /// The hold that keeps the system awake while the link is open.
     _activity: rt::Activity,
+    /// How many packets and errors the task dropped because the receiver's
+    /// channel was full.
+    dropped: AtomicU64,
 }
 
 impl Task {
@@ -145,22 +149,30 @@ impl Task {
             holdoff: rules.holdoff.map(|holdoff| now + holdoff),
             half_close: rules.half_close,
             _activity: rt::Activity::hold(),
+            dropped: AtomicU64::new(0),
         }
     }
 
     /// Hands `result` to the port's receiver, and drops it if the receiver's
-    /// channel is full. During the holdoff it drops packets and rejected frames,
-    /// but passes text and terminal errors. Returns `false` after a terminal
-    /// error or once nothing receives.
+    /// channel is full. What it drops so it counts, and the log says how
+    /// many each time the count doubles. During the holdoff it drops packets
+    /// and rejected frames, but passes text and terminal errors. Returns
+    /// `false` after a terminal error or once nothing receives.
     fn deliver(&self, result: ReceiveResult) -> bool {
         let terminal = result.is_err();
         if self.holdoff.is_some() && !terminal && !matches!(result, Ok(TransportEvent::Text(_))) {
             return true;
         }
-        let receiving = !matches!(
-            self.rx.try_send(result),
-            Err(crate::chan::TrySendError::Disconnected(_))
-        );
+        let sent = self.rx.try_send(result);
+        if matches!(sent, Err(crate::chan::TrySendError::Full(_))) {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                log::warn!(
+                    "a port's receiver fell behind, and {dropped} of its packets were dropped"
+                );
+            }
+        }
+        let receiving = !matches!(sent, Err(crate::chan::TrySendError::Disconnected(_)));
         receiving && !terminal
     }
 
@@ -407,4 +419,23 @@ fn is_advisory_network_error(err: &io::Error) -> bool {
             | io::ErrorKind::NetworkUnreachable
             | io::ErrorKind::HostUnreachable
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What arrives while the receiver's channel is full is dropped and
+    /// counted, and the task goes on receiving.
+    #[tokio::test]
+    async fn what_the_receiver_has_no_room_for_is_dropped_and_counted() {
+        let (rx, received) = crate::chan::bounded(1);
+        let (_port, queue) = mpsc::channel(1);
+        let task = Task::new(rx, queue, Rules::NONE);
+        for _ in 0..3 {
+            assert!(task.deliver(Ok(TransportEvent::Packet(host_heartbeat()))));
+        }
+        assert_eq!(task.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(received.len(), 1);
+    }
 }

@@ -80,7 +80,9 @@ impl<W: Write> Transcript<W> {
 
     /// Scans one tapped packet as replay will, then writes what replay needs.
     /// That is the samples the parser validated, the markers replay resets
-    /// on, and the stops a device announces, which replay tells restarts by.
+    /// on, the proxy's counts of the samples it dropped for the recorder,
+    /// which replay tells those gaps by, and the stops a device announces,
+    /// which replay tells restarts by.
     fn packet(&mut self, packet: &tio::Packet) -> Result<(), RecordError> {
         if let RecordMode::Raw = self.mode {
             return self.write(packet);
@@ -109,7 +111,9 @@ impl<W: Write> Transcript<W> {
 
         match packet.payload() {
             packet::Payload::LegacyStatus(_)
-            | packet::Payload::ProxyRx(packet::ProxyRx::Link(_)) => self.write(packet),
+            | packet::Payload::ProxyRx(
+                packet::ProxyRx::Link(_) | packet::ProxyRx::Dropped { .. },
+            ) => self.write(packet),
             packet::Payload::Samples(_) => {
                 self.describe(route)?;
                 if validated {
