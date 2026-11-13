@@ -193,6 +193,13 @@ tio proxy udp://localhost
 
 It listens on every interface. `--listen loopback` keeps it to this machine.
 
+It also serves three captures for `tio capture`: `test.capture`, `fid.capture`
+and `phase.capture`. `tio simulate --help` lists the flags that shape them.
+
+```sh
+tio capture fid.capture
+```
+
 ## Shell completions
 
 `tio` can generate completion scripts for bash, zsh, fish, and PowerShell. Add

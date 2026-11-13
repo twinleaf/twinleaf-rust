@@ -3,7 +3,7 @@
 use clap::{Parser, ValueEnum};
 use twinleaf::DeviceRoute;
 
-use super::{nonneg_f64, parse_device_route, ListenOn};
+use super::{nonneg_f64, parse_device_route, positive_f64, ListenOn};
 
 #[derive(Parser, Debug)]
 pub struct SimulateCli {
@@ -27,6 +27,22 @@ pub struct SimulateCli {
     /// Initial white noise level in V/sqrt(Hz)
     #[arg(long = "noise", default_value = ".01", value_parser = nonneg_f64)]
     pub(crate) noise: f64,
+
+    /// Initial precession frequency of the FID capture in Hz
+    #[arg(long = "fid-frequency", default_value = "175000", value_parser = nonneg_f64)]
+    pub(crate) fid_frequency: f64,
+
+    /// Initial decay time T2 of the FID capture in seconds
+    #[arg(long = "fid-t2", default_value = "250e-6", value_parser = positive_f64)]
+    pub(crate) fid_t2: f64,
+
+    /// Initial amplitude of the FID capture in V
+    #[arg(long = "fid-amplitude", default_value = "1", value_parser = nonneg_f64)]
+    pub(crate) fid_amplitude: f64,
+
+    /// Initial noise in each sample of the FID capture in V
+    #[arg(long = "fid-noise", default_value = ".01", value_parser = nonneg_f64)]
+    pub(crate) fid_noise: f64,
 
     /// Segment duration in seconds
     #[arg(

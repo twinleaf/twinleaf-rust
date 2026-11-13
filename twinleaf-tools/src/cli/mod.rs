@@ -59,6 +59,17 @@ pub(crate) fn nonneg_f64(s: &str) -> Result<f64, String> {
     }
 }
 
+pub(crate) fn positive_f64(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if v.is_finite() && v > 0.0 {
+        Ok(v)
+    } else {
+        Err("must be > 0".into())
+    }
+}
+
 /// The interfaces a server listens on, as `--listen` names them.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenOn {
