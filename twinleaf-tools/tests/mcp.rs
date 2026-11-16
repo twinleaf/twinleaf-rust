@@ -278,7 +278,7 @@ fn each_tool_call_is_a_line_of_the_log() {
         "export {\"signals\":[\"sine.sine\"],\"format\":\"csv\"}",
         "log {\"lines\":200}",
     ] {
-        let said = format!("agent: {said}");
+        let said = format!("agent: {said:?}");
         assert!(log.contains(&said), "{said} is not in the log\n{log}");
     }
 }

@@ -2,12 +2,15 @@
 //! the line of the log each call is.
 
 use super::reads;
+use crate::hub::Live;
+use crate::protocol::Level;
 use crate::routes::Hubs;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// The longest an argument list is in its line of the log, in characters.
 const SAID: usize = 160;
@@ -130,8 +133,10 @@ impl Door {
         description = "Lists each device the hub has mounted (route, name, serial, firmware, link state), its streams with their rates, and the signals in each with their units. Signals are named as the other tools take them. Rows lost so far are listed per stream when any were."
     )]
     async fn list_devices(&self) -> Result<CallToolResult, ErrorData> {
-        said("list_devices", &());
-        answer(reads::devices(self).await)
+        answer(match self.heard("list_devices", &()).await {
+            Ok(live) => reads::devices(&live).await,
+            Err(failed) => Err(failed),
+        })
     }
 
     #[tool(
@@ -141,16 +146,20 @@ impl Door {
         &self,
         Parameters(args): Parameters<ListRpcs>,
     ) -> Result<CallToolResult, ErrorData> {
-        said("list_rpcs", &args);
-        answer(reads::rpcs(self, args).await)
+        answer(match self.heard("list_rpcs", &args).await {
+            Ok(live) => reads::rpcs(&live, args).await,
+            Err(failed) => Err(failed),
+        })
     }
 
     #[tool(
         description = "Calls the RPC `name` on each device of `routes` and says each device's outcome. The devices are called at once, and every device takes the call or none does. With `value`, as text, it is the argument. Without it each device is called with no argument, which reads the RPC where it can be read. An RPC that cannot be read is an action, and a call of it with no value runs it only with `run` true, and is refused without."
     )]
     async fn call(&self, Parameters(args): Parameters<Call>) -> Result<CallToolResult, ErrorData> {
-        said("call", &args);
-        answer(reads::call(self, args).await)
+        answer(match self.heard("call", &args).await {
+            Ok(live) => reads::call(&live, args).await,
+            Err(failed) => Err(failed),
+        })
     }
 
     #[tool(
@@ -160,8 +169,11 @@ impl Door {
         &self,
         Parameters(args): Parameters<Glance>,
     ) -> Result<CallToolResult, ErrorData> {
-        said("glance", &args);
-        match reads::glance(self, args).await {
+        let live = match self.heard("glance", &args).await {
+            Ok(live) => live,
+            Err(failed) => return answer(Err(failed)),
+        };
+        match reads::glance(&live, args).await {
             Ok((text, png)) => {
                 let image = base64::Engine::encode(&base64::prelude::BASE64_STANDARD, png);
                 Ok(CallToolResult::success(vec![
@@ -180,8 +192,10 @@ impl Door {
         &self,
         Parameters(args): Parameters<ReadRows>,
     ) -> Result<CallToolResult, ErrorData> {
-        said("read_rows", &args);
-        answer(reads::rows(self, args).await)
+        answer(match self.heard("read_rows", &args).await {
+            Ok(live) => reads::rows(&live, args).await,
+            Err(failed) => Err(failed),
+        })
     }
 
     #[tool(
@@ -191,16 +205,20 @@ impl Door {
         &self,
         Parameters(args): Parameters<Export>,
     ) -> Result<CallToolResult, ErrorData> {
-        said("export", &args);
-        answer(reads::export(self, args).await)
+        answer(match self.heard("export", &args).await {
+            Ok(live) => reads::export(&live, args).await,
+            Err(failed) => Err(failed),
+        })
     }
 
     #[tool(
         description = "Gives the newest lines of the hub's log (30 by default, at most 200): what devices said, what the hub saw of them, and what agents did."
     )]
     async fn log(&self, Parameters(args): Parameters<Log>) -> Result<CallToolResult, ErrorData> {
-        said("log", &args);
-        answer(reads::log(self, args).await)
+        answer(match self.heard("log", &args).await {
+            Ok(live) => reads::log(&live, args).await,
+            Err(failed) => Err(failed),
+        })
     }
 }
 
@@ -225,18 +243,22 @@ impl ServerHandler for Door {
     }
 }
 
-/// Takes `tool`, called with `args`, as a line of the log, said by the
-/// part `agent`.
-fn said(tool: &str, args: &impl Serialize) {
-    let mut args = serde_json::to_string(args).unwrap_or_default();
-    if args == "null" {
-        args.clear();
+impl Door {
+    /// The hub, started when none lives, whose log takes `tool`, called
+    /// with `args`, as a line said by the part `agent`.
+    async fn heard(&self, tool: &str, args: &impl Serialize) -> Result<Arc<Live>, reads::Failed> {
+        let live = reads::live(self).await?;
+        let mut args = serde_json::to_string(args).unwrap_or_default();
+        if args == "null" {
+            args.clear();
+        }
+        if args.chars().count() > SAID {
+            args = args.chars().take(SAID).collect::<String>() + "…";
+        }
+        let text = [tool, &args].join(" ");
+        (live.log).said_by("agent", Level::Info, text.trim_end().to_string());
+        Ok(live)
     }
-    if args.chars().count() > SAID {
-        args = args.chars().take(SAID).collect::<String>() + "…";
-    }
-    let text = [tool, &args].join(" ");
-    crate::logbook::CONSOLE.take(log::Level::Info, "agent", text.trim_end());
 }
 
 /// The tool result of `text`, or of the sentence that says why it failed.

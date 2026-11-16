@@ -20,7 +20,7 @@
 
 use crate::data::ops::{self, Level, Pyramid, Stretch};
 use crate::data::{
-    Buffer, ColumnKey, ColumnProcessor, DataType, Lost, Run, SampleBatch, StreamKey,
+    Buffer, ColumnKey, ColumnProcessor, DataType, Gap, Lost, Run, SampleBatch, StreamKey,
 };
 use crate::proto::ColumnId;
 use std::collections::hash_map::Entry;
@@ -325,6 +325,28 @@ impl History {
         (self.spans(key, t0, t1).into_iter())
             .flat_map(|span| span.run.rows(span.rows))
             .collect()
+    }
+
+    /// Returns each gap between two rows that [`rows`](Self::rows) reads of
+    /// the stream within `t0..=t1`, oldest first, as its run records it in
+    /// [`Run::boundaries`]. A gap counts when the rows before and after it
+    /// are both read. So one where the held copy's part meets the buffer's
+    /// within one run counts, and the place where the copy's run ends and
+    /// the buffer's other run begins does not, as neither run records it.
+    pub fn gaps(&self, key: &StreamKey, t0: f64, t1: f64) -> Vec<Gap> {
+        let mut gaps = Vec::new();
+        let mut before: Option<(u64, u64)> = None;
+        for span in self.spans(key, t0, t1) {
+            let run = span.run.ordinal();
+            // The part goes on from the part before it, in the same run.
+            let joined = before == Some((run, span.rows.start));
+            let within = |row: u64| {
+                (row > span.rows.start || (joined && row == span.rows.start)) && row < span.rows.end
+            };
+            gaps.extend(span.run.boundaries().filter(|gap| within(gap.row)).cloned());
+            before = Some((run, span.rows.end));
+        }
+        gaps
     }
 
     /// Reads the column within `t0..=t1` for a view of `points` points, with
@@ -1000,6 +1022,55 @@ mod tests {
         }
     }
 
+    /// Asserts that `gaps` are `wanted`, each time within a microsecond.
+    fn assert_near(gaps: Vec<(f64, f64)>, wanted: &[(f64, f64)]) {
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let same = gaps.len() == wanted.len()
+            && (gaps.iter().zip(wanted)).all(|(g, w)| near(g.0, w.0) && near(g.1, w.1));
+        assert!(same, "{gaps:?} is not {wanted:?}");
+    }
+
+    /// The times of each gap of the one stream within [t0, t1].
+    fn gap_times(history: &History, t0: f64, t1: f64) -> Vec<(f64, f64)> {
+        let gaps = history.gaps(&stream_key(), t0, t1);
+        gaps.iter().map(|gap| (gap.before, gap.after)).collect()
+    }
+
+    /// A gap counts where the rows on both sides of it are read, in the
+    /// held copy's part or the buffer's, and the seam between the copy's
+    /// run and another run of the buffer is none.
+    #[test]
+    fn the_gaps_of_a_span_are_its_runs_own_between_two_rows_read() {
+        let mut history = fresh();
+        let mut parser = parser_at(100);
+        // At 100 Hz, sample n stands at (n + 1) / 100 s. Samples 1000 to
+        // 1009 and 3000 to 3004 are lost.
+        feed(&mut history, &mut parser, 0, 1000, 1);
+        feed(&mut history, &mut parser, 1010, 1990, 1);
+        history.hold();
+        feed(&mut history, &mut parser, 3005, 995, 1);
+        let at = |sample: u32| f64::from(sample + 1) / 100.0;
+        let (first, second) = ((at(999), at(1010)), (at(2999), at(3005)));
+        assert_near(gap_times(&history, 0.0, 1e9), &[first, second]);
+        assert_near(gap_times(&history, 9.0, 20.0), &[first]);
+        // A span that begins at the row after a gap or ends at the row
+        // before it holds no rows on both sides of it.
+        assert!(gap_times(&history, 10.11, 29.0).is_empty());
+        assert!(gap_times(&history, 0.0, 10.0).is_empty());
+        // The stream forgotten and gone on with no loss and the same
+        // generation is a run of its own, which follows the held copy's
+        // with no gap the runs record. The copy's gap stays, and the new
+        // run's own gap counts.
+        assert!(history.forget(&stream_key()));
+        feed(&mut history, &mut parser, 4000, 100, 1);
+        feed(&mut history, &mut parser, 4110, 90, 1);
+        let third = (at(4099), at(4110));
+        assert_near(gap_times(&history, 0.0, 1e9), &[first, third]);
+        let rows = history.rows(&stream_key(), 0.0, 1e9);
+        let count: usize = rows.iter().map(SampleBatch::len).sum();
+        assert_eq!(count, 1000 + 1990 + 100 + 90);
+    }
+
     /// A window's rows and points are bounded by its width, whatever its
     /// span. Under FINEST rows a point it reads the rows themselves, and
     /// otherwise the points of a level, at most two a window.
@@ -1608,6 +1679,7 @@ mod tests {
                     .collect();
                 let read = values(history.rows(&stream_key(), t0, t1));
                 prop_assert_eq!(read, want, "in {}..={}", t0, t1);
+                prop_assert!(history.gaps(&stream_key(), t0, t1).is_empty());
             }
         }
     }

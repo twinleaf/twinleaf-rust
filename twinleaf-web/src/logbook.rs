@@ -12,7 +12,9 @@
 //! on its console. Its logger hands each record it prints to [`Console`],
 //! which gives it to the log of the hub there is, as a line of no device
 //! said by the part of the proxy the console names as the record's source.
-//! The hub's own lines are said by the part [`HUB`]. With no hub yet, or between two, the console keeps the newest
+//! The hub's own lines are said by the part [`HUB`], and a reader of the
+//! hub says a line of its own as a part it names, as the MCP door says
+//! each call by the part `agent`. With no hub yet, or between two, the console keeps the newest
 //! [`HELD`] records and the next hub's log takes them, each with the time
 //! it was said, so the lines of the proxy's start are in the log. What the
 //! log's own owners write on the console of a line they also say here is
@@ -100,6 +102,20 @@ impl Logbook {
     ) {
         let said = (Source::Proxy, Some(HUB.to_string()));
         self.line(said, level, route, text, loss, wall());
+    }
+
+    /// Takes a line the part `part` of the proxy says at `level`, of no
+    /// device, as an agent's call is said by the part `agent`.
+    pub(crate) fn said_by(&self, part: &str, level: Level, text: String) {
+        let said = (Source::Proxy, Some(part.to_string()));
+        self.line(said, level, None, text, None, wall());
+    }
+
+    /// The newest `lines` lines kept, oldest first.
+    pub(crate) fn newest(&self, lines: usize) -> Vec<Message> {
+        let state = self.state.lock().unwrap();
+        let from = state.lines.len().saturating_sub(lines);
+        state.lines.range(from..).cloned().collect()
     }
 
     /// Takes a line the device at `route` said at `level`.
@@ -414,6 +430,33 @@ pub(crate) mod tests {
         assert_eq!(said[0]["text"], "between two hubs");
         assert_eq!(said[0]["part"], "server");
         assert_eq!(said[0]["n"], 1);
+    }
+
+    /// A line said by a named part is that log's alone, said by that part,
+    /// and the newest lines are read back oldest first.
+    #[test]
+    fn a_line_said_by_a_part_is_its_logs_and_the_newest_read_back() {
+        let feed = Feed::new();
+        let mut rx = feed.subscribe().1;
+        let log = Logbook::new(feed);
+        let other = Logbook::new(Feed::new());
+        for i in 0..5 {
+            log.said_by("agent", Level::Info, format!("call {i}"));
+        }
+        let said = heard(&mut rx);
+        assert_eq!(said.len(), 5);
+        assert_eq!(said[0]["part"], "agent");
+        assert_eq!(said[0]["source"], "proxy");
+        assert_eq!(said[0]["route"], serde_json::Value::Null);
+        assert!(other.snapshot().is_empty(), "another hub's log holds none");
+        let texts: Vec<String> = (log.newest(2).into_iter())
+            .map(|line| match line {
+                Message::Log { text, .. } => text,
+                _ => panic!("a line is a log message"),
+            })
+            .collect();
+        assert_eq!(texts, ["call 3", "call 4"]);
+        assert_eq!(log.newest(99).len(), 5);
     }
 
     /// The console keeps the newest HELD records that wait, and no older.

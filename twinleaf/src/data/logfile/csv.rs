@@ -175,6 +175,16 @@ pub struct MergedColumn {
     pub batches: Vec<SampleBatch>,
 }
 
+impl MergedColumn {
+    /// Returns the rows of the column, those of each batch that holds it.
+    pub fn rows(&self) -> usize {
+        (self.batches.iter())
+            .filter(|batch| batch.column(self.column).is_some())
+            .map(SampleBatch::len)
+            .sum()
+    }
+}
+
 /// One column's rows, read a row at a time.
 struct Cursor<'a> {
     batches: std::slice::Iter<'a, SampleBatch>,
@@ -424,6 +434,16 @@ mod tests {
                 ],
             },
         ];
+        assert_eq!((columns[0].rows(), columns[1].rows()), (2, 2));
+        let absent = MergedColumn {
+            column: ColumnId::new(5),
+            ..columns[0].clone()
+        };
+        assert_eq!(
+            absent.rows(),
+            0,
+            "a batch without the column holds none of it"
+        );
         let mut out = Vec::new();
         write_merged(&columns, &mut out).unwrap();
         let expected = "time (s),a.x (V),b.y\n0.25,0.100000001,\n0.5,0.200000003,5\n1,,6\n";

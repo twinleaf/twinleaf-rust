@@ -226,6 +226,14 @@ impl Losses {
             .collect()
     }
 
+    /// The counts last sent of the device at `route`, how often its link
+    /// dropped and the rows each of its streams lost, or `None` for a device
+    /// not counted.
+    pub(crate) fn counts(&self, route: DeviceRoute) -> Option<(Link, BTreeMap<String, Lost>)> {
+        let devices = self.devices.lock().unwrap();
+        devices.get(&route).map(|device| device.sent.clone())
+    }
+
     /// How often the link to the device at `route` dropped.
     #[cfg(test)]
     pub(crate) fn drops(&self, route: DeviceRoute) -> u64 {
@@ -346,6 +354,10 @@ mod tests {
         assert!((3.0..3.5).contains(&seconds), "{seconds}");
         assert_eq!(sent[0]["streams"], serde_json::json!({}));
         assert_eq!(losses.snapshot().len(), 1);
+        let (link, streams) = losses.counts(root).unwrap();
+        assert_eq!((link.times, link.seconds), (1, seconds));
+        assert!(streams.is_empty());
+        assert!(losses.counts("/4".parse().unwrap()).is_none());
     }
 
     /// A link that drops is a line of the log as it drops, and its return

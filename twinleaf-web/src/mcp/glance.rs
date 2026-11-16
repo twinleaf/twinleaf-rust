@@ -1,12 +1,13 @@
 //! The glance: a few lines and a picture of signals over a span. In time,
-//! each signal's rows, extremes and gaps, read from the window the page
-//! reads at the picture's width. As a spectrum, each signal's amplitude
-//! spectral density as the core's Welch estimate gives it over the span's
-//! rows, its largest peaks and its noise floor.
+//! each signal's rows, extremes and gaps, the extremes read from the window
+//! the page reads at the picture's width and the gaps from the run's own
+//! record. As a spectrum, each signal's amplitude spectral density as the
+//! core's Welch estimate gives it over the span's rows, its largest peaks
+//! and its noise floor.
 
 use super::picture::{Axes, Picture, COLOURS, HEIGHT, WIDTH};
 use super::reads::{self, num, retired, rows_of, time, Failed};
-use super::tools::{Door, Glance, View};
+use super::tools::{Glance, View};
 use crate::hub::Live;
 use twinleaf::data::csv::MergedColumn;
 use twinleaf::data::ops::{NoSpectrum, Spectrum, Welch};
@@ -20,12 +21,11 @@ const PEAKS: usize = 5;
 const SPECTRUM_ROWS: usize = 1 << 20;
 
 /// The text and the PNG of a glance.
-pub(crate) async fn glance(door: &Door, args: Glance) -> Result<(String, Vec<u8>), Failed> {
-    let live = reads::live(door).await?;
-    let (ids, t0, t1) = reads::resolve(&live, &args.signals, args.span).await?;
-    let columns = reads::span_rows(&live, ids.clone(), t0, t1).await?;
+pub(crate) async fn glance(live: &Live, args: Glance) -> Result<(String, Vec<u8>), Failed> {
+    let (ids, t0, t1) = reads::resolve(live, &args.signals, args.span).await?;
+    let columns = reads::span_rows(live, ids.clone(), t0, t1).await?;
     match args.view {
-        View::Time => time_view(&live, ids, columns, t0, t1).await,
+        View::Time => time_view(live, ids, columns, t0, t1).await,
         View::Spectrum => spectrum_view(columns, t0, t1).await,
     }
 }
@@ -55,6 +55,7 @@ async fn time_view(
     t1: f64,
 ) -> Result<(String, Vec<u8>), Failed> {
     let mut windows = Vec::new();
+    let mut gaps_of: Vec<Vec<(f64, f64)>> = Vec::new();
     for &id in &ids {
         let read = (live.window(id, t0, t1, WIDTH).await)
             .map_err(retired)?
@@ -63,13 +64,17 @@ async fn time_view(
             .await
             .map_err(|error| error.to_string())?;
         windows.push(window);
+        let gaps = (live.gaps(id, t0, t1).await)
+            .map_err(retired)?
+            .ok_or_else(|| retired(()))?;
+        gaps_of.push(gaps.iter().map(|gap| (gap.before, gap.after)).collect());
     }
     let mut text = format!("{} to {} s\n", time(t0), time(t1));
     let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
     let mut runs_of = Vec::new();
-    let mut gaps_of = Vec::new();
-    for (column, window) in columns.iter().zip(&windows) {
-        // The window splits its points at each loss of samples.
+    for ((column, window), gaps) in columns.iter().zip(&windows).zip(&gaps_of) {
+        // The window splits its points at each loss of samples, and where
+        // the held history meets the buffer.
         let runs: Vec<Vec<(f64, f64)>> = (window.chunks.iter())
             .map(|chunk| {
                 chunk
@@ -84,9 +89,6 @@ async fn time_view(
         let (min, max) = values.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), y| {
             (a.min(y), b.max(y))
         });
-        let gaps: Vec<(f64, f64)> = (runs.windows(2))
-            .filter_map(|pair| Some((pair[0].last()?.0, pair[1].first()?.0)))
-            .collect();
         let units = after(&column.units);
         let rows = rows_of(column);
         if rows == 0 {
@@ -113,7 +115,6 @@ async fn time_view(
             high = high.max(max);
         }
         runs_of.push(runs);
-        gaps_of.push(gaps);
     }
     text += "min and max are the envelope's, which holds every row's extremes. \
              Mean and standard deviation are not available yet.\n";

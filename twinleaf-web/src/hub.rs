@@ -58,14 +58,14 @@ use crate::logbook::{self, Logbook};
 use crate::loss::Losses;
 use crate::protocol::{self, Frame, Message, MountInfo, Rows, TraceInfo, Window, WindowChunk};
 use crate::wire::{encode, encode_spectra, split_at_breaks, Chunk, Spectrum};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 use twinleaf::data::csv::MergedColumn;
 use twinleaf::data::ops::{FpcsLevels, Stretch, Welch};
-use twinleaf::data::{ColumnKey, ColumnOp, ColumnProcessor, History, Run};
+use twinleaf::data::{ColumnKey, ColumnOp, ColumnProcessor, Gap, History, Run};
 use twinleaf::flume::{self, select::SelectError, Selector};
 use twinleaf::proxy::Layout;
 use twinleaf::{ColumnId, Connection, DeviceRoute, DeviceTree, Receiver, RecvError, SampleBatch};
@@ -101,6 +101,9 @@ const MEMORY_EVERY: Duration = Duration::from_secs(1);
 const SLOW_JOB: Duration = Duration::from_millis(50);
 /// Samples per Welch estimate, at most.
 const WELCH_WINDOW: usize = 16384;
+/// The span a reader's read takes when it names none, in seconds before
+/// the newest row.
+const SPAN_SECONDS: f64 = 10.0;
 /// The decimation a hub starts with, in points per second per trace.
 const POINTS_PER_SECOND: f64 = 500.0;
 
@@ -175,9 +178,9 @@ pub(crate) struct Live {
     mailbox: flume::Sender<Job>,
     pub(crate) devices: Arc<Devices>,
     /// What was lost of each device, which the hub's thread sends.
-    losses: Arc<Losses>,
+    pub(crate) losses: Arc<Losses>,
     /// The log's lines, which a snapshot holds the newest of.
-    log: Arc<Logbook>,
+    pub(crate) log: Arc<Logbook>,
     /// The tree the connection sees, which the page's calls go through.
     pub(crate) tree: DeviceTree,
     /// The captures the pages ask for.
@@ -391,6 +394,32 @@ impl Live {
     ) -> Result<Vec<MergedColumn>, Ended> {
         self.ask("export", move |hub| hub.export(&ids, t0, t1))
             .await
+    }
+
+    /// Every trace, grouped by device and stream, as [`Hub::signals`]
+    /// lists them.
+    pub(crate) async fn signals(&self) -> Result<Signals, Ended> {
+        self.ask("signals", |hub| hub.signals()).await
+    }
+
+    /// The traces of the signals `names`, and the span of them that
+    /// `seconds`, `t0` and `t1` name, as [`Hub::span`] reads them in one
+    /// read, or why there is none, in words.
+    pub(crate) async fn span(
+        &self,
+        names: Vec<String>,
+        seconds: Option<f64>,
+        t0: Option<f64>,
+        t1: Option<f64>,
+    ) -> Result<Result<Spanned, String>, Ended> {
+        self.ask("span", move |hub| hub.span(&names, seconds, t0, t1))
+            .await
+    }
+
+    /// The gaps of trace `id` within [t0, t1], as [`Hub::gaps`] reads them,
+    /// or `None` for no such trace.
+    pub(crate) async fn gaps(&self, id: u16, t0: f64, t1: f64) -> Result<Option<Vec<Gap>>, Ended> {
+        self.ask("gaps", move |hub| hub.gaps(id, t0, t1)).await
     }
 
     /// Whether a firmware upgrade waits or runs, which another hub taking
@@ -1057,6 +1086,99 @@ impl Hub {
             })
             .collect()
     }
+
+    /// Every trace, by id, with the name the page gives it and the time of
+    /// its stream's newest row the buffer holds.
+    fn signals(&self) -> Signals {
+        let mut signals = Signals::new();
+        for trace in &self.traces {
+            let signal = Signal {
+                name: signal_name(&trace.info),
+                info: trace.info.clone(),
+            };
+            let group = (trace.info.route.clone(), trace.info.stream.clone());
+            signals.entry(group).or_default().push(signal);
+        }
+        signals
+    }
+
+    /// The traces of the signals `names`, and the span of them `seconds`,
+    /// `t0` and `t1` name, whose newest row is the newest of any of them.
+    /// It is `t0` to `t1`, from `t0` to the newest row, the `seconds`
+    /// before `t1`, or the newest `seconds`, ten when none are named. Why
+    /// there is none is in words.
+    fn span(
+        &self,
+        names: &[String],
+        seconds: Option<f64>,
+        t0: Option<f64>,
+        t1: Option<f64>,
+    ) -> Result<Spanned, String> {
+        if names.is_empty() {
+            return Err("name at least one signal".into());
+        }
+        if self.traces.is_empty() {
+            return Err("the hub has no signals yet".into());
+        }
+        let mut ids = Vec::new();
+        let mut newest = f64::NEG_INFINITY;
+        for name in names {
+            let trace = (self.traces.iter())
+                .find(|trace| signal_name(&trace.info) == *name)
+                .ok_or_else(|| {
+                    format!("there is no signal {name}, and list_devices names those there are")
+                })?;
+            let run = self.history.run(&trace.key.stream_key());
+            newest = newest.max(
+                run.and_then(Run::last_timestamp)
+                    .unwrap_or(f64::NEG_INFINITY),
+            );
+            ids.push(trace.info.id);
+        }
+        if !newest.is_finite() {
+            return Err(format!("the hub holds no rows of {}", names.join(", ")));
+        }
+        let seconds = seconds.unwrap_or(SPAN_SECONDS);
+        if !(seconds.is_finite() && seconds > 0.0) {
+            return Err(format!("seconds must be a positive number, not {seconds}"));
+        }
+        let (t0, t1) = match (t0, t1) {
+            (Some(t0), Some(t1)) => (t0, t1),
+            (Some(t0), None) => (t0, newest),
+            (None, Some(t1)) => (t1 - seconds, t1),
+            (None, None) => (newest - seconds, newest),
+        };
+        if !(t0.is_finite() && t1.is_finite() && t0 < t1) {
+            return Err(format!(
+                "the span from {t0} to {t1} holds no time, as t0 must come before t1"
+            ));
+        }
+        Ok((ids, t0, t1))
+    }
+
+    /// The gaps of trace `id` within [t0, t1], each between two rows an
+    /// export of the span holds, from the run's own record, as
+    /// [`History::gaps`] reads them. `None` for no such trace.
+    fn gaps(&self, id: u16, t0: f64, t1: f64) -> Option<Vec<Gap>> {
+        let trace = self.traces.get(id as usize)?;
+        Some(self.history.gaps(&trace.key.stream_key(), t0, t1))
+    }
+}
+
+/// The traces of a span and its start and end, as [`Hub::span`] reads them.
+pub(crate) type Spanned = (Vec<u16>, f64, f64);
+
+/// Every trace as a reader of the hub names it, grouped by the route of its
+/// device and the name of its stream, each group in the order of its
+/// traces.
+pub(crate) type Signals = BTreeMap<(String, String), Vec<Signal>>;
+
+/// A trace as a reader of the hub names it.
+pub(crate) struct Signal {
+    /// The name the page gives it, as `stream.column` or `0/stream.column`.
+    pub(crate) name: String,
+    /// Its id, device, stream, units and rate.
+    pub(crate) info: TraceInfo,
 }
 
 /// The raw rows of one trace within a range of time, gathered on the hub's
@@ -1319,6 +1441,53 @@ mod tests {
         assert_eq!(said(&hub), (oldest, 10.0, 10.0));
         hub.hold(7, false);
         assert!(said(&hub).0 > oldest, "let go, the buffer has moved on");
+    }
+
+    /// A reader of the hub finds each trace by the name the page gives it,
+    /// with the time of its newest row, and the gaps of a span from the
+    /// run's own record.
+    #[test]
+    fn a_reader_finds_each_trace_and_the_gaps_of_a_span() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        // At 100 Hz, row n stands at (n + 1) / 100 s. Samples 100 to 109
+        // are lost.
+        for batch in samples(&mut parser, 0, 100) {
+            hub.ingest(&batch);
+        }
+        for batch in samples(&mut parser, 110, 90) {
+            hub.ingest(&batch);
+        }
+        let signals: Vec<Signal> = hub.signals().into_values().flatten().collect();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].name, "field.x");
+        assert_eq!((signals[0].info.id, signals[0].info.rate), (0, 100.0));
+        let field = || vec!["field.x".to_string()];
+        assert_eq!(
+            hub.span(&field(), None, None, None),
+            Ok((vec![0], -8.0, 2.0))
+        );
+        assert_eq!(
+            hub.span(&field(), Some(0.5), None, Some(1.5)),
+            Ok((vec![0], 1.0, 1.5))
+        );
+        assert_eq!(
+            hub.span(&field(), None, Some(1.0), None),
+            Ok((vec![0], 1.0, 2.0))
+        );
+        for refused in [
+            hub.span(&[], None, None, None),
+            hub.span(&["no.such".into()], None, None, None),
+            hub.span(&field(), Some(-1.0), None, None),
+            hub.span(&field(), None, Some(2.0), Some(1.0)),
+        ] {
+            assert!(refused.is_err(), "{refused:?}");
+        }
+        let gaps = hub.gaps(0, 0.0, 10.0).unwrap();
+        let times: Vec<(f64, f64)> = gaps.iter().map(|gap| (gap.before, gap.after)).collect();
+        assert_eq!(times, [(1.0, 1.11)]);
+        assert!(hub.gaps(0, 1.11, 10.0).unwrap().is_empty());
+        assert!(hub.gaps(9, 0.0, 10.0).is_none());
     }
 
     #[test]

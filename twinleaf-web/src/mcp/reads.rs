@@ -1,39 +1,26 @@
 //! What each tool reads of the hub and says of it. Each reads through what
-//! the hub offers its pages, `Live` and its devices, and says what it read
-//! as short text.
+//! the hub offers its readers, `Live`, its devices, its log and its counts
+//! of what was lost, and says what it read as short text.
 
 use super::tools::{Call, Door, Export, ListRpcs, Log, ReadRows, Span};
-use crate::hub::Live;
-use crate::protocol::{CallReply, Frame, Outcome};
+use crate::devices::Kind;
+use crate::hub::{Live, Spanned};
+use crate::protocol::{Access, CallReply, Message, Outcome};
 use serde_json::Value;
 use std::sync::Arc;
 use twinleaf::data::csv::MergedColumn;
-use twinleaf::DeviceRoute;
 
 pub(super) use super::glance::glance;
 
 /// A failed tool call's plain sentence.
 pub(super) type Failed = String;
 
-/// The span a call takes when it names none, in seconds before the newest
-/// row.
-const SECONDS: f64 = 10.0;
 /// The RPCs `list_rpcs` lists at most.
 const RPCS: usize = 200;
 /// The rows `read_rows` gives when asked for no number, and at most.
 const ROWS: (usize, usize) = (50, 200);
 /// The lines `log` gives when asked for no number, and at most.
 const LINES: (usize, usize) = (30, 200);
-
-/// The messages among `frames` of the type `kind`.
-fn messages<'a>(frames: &'a [Frame], kind: &'a str) -> impl Iterator<Item = Value> + 'a {
-    frames.iter().filter_map(move |frame| match frame {
-        Frame::Text(text) => serde_json::from_str::<Value>(text)
-            .ok()
-            .filter(|message| message["type"] == kind),
-        Frame::Binary(_) => None,
-    })
-}
 
 /// A number in few characters: four significant figures, in exponent form
 /// when far from one.
@@ -50,6 +37,14 @@ pub(super) fn num(value: f64) -> String {
 /// A time in seconds, to the millisecond.
 pub(super) fn time(t: f64) -> String {
     format!("{t:.3}")
+}
+
+/// The word the page's messages use for `value`, as `alive` or `warn`.
+fn word(value: impl serde::Serialize) -> String {
+    match serde_json::to_value(value) {
+        Ok(Value::String(word)) => word,
+        _ => String::new(),
+    }
 }
 
 /// `value`, a value a device sent, as a result writes it: a string quoted
@@ -72,68 +67,17 @@ pub(super) fn rows_of(column: &MergedColumn) -> usize {
     column.batches.iter().map(|batch| batch.len()).sum()
 }
 
-/// The span `span` names: `t0` to `t1`, from `t0` to the newest row, the
-/// `seconds` before `t1`, or the newest `seconds`.
-fn bounds(newest: f64, span: Span) -> Result<(f64, f64), Failed> {
-    let seconds = span.seconds.unwrap_or(SECONDS);
-    if !(seconds.is_finite() && seconds > 0.0) {
-        return Err(format!("seconds must be a positive number, not {seconds}"));
-    }
-    let (t0, t1) = match (span.t0, span.t1) {
-        (Some(t0), Some(t1)) => (t0, t1),
-        (Some(t0), None) => (t0, newest),
-        (None, Some(t1)) => (t1 - seconds, t1),
-        (None, None) => (newest - seconds, newest),
-    };
-    if !(t0.is_finite() && t1.is_finite() && t0 < t1) {
-        return Err(format!(
-            "the span from {t0} to {t1} holds no time, as t0 must come before t1"
-        ));
-    }
-    Ok((t0, t1))
-}
-
 /// The hub, started when none lives.
 pub(super) async fn live(door: &Door) -> Result<Arc<Live>, Failed> {
     (door.hubs.live().await)
         .map_err(|refused| format!("the hub has nothing mounted, as {}", refused.error))
 }
 
-/// Every signal of the hub, by trace id, each with its rows in [t0, t1].
-/// The rows share the history's chunks.
-async fn every_signal(live: &Live, t0: f64, t1: f64) -> Result<Vec<MergedColumn>, Failed> {
-    (live.export((0..=u16::MAX).collect(), t0, t1).await).map_err(retired)
-}
-
 /// The trace ids of the signals `names`, and the span `span` names of them,
-/// whose newest row is the newest of any of them.
-pub(super) async fn resolve(
-    live: &Live,
-    names: &[String],
-    span: Span,
-) -> Result<(Vec<u16>, f64, f64), Failed> {
-    if names.is_empty() {
-        return Err("name at least one signal".into());
-    }
-    let all = every_signal(live, f64::NEG_INFINITY, f64::INFINITY).await?;
-    if all.is_empty() {
-        return Err("the hub has no signals yet".into());
-    }
-    let mut ids = Vec::new();
-    let mut newest = f64::NEG_INFINITY;
-    for name in names {
-        let id = (all.iter().position(|signal| signal.name == *name)).ok_or_else(|| {
-            format!("there is no signal {name}, and list_devices names those there are")
-        })?;
-        let last = all[id].batches.last().and_then(|b| b.timestamps().last());
-        newest = newest.max(last.copied().unwrap_or(f64::NEG_INFINITY));
-        ids.push(id as u16);
-    }
-    if !newest.is_finite() {
-        return Err(format!("the hub holds no rows of {}", names.join(", ")));
-    }
-    let (t0, t1) = bounds(newest, span)?;
-    Ok((ids, t0, t1))
+/// as the hub reads them.
+pub(super) async fn resolve(live: &Live, names: &[String], span: Span) -> Result<Spanned, Failed> {
+    let spanned = live.span(names.to_vec(), span.seconds, span.t0, span.t1);
+    spanned.await.map_err(retired)?
 }
 
 /// Every row of traces `ids` within [t0, t1], of which there is one at
@@ -145,7 +89,7 @@ pub(super) async fn span_rows(
     t1: f64,
 ) -> Result<Vec<MergedColumn>, Failed> {
     let columns = live.export(ids, t0, t1).await.map_err(retired)?;
-    if columns.iter().all(|column| rows_of(column) == 0) {
+    if columns.iter().all(|column| column.rows() == 0) {
         let names: Vec<String> = columns.iter().map(|c| format!("{:?}", c.name)).collect();
         return Err(format!(
             "there are no rows of {} from {} to {} s",
@@ -157,87 +101,67 @@ pub(super) async fn span_rows(
     Ok(columns)
 }
 
-pub(super) async fn devices(door: &Door) -> Result<String, Failed> {
-    let live = live(door).await?;
-    let (frames, _) = live.snapshot(0).await.map_err(retired)?;
-    let routes: Vec<String> = messages(&frames, "routes")
-        .flat_map(|message| {
-            let routes = message["routes"].as_array().cloned().unwrap_or_default();
-            (routes.into_iter()).filter_map(|r| r.as_str().map(str::to_string))
-        })
-        .collect();
+pub(super) async fn devices(live: &Live) -> Result<String, Failed> {
+    let routes = live.devices.listed();
     if routes.is_empty() {
         return Err("the hub has no device mounted yet".into());
     }
-    let names: Vec<String> = every_signal(&live, f64::INFINITY, f64::INFINITY)
-        .await?
-        .into_iter()
-        .map(|signal| signal.name)
-        .collect();
-    let traces: Vec<Value> = messages(&frames, "trace")
-        .map(|message| message["trace"].clone())
-        .collect();
+    let signals = live.signals().await.map_err(retired)?;
     let mut text = String::new();
-    for route in &routes {
-        let of = |message: &Value| message["route"] == route.as_str();
-        let device = messages(&frames, "device").find(of);
-        let loss = messages(&frames, "loss").find(of);
-        let field = |name: &str| {
-            let value = device.as_ref().and_then(|d| d[name].as_str());
-            value.map(str::to_string)
-        };
-        text += route;
-        if let Some(name) = field("name") {
-            text += &format!(" {name}");
+    for &route in &routes {
+        let at = route.to_string();
+        text += &at;
+        match live.devices.newest(route, Kind::Device) {
+            Some(Message::Device {
+                name,
+                serial,
+                firmware,
+                presence,
+                ..
+            }) => {
+                if let Some(name) = name {
+                    text += &format!(" {name:?}");
+                }
+                if let Some(serial) = serial {
+                    text += &format!(", serial {serial:?}");
+                }
+                if let Some(firmware) = firmware {
+                    text += &format!(", firmware {firmware:?}");
+                }
+                text += &format!(", {}\n", word(presence));
+            }
+            _ => text += ", unknown\n",
         }
-        if let Some(serial) = field("serial") {
-            text += &format!(", serial {serial}");
-        }
-        if let Some(firmware) = field("firmware") {
-            text += &format!(", firmware {firmware}");
-        }
-        let presence = field("presence").unwrap_or_else(|| "unknown".into());
-        text += &format!(", {presence}\n");
-        if let Some(link) = loss.as_ref().map(|l| &l["link"]) {
-            let times = link["times"].as_u64().unwrap_or(0);
-            if times > 0 {
-                let seconds = link["seconds"].as_f64().unwrap_or(0.0);
-                text += &format!("  link dropped {times} times, {} s down\n", num(seconds));
+        let counts = live.losses.counts(route);
+        if let Some((link, _)) = &counts {
+            if link.times > 0 {
+                let (times, seconds) = (link.times, num(link.seconds));
+                text += &format!("  link dropped {times} times, {seconds} s down\n");
             }
         }
-        let mine: Vec<&Value> = traces.iter().filter(|t| of(t)).collect();
-        let mut streams: Vec<&str> = mine.iter().filter_map(|t| t["stream"].as_str()).collect();
-        streams.dedup();
-        for stream in streams {
-            let columns: Vec<&Value> = (mine.iter().copied())
-                .filter(|t| t["stream"] == stream)
-                .collect();
-            let rate = columns[0]["rate"].as_f64().unwrap_or(0.0);
-            let signals: Vec<String> = columns
-                .iter()
-                .map(|t| {
-                    let id = t["id"].as_u64().unwrap_or(u64::MAX) as usize;
-                    let name = names.get(id).cloned().unwrap_or_default();
-                    match t["units"].as_str().filter(|u| !u.is_empty()) {
-                        Some(units) => format!("{name} ({units})"),
-                        None => name,
-                    }
+        let mine = (signals.iter()).filter(|((device, _), _)| *device == at);
+        for ((_, stream), columns) in mine {
+            let named: Vec<String> = (columns.iter())
+                .map(|signal| match signal.info.units.as_str() {
+                    "" => format!("{:?}", signal.name),
+                    units => format!("{:?} ({units:?})", signal.name),
                 })
                 .collect();
-            text += &format!("  {stream} at {} Hz: {}\n", num(rate), signals.join(", "));
-            let lost = loss.as_ref().map(|l| &l["streams"][stream]);
-            if let Some(lost) = lost.filter(|lost| lost.is_object()) {
+            let rate = num(columns[0].info.rate);
+            text += &format!("  {stream:?} at {rate} Hz: {}\n", named.join(", "));
+            let lost = counts
+                .as_ref()
+                .and_then(|(_, streams)| streams.get(stream.as_str()));
+            if let Some(lost) = lost {
                 let counts: Vec<String> = [
-                    ("skipped by the device", "skipped"),
-                    ("lost with the link", "link"),
-                    ("dropped by the proxy", "proxy"),
-                    ("dropped by the hub", "hub"),
+                    ("skipped by the device", lost.skipped),
+                    ("lost with the link", lost.link),
+                    ("dropped by the proxy", lost.proxy),
+                    ("dropped by the hub", lost.hub),
                 ]
                 .iter()
-                .filter_map(|(said, key)| {
-                    let n = lost[key].as_u64().unwrap_or(0);
-                    (n > 0).then(|| format!("{n} {said}"))
-                })
+                .filter(|(_, n)| *n > 0)
+                .map(|(said, n)| format!("{n} {said}"))
                 .collect();
                 if !counts.is_empty() {
                     text += &format!("    rows lost: {}\n", counts.join(", "));
@@ -248,47 +172,39 @@ pub(super) async fn devices(door: &Door) -> Result<String, Failed> {
     Ok(text.trim_end().to_string())
 }
 
-pub(super) async fn rpcs(door: &Door, args: ListRpcs) -> Result<String, Failed> {
-    let route = (args.route.parse::<DeviceRoute>())
-        .map_err(|error| format!("{} is no route, as {error}", args.route))?
-        .to_string();
-    let live = live(door).await?;
-    let frames = live.devices.snapshot();
-    let mine = |message: &Value| message["route"] == route.as_str();
-    let table = (messages(&frames, "table").find(mine))
-        .ok_or_else(|| format!("the hub has no RPC table of a device at {route}"))?;
-    if let Some(error) = table["error"].as_str() {
-        return Err(format!("the RPC table of {route} did not load, as {error}"));
-    }
-    let settings = (messages(&frames, "settings").find(mine))
-        .map(|m| m["values"].clone())
-        .unwrap_or(Value::Null);
+pub(super) async fn rpcs(live: &Live, args: ListRpcs) -> Result<String, Failed> {
+    let (route, table) = (crate::devices::table(&live.tree, &args.route).await)
+        .map_err(|(_, why)| format!("the RPC table of {} is not to be had, {why:?}", args.route))?;
+    let rpcs: Vec<_> = (table.iter())
+        .filter(|desc| crate::devices::shown(desc))
+        .map(crate::devices::describe)
+        .collect();
+    let settings = match live.devices.newest(route, Kind::Settings) {
+        Some(Message::Settings { values, .. }) => values,
+        _ => Default::default(),
+    };
     let filter = args.filter.unwrap_or_default();
-    let rpcs = table["rpcs"].as_array().cloned().unwrap_or_default();
-    let matching: Vec<&Value> = (rpcs.iter())
-        .filter(|rpc| rpc["name"].as_str().is_some_and(|n| n.contains(&filter)))
+    let matching: Vec<_> = (rpcs.iter())
+        .filter(|rpc| rpc.name.contains(&filter))
         .collect();
     if matching.is_empty() {
         return Ok(format!("{route} has no RPC whose name holds {filter:?}"));
     }
     let mut text = String::new();
     for rpc in matching.iter().take(RPCS) {
-        let name = rpc["name"].as_str().unwrap_or_default();
-        let kind = rpc["type"].as_str().unwrap_or("none");
-        let access = rpc["access"].as_array().cloned().unwrap_or_default();
-        let mut access: String = (access.iter())
-            .filter_map(|a| match a.as_str() {
-                Some("read") => Some('r'),
-                Some("write") => Some('w'),
-                _ => None,
+        let kind = rpc.kind.as_deref().unwrap_or("none");
+        let mut access: String = (rpc.access.iter())
+            .map(|access| match access {
+                Access::Read => 'r',
+                Access::Write => 'w',
             })
             .collect();
         if access.is_empty() {
             access = "action".into();
         }
-        text += &format!("{name} {kind} {access}");
-        if let Some(value) = settings.get(name) {
-            text += &format!(" = {value}");
+        text += &format!("{:?} {kind} {access}", rpc.name);
+        if let Some(value) = settings.get(&rpc.name) {
+            text += &format!(" = {}", said(value));
         }
         text.push('\n');
     }
@@ -299,11 +215,10 @@ pub(super) async fn rpcs(door: &Door, args: ListRpcs) -> Result<String, Failed> 
     Ok(text.trim_end().to_string())
 }
 
-pub(super) async fn call(door: &Door, args: Call) -> Result<String, Failed> {
+pub(super) async fn call(live: &Live, args: Call) -> Result<String, Failed> {
     if args.routes.is_empty() {
         return Err("name at least one route".into());
     }
-    let live = live(door).await?;
     let value = args.value.as_deref();
     if value.is_none() && args.run != Some(true) {
         let mut actions = Vec::new();
@@ -333,7 +248,7 @@ pub(super) async fn call(door: &Door, args: Call) -> Result<String, Failed> {
     Ok(text.join("\n"))
 }
 
-/// What the device made of a call or a read, on a line.
+/// What the device made of a call, on a line.
 fn outcome(outcome: Outcome) -> String {
     match outcome {
         Outcome::Ok { route, value } => match value {
@@ -350,13 +265,12 @@ fn outcome(outcome: Outcome) -> String {
     }
 }
 
-pub(super) async fn rows(door: &Door, args: ReadRows) -> Result<String, Failed> {
-    let live = live(door).await?;
-    let (ids, t0, t1) = resolve(&live, &[args.signal], args.span).await?;
-    let columns = span_rows(&live, ids, t0, t1).await?;
+pub(super) async fn rows(live: &Live, args: ReadRows) -> Result<String, Failed> {
+    let (ids, t0, t1) = resolve(live, &[args.signal], args.span).await?;
+    let columns = span_rows(live, ids, t0, t1).await?;
     let column = &columns[0];
     let limit = args.limit.unwrap_or(ROWS.0).min(ROWS.1);
-    let count = rows_of(column);
+    let count = column.rows();
     let units = if column.units.is_empty() {
         String::new()
     } else {
@@ -389,13 +303,12 @@ pub(super) async fn rows(door: &Door, args: ReadRows) -> Result<String, Failed> 
     Ok(text.trim_end().to_string())
 }
 
-pub(super) async fn export(door: &Door, args: Export) -> Result<String, Failed> {
+pub(super) async fn export(live: &Live, args: Export) -> Result<String, Failed> {
     let path = crate::export::path_of(args.name.as_deref(), args.format)?;
-    let live = live(door).await?;
-    let (ids, t0, t1) = resolve(&live, &args.signals, args.span).await?;
-    let columns = span_rows(&live, ids, t0, t1).await?;
+    let (ids, t0, t1) = resolve(live, &args.signals, args.span).await?;
+    let columns = span_rows(live, ids, t0, t1).await?;
     let counts: Vec<String> = (columns.iter())
-        .map(|column| format!("{:?} {}", column.name, rows_of(column)))
+        .map(|column| format!("{:?} {}", column.name, column.rows()))
         .collect();
     let format = args.format;
     let bytes = {
@@ -414,32 +327,33 @@ pub(super) async fn export(door: &Door, args: Export) -> Result<String, Failed> 
     ))
 }
 
-pub(super) async fn log(door: &Door, args: Log) -> Result<String, Failed> {
-    let live = live(door).await?;
-    let (frames, _) = live.snapshot(0).await.map_err(retired)?;
-    let lines: Vec<Value> = messages(&frames, "log").collect();
+pub(super) async fn log(live: &Live, args: Log) -> Result<String, Failed> {
     let wanted = args.lines.unwrap_or(LINES.0).min(LINES.1);
-    let newest = &lines[lines.len().saturating_sub(wanted)..];
-    if newest.is_empty() {
+    let lines = live.log.newest(wanted);
+    if lines.is_empty() {
         return Ok("the log is empty".into());
     }
-    let text: Vec<String> = (newest.iter())
-        .map(|line| {
-            let who = match (line["part"].as_str(), line["route"].as_str()) {
-                (Some(part), Some(route)) => format!("{part} of {route}"),
-                (Some(part), None) => part.to_string(),
-                (None, Some(route)) => format!("device {route}"),
-                (None, None) => "proxy".to_string(),
-            };
-            let at = (line["time"].as_f64())
-                .map(|t| format!(" at {} s", time(t)))
-                .unwrap_or_default();
-            format!(
-                "{} {} {who}{at}: {}",
-                line["n"],
-                line["level"].as_str().unwrap_or("info"),
-                line["text"].as_str().unwrap_or_default()
-            )
+    let text: Vec<String> = (lines.into_iter())
+        .filter_map(|line| match line {
+            Message::Log {
+                n,
+                time: at,
+                level,
+                part,
+                route,
+                text,
+                ..
+            } => {
+                let who = match (part, route) {
+                    (Some(part), Some(route)) => format!("{part} of {route}"),
+                    (Some(part), None) => part,
+                    (None, Some(route)) => format!("device {route}"),
+                    (None, None) => "proxy".to_string(),
+                };
+                let at = at.map(|t| format!(" at {} s", time(t))).unwrap_or_default();
+                Some(format!("{n} {} {who}{at}: {text:?}", word(level)))
+            }
+            _ => None,
         })
         .collect();
     Ok(text.join("\n"))

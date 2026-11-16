@@ -22,9 +22,8 @@
 //! or what `t0` and `t1` bound.
 //!
 //! Each call is a line of the log, said by the part `agent`, so whoever
-//! watches the page sees what an agent did. The line goes through the
-//! console's path to the log of the hub that lives, as the hub offers its
-//! log no other way.
+//! watches the page sees what an agent did. The line goes to the log of the
+//! hub the call reads, and to no other.
 
 mod glance;
 mod picture;

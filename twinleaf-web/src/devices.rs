@@ -181,6 +181,17 @@ impl Devices {
         }
     }
 
+    /// The newest message of `kind` of the device at `route`, listed or
+    /// not, as a snapshot holds it.
+    pub(crate) fn newest(&self, route: DeviceRoute, kind: Kind) -> Option<Message> {
+        self.latest
+            .lock()
+            .unwrap()
+            .devices
+            .get(&(route, kind))
+            .cloned()
+    }
+
     /// The devices the routes list.
     pub(crate) fn listed(&self) -> BTreeSet<DeviceRoute> {
         self.latest.lock().unwrap().listed.clone()
@@ -628,6 +639,13 @@ mod tests {
         );
         devices.publish_routes(&[a], None);
         assert_eq!(types(&devices.snapshot()), ["routes ", "device /0"]);
+        let named = |route| match devices.newest(route, Kind::Device) {
+            Some(Message::Device { name, .. }) => name,
+            _ => None,
+        };
+        assert_eq!(named(a).as_deref(), Some("x"));
+        assert_eq!(named(b).as_deref(), Some("y"), "kept, though not listed");
+        assert!(devices.newest(a, Kind::Table).is_none());
     }
 
     #[test]
