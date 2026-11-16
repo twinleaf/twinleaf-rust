@@ -57,7 +57,6 @@ use crate::firmware::{Catalog, Firmware, Wanted};
 use crate::logbook::{self, Logbook};
 use crate::loss::Losses;
 use crate::protocol::{self, Frame, Message, MountInfo, Rows, TraceInfo, Window, WindowChunk};
-use crate::pyramid::{self, Level, Point, Pyramid, Slice};
 use crate::wire::{encode, encode_spectra, split_at_breaks, Chunk, Spectrum};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
@@ -65,7 +64,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
-use twinleaf::data::ops::{Fpcs, FpcsLevels, Welch};
+use twinleaf::data::ops::{self, FpcsLevels, Level, Pyramid, Stretch, Welch};
 use twinleaf::data::{Buffer, ColumnKey, ColumnOp, ColumnProcessor, Run, StreamKey};
 use twinleaf::flume::{self, select::SelectError, Selector};
 use twinleaf::proxy::Layout;
@@ -1140,15 +1139,15 @@ impl Hub {
         let trace = self.traces.get(id as usize)?;
         let key = trace.key.stream_key();
         self.buffer.run(&key)?;
-        let spans = self
+        let batches = self
             .spans(&key, t0, t1)
-            .iter()
-            .map(GatheredSpan::of)
+            .into_iter()
+            .flat_map(|span| span.run.rows(span.rows))
             .collect();
         Some(Gathered {
             column: trace.key.column_id,
             oldest: self.oldest(&key),
-            spans,
+            batches,
         })
     }
 
@@ -1172,7 +1171,6 @@ impl Hub {
             .map(|span| span.rows.end - span.rows.start)
             .sum();
         let ratio = (rows as usize).div_ceil((2 * width).max(64)).max(1);
-        let level = pyramid::level_for(ratio);
         let spans = spans
             .iter()
             .map(|span| {
@@ -1180,17 +1178,14 @@ impl Hub {
                     Some(held) if span.held => held.reduced.get(id as usize),
                     _ => Some(trace.reduced.output()),
                 };
-                level
-                    .and_then(|(level, _)| levels?.get(level))
-                    .and_then(|level| ReducedSpan::of(span, column, level))
-                    .map_or_else(|| SpanRead::Rows(GatheredSpan::of(span)), SpanRead::Reduced)
+                let levels = levels.map(Vec::as_slice);
+                Stretch::read(span.run, span.rows.clone(), column, ratio, levels)
             })
             .collect();
         Some(WindowRead {
             t0,
             t1,
-            column,
-            ratio: level.map_or(ratio, |(_, ratio)| ratio),
+            ratio: ops::level_for(ratio).map_or(ratio, |(_, ratio)| ratio),
             spans,
         })
     }
@@ -1235,147 +1230,8 @@ pub(crate) struct Gathered {
     column: ColumnId,
     /// The oldest time the history holds of the trace.
     oldest: Option<f64>,
-    /// The held history's rows, then the buffer's.
-    spans: Vec<GatheredSpan>,
-}
-
-/// The rows of one run within a range of time.
-struct GatheredSpan {
-    /// The run's row number of the first row.
-    start: u64,
-    len: u64,
-    /// The row numbers, in order, at which the run's samples were lost.
-    gaps: Vec<u64>,
+    /// The held history's rows, then the buffer's, which share their chunks.
     batches: Vec<SampleBatch>,
-}
-
-impl GatheredSpan {
-    /// The rows of `span`, which share the run's chunks.
-    fn of(span: &Span) -> GatheredSpan {
-        let rows = span.rows.clone();
-        GatheredSpan {
-            start: rows.start,
-            len: rows.end - rows.start,
-            gaps: (span.run.boundaries())
-                .map(|(row, _, _)| row)
-                .filter(|row| rows.contains(row))
-                .collect(),
-            batches: span.run.rows(rows),
-        }
-    }
-
-    /// The rows of `column`, split where samples were lost, each stretch
-    /// decimated by `ratio`, which may be one, with its first and last rows
-    /// kept, as the decimator emits the earlier extreme of its first window
-    /// and holds back its last.
-    fn decimated(&self, column: ColumnId, ratio: usize) -> Vec<Vec<Point>> {
-        let mut segments = Vec::new();
-        let mut fpcs = Fpcs::new(ratio, 0.0);
-        // The first and last rows fed to the decimator since the last loss.
-        let mut ends: Option<(Point, Point)> = None;
-        let mut finish = |fpcs: &mut Fpcs, ends: &mut Option<(Point, Point)>| {
-            let Some((first, last)) = ends.take() else {
-                return;
-            };
-            let emitted = fpcs.output();
-            let mut points = Vec::with_capacity(emitted.len() + 2);
-            if emitted.first().is_none_or(|point| first.0 < point.0) {
-                points.push(first);
-            }
-            points.extend_from_slice(emitted);
-            if points.last().is_some_and(|point| point.0 < last.0) {
-                points.push(last);
-            }
-            segments.push(points);
-            fpcs.reset();
-        };
-        let mut gaps = self.gaps.iter().copied().peekable();
-        let mut row = self.start;
-        for batch in &self.batches {
-            let (times, end) = (batch.timestamps(), row + batch.len() as u64);
-            let mut from = 0;
-            while from < times.len() {
-                let lost = gaps.next_if(|&gap| gap < end);
-                let to = lost.map_or(times.len(), |gap| gap.saturating_sub(row) as usize);
-                let values = batch.column(column).map(|values| values.slice(from..to));
-                if let Some(values) = values.filter(|values| !values.is_empty()) {
-                    fpcs.update_batch(&times[from..to], &values);
-                    let row = |at: usize| Some((times[from + at], values.get(at).try_as_f64()?));
-                    if let Some((first, last)) = row(0).zip(row(to - from - 1)) {
-                        ends = Some((ends.map_or(first, |ends| ends.0), last));
-                    }
-                }
-                if lost.is_some() {
-                    finish(&mut fpcs, &mut ends);
-                }
-                from = to;
-            }
-            row = end;
-        }
-        finish(&mut fpcs, &mut ends);
-        segments
-    }
-}
-
-/// The points of one run within a range of time at a level of its
-/// decimations, with the range's first and last rows. Every point is a row
-/// of the run.
-struct ReducedSpan {
-    first: Point,
-    last: Point,
-    slices: Vec<Slice>,
-    /// The time of the first row after each loss of samples, in order.
-    gaps: Vec<f64>,
-}
-
-impl ReducedSpan {
-    /// The points of `span` at `level`, one of the decimations of its run,
-    /// or `None` for a run without `column`. It finds them by bisection,
-    /// and copies none but the level's newest, fewer than a block.
-    fn of(span: &Span, column: ColumnId, level: &Level) -> Option<ReducedSpan> {
-        let (run, rows) = (span.run, span.rows.clone());
-        let row = |row: u64| -> Option<Point> {
-            let batch = run.rows(row..row + 1).pop()?;
-            let value = batch.column(column)?.get(0).try_as_f64()?;
-            Some((batch.timestamps()[0], value))
-        };
-        let (first, last) = (row(rows.start)?, row(rows.end - 1)?);
-        Some(ReducedSpan {
-            first,
-            last,
-            slices: level.between(first.0, last.0),
-            gaps: (run.boundaries())
-                .filter(|(row, _, _)| rows.contains(row))
-                .map(|(_, time, _)| time)
-                .collect(),
-        })
-    }
-
-    /// The points, split where samples were lost.
-    fn segments(&self) -> Vec<Vec<Point>> {
-        let mut segments: Vec<Vec<Point>> = vec![Vec::new()];
-        let mut gaps = self.gaps.iter().peekable();
-        let leveled = self.slices.iter().flat_map(|slice| slice.points());
-        let ends = [self.first, self.last];
-        let mut newest = f64::NEG_INFINITY;
-        // The first row, the level's points, then the last row, each end
-        // unless the level has it. They are in time order but for the ends.
-        for &point in ends[..1].iter().chain(leveled).chain(&ends[1..]) {
-            if point.0 <= newest {
-                continue;
-            }
-            newest = point.0;
-            let mut lost = false;
-            while gaps.next_if(|&&gap| gap <= point.0).is_some() {
-                lost = true;
-            }
-            if lost && !segments.last().unwrap().is_empty() {
-                segments.push(Vec::new());
-            }
-            segments.last_mut().unwrap().push(point);
-        }
-        segments
-    }
 }
 
 /// One trace within [t0, t1], gathered on the hub's thread for a window to
@@ -1384,19 +1240,10 @@ impl ReducedSpan {
 pub(crate) struct WindowRead {
     t0: f64,
     t1: f64,
-    column: ColumnId,
     /// The rows a point of the window stands for.
     ratio: usize,
     /// The held history's part, then the buffer's.
-    spans: Vec<SpanRead>,
-}
-
-/// One run's part of a [`WindowRead`].
-enum SpanRead {
-    /// Its rows, to decimate by the window's ratio.
-    Rows(GatheredSpan),
-    /// Its points at the window's ratio, already decimated.
-    Reduced(ReducedSpan),
+    spans: Vec<Stretch>,
 }
 
 impl WindowRead {
@@ -1405,10 +1252,7 @@ impl WindowRead {
     pub(crate) fn window(self) -> Window {
         let mut chunks = Vec::new();
         for span in &self.spans {
-            let segments = match span {
-                SpanRead::Rows(span) => span.decimated(self.column, self.ratio),
-                SpanRead::Reduced(span) => span.segments(),
-            };
+            let segments = span.points();
             let kept = segments.iter().filter(|segment| !segment.is_empty());
             chunks.extend(kept.map(|points| WindowChunk {
                 x: points.iter().map(|p| p.0).collect(),
@@ -1426,15 +1270,7 @@ impl WindowRead {
     /// How many rows and points of the history the window is made of.
     #[cfg(test)]
     fn touched(&self) -> usize {
-        (self.spans.iter())
-            .map(|span| match span {
-                SpanRead::Rows(span) => span.len as usize,
-                SpanRead::Reduced(span) => {
-                    let points = span.slices.iter().map(|slice| slice.points().len());
-                    2 + points.sum::<usize>()
-                }
-            })
-            .sum()
+        self.spans.iter().map(Stretch::len).sum()
     }
 }
 
@@ -1443,10 +1279,10 @@ impl Gathered {
     /// how many. With them, the oldest time the history still holds of the
     /// trace.
     pub(crate) fn rows(self, limit: usize) -> Rows {
-        let count = self.spans.iter().map(|span| span.len as usize).sum();
+        let count = self.batches.iter().map(SampleBatch::len).sum();
         let (mut x, mut y) = (Vec::new(), Vec::new());
         if count <= limit {
-            for batch in self.spans.iter().flat_map(|span| &span.batches) {
+            for batch in &self.batches {
                 if let Some(values) = batch.column(self.column) {
                     x.extend_from_slice(batch.timestamps());
                     y.extend(values.to_f64().iter());
@@ -1467,6 +1303,7 @@ mod tests {
     use super::*;
     use crate::wire::decode;
     use proptest::prelude::*;
+    use twinleaf::data::ops::{Fpcs, Point};
     use twinleaf::data::PacketParser;
     use twinleaf::proto::data::{self as data, DataType};
     use twinleaf::proto::sync::Epoch;
@@ -2607,13 +2444,13 @@ mod tests {
         let spans = hub.spans(&trace.key.stream_key(), t0, t1);
         let rows: u64 = spans.iter().map(|s| s.rows.end - s.rows.start).sum();
         let ratio = width.map_or(1, |width| (rows as usize).div_ceil((2 * width).max(64)));
+        let column = trace.key.column_id;
         let read = WindowRead {
             t0,
             t1,
-            column: trace.key.column_id,
             ratio: ratio.max(1),
             spans: (spans.iter())
-                .map(|span| SpanRead::Rows(GatheredSpan::of(span)))
+                .map(|span| Stretch::rows(span.run, span.rows.clone(), column, ratio.max(1)))
                 .collect(),
         };
         read.window()
@@ -2656,7 +2493,7 @@ mod tests {
         prop_assert_eq!(points.last().copied(), rows.count.checked_sub(1).map(row));
 
         prop_assert!(window.ratio <= reference.ratio);
-        if reference.ratio < pyramid::FINEST {
+        if reference.ratio < ops::FINEST {
             prop_assert_eq!(window.ratio, reference.ratio);
             prop_assert_eq!(chunks(&window), chunks(&reference));
         }
@@ -2683,7 +2520,7 @@ mod tests {
             prop_assert!(broken(*pair[0].x.last().unwrap(), pair[1].x[0]));
         }
 
-        if window.ratio >= pyramid::FINEST {
+        if window.ratio >= ops::FINEST {
             let reach = 2 * window.ratio;
             for part in parts {
                 for i in part.start + reach..part.end.saturating_sub(reach) {
@@ -2770,12 +2607,12 @@ mod tests {
             let (t0, t1) = (2000.0 - span / 2.0, 2000.0 + span / 2.0);
             let read = hub.window(0, t0, t1, width).unwrap();
             let rows = hub.gather(0, t0, t1).unwrap().rows(0).count;
-            if rows < pyramid::FINEST * points {
+            if rows < ops::FINEST * points {
                 assert_eq!(read.ratio, rows.div_ceil(points), "span {span}");
                 assert!(read.touched() <= rows + 1, "span {span}");
             } else {
                 leveled += 1;
-                assert!(read.ratio >= pyramid::FINEST, "span {span}");
+                assert!(read.ratio >= ops::FINEST, "span {span}");
                 assert!(
                     read.touched() <= 4 * points + 8,
                     "span {span} touched {}",
@@ -2835,7 +2672,7 @@ mod tests {
         // Wide enough to read the finest level, of which the hub's own no
         // longer has the held history's points.
         let window = checked(&mut hub, 0.0, 1e9, 400).unwrap();
-        assert_eq!(window.ratio, pyramid::FINEST);
+        assert_eq!(window.ratio, ops::FINEST);
         assert_eq!(window.chunks.len(), 2);
         assert_eq!(window.chunks[0].x.first(), Some(&held_from));
         assert_eq!(window.chunks[0].x.last(), Some(&2500.0));
@@ -2903,14 +2740,14 @@ mod tests {
             feed(&mut hub, &mut parser, start, 10_000, 3);
         }
         assert_eq!(held_span(&hub), Some((0.01, 2000.0)));
-        assert!(held_points_before(&hub, 1000.0) > pyramid::BLOCK);
+        assert!(held_points_before(&hub, 1000.0) > ops::BLOCK);
 
         hub.set_history(100.0, RAW_BYTES);
         let (first, last) = held_span(&hub).unwrap();
         assert_eq!(last, 2000.0, "the held history keeps its newest");
         let from = 2000.0 - 100.0 - HISTORY_HEADROOM;
         assert!((from..from + 0.011).contains(&first), "{first}");
-        assert!(held_points_before(&hub, first) < pyramid::BLOCK);
+        assert!(held_points_before(&hub, first) < ops::BLOCK);
         let live = hub.buffer.run(&stream_key()).unwrap();
         let live_first = live.first_timestamp().unwrap();
         assert!((2898.0..2898.011).contains(&live_first), "{live_first}");
@@ -2992,7 +2829,7 @@ mod tests {
             prop_assert_eq!(last, last_before, "the held history keeps its newest");
             prop_assert!(first >= first_before, "and gets back nothing");
             prop_assert!(last - first <= seconds + HISTORY_HEADROOM + 1e-9);
-            prop_assert!(held_points_before(hub, first) < pyramid::BLOCK);
+            prop_assert!(held_points_before(hub, first) < ops::BLOCK);
             prop_assert_eq!(held.unwrap().seconds, (last - first).min(seconds));
             prop_assert_eq!(oldest[&0], first.min(live.0));
         } else {
