@@ -305,8 +305,8 @@ fn metadata() -> impl Strategy<Value = Vec<u8>> {
 }
 
 /// A proxy reply payload, a kind byte then that kind's body. Kind 0 holds
-/// a reply, 1 an error, 2 a link status and 3 nothing, and any other
-/// kind holds any bytes.
+/// a reply, 1 an error, 2 a link status, 3 nothing and 4 a count of
+/// dropped packets, and any other kind holds any bytes.
 fn proxy_rx() -> impl Strategy<Value = Vec<u8>> {
     let kind = |kind: u8, body: Vec<u8>| [vec![kind], body].concat();
     prop_oneof![
@@ -314,7 +314,8 @@ fn proxy_rx() -> impl Strategy<Value = Vec<u8>> {
         payload(4, MAX - 1).prop_map(move |b| kind(1, b)),
         payload(1, MAX - 1).prop_map(move |b| kind(2, b)),
         payload(0, MAX - 1).prop_map(move |b| kind(3, b)),
-        (4..=255u8, payload(0, MAX - 1)).prop_map(move |(k, b)| kind(k, b)),
+        payload(5, MAX - 1).prop_map(move |b| kind(4, b)),
+        (5..=255u8, payload(0, MAX - 1)).prop_map(move |(k, b)| kind(k, b)),
     ]
 }
 
