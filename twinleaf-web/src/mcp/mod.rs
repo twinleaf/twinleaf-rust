@@ -9,7 +9,7 @@
 //!
 //! - `list_devices` names each device, its streams and the signals in them.
 //! - `list_rpcs` lists a device's RPCs and the values it announced.
-//! - `call` calls one RPC on several devices, all or none.
+//! - `call` calls one RPC on several devices at once, all or none.
 //! - `glance` sums signals up over a span and draws them, in time or as
 //!   spectra.
 //! - `read_rows` gives exact rows of one signal, a few at a time.

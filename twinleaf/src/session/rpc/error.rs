@@ -1,6 +1,6 @@
+use super::RpcValueDecodeError;
 use crate::proto::rpc as wire;
 use crate::proto::RouteError;
-use crate::tio::rpc::RpcDecodeError;
 
 /// A device's refusal of an RPC, with its error code and message.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -50,9 +50,10 @@ pub enum CallError {
     /// The device refused the call.
     #[error("device returned error: {0}")]
     DeviceError(RpcErrorPayload),
-    /// The reply did not decode as the expected type.
-    #[error("RPC reply did not match expected type: {0}")]
-    InvalidReply(#[source] RpcDecodeError),
+    /// The reply did not decode as the type expected of it. That type is
+    /// the caller's own or the one the device's RPC table gives.
+    #[error(transparent)]
+    InvalidReply(RpcValueDecodeError),
 }
 
 #[cfg(test)]
@@ -71,5 +72,18 @@ mod tests {
             "wrong device state: privileged: unlock with dev.priv"
         );
         assert_eq!(refused(b"").to_string(), "wrong device state");
+    }
+
+    /// A reply too short for its type reads as the reason it did not decode.
+    #[test]
+    fn a_short_reply_reads_as_its_reason() {
+        let short = crate::tio::rpc::RpcDecodeError::TooShort {
+            expected: 4,
+            actual: 2,
+        };
+        assert_eq!(
+            CallError::InvalidReply(short.into()).to_string(),
+            "RPC reply is too short: expected at least 4 bytes, got 2"
+        );
     }
 }

@@ -304,37 +304,31 @@ pub(super) async fn call(door: &Door, args: Call) -> Result<String, Failed> {
         return Err("name at least one route".into());
     }
     let live = live(door).await?;
-    let (name, routes) = (&args.name, &args.routes);
-    let Some(value) = args.value else {
-        return read(&live, name, routes).await;
-    };
-    let CallReply { sent, results } = crate::devices::call(&live.tree, name, &value, routes).await;
+    let value = args.value.as_deref();
+    if value.is_none() && args.run != Some(true) {
+        let mut actions = Vec::new();
+        for route in &args.routes {
+            let Ok((_, table)) = crate::devices::table(&live.tree, route).await else {
+                continue;
+            };
+            if (table.find(&args.name)).is_some_and(|desc| !desc.is_readable()) {
+                actions.push(route.as_str());
+            }
+        }
+        if !actions.is_empty() {
+            return Err(format!(
+                "{} cannot be read on {}, so a call of it with no value runs it as an action, \
+                 which takes run true. Nothing was sent to any device",
+                args.name,
+                actions.join(", ")
+            ));
+        }
+    }
+    let CallReply { sent, results } =
+        crate::devices::call(&live.tree, &args.name, value, &args.routes).await;
     let mut text: Vec<String> = results.into_iter().map(outcome).collect();
     if !sent {
         text.push("nothing was sent to any device".into());
-    }
-    Ok(text.join("\n"))
-}
-
-/// Reads `name` from each device of `routes`, as the page reads what no
-/// announcement keeps current. A device whose `name` is no value to read
-/// is called with no argument, as an action is.
-async fn read(live: &Live, name: &str, routes: &[String]) -> Result<String, Failed> {
-    let mut text = Vec::new();
-    let names = [name.to_string()];
-    for route in routes {
-        let read = crate::devices::read(&live.tree, &live.devices, route, &names).await;
-        let said = match read.map(|mut reply| reply.values.remove(name)) {
-            Ok(Some(read)) => outcome(read),
-            Ok(None) => {
-                let at = [route.clone()];
-                let CallReply { results, .. } =
-                    crate::devices::call(&live.tree, name, "", &at).await;
-                results.into_iter().map(outcome).collect()
-            }
-            Err(refused) => format!("{route}: refused, {}", refused.error),
-        };
-        text.push(said);
     }
     Ok(text.join("\n"))
 }

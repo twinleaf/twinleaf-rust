@@ -116,8 +116,14 @@ impl Bench {
     /// Starts the simulator and waits until its first signal holds `seconds`
     /// of rows.
     async fn start(seconds: f64) -> Bench {
+        Bench::with(&["--no-drop"], seconds).await
+    }
+
+    /// Starts the simulator with `args` and waits until the hub's first
+    /// signal holds `seconds` of rows.
+    async fn with(args: &[&str], seconds: f64) -> Bench {
         let stop = Arc::new(AtomicBool::new(false));
-        let url = twinleaf_tools::tools::simulate::serve(&["--no-drop"], stop.clone());
+        let url = twinleaf_tools::tools::simulate::serve(args, stop.clone());
         let root = DeviceRoute::root();
         let proxy = Proxy::host(HostOptions {
             port: 0,
@@ -234,12 +240,37 @@ async fn call_reads_and_writes_a_setting_and_says_a_refused_route() {
     assert_eq!(rpcs, "test.amplitude f64 rw = 2.5");
 }
 
+/// A call with no value reads every device it names, each decoded by its
+/// own table.
+#[tokio::test]
+async fn call_reads_two_devices_at_once() {
+    let bench = Bench::with(&["--no-drop", "--layout", "/,/0"], 0.0).await;
+    let set = json!({ "name": "test.amplitude", "value": "1.5", "routes": ["/", "/0"] });
+    assert_eq!(bench.text("call", set).await, "/: ok 1.5\n/0: ok 1.5");
+    let read = json!({ "name": "test.amplitude", "routes": ["/", "/0"] });
+    assert_eq!(bench.text("call", read).await, "/: ok 1.5\n/0: ok 1.5");
+    let twice = json!({ "name": "test.amplitude", "routes": ["/0", "/0"] });
+    let text = bench.text("call", twice).await;
+    assert_eq!(
+        text,
+        "/0: refused, \"it is named more than once\"\n\
+         /0: refused, \"it is named more than once\"\n\
+         nothing was sent to any device"
+    );
+}
+
 #[tokio::test]
 async fn glance_reports_a_dropped_sample_as_a_gap() {
     let bench = Bench::start(1.0).await;
     let (signal, _, _) = bench.first_signal().await.unwrap();
     let (_, before) = bench.until(|_| true).await;
+    // An action called with no value runs only when the call says run.
     let drop = json!({ "name": "test.drop", "routes": ["/"] });
+    let (failed, content) = bench.tool("call", drop).await;
+    let refused = content[0]["text"].as_str().unwrap();
+    assert!(failed, "{refused}");
+    assert!(refused.contains("takes run true"), "{refused}");
+    let drop = json!({ "name": "test.drop", "routes": ["/"], "run": true });
     assert_eq!(bench.text("call", drop).await, "/: ok");
     bench.until(|(_, last)| last > before + 1.5).await;
     let glance =

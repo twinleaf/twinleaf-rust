@@ -37,9 +37,13 @@ pub(crate) struct Call {
     /// to read the RPC or to run an action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) value: Option<String>,
-    /// The devices to call, by route. With a value every one takes the
-    /// call or none does.
+    /// The devices to call, by route. Every one takes the call or none
+    /// does.
     pub(super) routes: Vec<String>,
+    /// True to call with no value an RPC that cannot be read, which runs
+    /// it as an action. Such a call is refused without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) run: Option<bool>,
 }
 
 /// What a glance shows.
@@ -142,7 +146,7 @@ impl Door {
     }
 
     #[tool(
-        description = "Calls the RPC `name` on each device of `routes` and says each device's outcome. With `value`, as text, every device takes the call or none does. Without it each device's value is read, and an action runs with no argument."
+        description = "Calls the RPC `name` on each device of `routes` and says each device's outcome. The devices are called at once, and every device takes the call or none does. With `value`, as text, it is the argument. Without it each device is called with no argument, which reads the RPC where it can be read. An RPC that cannot be read is an action, and a call of it with no value runs it only with `run` true, and is refused without."
     )]
     async fn call(&self, Parameters(args): Parameters<Call>) -> Result<CallToolResult, ErrorData> {
         said("call", &args);

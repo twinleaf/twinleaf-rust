@@ -1817,7 +1817,9 @@ impl<'c> World<'c> {
     /// the cache and waits [`RELOAD_DELAY`] before the next.
     fn registry(&mut self, c: usize, answers: Vec<Answer>) {
         let decoded = |reply: &Result<Vec<u8>, CallError>| match reply {
-            Ok(reply) => u32::decode_reply(reply).map_err(CallError::InvalidReply),
+            Ok(reply) => {
+                u32::decode_reply(reply).map_err(|error| CallError::InvalidReply(error.into()))
+            }
             Err(error) => Err(error.clone()),
         };
         let read = match answers.as_slice() {

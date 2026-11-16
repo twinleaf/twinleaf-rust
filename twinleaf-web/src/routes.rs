@@ -368,7 +368,7 @@ async fn call(
     Json(args): Json<CallRequest>,
 ) -> Result<Response, Refusal> {
     let live = hubs.live().await?;
-    let reply = crate::devices::call(&live.tree, &args.name, &args.value, &args.routes).await;
+    let reply = crate::devices::call(&live.tree, &args.name, Some(&args.value), &args.routes).await;
     Ok(Json(reply).into_response())
 }
 
@@ -378,7 +378,7 @@ async fn read(
     Json(args): Json<ReadRequest>,
 ) -> Result<Response, Refusal> {
     let live = hubs.live().await?;
-    let reply = crate::devices::read(&live.tree, &live.devices, &args.route, &args.names).await?;
+    let reply = crate::devices::read(&live.tree, &args.route, &args.names).await?;
     Ok(Json(reply).into_response())
 }
 

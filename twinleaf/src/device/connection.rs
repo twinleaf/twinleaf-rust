@@ -7,7 +7,7 @@ use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
 use crate::rt::Supervisor;
 use crate::session::rpc::{
-    plan, CallError, Outcome, PendingReply, RpcMeta, RpcRegistry, RpcRegistryError,
+    plan, CallError, Outcome, PendingReply, Refusal, RpcMeta, RpcRegistry, RpcRegistryError,
 };
 use crate::session::{Field, CHANGES, LINK, METADATA, PRESENCE, REGISTRY, SETTINGS};
 use crate::session::{Handle, Session};
@@ -620,7 +620,7 @@ impl DeviceTree {
         arg: ReqT,
     ) -> Result<RepT, CallError> {
         let ret = self.raw_rpc(route, name, &arg.encode_args())?;
-        RepT::decode_reply(&ret).map_err(CallError::InvalidReply)
+        RepT::decode_reply(&ret).map_err(|error| CallError::InvalidReply(error.into()))
     }
 
     /// Calls the no-argument RPC `name` at `route` and expects no value.
@@ -666,31 +666,38 @@ impl DeviceTree {
         self.rpc(route, "rpc.info", name).map(RpcMeta::from_bits)
     }
 
-    /// Calls `name` with the argument `text` on each of `routes`, and
-    /// returns what each device made of it, in the order of `routes`.
+    /// Calls `name` with the argument `text`, or with none, on each of
+    /// `routes`, and returns what each device made of it, in the order of
+    /// `routes`.
     ///
-    /// Each device's argument is `text` encoded by its own RPC table. The
-    /// call waits for every device's table at once, as
-    /// [`Device::rpc_registry`] waits for one, up to 30 s. Nothing is sent
-    /// unless every device takes the text, as a write that reaches only
-    /// some devices cannot be taken back. A route outside this view, one
-    /// whose table failed to load or did not load in time, one whose table
-    /// lacks `name`, or one whose type cannot hold `text` is
-    /// [`Outcome::Refused`], and every other route is then
-    /// [`Outcome::Skipped`]. Otherwise the call goes to every device at
-    /// once, and each waits for its reply up to the view's timeout.
+    /// Each device's argument is `text` encoded by its own RPC table. With
+    /// no `text` each device is called with no argument, which reads a
+    /// value or runs an action, and each reply decodes by that device's
+    /// table. Either way the calls go to all the devices at once. The call
+    /// waits for every device's table at once, as
+    /// [`Device::rpc_registry_async`] waits for one, up to 30 s. The call is
+    /// planned for every device before anything is sent, as a write that
+    /// reaches only some devices cannot be taken back. Nothing is sent when
+    /// any route is outside this view, is named more than once, has a table
+    /// that failed to load or did not load in time, has a table that lacks
+    /// `name`, or has a type that cannot hold `text`. Each such route is
+    /// then [`Outcome::Refused`] with its [`Refusal`], and every other route
+    /// is [`Outcome::Skipped`]. Otherwise the call goes to every device at
+    /// once, and each waits for its reply up to the view's timeout. A device
+    /// lost after the plan is made is sent the call all the same, and its
+    /// outcome is an error or unknown, while the others are sent theirs.
     pub async fn call_each(
         &self,
         name: &str,
-        text: &str,
+        text: Option<&str>,
         routes: &[DeviceRoute],
     ) -> Vec<(DeviceRoute, Outcome)> {
-        let deadline = tokio::time::Instant::now() + TABLE_TIMEOUT;
         let waits = routes.iter().map(|&route| async move {
-            let device = self.device(route).map_err(|error| error.to_string());
-            let table = match device {
-                Ok(device) => table_by(&device.rpc_registry_updates(), deadline).await,
-                Err(error) => Err(error),
+            let named = routes.iter().filter(|&&other| other == route).count();
+            let table = match self.device(route) {
+                _ if named > 1 => Err(Refusal::NamedTwice),
+                Ok(device) => device.rpc_registry_async().await,
+                Err(error) => Err(Refusal::OutsideView(error)),
             };
             (route, table)
         });
@@ -711,27 +718,23 @@ impl DeviceTree {
     }
 }
 
-/// Why a call is refused a device whose RPC table did not load by its
-/// deadline.
-pub(super) const TABLE_NOT_LOADED: &str = "its RPC table has not loaded";
-
 /// Waits until `updates` yields a device's RPC table, or why it could not
 /// be loaded, or until `deadline`. Returns the table, or why there is none
 /// to call the device by.
 pub(super) async fn table_by(
     updates: &Receiver<RegistryState>,
     deadline: tokio::time::Instant,
-) -> Result<Arc<RpcRegistry>, String> {
+) -> Result<Arc<RpcRegistry>, Refusal> {
     loop {
         let received = tokio::select! {
             received = updates.recv_async() => received,
-            () = crate::chan::sleep_until(deadline) => return Err(TABLE_NOT_LOADED.to_string()),
+            () = crate::chan::sleep_until(deadline) => return Err(Refusal::TableNotLoaded),
         };
         return match received {
             Ok(Ok(table)) => Ok(table),
-            Ok(Err(error)) => Err(format!("its RPC table did not load. {error}")),
+            Ok(Err(error)) => Err(Refusal::TableFailed(error)),
             Err(RecvError::Lagged(_)) => continue,
-            Err(_) => Err(TABLE_NOT_LOADED.to_string()),
+            Err(_) => Err(Refusal::TableNotLoaded),
         };
     }
 }
@@ -946,6 +949,22 @@ impl Device {
     pub fn rpc_registry(&self) -> Result<Arc<RpcRegistry>, RpcRegistryError> {
         let registry = self.rpc_registry_updates().recv_timeout(TABLE_TIMEOUT);
         registry.map_err(unreceived)?
+    }
+
+    /// Returns the RPCs this device offers, waiting up to 30 s until the
+    /// table is loaded, without blocking the thread. It is the table
+    /// [`rpc_registry`](Self::rpc_registry) returns, and the one
+    /// [`DeviceTree::call_each`] calls the device by.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no call can be made of the device by its table.
+    /// [`Refusal::TableNotLoaded`] is a table not loaded in time or a
+    /// connection that ended, and [`Refusal::TableFailed`] is a table that
+    /// failed to load, with why.
+    pub async fn rpc_registry_async(&self) -> Result<Arc<RpcRegistry>, Refusal> {
+        let deadline = tokio::time::Instant::now() + TABLE_TIMEOUT;
+        table_by(&self.rpc_registry_updates(), deadline).await
     }
 
     /// Subscribes to this device's RPC table. The receiver yields the table,

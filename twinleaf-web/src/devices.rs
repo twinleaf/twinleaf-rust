@@ -30,7 +30,7 @@ use crate::protocol::{
     Presence, ReadReply, Refusal, RpcInfo, TableInfo, TableState,
 };
 use axum::http::StatusCode;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use twinleaf::device::capture::Capture;
@@ -63,9 +63,6 @@ pub(crate) enum Kind {
 /// The newest of what the watchers sent, and the feed it goes out on.
 pub(crate) struct Devices {
     latest: Mutex<Latest>,
-    /// Each device's RPC table as last loaded, which a read finds its
-    /// entries in.
-    tables: Mutex<HashMap<DeviceRoute, Arc<RpcRegistry>>>,
     feed: Arc<Feed>,
 }
 
@@ -86,7 +83,6 @@ impl Devices {
     pub(crate) fn new(feed: Arc<Feed>) -> Arc<Devices> {
         Arc::new(Devices {
             latest: Mutex::new(Latest::default()),
-            tables: Mutex::new(HashMap::new()),
             feed,
         })
     }
@@ -190,13 +186,14 @@ impl Devices {
         self.latest.lock().unwrap().listed.clone()
     }
 
-    /// The RPC table of the device at `route` as last loaded.
-    pub(crate) fn table(&self, route: DeviceRoute) -> Option<Arc<RpcRegistry>> {
-        self.tables.lock().unwrap().get(&route).cloned()
-    }
-
-    fn set_table(&self, route: DeviceRoute, table: Arc<RpcRegistry>) {
-        self.tables.lock().unwrap().insert(route, table);
+    /// Whether the hub lists `rpc` among the captures of the device at
+    /// `route`, as its newest list of them has it.
+    pub(crate) fn lists_capture(&self, route: DeviceRoute, rpc: &str) -> bool {
+        let latest = self.latest.lock().unwrap();
+        match latest.devices.get(&(route, Kind::Captures)) {
+            Some(Message::Captures { captures, .. }) => captures.iter().any(|info| info.rpc == rpc),
+            _ => false,
+        }
     }
 }
 
@@ -331,7 +328,6 @@ async fn watch_device(
             update = table.recv_async() => {
                 let table = match update {
                     Ok(Ok(registry)) => {
-                        devices.set_table(route, registry.clone());
                         loads += 1;
                         tokio::spawn(list_captures(device.clone(), route, registry.clone(), devices.clone(), loads));
                         firmware.read_installed(device.clone(), route);
@@ -421,12 +417,12 @@ async fn list_captures(
 
 /// Whether the page lists `desc`. A protocol entry is how the host speaks
 /// to the device, which no person calls.
-fn shown(desc: &RpcDescriptor) -> bool {
+pub(crate) fn shown(desc: &RpcDescriptor) -> bool {
     desc.channel() != Some(Channel::Protocol)
 }
 
 /// The page's view of one table entry.
-fn describe(desc: &RpcDescriptor) -> RpcInfo {
+pub(crate) fn describe(desc: &RpcDescriptor) -> RpcInfo {
     let access = match desc.meta.access() {
         RpcAccess::ReadWrite => vec![Access::Read, Access::Write],
         RpcAccess::ReadOnly => vec![Access::Read],
@@ -451,21 +447,30 @@ fn outcome(route: &str, outcome: rpc::Outcome) -> Outcome {
             route,
             value: value.map_or(serde_json::Value::Null, |value| value.to_json()),
         },
-        rpc::Outcome::Error(error) => Outcome::Error { route, error },
-        rpc::Outcome::Unknown(error) => Outcome::Unknown { route, error },
-        rpc::Outcome::Refused(error) => Outcome::Refused { route, error },
+        rpc::Outcome::Error(error) => Outcome::Error {
+            route,
+            error: error.to_string(),
+        },
+        rpc::Outcome::Unknown(error) => Outcome::Unknown {
+            route,
+            error: error.to_string(),
+        },
+        rpc::Outcome::Refused(why) => Outcome::Refused {
+            route,
+            error: why.to_string(),
+        },
         rpc::Outcome::Skipped => Outcome::Skipped { route },
     }
 }
 
-/// Calls `name` with `text` on each of `routes`, as
-/// [`DeviceTree::call_each`] does, and returns each device's outcome in the
-/// order of `routes`. A route that does not parse refuses the call, and
-/// every other route is skipped.
+/// Calls `name` with `text`, or with no argument for none, on each of
+/// `routes`, as [`DeviceTree::call_each`] does, and returns each device's
+/// outcome in the order of `routes`. A route that does not parse refuses
+/// the call, and every other route is skipped.
 pub(crate) async fn call(
     tree: &DeviceTree,
     name: &str,
-    text: &str,
+    text: Option<&str>,
     routes: &[String],
 ) -> CallReply {
     let parsed: Vec<Result<DeviceRoute, String>> = routes
@@ -503,23 +508,32 @@ pub(crate) async fn call(
     CallReply { sent, results }
 }
 
+/// The device at `route` and its RPC table as the core holds it, waiting
+/// for the table as a call does, or the status and the words of why there
+/// is none.
+pub(crate) async fn table(
+    tree: &DeviceTree,
+    route: &str,
+) -> Result<(DeviceRoute, Arc<RpcRegistry>), (StatusCode, String)> {
+    let parsed = (route.parse::<DeviceRoute>())
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("{route}: {error}")))?;
+    let device = (tree.device(parsed))
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("{route}: {error}")))?;
+    let table = (device.rpc_registry_async().await)
+        .map_err(|why| (StatusCode::SERVICE_UNAVAILABLE, why.to_string()))?;
+    Ok((parsed, table))
+}
+
 /// Reads each of `names` from the device at `route` at once, for the entries
-/// no announcement keeps current. A name the device cannot read is left out.
+/// no announcement keeps current, by the table the core holds of it, waiting
+/// for it as a call does. A name the device cannot read is left out.
 pub(crate) async fn read(
     tree: &DeviceTree,
-    devices: &Devices,
     route: &str,
     names: &[String],
 ) -> Result<ReadReply, Refusal> {
-    let parsed = route
-        .parse::<DeviceRoute>()
-        .map_err(|error| Refusal::new(StatusCode::BAD_REQUEST, format!("{route}: {error}")))?;
-    let table = devices.table(parsed).ok_or_else(|| {
-        Refusal::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "its RPC table has not loaded",
-        )
-    })?;
+    let (parsed, table) =
+        (table(tree, route).await).map_err(|(status, why)| Refusal::new(status, why))?;
     let tree = tree.with_timeout(CALL_TIMEOUT);
     let pending: Vec<_> = names
         .iter()
@@ -555,10 +569,17 @@ mod tests {
         let none = serde_json::to_value(outcome("/", rpc::Outcome::Ok(None))).unwrap();
         assert_eq!(none["value"], serde_json::Value::Null);
         assert_eq!(
-            outcome("/0", rpc::Outcome::Unknown("timed out".into())),
+            outcome("/0", rpc::Outcome::Unknown(rpc::CallError::Timeout)),
             Outcome::Unknown {
                 route: "/0".into(),
-                error: "timed out".into()
+                error: "timed out waiting for the RPC reply".into()
+            }
+        );
+        assert_eq!(
+            outcome("/0", rpc::Outcome::Refused(rpc::Refusal::NoSuchRpc)),
+            Outcome::Refused {
+                route: "/0".into(),
+                error: "it has no such RPC".into()
             }
         );
         assert_eq!(
@@ -653,7 +674,13 @@ mod tests {
         let devices = Devices::new(Feed::new());
         let root = DeviceRoute::root();
         devices.publish_routes(&[root], None);
+        assert!(
+            !devices.lists_capture(root, "fid.capture"),
+            "nothing is listed yet"
+        );
         devices.publish_captures(root, 2, listed(&["fid.capture", "phase.capture"]));
+        assert!(devices.lists_capture(root, "fid.capture"));
+        assert!(!devices.lists_capture(root, "fid.capture.rate"));
         for rpc in ["phase.capture", "fid.capture"] {
             devices.publish(root, Kind::Capture(rpc.into()), capture_state("/", rpc));
         }
@@ -681,6 +708,10 @@ mod tests {
             panic!("a state is text")
         };
         assert!(last.contains("phase.capture"), "{last}");
+        assert!(
+            !devices.lists_capture(root, "fid.capture"),
+            "the newest list has it not"
+        );
         assert_eq!(
             types(&devices.snapshot()),
             ["routes ", "device /", "captures /", "capture /"]

@@ -49,7 +49,7 @@ pub use crate::proto::rpc::{RpcAccess, RpcMeta, RpcMetaFlags, RpcStringLen, RpcV
 pub use crate::tio::rpc::{RpcArgs, RpcDecodeError, RpcReply, RpcReplyFixedSize};
 pub use error::{CallError, RpcErrorPayload};
 pub(crate) use outcome::plan;
-pub use outcome::Outcome;
+pub use outcome::{Outcome, Refusal};
 pub use registry::{RpcDescriptor, RpcRegistry, RpcRegistryError};
 pub(crate) use reply::Pipeline;
 pub use reply::{pipelined, PendingReply, ReplyFuture};

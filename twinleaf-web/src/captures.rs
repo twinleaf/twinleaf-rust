@@ -285,8 +285,8 @@ impl Captures {
     }
 
     /// Takes what page `page` asks of the capture `rpc` of the device at
-    /// `route`, whose captures go to `outbox`. An ask of what the device's
-    /// table does not list as a capture is dropped.
+    /// `route`, whose captures go to `outbox`. An ask of what the hub does
+    /// not list among the device's captures is dropped.
     pub(crate) fn ask(
         self: &Arc<Self>,
         page: u64,
@@ -335,12 +335,11 @@ impl Captures {
         }
     }
 
-    /// The capture `rpc` of the device at `route`, when its table lists it.
+    /// The capture `rpc` of the device at `route`, when the hub lists it
+    /// among the device's captures.
     fn listed(&self, route: &str, rpc: &str) -> Option<Key> {
         let route = route.parse::<DeviceRoute>().ok()?;
-        let table = self.devices.table(route)?;
-        let desc = table.find(rpc).filter(|desc| is_capture(desc))?;
-        Some((route, desc.full_name.clone()))
+        (self.devices.lists_capture(route, rpc)).then(|| (route, rpc.to_string()))
     }
 
     /// Tells every page that the capture `key` stands as `state`, unless

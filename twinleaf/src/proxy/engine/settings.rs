@@ -230,7 +230,7 @@ impl SettingsCache {
 
 /// Decodes the reply to a read of `settings.version`.
 fn version(reply: Result<Vec<u8>, CallError>) -> Result<u32, CallError> {
-    u32::decode_reply(&reply?).map_err(CallError::InvalidReply)
+    u32::decode_reply(&reply?).map_err(|error| CallError::InvalidReply(error.into()))
 }
 
 /// Whether sequence number `seq` comes after `applied`, across a wrap.

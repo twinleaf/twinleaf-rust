@@ -201,7 +201,7 @@ fn optional(reply: Result<Vec<u8>, CallError>) -> Result<Option<u32>, RpcRegistr
 
 fn decode<T: RpcReply>(reply: Vec<u8>) -> Result<T, RpcRegistryError> {
     T::decode_reply(&reply)
-        .map_err(|error| RpcRegistryError::DeviceRpcError(CallError::InvalidReply(error)))
+        .map_err(|error| RpcRegistryError::DeviceRpcError(CallError::InvalidReply(error.into())))
 }
 
 #[cfg(test)]

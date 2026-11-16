@@ -1,11 +1,11 @@
 //! The app's API over a proxy on this machine.
 
 use crate::device::Connection;
-use crate::proto::DeviceRoute;
+use crate::proto::{DeviceRoute, RouteError};
 use crate::proxy::tests::fixtures::options;
 use crate::proxy::{host, HostOptions, Proxy};
 use crate::rt;
-use crate::session::rpc::{Outcome, RpcValue};
+use crate::session::rpc::{Outcome, Refusal, RpcValue};
 use crate::session::{Layout, Mount, ProxyAddress, Session};
 use crate::tio::tests::device::FakeDevice;
 use crate::tio::tests::WAIT;
@@ -155,16 +155,58 @@ async fn a_call_each_device_takes_reaches_every_device() {
     let tree = connection.tree(DeviceRoute::root());
     let order = [prefixes[1], prefixes[0]];
 
-    let results = tree.call_each("test.amplitude", "3", &order).await;
+    let results = tree.call_each("test.amplitude", Some("3"), &order).await;
 
-    let answered = Some(RpcValue::U64(1));
-    assert_eq!(
-        results,
-        [
-            (order[0], Outcome::Ok(answered.clone())),
-            (order[1], Outcome::Ok(answered))
-        ]
-    );
+    let routes: Vec<DeviceRoute> = results.iter().map(|(route, _)| *route).collect();
+    assert_eq!(routes, order);
+    for (_, outcome) in &results {
+        assert!(
+            matches!(outcome, Outcome::Ok(Some(RpcValue::U64(1)))),
+            "{results:?}"
+        );
+    }
+    for (device, before) in devices.iter().zip(before) {
+        assert_eq!(device.calls("test.amplitude"), before + 1);
+    }
+    drop(connection);
+    drop(proxy);
+}
+
+/// The awaited table of a device is the one the blocking read returns.
+#[tokio::test]
+async fn a_tables_awaited_read_is_the_blocking_reads_table() {
+    let (_devices, proxy, connection, prefixes) = two_devices();
+    let device = connection.device(prefixes[0]);
+    let awaited = device.rpc_registry_async().await.unwrap();
+    assert!(awaited.find("test.amplitude").is_some());
+    let blocking = tokio::task::spawn_blocking(move || device.rpc_registry().unwrap());
+    let names = |table: &crate::session::rpc::RpcRegistry| -> Vec<String> {
+        table.iter().map(|desc| desc.full_name.clone()).collect()
+    };
+    assert_eq!(names(&awaited), names(&blocking.await.unwrap()));
+    drop(connection);
+    drop(proxy);
+}
+
+/// A call with no argument reads each device at once, and decodes each
+/// reply by that device's table.
+#[tokio::test]
+async fn a_call_with_no_argument_reads_every_device() {
+    let (devices, proxy, connection, prefixes) = two_devices();
+    settle(&connection, &prefixes);
+    let before: Vec<usize> = devices.iter().map(|d| d.calls("test.amplitude")).collect();
+    let tree = connection.tree(DeviceRoute::root());
+
+    let results = tree.call_each("test.amplitude", None, &prefixes).await;
+
+    let routes: Vec<DeviceRoute> = results.iter().map(|(route, _)| *route).collect();
+    assert_eq!(routes, prefixes);
+    for (_, outcome) in &results {
+        assert!(
+            matches!(outcome, Outcome::Ok(Some(RpcValue::U64(1)))),
+            "{results:?}"
+        );
+    }
     for (device, before) in devices.iter().zip(before) {
         assert_eq!(device.calls("test.amplitude"), before + 1);
     }
@@ -179,13 +221,16 @@ async fn a_client_that_holds_no_table_gets_its_call_made() {
     let (_devices, proxy, connection, prefixes) = two_devices();
     let tree = connection.tree(DeviceRoute::root());
 
-    let results = tree.call_each("test.amplitude", "3", &prefixes).await;
+    let results = tree.call_each("test.amplitude", Some("3"), &prefixes).await;
 
-    let answered = Outcome::Ok(Some(RpcValue::U64(1)));
-    assert_eq!(
-        results,
-        [(prefixes[0], answered.clone()), (prefixes[1], answered)]
-    );
+    let routes: Vec<DeviceRoute> = results.iter().map(|(route, _)| *route).collect();
+    assert_eq!(routes, prefixes);
+    for (_, outcome) in &results {
+        assert!(
+            matches!(outcome, Outcome::Ok(Some(RpcValue::U64(1)))),
+            "{results:?}"
+        );
+    }
     drop(connection);
     drop(proxy);
 }
@@ -200,24 +245,104 @@ async fn a_device_that_refuses_a_call_stops_it_for_every_device() {
     let tree = connection.tree(prefixes[0]);
 
     let results = tree
-        .call_each("test.amplitude", "3", &[prefixes[0], prefixes[1]])
+        .call_each("test.amplitude", Some("3"), &[prefixes[0], prefixes[1]])
         .await;
-    assert_eq!(results[0], (prefixes[0], Outcome::Skipped));
     assert!(
-        matches!(&results[1], (route, Outcome::Refused(why)) if *route == prefixes[1] && why.contains("outside")),
+        matches!(&results[0], (route, Outcome::Skipped) if *route == prefixes[0]),
+        "{results:?}"
+    );
+    assert!(
+        matches!(
+            &results[1],
+            (route, Outcome::Refused(Refusal::OutsideView(RouteError::OutsideSubtree)))
+                if *route == prefixes[1]
+        ),
         "{results:?}"
     );
 
     let first = [prefixes[0]];
-    let refused = tree.call_each("test.amplitude", "300", &first).await;
-    assert!(matches!(&refused[0].1, Outcome::Refused(_)), "{refused:?}");
-    let unnamed = tree.call_each("test.nothing", "3", &first).await;
-    let no_such = Outcome::Refused("it has no such RPC".into());
-    assert_eq!(unnamed, [(prefixes[0], no_such)]);
+    let refused = tree.call_each("test.amplitude", Some("300"), &first).await;
+    assert!(
+        matches!(&refused[0].1, Outcome::Refused(Refusal::DoesNotFit(_))),
+        "{refused:?}"
+    );
+    let unnamed = tree.call_each("test.nothing", Some("3"), &first).await;
+    assert!(
+        matches!(&unnamed[..], [(route, Outcome::Refused(Refusal::NoSuchRpc))] if *route == prefixes[0]),
+        "{unnamed:?}"
+    );
 
     for (device, before) in devices.iter().zip(before) {
         assert_eq!(device.calls("test.amplitude"), before, "nothing is sent");
     }
+    drop(connection);
+    drop(proxy);
+}
+
+/// A route named twice in one call refuses the call for every device. Each
+/// place it is named says so, the others are skipped, and nothing is sent.
+#[tokio::test]
+async fn a_route_named_twice_stops_the_call_for_every_device() {
+    let (devices, proxy, connection, prefixes) = two_devices();
+    settle(&connection, &prefixes);
+    let before: Vec<usize> = devices.iter().map(|d| d.calls("test.amplitude")).collect();
+    let tree = connection.tree(DeviceRoute::root());
+    let routes = [prefixes[0], prefixes[1], prefixes[0]];
+
+    let results = tree.call_each("test.amplitude", Some("3"), &routes).await;
+
+    assert!(
+        matches!(
+            &results[..],
+            [
+                (_, Outcome::Refused(Refusal::NamedTwice)),
+                (_, Outcome::Skipped),
+                (_, Outcome::Refused(Refusal::NamedTwice)),
+            ]
+        ),
+        "{results:?}"
+    );
+    let said: Vec<DeviceRoute> = results.iter().map(|(route, _)| *route).collect();
+    assert_eq!(said, routes);
+    for (device, before) in devices.iter().zip(before) {
+        assert_eq!(device.calls("test.amplitude"), before, "nothing is sent");
+    }
+    drop(connection);
+    drop(proxy);
+}
+
+/// A device lost once its table is known is sent the call all the same.
+/// Its outcome is an error or unknown, and every other device takes it.
+#[tokio::test]
+async fn a_device_lost_after_its_table_loaded_fails_alone() {
+    let (mut devices, proxy, connection, prefixes) = two_devices();
+    settle(&connection, &prefixes);
+    let before = devices[0].calls("test.amplitude");
+    let lost = connection.device(prefixes[1]);
+    let presence = lost.presence_updates();
+    drop(devices.pop());
+    let start = std::time::Instant::now();
+    loop {
+        let update = presence.recv_async().await.unwrap();
+        if matches!(update, crate::session::Presence::Lost { .. }) {
+            break;
+        }
+        assert!(start.elapsed() < WAIT, "the device was never lost");
+    }
+    let tree =
+        (connection.tree(DeviceRoute::root())).with_timeout(std::time::Duration::from_millis(500));
+
+    let results = tree.call_each("test.amplitude", Some("3"), &prefixes).await;
+
+    assert!(
+        matches!(&results[0], (route, Outcome::Ok(_)) if *route == prefixes[0]),
+        "{results:?}"
+    );
+    assert!(
+        matches!(&results[1], (route, Outcome::Error(_) | Outcome::Unknown(_)) if *route == prefixes[1]),
+        "{results:?}"
+    );
+    assert_eq!(devices[0].calls("test.amplitude"), before + 1);
     drop(connection);
     drop(proxy);
 }

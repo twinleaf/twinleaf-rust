@@ -358,7 +358,7 @@ fn scalar<T: RpcReply>(mut bytes: &[u8]) -> Result<T, RpcDecodeError> {
 }
 
 /// Why a value could not be encoded as the type an RPC takes.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum RpcValueEncodeError {
     /// The value's kind is not the type's.
@@ -417,7 +417,7 @@ pub enum RpcValueEncodeError {
 }
 
 /// Why reply bytes could not be read as the type an RPC returns.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum RpcValueDecodeError {
     /// The bytes are fewer than the type needs.
