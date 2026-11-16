@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::{Boundary, BoundaryClass, Change, SampleBatch, StreamKey, StreamMetadataSnapshot},
+    data::{Boundary, BoundaryClass, Change, Lost, SampleBatch, StreamKey, StreamMetadataSnapshot},
     device::{MetadataState, Presence, RecvError},
     Connection, DeviceRoute, SampleNumber, StreamId,
 };
@@ -159,7 +159,7 @@ struct StreamStats {
     jitter_window: Option<TimeWindow>,
 
     last_n: Option<SampleNumber>,
-    samples_dropped: u64,
+    lost: Lost,
 
     rate_slope: OnlineSlope,
     received_count: u64,
@@ -243,7 +243,7 @@ impl StreamStats {
     fn reset_all(&mut self) {
         self.reset_timing();
         self.reset_rate();
-        self.samples_dropped = 0;
+        self.lost = Lost::default();
     }
 
     // floor of stale_dur
@@ -548,7 +548,7 @@ impl HealthState {
                 boundary_severity(BoundaryClass::DataLoss),
             );
             if let Some(st) = self.stats.get_mut(&key) {
-                st.samples_dropped += loss.samples;
+                st.lost.add(loss);
             }
         }
     }
@@ -835,7 +835,7 @@ impl DisplayRow {
             drift_s: st.drift_s,
             ppm: st.ppm,
             jitter_ms: st.jitter_ms,
-            samples_dropped: st.samples_dropped,
+            samples_dropped: st.lost.total(),
             last_n: st.last_n,
             last_data: st.last_data,
             elapsed_time,

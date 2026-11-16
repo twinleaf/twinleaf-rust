@@ -167,7 +167,7 @@ pub use decode::parser::{PacketOutcome, PacketParser};
 pub use decode::state::{DataError, StreamDataError};
 pub use graph::pipeline::{ColumnOp, ColumnProcessor, Continuity};
 pub use logfile::reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
-pub use model::continuity::{Boundary, BoundaryClass, Change, Generations, Loss};
+pub use model::continuity::{Boundary, BoundaryClass, Change, Generations, Loss, Lost};
 pub use model::filter::ColumnFilter;
 #[cfg(feature = "host")]
 pub(crate) use model::sample::RowSource;

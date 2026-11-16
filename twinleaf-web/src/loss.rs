@@ -2,9 +2,9 @@
 //! the hub started. Every page is sent the counts as they grow.
 //!
 //! A sample can be lost in four places before the hub's history holds it,
-//! and [`Lost`] counts the rows of a stream lost in each. Each batch says
-//! what was lost before it, in its [`Loss`](twinleaf::data::Loss), which is
-//! where the counts come from.
+//! and [`Lost`] counts the rows of a stream lost in each. The hub's buffer
+//! sums them by stream as each batch says what was lost before it, and the
+//! counts sent are the buffer's.
 //!
 //! - `skipped`: the device sent none, or its link lost them while it stayed
 //!   up. The sample numbers jump.
@@ -35,15 +35,18 @@
 use crate::feed::Feed;
 use crate::logbook::{self, Logbook};
 use crate::protocol::{Frame, Level, Link, LossLine, Lost, Message, Why};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use twinleaf::data::{Buffer, StreamKey};
 use twinleaf::device::{LinkState, LostCause};
-use twinleaf::{DeviceRoute, SampleBatch};
+use twinleaf::DeviceRoute;
 
 /// The counts of every device, and the feed they go out on.
 pub(crate) struct Losses {
     devices: Mutex<BTreeMap<DeviceRoute, Device>>,
+    /// The name of each stream that lost rows, as its run last said it.
+    names: Mutex<HashMap<StreamKey, String>>,
     feed: Arc<Feed>,
     /// The log, which each loss is a line of.
     log: Arc<Logbook>,
@@ -60,8 +63,6 @@ struct Device {
     /// up, and when the link dropped, while it is down.
     up: bool,
     down: Option<Instant>,
-    /// The rows lost of each stream, by the stream's name.
-    streams: BTreeMap<String, Lost>,
     /// What the last message said, or nothing lost before the first.
     sent: (Link, BTreeMap<String, Lost>),
 }
@@ -84,27 +85,10 @@ impl Losses {
     pub(crate) fn new(feed: Arc<Feed>, log: Arc<Logbook>) -> Arc<Losses> {
         Arc::new(Losses {
             devices: Mutex::new(BTreeMap::new()),
+            names: Mutex::new(HashMap::new()),
             feed,
             log,
         })
-    }
-
-    /// Counts the rows `batch` says were lost before it, by where.
-    pub(crate) fn count(&self, batch: &SampleBatch) {
-        let Some(loss) = batch.boundary().and_then(|b| b.loss.as_ref()) else {
-            return;
-        };
-        let mut devices = self.devices.lock().unwrap();
-        let device = devices.entry(batch.route()).or_default();
-        let stream = batch.schema().stream().name();
-        if !device.streams.contains_key(stream) {
-            device.streams.insert(stream.to_string(), Lost::default());
-        }
-        let lost = device.streams.get_mut(stream).expect("the stream");
-        lost.skipped += loss.skipped_samples();
-        lost.link += loss.link_samples;
-        lost.proxy += loss.proxy_samples;
-        lost.hub += loss.dropped_samples;
     }
 
     /// Counts a drop of the link to the device at `route`, which went down
@@ -156,12 +140,18 @@ impl Losses {
 
     /// Sends the counts of each device whose counts changed since they were
     /// last sent, with a line of the log for the rows each stream lost
-    /// meanwhile in each place, and logs how many rows the hub dropped.
-    pub(crate) fn send_changed(&self) {
+    /// meanwhile in each place, and logs how many rows the hub dropped. The
+    /// rows each stream lost are those `buffer`, the hub's, counted.
+    pub(crate) fn send_changed(&self, buffer: &Buffer) {
         let now = Instant::now();
+        let mut streams = streams(buffer, &mut self.names.lock().unwrap());
+        let mut devices = self.devices.lock().unwrap();
+        for route in streams.keys() {
+            devices.entry(*route).or_default();
+        }
         let mut dropped = 0;
-        for (route, device) in self.devices.lock().unwrap().iter_mut() {
-            let counts = (device.link(now), device.streams.clone());
+        for (route, device) in devices.iter_mut() {
+            let counts = (device.link(now), streams.remove(route).unwrap_or_default());
             if device.sent == counts {
                 continue;
             }
@@ -242,16 +232,41 @@ impl Losses {
         let devices = self.devices.lock().unwrap();
         devices.get(&route).map_or(0, |device| device.drops)
     }
+}
 
-    /// The rows counted lost of stream `stream` of the device at `route`.
-    #[cfg(test)]
-    pub(crate) fn of(&self, route: DeviceRoute, stream: &str) -> Lost {
-        let devices = self.devices.lock().unwrap();
-        let device = devices.get(&route);
-        device
-            .and_then(|device| device.streams.get(stream).copied())
-            .unwrap_or_default()
+/// The rows each stream `buffer` counted lost, by the stream's device and
+/// name, for the streams that lost any, those of one name summed. `names`
+/// keeps the name each stream's run last said, so a stream that holds no
+/// run now goes on under the name it had. One that never held a run has no
+/// name yet, and its rows are told once it has one, as the counts only grow.
+fn streams(
+    buffer: &Buffer,
+    names: &mut HashMap<StreamKey, String>,
+) -> BTreeMap<DeviceRoute, BTreeMap<String, Lost>> {
+    let mut streams: BTreeMap<DeviceRoute, BTreeMap<String, Lost>> = BTreeMap::new();
+    for (key, lost) in buffer.losses() {
+        if let Some(run) = buffer.run(key) {
+            let name = run.metadata().schema().stream().name();
+            if names.get(key).is_none_or(|known| known != name) {
+                names.insert(*key, name.to_string());
+            }
+        }
+        let Some(name) = names.get(key) else {
+            continue;
+        };
+        let by_name = streams.entry(key.route).or_default();
+        *by_name.entry(name.clone()).or_default() += Lost::from(lost);
     }
+    streams
+}
+
+/// The rows `buffer` counted lost of stream `stream` of the device at
+/// `route`.
+#[cfg(test)]
+pub(crate) fn of(buffer: &Buffer, route: DeviceRoute, stream: &str) -> Lost {
+    let streams = streams(buffer, &mut HashMap::new());
+    let lost = streams.get(&route).and_then(|streams| streams.get(stream));
+    lost.copied().unwrap_or_default()
 }
 
 /// Why the proxy lost a device, as the page is told, or `None` for a cause
@@ -308,20 +323,20 @@ mod tests {
         let mut rx = feed.subscribe().1;
         let losses = losses(feed);
         let root = DeviceRoute::root();
-        losses.send_changed();
+        losses.send_changed(&Buffer::new(0));
         assert!(heard(&mut rx).is_empty(), "nothing was lost");
 
         let since = Instant::now() - Duration::from_secs(3);
         losses.link_down(root, since, None);
-        losses.send_changed();
+        losses.send_changed(&Buffer::new(0));
         assert!(heard(&mut rx).is_empty(), "a link never up did not drop");
         losses.link_up(root, None);
         losses.link_down(root, since, None);
         losses.link_down(root, Instant::now(), None);
         losses.link_up(root, None);
         losses.link_up(root, None);
-        losses.send_changed();
-        losses.send_changed();
+        losses.send_changed(&Buffer::new(0));
+        losses.send_changed(&Buffer::new(0));
         let sent = heard(&mut rx);
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0]["type"], "loss");
@@ -403,9 +418,9 @@ mod tests {
             Instant::now() - Duration::from_secs(10),
             None,
         );
-        losses.send_changed();
+        losses.send_changed(&Buffer::new(0));
         std::thread::sleep(Duration::from_millis(250));
-        losses.send_changed();
+        losses.send_changed(&Buffer::new(0));
         let seconds: Vec<f64> = heard(&mut rx)
             .iter()
             .map(|sent| sent["link"]["seconds"].as_f64().unwrap())

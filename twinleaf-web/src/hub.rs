@@ -33,9 +33,9 @@
 //!
 //! Each batch says what was lost before it and where, the rows its device
 //! skipped, those lost with its link down, those the proxy dropped for the
-//! hub's connection and those the connection's queue dropped. The hub
-//! counts them by device and stream in its [`Losses`], with each drop of a
-//! device's link, and sends every page the counts each second they grew.
+//! hub's connection and those the connection's queue dropped. The buffer
+//! counts them by stream. The hub's [`Losses`] counts each drop of a
+//! device's link, and sends every page both counts each second they grew.
 //!
 //! The hub keeps the log's lines in its [`Logbook`], those its devices
 //! send as log packets and its own, and notes there the time of the newest
@@ -159,8 +159,9 @@ pub(crate) struct Hub {
     /// The number of the newest change of decimation, so the replay of an
     /// older one is dropped.
     decimation: u64,
-    /// What was lost of each device and stream before the hub held it, which
-    /// the watchers of the devices add each drop of a link to.
+    /// What was lost of each device before the hub held it, which the
+    /// watchers of the devices add each drop of a link to, and which sends
+    /// the rows the buffer counted lost.
     losses: Arc<Losses>,
     /// The log's lines, which the hub tells the time of each device's
     /// newest sample.
@@ -641,7 +642,7 @@ fn run(mut hub: Hub, samples: &Receiver<SampleBatch>, mail: &flume::Receiver<Job
         if last_memory.elapsed() >= MEMORY_EVERY {
             last_memory = Instant::now();
             timed("memory", || hub.send_memory());
-            hub.losses.send_changed();
+            hub.losses.send_changed(&hub.buffer);
         }
     }
 }
@@ -708,12 +709,13 @@ impl Hub {
     }
 
     fn ingest(&mut self, batch: &SampleBatch) {
-        self.losses.count(batch);
+        // An empty batch adds no rows, and the buffer counts what it says
+        // was lost.
+        self.buffer.process_batch(batch);
         let Some(newest) = batch.timestamps().last() else {
             return;
         };
         self.log.heard(batch.route(), *newest);
-        self.buffer.process_batch(batch);
         // As the buffer drops what the held history keeps, the held history
         // costs more, and gives up its oldest to stay within the room left.
         self.trim_held();
@@ -1877,7 +1879,7 @@ mod tests {
             });
             let rows = run.retained_rows();
             let span = run.last_timestamp()? - run.first_timestamp()?;
-            let counted = hub.losses.of(stream.route, "sine").hub;
+            let counted = crate::loss::of(&hub.buffer, stream.route, "sine").hub;
             Some((rows.end - rows.start, span, lost, dropped, counted))
         };
         // The stream flows before the hub is held up.
@@ -2057,6 +2059,82 @@ mod tests {
         assert!(next.first().unwrap().0 > points(&sent, 0).last().unwrap().0);
     }
 
+    /// An empty batch adds no rows, and the rows it says were lost count.
+    #[test]
+    fn the_rows_an_empty_batch_says_were_lost_count() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        for batch in samples(&mut parser, 0, 10) {
+            hub.ingest(&batch);
+        }
+        let after = samples(&mut parser, 15, 10).remove(0);
+        let loss = after.boundary().and_then(|b| b.loss.as_ref());
+        assert_eq!(loss.map(|loss| loss.samples), Some(5));
+        hub.ingest(&after.slice(0..0));
+        let lost = crate::loss::of(&hub.buffer, DeviceRoute::root(), "field");
+        assert_eq!(lost.skipped, 5);
+    }
+
+    /// Two streams of a device that have one name are one stream to the
+    /// pages, and the rows each lost add up.
+    #[test]
+    fn the_rows_two_streams_of_one_name_lost_add_up() {
+        let mut hub = Hub::new();
+        let mut parser = PacketParser::new(false);
+        let route = DeviceRoute::root();
+        let device = data::Metadata::Device(data::Device {
+            session: SessionId::new(1),
+            n_streams: 2,
+            name: "sim",
+            serial: "S1",
+            firmware: "1",
+            protocol: 0,
+        });
+        let mut records = vec![device];
+        for id in [1, 2] {
+            let stream_id = StreamId::new(id);
+            records.push(data::Metadata::Stream(data::Stream {
+                stream_id,
+                n_columns: 1,
+                n_segments: 1,
+                sample_size: 4,
+                buf_samples: 128,
+                name: "field",
+            }));
+            let data::Metadata::Segment(segment) = segment(0, 100) else {
+                unreachable!()
+            };
+            records.push(data::Metadata::Segment(data::Segment {
+                stream_id,
+                ..segment
+            }));
+            records.push(data::Metadata::Column(data::Column {
+                stream_id,
+                index: ColumnId::new(0),
+                data_type: DataType::F32,
+                name: "x",
+                units: "nT",
+                description: "",
+            }));
+        }
+        for record in records {
+            let packet = Packet::metadata(record, data::MetadataFlags::UPDATE, route).unwrap();
+            parser.push_packet(&packet).unwrap();
+        }
+        // Stream 1 loses 5 rows and stream 2 loses 10.
+        for (id, first) in [(1, 0), (2, 0), (1, 15), (2, 20)] {
+            let data: Vec<u8> = (0..10u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+            let packet = Packet::samples(id, 0, first, &data, route).unwrap();
+            parser.push_packet(&packet).unwrap();
+        }
+        for batch in std::iter::from_fn(|| parser.pop_batch()) {
+            hub.ingest(&batch);
+        }
+        assert_eq!(hub.buffer.stream_keys().count(), 2);
+        let lost = crate::loss::of(&hub.buffer, route, "field");
+        assert_eq!(lost.skipped, 15);
+    }
+
     /// The hub counts the rows each batch says were lost before it by where
     /// they went: skipped with nothing said, the proxy's after its count of
     /// what it dropped, the hub's after its connection dropped a packet, and
@@ -2073,7 +2151,7 @@ mod tests {
             for batch in samples(parser, first, 10) {
                 hub.ingest(&batch);
             }
-            hub.losses.of(root, "field")
+            crate::loss::of(&hub.buffer, root, "field")
         };
         let lost = |skipped, link, proxy, hub| Lost {
             skipped,
@@ -2096,7 +2174,7 @@ mod tests {
         assert_eq!(feed(&mut parser, 73), lost(5, 3, 7, 8));
 
         let told = |hub: &Hub, rx: &mut broadcast::Receiver<Arc<Frame>>| {
-            hub.losses.send_changed();
+            hub.losses.send_changed(&hub.buffer);
             let sent: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok())
                 .filter_map(|frame| match &*frame {
                     Frame::Text(text) => serde_json::from_str(text).ok(),
@@ -2141,7 +2219,7 @@ mod tests {
             .unwrap();
         feed(&mut hub, &mut parser, 32);
         assert!(logbook::tests::heard(&mut rx).is_empty());
-        hub.losses.send_changed();
+        hub.losses.send_changed(&hub.buffer);
         let lines = logbook::tests::heard(&mut rx);
         let lost: Vec<serde_json::Value> = lines.iter().map(|line| line["loss"].clone()).collect();
         assert_eq!(
@@ -2157,7 +2235,7 @@ mod tests {
             assert_eq!(line["source"], "proxy");
             assert_eq!(line["route"], "/");
         }
-        hub.losses.send_changed();
+        hub.losses.send_changed(&hub.buffer);
         assert!(logbook::tests::heard(&mut rx).is_empty(), "nothing more");
     }
 

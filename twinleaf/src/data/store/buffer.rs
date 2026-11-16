@@ -23,8 +23,11 @@
 //! [`Buffer::frozen`] copies a buffer as it is, to read while the buffer goes
 //! on. The copy shares the chunks, which never change, so only the rows still
 //! accumulating are copied.
+//!
+//! A buffer counts the rows each stream lost since the buffer was made, as a
+//! [`Lost`], which no eviction or new run resets.
 
-use crate::data::model::continuity::{Boundary, Generations};
+use crate::data::model::continuity::{Boundary, Generations, Lost};
 use crate::data::model::sample::SampleBatch;
 use crate::data::model::schema::{StreamKey, StreamMetadataSnapshot};
 use crate::data::store::coalesce::BatchCoalescer;
@@ -96,6 +99,9 @@ pub struct Buffer {
     /// of the newest.
     arrivals: u64,
     runs: HashMap<StreamKey, Run>,
+    /// The rows each stream lost since the buffer was made, for the streams
+    /// that lost any.
+    lost: HashMap<StreamKey, Lost>,
 }
 
 impl Buffer {
@@ -107,6 +113,7 @@ impl Buffer {
             max_age: None,
             arrivals: 0,
             runs: HashMap::new(),
+            lost: HashMap::new(),
         }
     }
 
@@ -176,9 +183,13 @@ impl Buffer {
     /// Appends `batch`'s rows to its stream's run. A batch of the run's
     /// latest per-stream generation joins the run. So does a batch of a newer
     /// one whose boundary is monotonic and whose schema is the run's, and the
-    /// run records that boundary. Any other batch starts a new run. Empty
-    /// batches are ignored.
+    /// run records that boundary. Any other batch starts a new run. The rows
+    /// the batch's boundary says were lost add to the stream's [`Lost`], and
+    /// those of an empty batch do too. An empty batch adds no rows.
     pub fn process_batch(&mut self, batch: &SampleBatch) {
+        if let Some(loss) = batch.boundary().and_then(|b| b.loss.as_ref()) {
+            self.lost.entry(batch.stream_key()).or_default().add(loss);
+        }
         if batch.is_empty() {
             return;
         }
@@ -210,6 +221,7 @@ impl Buffer {
                 .iter()
                 .map(|(key, run)| (*key, run.frozen()))
                 .collect(),
+            lost: self.lost.clone(),
         }
     }
 
@@ -265,6 +277,18 @@ impl Buffer {
     /// order.
     pub fn stream_keys(&self) -> impl Iterator<Item = &StreamKey> {
         self.runs.keys()
+    }
+
+    /// Returns the rows the stream lost since the buffer was made, by the
+    /// place they were lost, or no rows for a stream that lost none.
+    pub fn lost(&self, stream_key: &StreamKey) -> Lost {
+        self.lost.get(stream_key).copied().unwrap_or_default()
+    }
+
+    /// Returns every stream that lost rows since the buffer was made, with
+    /// what it lost, whether or not it holds a run, in no particular order.
+    pub fn losses(&self) -> impl Iterator<Item = (&StreamKey, Lost)> {
+        self.lost.iter().map(|(key, lost)| (key, *lost))
     }
 
     /// Returns the stream's newest retained row as a one-row batch, copying at
@@ -974,6 +998,79 @@ mod tests {
             ],
             "each gap at the row after it, with that row's time"
         );
+    }
+
+    /// What a stream lost is counted since the buffer was made. Eviction of
+    /// the rows after a gap, a new run and a frozen copy keep the counts, and
+    /// the copy keeps them as they were when it was made.
+    #[test]
+    fn the_rows_a_stream_lost_outlast_eviction_a_new_run_and_a_frozen_copy() {
+        let mut buffer = Buffer::new(8);
+        let fx = test_fixture(&[DataType::F64]);
+        let other = stream_fixture(2, &[DataType::F64]);
+        assert_eq!(buffer.lost(&fx.stream_key), Lost::default());
+        fx.push_floats(&mut buffer, 1, 0..4);
+        fx.push_floats_after(&mut buffer, 2, 10..14, loss(6));
+        let link = Boundary {
+            change: None,
+            loss: Some(Loss {
+                link_samples: 2,
+                ..loss(2).loss.unwrap()
+            }),
+        };
+        fx.push_floats_after(&mut buffer, 2, 16..18, link);
+        let counted = Lost {
+            skipped: 6,
+            link: 2,
+            ..Lost::default()
+        };
+        assert_eq!(buffer.lost(&fx.stream_key), counted);
+        assert_eq!(buffer.lost(&other.stream_key), Lost::default());
+
+        // The rows around both gaps go, and the counts stay.
+        fx.push_floats(&mut buffer, 2, 18..40);
+        assert_eq!(buffer.run(&fx.stream_key).unwrap().boundaries().len(), 0);
+        assert_eq!(buffer.lost(&fx.stream_key), counted);
+
+        // A new run keeps them, and a frozen copy keeps them as they were.
+        let initial = Boundary {
+            change: Some(Change::Initial),
+            loss: Some(Loss {
+                dropped_samples: 3,
+                ..loss(3).loss.unwrap()
+            }),
+        };
+        fx.push_floats_after(&mut buffer, 3, 0..4, initial);
+        assert_eq!(buffer.run(&fx.stream_key).unwrap().generations().stream, 3);
+        let counted = Lost {
+            dropped: 3,
+            ..counted
+        };
+        assert_eq!(buffer.lost(&fx.stream_key), counted);
+        let frozen = buffer.frozen();
+        fx.push_floats_after(&mut buffer, 4, 9..10, loss(5));
+        assert_eq!(frozen.lost(&fx.stream_key), counted);
+        assert_eq!(buffer.lost(&fx.stream_key).total(), counted.total() + 5);
+    }
+
+    /// Every stream that lost rows is among the losses, with what it lost,
+    /// and so is one that lost rows in an empty batch and holds no run.
+    #[test]
+    fn the_losses_are_every_stream_that_lost_rows_with_a_run_or_none() {
+        let mut buffer = Buffer::new(8);
+        let fx = test_fixture(&[DataType::F64]);
+        let other = stream_fixture(2, &[DataType::F64]);
+        let quiet = stream_fixture(3, &[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..4);
+        fx.push_floats_after(&mut buffer, 2, 10..14, loss(6));
+        other.push_floats_after(&mut buffer, 1, 0..0, loss(4));
+        quiet.push_floats(&mut buffer, 1, 0..4);
+        assert!(buffer.run(&other.stream_key).is_none());
+        let mut losses: Vec<(StreamKey, u64)> = (buffer.losses())
+            .map(|(key, lost)| (*key, lost.total()))
+            .collect();
+        losses.sort_by_key(|(key, _)| key.stream_id);
+        assert_eq!(losses, [(fx.stream_key, 6), (other.stream_key, 4)]);
     }
 
     #[test]

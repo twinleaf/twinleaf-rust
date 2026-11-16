@@ -451,6 +451,29 @@ pub(crate) struct Lost {
     pub(crate) hub: u64,
 }
 
+/// Each place's count of `other` added to its own.
+impl std::ops::AddAssign for Lost {
+    fn add_assign(&mut self, other: Lost) {
+        self.skipped += other.skipped;
+        self.link += other.link;
+        self.proxy += other.proxy;
+        self.hub += other.hub;
+    }
+}
+
+/// The counts of a stream's buffer, where the rows its connection dropped
+/// are the hub's.
+impl From<twinleaf::data::Lost> for Lost {
+    fn from(lost: twinleaf::data::Lost) -> Lost {
+        Lost {
+            skipped: lost.skipped,
+            link: lost.link,
+            proxy: lost.proxy,
+            hub: lost.dropped,
+        }
+    }
+}
+
 /// How often the link to a device dropped, and for how many seconds in all
 /// it was down, up to now while it is.
 #[derive(Serialize, Clone, Copy, Debug, Default, PartialEq)]
