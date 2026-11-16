@@ -479,7 +479,7 @@ async fn export(
             tokio::task::spawn_blocking(move || {
                 let mut out = std::io::BufWriter::with_capacity(EXPORT_CHUNK, Sender(tx));
                 // A page that stops reading ends the export.
-                let _ = crate::export::write_csv(&traces, &mut out);
+                let _ = twinleaf::data::csv::write_merged(&traces, &mut out);
             });
             "text/csv; charset=utf-8"
         }

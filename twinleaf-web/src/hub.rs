@@ -51,7 +51,6 @@
 
 use crate::captures::{Captures, Outbox, Want};
 use crate::devices::Devices;
-use crate::export::ExportTrace;
 use crate::feed::Feed;
 use crate::firmware::{Catalog, Firmware, Wanted};
 use crate::logbook::{self, Logbook};
@@ -64,6 +63,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
+use twinleaf::data::csv::MergedColumn;
 use twinleaf::data::ops::{self, FpcsLevels, Level, Pyramid, Stretch, Welch};
 use twinleaf::data::{Buffer, ColumnKey, ColumnOp, ColumnProcessor, Run, StreamKey};
 use twinleaf::flume::{self, select::SelectError, Selector};
@@ -426,7 +426,7 @@ impl Live {
         ids: Vec<u16>,
         t0: f64,
         t1: f64,
-    ) -> Result<Vec<ExportTrace>, Ended> {
+    ) -> Result<Vec<MergedColumn>, Ended> {
         self.ask("export", move |hub| hub.export(&ids, t0, t1))
             .await
     }
@@ -1194,7 +1194,7 @@ impl Hub {
     /// for paused plots where the buffer no longer reaches, to export. The
     /// batches share the history's chunks, so gathering them copies no rows.
     /// An id of no trace is passed over.
-    fn export(&self, ids: &[u16], t0: f64, t1: f64) -> Vec<ExportTrace> {
+    fn export(&self, ids: &[u16], t0: f64, t1: f64) -> Vec<MergedColumn> {
         ids.iter()
             .filter_map(|&id| {
                 let trace = self.traces.get(id as usize)?;
@@ -1204,7 +1204,7 @@ impl Hub {
                     .into_iter()
                     .flat_map(|span| span.run.rows(span.rows))
                     .collect();
-                Some(ExportTrace {
+                Some(MergedColumn {
                     name: signal_name(&trace.info),
                     units: trace.info.units.clone(),
                     unix: trace.info.epoch == "unix",
@@ -1575,7 +1575,7 @@ mod tests {
         // The id of no trace is passed over.
         assert_eq!(traces.len(), 1);
         let mut out = Vec::new();
-        crate::export::write_csv(&traces, &mut out).unwrap();
+        twinleaf::data::csv::write_merged(&traces, &mut out).unwrap();
         let csv = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = csv.lines().collect();
         assert!(lines[0].starts_with("time (Unix s),"));

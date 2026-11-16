@@ -23,6 +23,7 @@
 //! - [`Buffer`] retains a bounded tail of each stream.
 //! - [`ColumnProcessor`] applies a [`ColumnOp`] incrementally.
 //! - [`LogFile`] memory-maps and indexes recorded logs.
+//! - [`csv`] writes batches as CSV tables.
 #![cfg_attr(feature = "hdf5", doc = "- [`export`] writes HDF5 (`hdf5` feature).")]
 #![cfg_attr(not(feature = "hdf5"), doc = "- The `hdf5` feature adds HDF5 export.")]
 #![cfg_attr(
@@ -149,6 +150,8 @@ mod graph;
 mod logfile;
 mod model;
 mod store;
+
+pub use logfile::csv;
 
 #[cfg(feature = "hdf5")]
 #[cfg_attr(docsrs, doc(cfg(feature = "hdf5")))]

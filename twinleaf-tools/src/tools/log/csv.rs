@@ -1,13 +1,13 @@
 //! The `tio log csv` subcommand, which writes one stream of a log to CSV
-//! with [`log_csv`].
+//! with [`log_csv`]. The table is the core's
+//! [`StreamTable`](twinleaf::data::csv::StreamTable).
 
 use super::{missing_metadata_error, read::LogReader, LOG_BATCH_ROWS};
 use crate::{parse_csv_target, LogCsvCli, StreamSel};
-use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::Arc;
-use twinleaf::data::{PacketParser, SampleBatch, StreamSchema};
+use std::io::BufWriter;
+use twinleaf::data::csv::{StreamTable, WriteError};
+use twinleaf::data::{PacketParser, SampleBatch};
 use twinleaf::DeviceRoute;
 
 struct CsvOutput {
@@ -17,11 +17,7 @@ struct CsvOutput {
     force: bool,
     path: Option<String>,
     stream_name: Option<String>,
-    writer: Option<BufWriter<File>>,
-    schema: Option<Arc<StreamSchema>>,
-    header: Vec<String>,
-    row: String,
-    rows_written: u64,
+    table: Option<StreamTable<BufWriter<File>>>,
 }
 
 impl CsvOutput {
@@ -33,11 +29,7 @@ impl CsvOutput {
             force,
             path: None,
             stream_name: None,
-            writer: None,
-            schema: None,
-            header: Vec::new(),
-            row: String::new(),
-            rows_written: 0,
+            table: None,
         }
     }
 
@@ -56,26 +48,7 @@ impl CsvOutput {
             return Ok(());
         }
 
-        if let Some(existing) = &self.schema {
-            if existing != batch.schema() {
-                return Err(eyre::eyre!(
-                    "stream identity or schema changed while writing {}; refusing to emit rows under a stale CSV header",
-                    self.path.as_deref().unwrap_or("CSV output")
-                ));
-            }
-        } else {
-            self.schema = Some(batch.schema().clone());
-        }
-
-        if self.writer.is_none() {
-            self.header.push("time".to_string());
-            self.header.extend(
-                batch
-                    .schema()
-                    .columns()
-                    .map(|column| column.name().to_string()),
-            );
-
+        if self.table.is_none() {
             let route_label = route_filename_label(&self.route);
             let path = format!(
                 "{}.{}.{}.csv",
@@ -93,44 +66,30 @@ impl CsvOutput {
                 .truncate(true)
                 .open(&path)
                 .wrap_err_with(|| format!("could not open {}", path))?;
-            self.writer = Some(BufWriter::new(file));
+            let table = StreamTable::new(batch.schema(), BufWriter::new(file))
+                .wrap_err_with(|| format!("failed to write {}", path))?;
+            self.table = Some(table);
             self.stream_name = Some(batch.schema().stream().name().to_string());
             self.path = Some(path);
-
-            let output_path = self.path.as_deref().unwrap_or_default();
-            writeln!(
-                self.writer.as_mut().unwrap(),
-                "{}",
-                csv_header(&self.header)
-            )
-            .wrap_err_with(|| format!("failed to write {}", output_path))?;
         }
 
         let output_path = self.path.as_deref().unwrap_or_default();
-        for sample in batch.iter() {
-            self.row.clear();
-            write!(&mut self.row, "{:.6}", sample.timestamp_end())
-                .expect("writing to a string cannot fail");
-            for value in sample.values() {
-                write!(&mut self.row, ",{}", value).expect("writing to a string cannot fail");
-            }
-            self.row.push('\n');
-            self.writer
-                .as_mut()
-                .unwrap()
-                .write_all(self.row.as_bytes())
-                .wrap_err_with(|| format!("failed to write {}", output_path))?;
-            self.rows_written += 1;
-        }
-        Ok(())
+        let table = self.table.as_mut().expect("the table was started");
+        table.write_batch(&batch).map_err(|error| match error {
+            WriteError::Schema => eyre::eyre!(
+                "stream identity or schema changed while writing {}; refusing to emit rows under a stale CSV header",
+                output_path
+            ),
+            error => eyre::Report::new(error).wrap_err(format!("failed to write {}", output_path)),
+        })
     }
 
     fn flush(&mut self) -> eyre::Result<()> {
         use eyre::WrapErr;
 
-        if let Some(writer) = &mut self.writer {
+        if let Some(table) = &mut self.table {
             let output_path = self.path.as_deref().unwrap_or_default();
-            writer
+            table
                 .flush()
                 .wrap_err_with(|| format!("failed to write {}", output_path))?;
         }
@@ -214,7 +173,7 @@ pub fn log_csv(cli: LogCsvCli) -> eyre::Result<()> {
     )?;
     csv.flush()?;
 
-    if csv.writer.is_none() {
+    let Some(table) = &csv.table else {
         if read.missing_metadata.contains(&target_route) {
             return Err(missing_metadata_error(&[target_route]));
         }
@@ -233,7 +192,7 @@ pub fn log_csv(cli: LogCsvCli) -> eyre::Result<()> {
             "see available routes and streams with: tio log dump -m {}",
             files.first().unwrap_or(&"<file>".to_string())
         )));
-    }
+    };
 
     use console::style;
     let rule = style("─".repeat(50)).dim();
@@ -250,8 +209,8 @@ pub fn log_csv(cli: LogCsvCli) -> eyre::Result<()> {
         csv.path.as_deref().unwrap_or_default()
     );
     println!(" {} {} @ {}", label("Stream:"), stream_label, target_route);
-    println!(" {} {}", label("Rows:"), csv.rows_written);
-    println!(" {} {}", label("Columns:"), csv.header.join(", "));
+    println!(" {} {}", label("Rows:"), table.rows());
+    println!(" {} {}", label("Columns:"), table.header().join(", "));
     println!("{rule}");
 
     Ok(())
@@ -270,20 +229,6 @@ fn route_filename_label(route: &DeviceRoute) -> String {
             .collect::<Vec<_>>()
             .join(".")
     }
-}
-
-fn csv_header(fields: &[String]) -> String {
-    fields
-        .iter()
-        .map(|field| {
-            if field.contains([',', '"', '\n', '\r']) {
-                format!("\"{}\"", field.replace('"', "\"\""))
-            } else {
-                field.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 fn filename_component(name: &str) -> String {
@@ -354,13 +299,5 @@ mod tests {
         assert_eq!(csv.lines().count(), 4, "{csv}");
         std::fs::remove_file(output(&prefix)).expect("remove the output");
         std::fs::remove_file(log).expect("remove the log");
-    }
-
-    #[test]
-    fn csv_header_quotes_special_column_names() {
-        assert_eq!(
-            csv_header(&["time".to_string(), "x,\"quoted\"".to_string()]),
-            "time,\"x,\"\"quoted\"\"\""
-        );
     }
 }
