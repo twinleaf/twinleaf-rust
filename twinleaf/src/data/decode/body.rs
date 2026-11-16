@@ -5,8 +5,8 @@
 //! reads a packet's samples column by column, each in one strided pass, and
 //! [`ColumnData::from_le_bytes`] reads one value.
 
-use super::metadata::StreamSchema;
-use super::sample::{native_types, ColumnBuilder, ColumnData};
+use crate::data::model::sample::{native_types, ColumnBuilder, ColumnData};
+use crate::data::model::schema::StreamSchema;
 use crate::proto::data as wire;
 
 macro_rules! define_decoders {
@@ -68,7 +68,7 @@ native_types!(define_decoders);
 /// # Panics
 ///
 /// Panics if `encoded` holds fewer than `rows` samples.
-pub(super) fn decode_samples<'a>(
+pub(in crate::data) fn decode_samples<'a>(
     schema: &StreamSchema,
     encoded: &[u8],
     rows: usize,

@@ -165,7 +165,7 @@ pub struct MetadataQuery {
     /// Empty when only the device record is missing. An empty argument
     /// selects the device-chosen bootstrap prefix.
     pub selectors: Vec<wire::MetadataSelector>,
-    pub(super) generation: u32,
+    pub(in crate::data) generation: u32,
 }
 
 impl MetadataQuery {
@@ -201,7 +201,7 @@ impl StreamSchema {
     ///
     /// Panics if a record describes a stream other than `key`'s, or if a
     /// column is out of index order.
-    pub(super) fn new(
+    pub(in crate::data) fn new(
         key: StreamKey,
         stream: StreamRecord,
         columns: Vec<ColumnRecord>,
@@ -250,7 +250,11 @@ impl StreamSchema {
 
     /// Returns `true` if `stream` and `columns` are the records this schema
     /// was built from.
-    pub(super) fn describes(&self, stream: &StreamRecord, columns: &[ColumnRecord]) -> bool {
+    pub(in crate::data) fn describes(
+        &self,
+        stream: &StreamRecord,
+        columns: &[ColumnRecord],
+    ) -> bool {
         self.stream == *stream && self.columns == columns
     }
 }
@@ -267,8 +271,8 @@ impl Eq for StreamSchema {}
 /// Point-in-time metadata for one routed stream. It holds the stream's
 /// schema, the record of the device that sent it, and its current segment.
 ///
-/// A [`SampleBatch`](super::SampleBatch), a [`Run`](super::Run) and a
-/// [`StreamSummary`](super::StreamSummary) each carry one, and reach the
+/// A [`SampleBatch`](crate::data::SampleBatch), a [`Run`](crate::data::Run) and a
+/// [`StreamSummary`](crate::data::StreamSummary) each carry one, and reach the
 /// protocol views of their records through it. It holds no sample arrays,
 /// clones by pointer, and outlives the batch it came from.
 #[derive(Debug, Clone)]
@@ -285,7 +289,7 @@ impl StreamMetadataSnapshot {
     /// # Panics
     ///
     /// Panics if `segment` describes a stream other than the schema's.
-    pub(super) fn new(
+    pub(in crate::data) fn new(
         schema: Arc<StreamSchema>,
         device: DeviceRecord,
         segment: SegmentRecord,
@@ -308,7 +312,7 @@ impl StreamMetadataSnapshot {
     }
 
     /// Returns the route and stream id together, the identity a
-    /// [`SampleBatch`](super::SampleBatch) carries.
+    /// [`SampleBatch`](crate::data::SampleBatch) carries.
     pub fn stream_key(&self) -> StreamKey {
         self.schema.key
     }
@@ -336,7 +340,7 @@ impl StreamMetadataSnapshot {
         rate_hz(&self.segment.get()).unwrap_or(0.0)
     }
 
-    pub(super) fn segment_record(&self) -> &SegmentRecord {
+    pub(in crate::data) fn segment_record(&self) -> &SegmentRecord {
         &self.segment
     }
 
@@ -385,7 +389,7 @@ struct DeviceMetadataInner {
 }
 
 impl DeviceMetadataSnapshot {
-    pub(super) fn new(
+    pub(in crate::data) fn new(
         route: DeviceRoute,
         device: DeviceRecord,
         streams: BTreeMap<StreamId, StreamMetadataSnapshot>,

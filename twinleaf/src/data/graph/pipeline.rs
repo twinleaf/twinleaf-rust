@@ -1,9 +1,9 @@
 //! Incremental per-column computation driven by a [`Buffer`].
 
-use super::buffer::{Buffer, Run};
-use super::continuity::Generations;
-use super::metadata::ColumnKey;
-use super::sample::ColumnArray;
+use crate::data::model::continuity::Generations;
+use crate::data::model::sample::ColumnArray;
+use crate::data::model::schema::ColumnKey;
+use crate::data::store::buffer::{Buffer, Run};
 use std::ops::Range;
 
 /// An incremental computation over one column's sample stream, such as
@@ -119,8 +119,8 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::metadata::{DeviceRecord, SegmentRecord, StreamMetadataSnapshot};
-    use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
+    use crate::data::model::sample::{BatchContext, ColumnData, SampleBatchBuilder};
+    use crate::data::model::schema::{DeviceRecord, SegmentRecord, StreamMetadataSnapshot};
     use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::DataType;

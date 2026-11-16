@@ -3,11 +3,11 @@
 //! [`LogFile`] holds a log's bytes and iterates its packets. [`LogFile::scan`] builds a
 //! [`LogIndex`], which summarizes the log and decodes it in batches.
 
-use super::continuity::{Boundary, BoundaryClass};
-use super::metadata::{DeviceRecord, StreamKey, StreamMetadataSnapshot};
-use super::parser::{PacketParser, ParserCheckpoint};
-use super::sample::{sample_time, RowSource, SampleBatch};
-use super::state::{DataError, ScannedRows};
+use crate::data::decode::parser::{PacketParser, ParserCheckpoint};
+use crate::data::decode::state::{DataError, ScannedRows};
+use crate::data::model::continuity::{Boundary, BoundaryClass};
+use crate::data::model::sample::{sample_time, RowSource, SampleBatch};
+use crate::data::model::schema::{DeviceRecord, StreamKey, StreamMetadataSnapshot};
 use crate::proto::data as wire;
 use crate::tio::{self, Packet};
 use bytes::{Buf, Bytes};
@@ -571,8 +571,8 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::continuity::Generations;
-    use crate::data::state::StreamDataError;
+    use crate::data::decode::state::StreamDataError;
+    use crate::data::model::continuity::Generations;
     use crate::data::tests::fixtures::{column, device, segment, stream};
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;

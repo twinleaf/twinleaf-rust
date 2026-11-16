@@ -4,10 +4,10 @@
 //! continuity state validates each stream payload, after which this module
 //! decodes its rows and accumulates them into [`SampleBatch`] values.
 
-use super::coalesce::BatchCoalescer;
-use super::metadata::{DeviceMetadataSnapshot, MetadataQuery, StreamKey};
-use super::sample::{RowSource, SampleBatch};
-use super::state::{DataError, PacketEvent, ParseState, ScannedRows};
+use crate::data::decode::state::{DataError, PacketEvent, ParseState, ScannedRows};
+use crate::data::model::sample::{RowSource, SampleBatch};
+use crate::data::model::schema::{DeviceMetadataSnapshot, MetadataQuery, StreamKey};
+use crate::data::store::coalesce::BatchCoalescer;
 use crate::proto::DeviceRoute;
 use crate::tio;
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 /// The parser decodes a segment's rows only with that segment's record,
 /// which the device sends before the segment's first sample. Rows that
 /// arrive without it are lost, and the first batch of the stream once the
-/// record is known reports them as a [`Loss`](super::Loss), unless a change
+/// record is known reports them as a [`Loss`](crate::data::Loss), unless a change
 /// other than a rollover stands for them. A record the parser holds counts
 /// only if the device announced its segment since the stream's last rows,
 /// by a broadcast, a proxy metadata update or a bootstrap reply.
@@ -38,7 +38,7 @@ use std::collections::VecDeque;
 /// and closes each segment a stop ends with a record without
 /// [`ACTIVE`](crate::proto::data::SegmentFlags::ACTIVE), both on the lane of
 /// its rows. Rows of a segment a start opened, or of one after a close, come
-/// as a [`Change::Restarted`](super::Change::Restarted) with no loss, a
+/// as a [`Change::Restarted`](crate::data::Change::Restarted) with no loss, a
 /// reboot among them, and a new session changes nothing of a stream's
 /// state, as rows of the last session may still come after it. A new segment
 /// that starts before the last rows end comes as a backward step in time.
@@ -46,7 +46,7 @@ use std::collections::VecDeque;
 /// A device whose record declares no revision, the deprecated C firmware,
 /// marks neither, so its restarts come as a rollover with a loss of the
 /// sample periods between the acquisitions, and its reboots as a
-/// [`Change::SessionChanged`](super::Change::SessionChanged).
+/// [`Change::SessionChanged`](crate::data::Change::SessionChanged).
 ///
 /// # Examples
 ///
@@ -386,10 +386,10 @@ impl Batcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::buffer::Buffer;
-    use crate::data::continuity::{Boundary, Change, Generations, Loss};
-    use crate::data::sample::ColumnData;
-    use crate::data::state::StreamDataError;
+    use crate::data::decode::state::StreamDataError;
+    use crate::data::model::continuity::{Boundary, Change, Generations, Loss};
+    use crate::data::model::sample::ColumnData;
+    use crate::data::store::buffer::Buffer;
     use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};
@@ -1857,7 +1857,7 @@ mod tests {
             .expect("valid rows");
         let first = parser.pop_batch().expect("the first batch");
 
-        let before = crate::data::metadata::record_parses();
+        let before = crate::data::model::schema::record_parses();
         for packet in 1..=10 {
             let first_sample = packet * rows as u32;
             parser
@@ -1867,7 +1867,7 @@ mod tests {
             assert_eq!(batch.schema().columns().len(), types.len());
             assert!(std::sync::Arc::ptr_eq(batch.schema(), first.schema()));
         }
-        assert_eq!(crate::data::metadata::record_parses() - before, 0);
+        assert_eq!(crate::data::model::schema::record_parses() - before, 0);
     }
 
     /// One `f32` and one `i16` column, six bytes a sample.

@@ -6,8 +6,8 @@
 //! merge only while they carry the same metadata and generations, and rows
 //! that start at a boundary form a batch of their own.
 
-use super::continuity::Generations;
-use super::sample::{RowSource, SampleBatch, SampleBatchBuilder};
+use crate::data::model::continuity::Generations;
+use crate::data::model::sample::{RowSource, SampleBatch, SampleBatchBuilder};
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -43,7 +43,7 @@ impl BatchCoalescer {
 
     /// Merges `rows` into the buffered tail, completing batches as needed.
     /// Empty inputs are ignored.
-    pub(super) fn push(&mut self, rows: &impl RowSource) {
+    pub(in crate::data) fn push(&mut self, rows: &impl RowSource) {
         if rows.len() == 0 {
             return;
         }
@@ -91,7 +91,7 @@ impl BatchCoalescer {
     /// # Panics
     ///
     /// Panics if `rows` reaches past the buffered rows.
-    pub(super) fn buffered_rows(&self, rows: Range<usize>) -> Option<SampleBatch> {
+    pub(in crate::data) fn buffered_rows(&self, rows: Range<usize>) -> Option<SampleBatch> {
         self.tail.as_ref().map(|tail| tail.freeze_rows(rows))
     }
 
@@ -105,9 +105,9 @@ impl BatchCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::continuity::{Boundary, Loss};
-    use crate::data::metadata::StreamMetadataSnapshot;
-    use crate::data::sample::{BatchContext, ColumnArray, ColumnData};
+    use crate::data::model::continuity::{Boundary, Loss};
+    use crate::data::model::sample::{BatchContext, ColumnArray, ColumnData};
+    use crate::data::model::schema::StreamMetadataSnapshot;
     use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
