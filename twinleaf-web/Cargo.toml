@@ -26,6 +26,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 futures-util = { version = "0.3", default-features = false }
+# The MCP endpoint at `/mcp`: the SDK's server, its tool macros and its
+# Streamable HTTP transport, mounted on the router as a Tower service.
+rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
+# The pictures the MCP tools return.
+png = { version = "0.18", default-features = false }
+# The pictures as the base64 text an MCP image carries.
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 
 [features]
 # Exports the history as HDF5 as well as CSV.

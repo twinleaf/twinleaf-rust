@@ -19,8 +19,9 @@ default = ["serial", "mdns", "hdf5", "web"]
 serial = ["dep:serialport", "twinleaf/serial"]
 mdns = ["twinleaf/mdns", "dep:gethostname", "dep:mdns-sd"]
 hdf5 = ["twinleaf/hdf5", "twinleaf-web?/hdf5"]
-# The web page of `tio proxy`, at http://localhost:7855.
-web = ["dep:twinleaf-web"]
+# The web page of `tio proxy`, at http://localhost:7855, and `tio mcp`, which
+# bridges an MCP host's stdio to the page's MCP endpoint.
+web = ["dep:twinleaf-web", "dep:rmcp", "dep:reqwest", "dep:tokio"]
 
 [[bench]]
 name = "log_workflows"
@@ -35,6 +36,13 @@ toml_edit = {version = "0.25", features = ["parse"]}
 twinleaf = { version = "2.0", path = "../twinleaf", default-features = false, features = ["host", "firmware-update", "json", "processing"] }
 twinleaf-device = { version = "0.1", path = "../twinleaf-device", features = ["sim"] }
 twinleaf-web = { version = "0.1", path = "../twinleaf-web", optional = true }
+# `tio mcp`: the SDK's stdio transport, which serves the host as a server
+# does, and its Streamable HTTP client, which
+# reaches the hub over plain HTTP on loopback, so with no TLS.
+rmcp = { version = "3.8", default-features = false, features = ["client", "server", "transport-io", "transport-streamable-http-client-reqwest"], optional = true }
+# `tio mcp` asks the hub whether its MCP endpoint is on before it bridges.
+reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }
+tokio = { version = "1.47", features = ["rt", "net", "io-std", "macros"], optional = true }
 clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30"
 tui-prompts = "0.6"

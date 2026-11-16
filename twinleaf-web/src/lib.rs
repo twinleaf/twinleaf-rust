@@ -18,6 +18,11 @@
 //! for the pages that ask in `captures`, the devices' firmware and the
 //! upgrades the pages ask for in `firmware`, the log's lines in `logbook`,
 //! the routes in `routes`, and the checks every request passes in `guard`.
+//!
+//! An agent drives the same hub through `mcp`, a door at `/mcp` that speaks
+//! the Model Context Protocol. It answers 404 unless [`handler`] opens it,
+//! or a page opens it through `/api/mcp`, and every tool an agent calls is
+//! a line of the log.
 
 mod assets;
 mod captures;
@@ -30,6 +35,7 @@ mod guard;
 mod hub;
 mod logbook;
 mod loss;
+mod mcp;
 mod protocol;
 mod routes;
 mod wire;
@@ -54,9 +60,11 @@ pub fn console(level: log::Level, source: &str, text: &str) {
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returns the handler that serves the page on each connection a proxy
-/// hands it. It must be called on a tokio runtime, as a proxy calls it.
-pub fn handler() -> Foreign {
-    let router = routes::router();
+/// hands it. Its MCP door at `/mcp` is open from the start when `mcp`, and
+/// otherwise answers 404 until a page opens it. It must be called on a
+/// tokio runtime, as a proxy calls it.
+pub fn handler(mcp: bool) -> Foreign {
+    let router = routes::router(mcp);
     Foreign::new(move |stream, peer| {
         let service = TowerToHyperService::new(router.clone());
         tokio::spawn(async move {

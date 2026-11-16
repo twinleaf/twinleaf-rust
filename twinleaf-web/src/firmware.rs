@@ -1943,7 +1943,7 @@ pub(crate) mod tests {
                     prefix: root,
                 }],
             }),
-            foreign: Some(crate::handler()),
+            foreign: Some(crate::handler(false)),
             ..HostOptions::default()
         })
         .unwrap();

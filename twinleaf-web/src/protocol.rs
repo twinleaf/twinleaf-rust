@@ -897,6 +897,13 @@ pub(crate) struct WindowChunk {
     pub(crate) y: Vec<f64>,
 }
 
+/// `GET /api/mcp` replies it, and `POST /api/mcp` sets it: whether the MCP
+/// door at `/mcp` answers.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub(crate) struct McpSwitch {
+    pub(crate) on: bool,
+}
+
 /// The reply to a request that changes something and has nothing to say.
 #[derive(Serialize, Debug)]
 pub(crate) struct Done {}

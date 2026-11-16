@@ -77,6 +77,7 @@ fn hold_selection(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
 /// Serves the sensors the arguments name, or the one attached, from a terminal
 /// until Ctrl-C.
 fn run_foreground(cli: &ProxyCli) -> eyre::Result<()> {
+    mcp_has_a_page(cli)?;
     let requested = requested_layout(cli.sensor_url.as_deref(), &cli.mounts)?;
     let default = requested
         .as_ref()
@@ -166,10 +167,31 @@ pub(crate) fn serves_page(cli: &ProxyCli) -> bool {
     cfg!(feature = "web") && cli.port == twinleaf::proto::TCP_DEFAULT_PORT
 }
 
-/// The handler of the web page, when `tio proxy` serves it.
+/// Refuses `--mcp` when this proxy serves no web page, whose endpoint it
+/// opens, and says why.
+fn mcp_has_a_page(cli: &ProxyCli) -> eyre::Result<()> {
+    if !cli.mcp || serves_page(cli) {
+        return Ok(());
+    }
+    let port = twinleaf::proto::TCP_DEFAULT_PORT;
+    Err(match cfg!(feature = "web") {
+        true => eyre::eyre!(
+            "--mcp opens the MCP endpoint of the web page, which a proxy serves only on \
+             port {port}, and this one listens on port {}",
+            cli.port
+        ),
+        false => eyre::eyre!(
+            "--mcp opens the MCP endpoint of the web page, and this tio was built without \
+             the page"
+        ),
+    })
+}
+
+/// The handler of the web page, when `tio proxy` serves it, with its MCP
+/// door open when `--mcp` asks.
 fn web_page(cli: &ProxyCli) -> Option<proxy::Foreign> {
     #[cfg(feature = "web")]
-    return serves_page(cli).then(twinleaf_web::handler);
+    return serves_page(cli).then(|| twinleaf_web::handler(cli.mcp));
     #[cfg(not(feature = "web"))]
     {
         let _ = cli;
@@ -402,6 +424,9 @@ impl FrontDoor {
         println!("  TCP port: {}", cli.port);
         if page {
             println!("  Plots: http://localhost:{}", cli.port);
+            if cli.mcp {
+                println!("  MCP: http://localhost:{}/mcp", cli.port);
+            }
         }
         println!("  Subtree: {}", cli.subtree);
 
@@ -706,6 +731,21 @@ mod tests {
         assert_eq!(listen(&[]), Listen::AllInterfaces);
         assert_eq!(listen(&["--listen", "all"]), Listen::AllInterfaces);
         assert_eq!(listen(&["--listen", "loopback"]), Listen::Loopback);
+    }
+
+    /// `--mcp` on a proxy that serves no page is refused with the reason,
+    /// and a proxy that serves one takes it.
+    #[test]
+    fn mcp_is_refused_where_no_page_is_served() {
+        use clap::Parser;
+        let checked = |args: &[&str]| {
+            let cli = ProxyCli::parse_from(["tio-proxy"].iter().chain(args));
+            mcp_has_a_page(&cli)
+        };
+        let refused = checked(&["--mcp", "--port", "17855"]).unwrap_err();
+        assert!(refused.to_string().contains("--mcp opens"), "{refused}");
+        assert!(checked(&["--port", "17855"]).is_ok());
+        assert_eq!(checked(&["--mcp"]).is_ok(), cfg!(feature = "web"));
     }
 
     fn route(path: &str) -> DeviceRoute {

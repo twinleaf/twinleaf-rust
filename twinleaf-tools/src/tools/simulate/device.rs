@@ -27,7 +27,6 @@ use twinleaf_device::Sink;
 use super::{unix_duration, GaussianRng};
 use crate::{SimulateCli, UploadKind};
 
-const DEVICE_NAME: &str = "tio-test";
 /// The description before the build, which `--build` gives in brackets.
 const DEVICE_DESC: &str = "Twinleaf tio-test R1 ((null))";
 /// The description a firmware upgrade leaves, so a re-read shows a new build.
@@ -476,7 +475,7 @@ impl SimDevice {
             _ => format!("SIM{:04}", index + 1),
         };
         let desc = format!("{DEVICE_DESC} [{}]", cli.build);
-        let identity = Identity::new(DEVICE_NAME, &desc, &serial, DEVICE_FIRMWARE)
+        let identity = Identity::new(&cli.name, &desc, &serial, DEVICE_FIRMWARE)
             .expect("the simulator's identity fits");
         let mut sim = Sim::new(
             identity,
@@ -495,7 +494,7 @@ impl SimDevice {
             },
             UploadKind::Signed => Slot::Signed(PACKAGE, Upload::new()),
         });
-        sim.upgraded = Identity::new(DEVICE_NAME, UPGRADED_DESC, &serial, DEVICE_FIRMWARE);
+        sim.upgraded = Identity::new(&cli.name, UPGRADED_DESC, &serial, DEVICE_FIRMWARE);
         let next_log_ns = now_ns + next_log_delay_ns(&mut rng);
         let mut device = Self {
             route,

@@ -1,14 +1,15 @@
 //! The page's routes. `/ws` streams what the hub sends, and `/api` calls
 //! RPCs, finds devices and mounts them, changes the decimation, reads a
 //! window of raw rows and exports them to a file. What each says is in
-//! `protocol`.
+//! `protocol`. `/mcp` is the door for agents that `mcp` serves, and
+//! `/api/mcp` opens and closes it.
 
 use crate::captures::Want;
 use crate::firmware::Wanted;
 use crate::hub::{Ended, Live, Page};
 use crate::protocol::{
     self, Ask, CallRequest, DiscoverRequest, Done, ExportRequest, Frame, HistoryRequest,
-    ImageSource, MountArg, MountRequest, PageMessage, PpsRequest, ReadRequest, Refusal,
+    ImageSource, McpSwitch, MountArg, MountRequest, PageMessage, PpsRequest, ReadRequest, Refusal,
     RowsRequest, WindowRequest,
 };
 use axum::body::{Body, Bytes};
@@ -19,14 +20,23 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use twinleaf::proxy::{Layout, Mount};
 use twinleaf::DeviceRoute;
 
-/// The routes, guarded, with the page's files behind them.
-pub(crate) fn router() -> Router {
+/// The routes, guarded, with the page's files behind them. The MCP door is
+/// open from the start when `mcp`.
+pub(crate) fn router(mcp: bool) -> Router {
+    router_of(Hubs::new(mcp))
+}
+
+/// The routes over `hubs`.
+pub(crate) fn router_of(hubs: Hubs) -> Router {
     Router::new()
+        .route("/mcp", crate::mcp::route(&hubs))
+        .route("/api/mcp", get(mcp_state).post(set_mcp))
         .route("/ws", get(ws))
         .route("/api/call", post(call))
         .route("/api/read", post(read))
@@ -38,15 +48,19 @@ pub(crate) fn router() -> Router {
         .route("/api/rows", get(rows))
         .route("/api/export", get(export))
         .fallback(crate::assets::serve)
-        .with_state(Hubs::default())
+        .with_state(hubs)
         .layer(axum::middleware::from_fn(crate::guard::guard))
 }
 
-/// The hub every page shares, and the layout it opens. The hub starts with
-/// the first request that needs it, and again after it retires, of the
-/// layout a page last mounted.
-#[derive(Clone, Default)]
-struct Hubs(Arc<Mutex<Current>>);
+/// The hub every page and agent shares, and the layout it opens. The hub
+/// starts with the first request that needs it, and again after it
+/// retires, of the layout a page last mounted. With it, whether the MCP
+/// door answers.
+#[derive(Clone)]
+pub(crate) struct Hubs {
+    current: Arc<Mutex<Current>>,
+    mcp: Arc<AtomicBool>,
+}
 
 #[derive(Default)]
 struct Current {
@@ -64,8 +78,30 @@ async fn start(layout: Option<Layout>) -> Result<Live, Refusal> {
 }
 
 impl Hubs {
-    async fn live(&self) -> Result<Arc<Live>, Refusal> {
-        let mut current = self.0.lock().await;
+    /// No hub yet, and the MCP door open when `mcp`.
+    fn new(mcp: bool) -> Hubs {
+        Hubs {
+            current: Arc::default(),
+            mcp: Arc::new(AtomicBool::new(mcp)),
+        }
+    }
+
+    /// The hub `live`, of the proxy's default layout, and the MCP door open.
+    #[cfg(test)]
+    pub(crate) fn over(live: Arc<Live>) -> Hubs {
+        let hubs = Hubs::new(true);
+        hubs.current.try_lock().expect("a new lock").live = Some(live);
+        hubs
+    }
+
+    /// Whether the MCP door answers.
+    pub(crate) fn mcp(&self) -> bool {
+        self.mcp.load(Ordering::Relaxed)
+    }
+
+    /// The hub, started anew when none lives.
+    pub(crate) async fn live(&self) -> Result<Arc<Live>, Refusal> {
+        let mut current = self.current.lock().await;
         if let Some(live) = current.live.as_ref().filter(|live| !live.is_retired()) {
             return Ok(live.clone());
         }
@@ -78,7 +114,7 @@ impl Hubs {
     /// replaces. A layout the proxy refuses leaves the hub as it was, and so
     /// does a firmware upgrade that waits or runs.
     async fn mount(&self, layout: Option<Layout>) -> Result<(), Refusal> {
-        let mut current = self.0.lock().await;
+        let mut current = self.current.lock().await;
         if let Some(refused) = mount_refusal(&current) {
             return Err(refused);
         }
@@ -314,6 +350,17 @@ async fn send(socket: &mut WebSocket, frame: &Frame) -> Result<(), axum::Error> 
     }
 }
 
+/// Whether the MCP door answers.
+async fn mcp_state(State(hubs): State<Hubs>) -> Json<McpSwitch> {
+    Json(McpSwitch { on: hubs.mcp() })
+}
+
+/// Opens or closes the MCP door, and says whether it answers now.
+async fn set_mcp(State(hubs): State<Hubs>, Json(args): Json<McpSwitch>) -> Json<McpSwitch> {
+    hubs.mcp.store(args.on, Ordering::Relaxed);
+    Json(McpSwitch { on: hubs.mcp() })
+}
+
 /// Calls one RPC on every device the request names, with one argument, and
 /// replies each device's outcome.
 async fn call(
@@ -492,10 +539,10 @@ async fn export(
             ));
             let written = {
                 let path = path.clone();
-                blocking(move || crate::export::write_hdf5(traces, &path)).await?
+                let format = crate::export::Format::Hdf5;
+                blocking(move || crate::export::write_new(traces, format, &path)).await?
             };
             if let Err(error) = written {
-                let _ = std::fs::remove_file(&path);
                 return Err(Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, error));
             }
             tokio::task::spawn_blocking(move || {

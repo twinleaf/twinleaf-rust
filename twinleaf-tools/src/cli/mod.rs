@@ -6,6 +6,8 @@ mod dump;
 mod health;
 mod list;
 mod log;
+#[cfg(feature = "web")]
+mod mcp;
 mod monitor;
 mod proxy;
 mod rpc;
@@ -21,6 +23,8 @@ pub use log::{
     LogMetaCli, LogSubcommands, MetaRerouteCli, MetaSubcommands, SplitLevel, SplitPolicy,
     StreamSel,
 };
+#[cfg(feature = "web")]
+pub use mcp::McpCli;
 pub use monitor::MonitorCli;
 pub use proxy::{MountArg, ProxyCli, ProxySubcommands};
 pub use rpc::{RPCSubcommands, RpcCli};
@@ -139,6 +143,10 @@ pub enum Commands {
 
     /// Multiplex a sensor over TCP
     Proxy(ProxyCli),
+
+    /// Bridge an MCP host's stdio to the MCP endpoint of `tio proxy --mcp`
+    #[cfg(feature = "web")]
+    Mcp(McpCli),
 
     /// Run a simulated sine wave Twinleaf device over UDP
     Simulate(SimulateCli),

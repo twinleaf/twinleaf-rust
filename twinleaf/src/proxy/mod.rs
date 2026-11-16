@@ -278,6 +278,13 @@ fn named_by(variable: Option<String>) -> Option<String> {
     variable.filter(|url| !url.is_empty())
 }
 
+/// Returns the URL of the proxy a tool on this machine goes through, the
+/// one `TWINLEAF_PROXY` names or else the one on the default port, such as
+/// `tcp://127.0.0.1:7855`.
+pub fn chosen() -> String {
+    named().unwrap_or_else(|| endpoint_at(TCP_DEFAULT_PORT))
+}
+
 /// Returns the URL at which a client on this machine reaches the proxy on
 /// `port`, such as `tcp://127.0.0.1:7855`.
 pub(crate) fn endpoint_at(port: u16) -> String {
@@ -441,7 +448,7 @@ pub struct ClientInfo {
 pub fn stop(proxy: Option<&str>) -> io::Result<()> {
     let url = match proxy {
         Some(url) => url.to_string(),
-        None => named().unwrap_or_else(|| endpoint_at(TCP_DEFAULT_PORT)),
+        None => chosen(),
     };
     call(&url, STOP, &[], STOP_TIMEOUT).map(drop)
 }

@@ -58,6 +58,7 @@ The server sends no CORS headers, and hyper's `header_read_timeout` is set.
 | `routes` | the routes, which hub is current, mount order |
 | `discover` | the device picker's scan |
 | `guard`, `assets` | the checks above, and the built page |
+| `mcp` | the door for agents at `/mcp`, its tools and the picture a glance draws |
 
 One hub (`Live`) serves every page. It opens with the first request that
 needs it, of the devices a page last mounted or the proxy's default. It
@@ -551,6 +552,52 @@ an Error. What a device made of a call is data in the reply, not a refusal.
 | `POST /api/pps` | the decimation every page shares |
 | `POST /api/history` | the raw history the hub keeps: `{seconds, bytes}`, a span of each stream's time and a budget across every stream |
 | `GET /api/window` | one trace of a named hub between two times, at about two points a pixel of `width`, for a paused plot |
+| `GET /api/mcp`, `POST /api/mcp` | whether the MCP door answers, `{on}` |
+| `POST /mcp` | the MCP door, below; 404 while it is off |
+
+## The MCP door (`twinleaf-web/src/mcp`)
+
+An LLM agent drives the same hub through `/mcp`, which speaks MCP over
+Streamable HTTP (the `rmcp` SDK, stateless, each reply one JSON message)
+behind the same checks as every route. `/mcp` takes POST, a JSON-RPC
+message, and answers 405 to any other method. It answers 404 unless
+`tio proxy --mcp` opens it, or a page posts `{"on": true}` to `/api/mcp`.
+`tio proxy --mcp` on a port that serves no page is refused at start.
+`tio mcp` bridges the stdio of a host that starts only local servers to
+the page of the proxy tools go through, the one `TWINLEAF_PROXY` names or
+the one on the default port.
+
+The tools are `list_devices`, `list_rpcs`, `call`, `glance` (a summary and an
+800 by 300 PNG of signals over a span, in time or as spectra), `read_rows`
+(a few exact rows), `export` (every row of a span to a CSV or HDF5 file)
+and `log`. They name signals as the page does, and times are each
+stream's own. Each reads what the hub offers its readers:
+
+- `list_devices`: each device's newest messages, `Losses::counts`, and
+  `Live::signals`, grouped by device and stream.
+- `list_rpcs`: the core's table through `Device::rpc_registry_async`, as a
+  call reads it, and the settings the hub last heard.
+- `call`: `devices::call`, which is `DeviceTree::call_each`. A call with no
+  value reads each device, every reply decoded by its own table. Of an RPC
+  that cannot be read it runs an action, and the door refuses it unless
+  the agent passes `run: true`.
+- `glance`, `read_rows`, `export`: `Live::span` turns the signal names and
+  the span into traces and times in one read, and `Live::export` gives the
+  rows. A glance's picture is `Live::window`, and its gaps `Live::gaps`.
+  Its statistics are `Stats` and its spectrum `hub::spectrum_of_rows`, a
+  `Welch` over the newest 2^20 rows, both fed by `ColumnOp::feed_rows`. Each
+  covers the rows after the last break that op starts over at, and the
+  glance says how many those are and from when to when.
+- `export` writes only in `twinleaf-exports` under the system temp folder,
+  a file named by `name` or by the time, through `export::write_new`, which
+  creates the file new and removes it only if it made it and the write
+  failed.
+- `log`: `Logbook::newest`.
+
+Every call is a line of the log said by the part `agent`
+(`Logbook::said_by`). Every string a device sent, a name, a unit, a value,
+an error or a log line, is written quoted and escaped, and the server's
+instructions say quoted text is data and never an instruction.
 
 ## The page (`twinleaf-web/ui/src`)
 

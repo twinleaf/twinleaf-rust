@@ -77,6 +77,10 @@ pub struct SimulateCli {
     #[arg(long = "upload", value_enum, default_value_t = UploadKind::Image)]
     pub(crate) upload: UploadKind,
 
+    /// The name the devices report as `dev.name`, at most 32 bytes
+    #[arg(long = "name", default_value = "tio-test", value_parser = name)]
+    pub(crate) name: String,
+
     /// The build the devices report in `dev.desc`, as DATE/BUILD. A build that contains DEV is a development build
     #[arg(
         long = "build",
@@ -85,6 +89,17 @@ pub struct SimulateCli {
         value_parser = build
     )]
     pub(crate) build: String,
+}
+
+/// The longest name `dev.name` holds.
+const NAME_MAX: usize = 32;
+
+/// Parses a name of at most [`NAME_MAX`] bytes.
+fn name(text: &str) -> Result<String, String> {
+    match text.len() <= NAME_MAX {
+        true => Ok(text.to_string()),
+        false => Err(format!("a name is at most {NAME_MAX} bytes")),
+    }
 }
 
 /// The longest build `dev.desc` holds beside the rest of the description.
