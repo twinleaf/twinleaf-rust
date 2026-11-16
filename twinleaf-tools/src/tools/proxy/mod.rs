@@ -57,7 +57,9 @@ fn hold_selection(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
     let routes = held.tree(DeviceRoute::root()).routes_updates();
     let closer = held.clone();
     ctrlc::set_handler(move || closer.close())?;
-    front.print_startup(&cli);
+    // This process serves no page. A foreground proxy that holds the
+    // selection says its own page's address.
+    front.print_startup(&cli, false);
     println!(
         "Using {} as the default while this runs. Ctrl-C to stop.",
         front.describe(cli.subtree)
@@ -84,6 +86,7 @@ fn run_foreground(cli: &ProxyCli) -> eyre::Result<()> {
     // rather than whatever detecting the device finds.
     let proxy = host(HostOptions {
         default,
+        foreign: web_page(cli),
         ..host_options(cli, "tio proxy")
     })?;
     let front = match requested {
@@ -153,6 +156,24 @@ fn host_options(cli: &ProxyCli, name: &str) -> HostOptions {
             heartbeats: cli.dump_hb,
         },
         ..HostOptions::default()
+    }
+}
+
+/// Whether `tio proxy` serves the web page on its own port. A build with the
+/// `web` feature serves it on the default port. The page reads through the
+/// proxy on the default port, so a proxy on another port serves no page.
+pub(crate) fn serves_page(cli: &ProxyCli) -> bool {
+    cfg!(feature = "web") && cli.port == twinleaf::proto::TCP_DEFAULT_PORT
+}
+
+/// The handler of the web page, when `tio proxy` serves it.
+fn web_page(cli: &ProxyCli) -> Option<proxy::Foreign> {
+    #[cfg(feature = "web")]
+    return serves_page(cli).then(twinleaf_web::handler);
+    #[cfg(not(feature = "web"))]
+    {
+        let _ = cli;
+        None
     }
 }
 
@@ -342,7 +363,9 @@ impl FrontDoor {
         }
     }
 
-    fn print_startup(&self, cli: &ProxyCli) {
+    /// Prints what the proxy hosts and how, with the address of the web
+    /// page when `page` says this process serves it.
+    fn print_startup(&self, cli: &ProxyCli, page: bool) {
         let mounts = &self.layout.mounts;
         match self.names.as_slice() {
             [Some(name)] => println!("tio proxy starting (selected {name}):"),
@@ -377,6 +400,9 @@ impl FrontDoor {
             }
         }
         println!("  TCP port: {}", cli.port);
+        if page {
+            println!("  Plots: http://localhost:{}", cli.port);
+        }
         println!("  Subtree: {}", cli.subtree);
 
         let flags = [
@@ -406,7 +432,7 @@ fn serve(proxy: Proxy, front: &FrontDoor, cli: &ProxyCli) -> eyre::Result<()> {
     let proxy = Arc::new(proxy);
     stop_on_signals(proxy.clone())?;
 
-    front.print_startup(cli);
+    front.print_startup(cli, serves_page(cli));
     // The advertisement lasts until this returns, then says goodbye.
     #[cfg(feature = "mdns")]
     let _mdns = advertise_mdns(&proxy, cli);
