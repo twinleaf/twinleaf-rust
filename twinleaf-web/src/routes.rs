@@ -321,14 +321,7 @@ async fn call(
     Json(args): Json<CallRequest>,
 ) -> Result<Response, Refusal> {
     let live = hubs.live().await?;
-    let reply = crate::devices::call(
-        &live.tree,
-        &live.devices,
-        &args.name,
-        &args.value,
-        &args.routes,
-    )
-    .await;
+    let reply = crate::devices::call(&live.tree, &args.name, &args.value, &args.routes).await;
     Ok(Json(reply).into_response())
 }
 

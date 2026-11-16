@@ -35,8 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use twinleaf::device::capture::Capture;
 use twinleaf::device::rpc::{
-    CallError, Channel, RpcAccess, RpcDescriptor, RpcMetaExt, RpcRegistry, RpcValueType,
-    RpcValueTypeExt,
+    self, Channel, RpcAccess, RpcDescriptor, RpcMetaExt, RpcRegistry, RpcValueTypeExt,
 };
 use twinleaf::device::MetadataState;
 use twinleaf::{Connection, Device, DeviceRoute, DeviceTree, RecvError};
@@ -64,7 +63,8 @@ pub(crate) enum Kind {
 /// The newest of what the watchers sent, and the feed it goes out on.
 pub(crate) struct Devices {
     latest: Mutex<Latest>,
-    /// Each device's RPC table as last loaded, which a call encodes by.
+    /// Each device's RPC table as last loaded, which a read finds its
+    /// entries in.
     tables: Mutex<HashMap<DeviceRoute, Arc<RpcRegistry>>>,
     feed: Arc<Feed>,
 }
@@ -443,131 +443,64 @@ fn describe(desc: &RpcDescriptor) -> RpcInfo {
     }
 }
 
-/// What the device at `route` made of a call, whose reply is of `kind`, or
-/// of no value for `None`. A call that timed out or lost its reply may or
-/// may not have taken effect, so it is unknown, not failed.
-fn outcome(route: &str, kind: Option<RpcValueType>, reply: Result<Vec<u8>, CallError>) -> Outcome {
+/// The page's view of what the device at `route` made of a call or a read.
+fn outcome(route: &str, outcome: rpc::Outcome) -> Outcome {
     let route = route.to_string();
-    match reply {
-        Ok(bytes) => match kind.map(|kind| kind.decode_shortest(&bytes)) {
-            Some(Ok(value)) => Outcome::Ok {
-                route,
-                value: value.to_json(),
-            },
-            Some(Err(error)) => Outcome::Error {
-                route,
-                error: error.to_string(),
-            },
-            None => Outcome::Ok {
-                route,
-                value: serde_json::Value::Null,
-            },
-        },
-        Err(error @ (CallError::Timeout | CallError::ResponseLost)) => Outcome::Unknown {
+    match outcome {
+        rpc::Outcome::Ok(value) => Outcome::Ok {
             route,
-            error: error.to_string(),
+            value: value.map_or(serde_json::Value::Null, |value| value.to_json()),
         },
-        Err(error) => Outcome::Error {
-            route,
-            error: error.to_string(),
-        },
+        rpc::Outcome::Error(error) => Outcome::Error { route, error },
+        rpc::Outcome::Unknown(error) => Outcome::Unknown { route, error },
+        rpc::Outcome::Refused(error) => Outcome::Refused { route, error },
+        rpc::Outcome::Skipped => Outcome::Skipped { route },
     }
 }
 
-/// One device's part of a call, its argument encoded by its own table.
-#[derive(Debug)]
-struct Planned {
-    at: String,
-    route: DeviceRoute,
-    /// What the reply decodes as.
-    kind: RpcValueType,
-    arg: Vec<u8>,
-}
-
-/// Encodes `text` as the argument of `name` for each of `routes`, or, when
-/// any device cannot take it, an outcome for every route, the devices that
-/// cannot refused and the others skipped.
-fn plan(
-    devices: &Devices,
-    name: &str,
-    text: &str,
-    routes: &[String],
-) -> Result<Vec<Planned>, Vec<Outcome>> {
-    let encoded: Vec<Result<Planned, String>> = routes
-        .iter()
-        .map(|at| {
-            let route = at
-                .parse::<DeviceRoute>()
-                .map_err(|error| error.to_string())?;
-            let table = devices.table(route).ok_or("its RPC table has not loaded")?;
-            let desc = table.find(name).ok_or("it has no such RPC")?;
-            let arg = desc
-                .meta
-                .text_type()
-                .encode_text(text)
-                .map_err(|error| error.to_string())?;
-            Ok(Planned {
-                at: at.clone(),
-                route,
-                kind: desc.meta.kind(),
-                arg,
-            })
-        })
-        .collect();
-    if encoded.iter().all(Result::is_ok) {
-        return Ok(encoded.into_iter().map(Result::unwrap).collect());
-    }
-    Err(encoded
-        .into_iter()
-        .zip(routes)
-        .map(|(planned, at)| match planned {
-            Ok(_) => Outcome::Skipped { route: at.clone() },
-            Err(error) => Outcome::Refused {
-                route: at.clone(),
-                error,
-            },
-        })
-        .collect())
-}
-
-/// Calls `name` with `text` on each of `routes` at once, each argument
-/// encoded by that device's own table, and returns each device's outcome in
-/// the order of `routes`.
-///
-/// Nothing is sent unless every device takes the text. A device whose
-/// table lacks the name, or whose type the text does not fit, refuses the
-/// whole call, as a write that reaches only some devices cannot be taken
-/// back.
+/// Calls `name` with `text` on each of `routes`, as
+/// [`DeviceTree::call_each`] does, and returns each device's outcome in the
+/// order of `routes`. A route that does not parse refuses the call, and
+/// every other route is skipped.
 pub(crate) async fn call(
     tree: &DeviceTree,
-    devices: &Devices,
     name: &str,
     text: &str,
     routes: &[String],
 ) -> CallReply {
-    let planned = match plan(devices, name, text, routes) {
-        Ok(planned) => planned,
-        Err(results) => {
-            return CallReply {
-                sent: false,
-                results,
-            }
-        }
-    };
-    let tree = tree.with_timeout(CALL_TIMEOUT);
-    let pending: Vec<_> = planned
-        .into_iter()
-        .map(|p| (p.at, p.kind, tree.submit(p.route, name, &p.arg)))
+    let parsed: Vec<Result<DeviceRoute, String>> = routes
+        .iter()
+        .map(|at| at.parse::<DeviceRoute>().map_err(|error| error.to_string()))
         .collect();
-    let mut results = Vec::new();
-    for (at, kind, reply) in pending {
-        let kind = (kind != RpcValueType::Unit).then_some(kind);
-        results.push(outcome(&at, kind, reply.await));
+    if parsed.iter().any(Result::is_err) {
+        let results = parsed
+            .into_iter()
+            .zip(routes)
+            .map(|(parsed, at)| match parsed {
+                Ok(_) => Outcome::Skipped { route: at.clone() },
+                Err(error) => Outcome::Refused {
+                    route: at.clone(),
+                    error,
+                },
+            })
+            .collect();
+        return CallReply {
+            sent: false,
+            results,
+        };
     }
-    CallReply {
-        sent: true,
-        results,
-    }
+    let parsed: Vec<DeviceRoute> = parsed.into_iter().filter_map(Result::ok).collect();
+    let tree = tree.with_timeout(CALL_TIMEOUT);
+    let each = tree.call_each(name, text, &parsed).await;
+    let sent = !each
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, rpc::Outcome::Refused(_)));
+    let results = each
+        .into_iter()
+        .zip(routes)
+        .map(|((_, each), at)| outcome(at, each))
+        .collect();
+    CallReply { sent, results }
 }
 
 /// Reads each of `names` from the device at `route` at once, for the entries
@@ -601,7 +534,8 @@ pub(crate) async fn read(
         .collect();
     let mut values = BTreeMap::new();
     for (name, kind, reply) in pending {
-        values.insert(name, outcome(route, Some(kind), reply.await));
+        let each = rpc::Outcome::of_reply(kind, reply.await);
+        values.insert(name, outcome(route, each));
     }
     Ok(ReadReply { values })
 }
@@ -609,31 +543,29 @@ pub(crate) async fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use twinleaf::device::rpc::{RpcMeta, RpcMetaFlags};
+    use twinleaf::device::rpc::RpcValue;
 
-    fn devices(tables: &[(&str, &[(&str, RpcValueType)])]) -> Arc<Devices> {
-        let devices = Devices::new(Feed::new());
-        let setting = RpcMetaFlags::READABLE | RpcMetaFlags::WRITABLE;
-        for (route, entries) in tables {
-            let rpcs = entries
-                .iter()
-                .map(|(name, kind)| {
-                    RpcDescriptor::from_meta(
-                        RpcMeta::typed(*kind, setting).bits(),
-                        name.to_string(),
-                    )
-                })
-                .collect();
-            devices.set_table(route.parse().unwrap(), Arc::new(RpcRegistry::new(rpcs)));
-        }
-        devices
+    /// The page reads an answer of no value as `null`, and each other
+    /// outcome with the route it is of.
+    #[test]
+    fn an_outcome_is_the_pages_json_of_it() {
+        let ok = outcome("/1", rpc::Outcome::Ok(Some(RpcValue::F64(0.5))));
+        let value = serde_json::json!({ "state": "ok", "route": "/1", "value": 0.5 });
+        assert_eq!(serde_json::to_value(ok).unwrap(), value);
+        let none = serde_json::to_value(outcome("/", rpc::Outcome::Ok(None))).unwrap();
+        assert_eq!(none["value"], serde_json::Value::Null);
+        assert_eq!(
+            outcome("/0", rpc::Outcome::Unknown("timed out".into())),
+            Outcome::Unknown {
+                route: "/0".into(),
+                error: "timed out".into()
+            }
+        );
+        assert_eq!(
+            outcome("/0", rpc::Outcome::Skipped),
+            Outcome::Skipped { route: "/0".into() }
+        );
     }
-
-    fn routes(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| name.to_string()).collect()
-    }
-
-    const F32: RpcValueType = RpcValueType::Float { size: 4 };
 
     fn device(route: &str, name: &str) -> Message {
         Message::Device {
@@ -811,63 +743,6 @@ mod tests {
         assert_eq!(
             *rx.try_recv().unwrap(),
             Frame::Binary((start + 2).to_le_bytes().to_vec())
-        );
-    }
-
-    #[test]
-    fn a_call_every_device_takes_is_planned_for_each() {
-        let devices = devices(&[("/0", &[("gain", F32)]), ("/1", &[("gain", F32)])]);
-        let planned = plan(&devices, "gain", "2.5", &routes(&["/0", "/1"])).unwrap();
-        assert_eq!(
-            planned.iter().map(|p| p.at.as_str()).collect::<Vec<_>>(),
-            ["/0", "/1"]
-        );
-        assert_eq!(planned[0].arg, 2.5f32.to_le_bytes());
-    }
-
-    #[test]
-    fn a_device_that_refuses_a_call_stops_it_for_every_device() {
-        let devices = devices(&[("/0", &[("gain", F32)]), ("/1", &[("other", F32)])]);
-        let results = plan(&devices, "gain", "2.5", &routes(&["/0", "/1", "/2"])).unwrap_err();
-        assert_eq!(
-            results,
-            [
-                Outcome::Skipped { route: "/0".into() },
-                Outcome::Refused {
-                    route: "/1".into(),
-                    error: "it has no such RPC".into()
-                },
-                Outcome::Refused {
-                    route: "/2".into(),
-                    error: "its RPC table has not loaded".into()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn a_text_one_type_cannot_hold_refuses_the_call() {
-        let devices = devices(&[
-            ("/0", &[("gain", F32)]),
-            ("/1", &[("gain", RpcValueType::Bool)]),
-        ]);
-        let results = plan(&devices, "gain", "2.5", &routes(&["/0", "/1"])).unwrap_err();
-        assert!(matches!(results[0], Outcome::Skipped { .. }));
-        assert!(matches!(results[1], Outcome::Refused { .. }));
-    }
-
-    #[test]
-    fn a_reply_that_never_came_is_unknown() {
-        assert!(matches!(
-            outcome("/", Some(F32), Err(CallError::Timeout)),
-            Outcome::Unknown { .. }
-        ));
-        assert_eq!(
-            outcome("/", Some(F32), Ok(0.5f32.to_le_bytes().to_vec())),
-            Outcome::Ok {
-                route: "/".into(),
-                value: serde_json::json!(0.5)
-            }
         );
     }
 }

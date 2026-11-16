@@ -6,7 +6,9 @@ use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
 use crate::rt::Supervisor;
-use crate::session::rpc::{CallError, PendingReply, RpcMeta, RpcRegistry, RpcRegistryError};
+use crate::session::rpc::{
+    plan, CallError, Outcome, PendingReply, RpcMeta, RpcRegistry, RpcRegistryError,
+};
 use crate::session::{Field, CHANGES, LINK, METADATA, PRESENCE, REGISTRY, SETTINGS};
 use crate::session::{Handle, Session};
 use crate::session::{Layout, ProxyAddress, Purpose, Receiver, RecvError, Scope};
@@ -24,7 +26,7 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long [`Device::rpc_registry`] and [`Device::settings`] wait for the
 /// table to load and the settings to be read.
-const TABLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const TABLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long [`Connection::open`] waits for the proxy to open a device. The
 /// proxy itself gives a device 10 s to answer.
@@ -662,6 +664,75 @@ impl DeviceTree {
     /// refuses with [`CallError::DeviceError`].
     pub fn rpc_meta(&self, route: DeviceRoute, name: &str) -> Result<RpcMeta, CallError> {
         self.rpc(route, "rpc.info", name).map(RpcMeta::from_bits)
+    }
+
+    /// Calls `name` with the argument `text` on each of `routes`, and
+    /// returns what each device made of it, in the order of `routes`.
+    ///
+    /// Each device's argument is `text` encoded by its own RPC table. The
+    /// call waits for every device's table at once, as
+    /// [`Device::rpc_registry`] waits for one, up to 30 s. Nothing is sent
+    /// unless every device takes the text, as a write that reaches only
+    /// some devices cannot be taken back. A route outside this view, one
+    /// whose table failed to load or did not load in time, one whose table
+    /// lacks `name`, or one whose type cannot hold `text` is
+    /// [`Outcome::Refused`], and every other route is then
+    /// [`Outcome::Skipped`]. Otherwise the call goes to every device at
+    /// once, and each waits for its reply up to the view's timeout.
+    pub async fn call_each(
+        &self,
+        name: &str,
+        text: &str,
+        routes: &[DeviceRoute],
+    ) -> Vec<(DeviceRoute, Outcome)> {
+        let deadline = tokio::time::Instant::now() + TABLE_TIMEOUT;
+        let waits = routes.iter().map(|&route| async move {
+            let device = self.device(route).map_err(|error| error.to_string());
+            let table = match device {
+                Ok(device) => table_by(&device.rpc_registry_updates(), deadline).await,
+                Err(error) => Err(error),
+            };
+            (route, table)
+        });
+        let tables = futures_util::future::join_all(waits).await;
+        let planned = match plan(name, text, tables) {
+            Ok(planned) => planned,
+            Err(refused) => return refused,
+        };
+        let pending: Vec<_> = planned
+            .into_iter()
+            .map(|p| (p.route, p.kind, self.submit(p.route, name, &p.arg)))
+            .collect();
+        let mut results = Vec::with_capacity(pending.len());
+        for (route, kind, reply) in pending {
+            results.push((route, Outcome::of_reply(kind, reply.await)));
+        }
+        results
+    }
+}
+
+/// Why a call is refused a device whose RPC table did not load by its
+/// deadline.
+pub(super) const TABLE_NOT_LOADED: &str = "its RPC table has not loaded";
+
+/// Waits until `updates` yields a device's RPC table, or why it could not
+/// be loaded, or until `deadline`. Returns the table, or why there is none
+/// to call the device by.
+pub(super) async fn table_by(
+    updates: &Receiver<RegistryState>,
+    deadline: tokio::time::Instant,
+) -> Result<Arc<RpcRegistry>, String> {
+    loop {
+        let received = tokio::select! {
+            received = updates.recv_async() => received,
+            () = crate::chan::sleep_until(deadline) => return Err(TABLE_NOT_LOADED.to_string()),
+        };
+        return match received {
+            Ok(Ok(table)) => Ok(table),
+            Ok(Err(error)) => Err(format!("its RPC table did not load. {error}")),
+            Err(RecvError::Lagged(_)) => continue,
+            Err(_) => Err(TABLE_NOT_LOADED.to_string()),
+        };
     }
 }
 

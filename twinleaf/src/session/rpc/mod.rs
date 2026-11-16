@@ -28,6 +28,8 @@
 //! returns a [`PendingReply`] to block on or await. [`pipelined`] keeps a
 //! window of them in flight. Every failure is a [`CallError`], and a device's
 //! refusal carries its [`RpcErrorPayload`].
+//! [`call_each`](crate::device::DeviceTree::call_each) makes one call of
+//! several devices, all or none, and says each device's [`Outcome`].
 //!
 //! [`RpcMeta`], [`RpcValueType`], [`RpcAccess`], [`RpcStringLen`], and
 //! [`RpcMetaFlags`] are the protocol's own definitions, re-exported from
@@ -36,6 +38,7 @@
 
 pub(crate) mod cache;
 mod error;
+mod outcome;
 mod registry;
 mod reply;
 mod value;
@@ -45,6 +48,8 @@ pub use crate::proto::rpc::{RpcAccess, RpcMeta, RpcMetaFlags, RpcStringLen, RpcV
 #[doc(inline)]
 pub use crate::tio::rpc::{RpcArgs, RpcDecodeError, RpcReply, RpcReplyFixedSize};
 pub use error::{CallError, RpcErrorPayload};
+pub(crate) use outcome::plan;
+pub use outcome::Outcome;
 pub use registry::{RpcDescriptor, RpcRegistry, RpcRegistryError};
 pub(crate) use reply::Pipeline;
 pub use reply::{pipelined, PendingReply, ReplyFuture};
