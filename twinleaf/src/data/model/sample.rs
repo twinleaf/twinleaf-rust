@@ -292,6 +292,8 @@ pub(in crate::data) struct BatchContext {
 #[derive(Debug, Clone)]
 pub struct SampleBatch {
     context: BatchContext,
+    /// The ordinal of the buffer run a read took the rows from, if any.
+    run: Option<u64>,
     sample_numbers: ScalarBuffer<SampleNumber>,
     /// Each row's end-of-sample time, materialized at construction.
     timestamps: ScalarBuffer<f64>,
@@ -508,6 +510,7 @@ impl SampleBatch {
         );
         SampleBatch {
             context,
+            run: None,
             sample_numbers,
             timestamps,
             columns,
@@ -528,6 +531,7 @@ impl SampleBatch {
         }
         SampleBatch {
             context,
+            run: self.run,
             sample_numbers: self.sample_numbers.slice(rows.clone()),
             timestamps: self.timestamps.slice(rows.clone()),
             columns: self.columns.iter().map(|c| c.slice(rows.clone())).collect(),
@@ -563,6 +567,19 @@ impl SampleBatch {
     /// Returns the continuity generations this batch's rows belong to.
     pub fn generations(&self) -> Generations {
         self.context.generations
+    }
+
+    /// Returns the [ordinal](crate::data::Run::ordinal) of the buffer run a
+    /// read took this batch's rows from, or `None` for a batch no run gave.
+    /// Two batches of one read with the same ordinal are of one run.
+    pub fn run(&self) -> Option<u64> {
+        self.run
+    }
+
+    /// Returns this batch as read from the run of `ordinal`.
+    pub(in crate::data) fn in_run(mut self, ordinal: u64) -> SampleBatch {
+        self.run = Some(ordinal);
+        self
     }
 
     /// Returns each row's sample number within its segment, in row order.

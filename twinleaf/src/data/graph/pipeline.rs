@@ -1,6 +1,5 @@
 //! Incremental per-column computation driven by a [`Buffer`].
 
-use crate::data::model::continuity::Generations;
 use crate::data::model::sample::ColumnArray;
 use crate::data::model::schema::ColumnKey;
 use crate::data::store::buffer::{Buffer, Run};
@@ -52,9 +51,9 @@ pub trait ColumnOp {
 pub struct ColumnProcessor<Op: ColumnOp> {
     key: ColumnKey,
     op: Op,
-    /// Stamps of the run being followed. A different `stream` generation is a
+    /// The ordinal of the run being followed. A run of another ordinal is a
     /// different run.
-    cursor: Option<Generations>,
+    cursor: Option<u64>,
     next_row: u64,
 }
 
@@ -88,19 +87,17 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
         };
         let retained = run.retained_rows();
 
-        let needs_replay = self
-            .cursor
-            .is_none_or(|c| c.stream != run.generations().stream)
+        let needs_replay = self.cursor.is_none_or(|ordinal| ordinal != run.ordinal())
             || self.next_row < retained.start
             || self.next_row > retained.end;
         let rows = if needs_replay {
             self.op.reset();
-            self.cursor = Some(run.generations());
+            self.cursor = Some(run.ordinal());
             let from = match self.op.continuity() {
                 // Rows before the last gap would be reset away.
                 Continuity::Continuous => run
                     .boundaries()
-                    .map(|(row, _, _)| row)
+                    .map(|gap| gap.row)
                     .next_back()
                     .map_or(retained.start, |row| row.max(retained.start)),
                 Continuity::Monotonic => retained.start,
@@ -123,7 +120,7 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
         let continuous = self.op.continuity() == Continuity::Continuous;
         let gaps: Vec<u64> = run
             .boundaries()
-            .map(|(row, _, _)| row)
+            .map(|gap| gap.row)
             .filter(|&row| row >= rows.start && row < rows.end)
             .collect();
         let mut gaps = gaps.into_iter().peekable();
@@ -183,6 +180,7 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::model::continuity::Generations;
     use crate::data::model::sample::{BatchContext, ColumnData, SampleBatchBuilder};
     use crate::data::model::schema::{DeviceRecord, SegmentRecord, StreamMetadataSnapshot};
     use crate::data::tests::fixtures;
@@ -339,6 +337,23 @@ mod tests {
             1,
             "only the initial hydrate should reset"
         );
+    }
+
+    /// A run that opens after its stream is forgotten is a new run to the
+    /// processor, though its batches carry the generation of the run before
+    /// and it holds more rows than the processor saw.
+    #[test]
+    fn catch_up_replays_a_run_opened_after_a_forget() {
+        let fx = fixture();
+        let mut buffer = Buffer::new(64);
+        let mut processor = ColumnProcessor::new(fx.column_key, Recorder::default());
+        fx.push(&mut buffer, 1, &[(0, 0.0), (1, 1.0)]);
+        processor.catch_up(&buffer);
+        assert!(buffer.forget(&fx.column_key.stream_key()));
+        fx.push(&mut buffer, 1, &[(2, 2.0), (3, 3.0), (4, 4.0)]);
+        let out = processor.catch_up(&buffer).clone();
+        assert_eq!(out, vec![(3.0, 2.0), (4.0, 3.0), (5.0, 4.0)]);
+        assert_eq!(processor.op().reset_count, 2);
     }
 
     #[test]

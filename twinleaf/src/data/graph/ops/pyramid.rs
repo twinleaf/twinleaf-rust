@@ -297,7 +297,7 @@ impl Stretch {
             ratio,
             start: rows.start,
             gaps: (run.boundaries())
-                .map(|(row, _, _)| row)
+                .map(|gap| gap.row)
                 .filter(|row| rows.contains(row))
                 .collect(),
             batches: run.rows(rows),
@@ -363,8 +363,8 @@ impl Read {
             last,
             slices: level.between(first.0, last.0),
             gaps: (run.boundaries())
-                .filter(|(row, _, _)| rows.contains(row))
-                .map(|(_, time, _)| time)
+                .filter(|gap| rows.contains(&gap.row))
+                .map(|gap| gap.after)
                 .collect(),
         })
     }

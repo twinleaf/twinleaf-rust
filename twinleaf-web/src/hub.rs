@@ -123,8 +123,8 @@ struct Trace {
     spectrum: ColumnProcessor<Welch>,
     /// Time of the last point sent of each level.
     last_sent: Vec<f64>,
-    /// The stream generation the last points came from. A new one is a new run.
-    generation: Option<u32>,
+    /// The ordinal of the run the last points came from. Another is a new run.
+    run: Option<u64>,
 }
 
 /// What every page shows, and the channel each page hears it on.
@@ -665,7 +665,7 @@ fn ratio_for(rate: f64, pps: f64) -> usize {
 
 /// The times of the run's gaps, oldest first.
 fn gap_times(run: Option<&Run>) -> Vec<f64> {
-    run.map(|r| r.boundaries().map(|(_, time, _)| time).collect())
+    run.map(|r| r.boundaries().map(|gap| gap.after).collect())
         .unwrap_or_default()
 }
 
@@ -758,7 +758,7 @@ impl Hub {
                 reduced: ColumnProcessor::new(key, Pyramid::new()),
                 spectrum: ColumnProcessor::new(key, Welch::new(window, rate)),
                 last_sent: vec![f64::NEG_INFINITY; LEVELS],
-                generation: None,
+                run: None,
             });
         }
     }
@@ -776,9 +776,9 @@ impl Hub {
             if let Some(oldest) = run.first_timestamp() {
                 trace.reduced.op_mut().drop_before(oldest);
             }
-            let generation = run.generations().stream;
-            let new_run = trace.generation.is_some_and(|g| g != generation);
-            trace.generation = Some(generation);
+            let ordinal = run.ordinal();
+            let new_run = trace.run.is_some_and(|last| last != ordinal);
+            trace.run = Some(ordinal);
             let breaks = gap_times(Some(run));
             let levels = trace.live.catch_up(&self.buffer);
             for (level, (fpcs, last_sent)) in levels.iter().zip(&mut trace.last_sent).enumerate() {
@@ -1710,7 +1710,7 @@ mod tests {
         let stream = StreamKey::new(DeviceRoute::root(), StreamId::new(1));
         let held = move |hub: &mut Hub| {
             let run = hub.buffer.run(&stream)?;
-            let losses = run.boundaries().filter_map(|(_, _, b)| b.loss.clone());
+            let losses = run.boundaries().filter_map(|gap| gap.boundary.loss.clone());
             let (lost, dropped) = losses.fold((0, 0), |(lost, dropped), loss| {
                 (lost + loss.samples, dropped + loss.dropped_samples)
             });
@@ -1910,6 +1910,38 @@ mod tests {
         hub.ingest(&after.slice(0..0));
         let lost = crate::loss::of(&hub.buffer, DeviceRoute::root(), "field");
         assert_eq!(lost.skipped, 5);
+    }
+
+    /// A stream the buffer forgot goes on under the name its run had, and
+    /// the rows it loses after are told with those before.
+    #[test]
+    fn a_forgotten_stream_keeps_its_counts_under_its_name() {
+        let mut hub = Hub::new();
+        let mut rx = hub.feed.subscribe().1;
+        let mut parser = parser();
+        let mut told = |hub: &Hub| -> Vec<serde_json::Value> {
+            hub.losses.send_changed(&hub.buffer);
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|frame| match &*frame {
+                    Frame::Text(text) => serde_json::from_str(text).ok(),
+                    Frame::Binary(_) => None,
+                })
+                .filter(|message: &serde_json::Value| message["type"] == "loss")
+                .map(|message| message["streams"]["field"]["skipped"].clone())
+                .collect()
+        };
+        for first in [0, 15] {
+            for batch in samples(&mut parser, first, 10) {
+                hub.ingest(&batch);
+            }
+        }
+        assert_eq!(told(&hub), [5]);
+        let key = StreamKey::new(DeviceRoute::root(), StreamId::new(1));
+        assert!(hub.buffer.forget(&key));
+        let after = samples(&mut parser, 30, 10).remove(0);
+        hub.ingest(&after.slice(0..0));
+        assert!(hub.buffer.run(&key).is_none());
+        assert_eq!(told(&hub), [10]);
     }
 
     /// Two streams of a device that have one name are one stream to the
@@ -2508,8 +2540,11 @@ mod tests {
             if start > 0 {
                 breaks.push(rows.x[start]);
             }
-            let lost = span.run.boundaries().filter(|b| span.rows.contains(&b.0));
-            breaks.extend(lost.map(|(_, time, _)| time));
+            let lost = span
+                .run
+                .boundaries()
+                .filter(|gap| span.rows.contains(&gap.row));
+            breaks.extend(lost.map(|gap| gap.after));
             parts.push(start..start + (span.rows.end - span.rows.start) as usize);
         }
         let broken = |a: f64, b: f64| breaks.iter().any(|&at| a < at && at <= b);

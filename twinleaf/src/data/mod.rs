@@ -179,4 +179,4 @@ pub use model::schema::{
     ColumnKey, DeviceMetadataSnapshot, MetadataQuery, StreamKey, StreamMetadataSnapshot,
     StreamSchema,
 };
-pub use store::buffer::{Buffer, Run};
+pub use store::buffer::{Buffer, Gap, Run, RunStart};

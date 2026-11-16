@@ -182,10 +182,21 @@ impl Buffer {
 
     /// Appends `batch`'s rows to its stream's run. A batch of the run's
     /// latest per-stream generation joins the run. So does a batch of a newer
-    /// one whose boundary is monotonic and whose schema is the run's, and the
-    /// run records that boundary. Any other batch starts a new run. The rows
-    /// the batch's boundary says were lost add to the stream's [`Lost`], and
-    /// those of an empty batch do too. An empty batch adds no rows.
+    /// one whose boundary keeps time monotonic and whose schema is the run's,
+    /// and the run records that boundary as a [`Gap`] when it is not
+    /// continuous.
+    ///
+    /// Any other batch with rows starts a new run, and [`Run::began`] says
+    /// which of these it was. The buffer held no run of the stream. The
+    /// batch's boundary turns time back or starts the stream over. The
+    /// batch's schema is not the run's. The batch is of a newer generation
+    /// and carries no boundary. The new run takes the place of the old one,
+    /// which is dropped with every row it held, and the stream's [`Lost`]
+    /// stays.
+    ///
+    /// The rows the batch's boundary says were lost add to the stream's
+    /// [`Lost`], and those of an empty batch do too. An empty batch adds no
+    /// rows.
     pub fn process_batch(&mut self, batch: &SampleBatch) {
         if let Some(loss) = batch.boundary().and_then(|b| b.loss.as_ref()) {
             self.lost.entry(batch.stream_key()).or_default().add(loss);
@@ -195,12 +206,17 @@ impl Buffer {
         }
         self.arrivals += 1;
         let stream_key = batch.stream_key();
-        match self.runs.get_mut(&stream_key) {
-            Some(run) if run.admits(batch) => run.append(batch, self.arrivals),
-            _ => {
-                let run = Run::new(batch, self.capacity, self.max_age, self.arrivals);
-                self.runs.insert(stream_key, run);
+        let began = match self.runs.get_mut(&stream_key) {
+            Some(run) if run.admits(batch) => {
+                run.append(batch, self.arrivals);
+                None
             }
+            Some(run) => Some(run.ended_by(batch)),
+            None => Some(RunStart::First),
+        };
+        if let Some(began) = began {
+            let run = Run::new(batch, self.capacity, self.max_age, self.arrivals, began);
+            self.runs.insert(stream_key, run);
         }
         self.trim_to_budget();
     }
@@ -268,6 +284,13 @@ impl Buffer {
             .unwrap_or(u64::MAX)
     }
 
+    /// Drops the stream's run and every row it held, and returns whether
+    /// there was one. The rows the stream lost stay counted, as
+    /// [`lost`](Self::lost) counts them since the buffer was made.
+    pub fn forget(&mut self, stream_key: &StreamKey) -> bool {
+        self.runs.remove(stream_key).is_some()
+    }
+
     /// Returns the stream's current run, or `None` if it has delivered no data.
     pub fn run(&self, stream_key: &StreamKey) -> Option<&Run> {
         self.runs.get(stream_key)
@@ -299,19 +322,60 @@ impl Buffer {
     }
 }
 
+/// Why a run began, as [`Run::began`] says. [`Buffer::process_batch`]
+/// says when a batch begins a run.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RunStart {
+    /// The buffer held no run of the stream. The run is the stream's first
+    /// in the buffer, or its first since [`Buffer::forget`].
+    First,
+    /// The run's first batch carried this boundary, which turns time back
+    /// or starts the stream over.
+    Boundary(Boundary),
+    /// The run's first batch has a schema other than the run before it, and
+    /// carried no boundary that turns time back or starts the stream over.
+    Schema,
+    /// The run's first batch is of a newer generation than the run before
+    /// it, and carried no boundary to say why. The batch that carried the
+    /// boundary never reached the buffer.
+    Generation,
+}
+
+/// A boundary within a run that is not continuous, and where in the run it
+/// fell. Every one keeps time monotonic. Most are lost samples, others a
+/// rate change or an acquisition restart.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct Gap {
+    /// The logical position of the row after the gap, which the gap falls
+    /// before.
+    pub row: u64,
+    /// The time of the last row before the gap. It is the time that row had
+    /// when the gap arrived, and stays once retention has dropped that row.
+    pub before: f64,
+    /// The time of the first row after the gap, the row at `row`.
+    pub after: f64,
+    /// The boundary of the batch that began after the gap.
+    pub boundary: Boundary,
+}
+
 /// The retained rows of one stream's current run, oldest first.
 ///
 /// Time never moves backward within a run, so its rows are in time order.
 /// Rows may be missing between them, and [`boundaries`](Run::boundaries)
 /// says where.
 pub struct Run {
+    /// The arrival number of the batch that opened this run, which tells it
+    /// from every other run of its buffer.
+    ordinal: u64,
     /// The continuity generations of the batch that opened this run.
     generations: Generations,
     /// The continuity generations of the run's newest batch.
     latest: Generations,
-    /// Each boundary within the run that is not continuous, with the logical
-    /// position and time of the row it precedes, oldest first.
-    boundaries: VecDeque<(u64, f64, Boundary)>,
+    /// Why this run began.
+    began: RunStart,
+    /// Each boundary within the run that is not continuous, oldest first.
+    boundaries: VecDeque<Gap>,
     /// The newest batch's metadata. Its schema is constant within a run.
     metadata: StreamMetadataSnapshot,
     /// Completed chunks in row order. The coalescer holds the rows after them.
@@ -343,6 +407,7 @@ pub struct Run {
 impl std::fmt::Debug for Run {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Run")
+            .field("ordinal", &self.ordinal)
             .field("generations", &self.generations)
             .field("latest", &self.latest)
             .field("boundaries", &self.boundaries.len())
@@ -354,15 +419,23 @@ impl std::fmt::Debug for Run {
 }
 
 impl Run {
-    fn new(batch: &SampleBatch, capacity: usize, max_age: Option<f64>, arrival: u64) -> Run {
+    fn new(
+        batch: &SampleBatch,
+        capacity: usize,
+        max_age: Option<f64>,
+        arrival: u64,
+        began: RunStart,
+    ) -> Run {
         let columns: usize = batch.schema().columns().map(|c| c.data_type().size()).sum();
         let row_bytes = size_of::<f64>() + size_of::<SampleNumber>() + columns;
         let target = (capacity / 16)
             .clamp(256, 65_536)
             .min((CHUNK_BYTES / row_bytes).max(256));
         let mut run = Run {
+            ordinal: arrival,
             generations: batch.generations(),
             latest: batch.generations(),
+            began,
             boundaries: VecDeque::new(),
             metadata: batch.metadata().clone(),
             chunks: VecDeque::new(),
@@ -401,8 +474,10 @@ impl Run {
             arrived.push_back(self.tail_arrived);
         }
         Run {
+            ordinal: self.ordinal,
             generations: self.generations,
             latest: self.latest,
+            began: self.began.clone(),
             boundaries: self.boundaries.clone(),
             metadata: self.metadata.clone(),
             chunks,
@@ -434,17 +509,31 @@ impl Run {
             && batch.schema() == self.metadata.schema()
     }
 
+    /// Why `batch`, which this run does not admit, begins a new run.
+    fn ended_by(&self, batch: &SampleBatch) -> RunStart {
+        match batch.boundary() {
+            Some(boundary) if !boundary.is_monotonic() || boundary.is_initial() => {
+                RunStart::Boundary(boundary.clone())
+            }
+            _ if batch.schema() != self.metadata.schema() => RunStart::Schema,
+            _ => RunStart::Generation,
+        }
+    }
+
     /// Appends `batch`, which arrived as the buffer's batch `arrival`.
     fn append(&mut self, batch: &SampleBatch, arrival: u64) {
         debug_assert!(
             batch.schema() == self.metadata.schema(),
             "a run admits only batches of its schema"
         );
-        if self.rows > 0 || !self.chunks.is_empty() || self.coalescer.buffered_len() > 0 {
+        if let Some(before) = self.last_timestamp() {
             if let Some(boundary) = batch.boundary().filter(|b| !b.is_continuous()) {
-                let time = batch.timestamps()[0];
-                self.boundaries
-                    .push_back((self.next_row, time, boundary.clone()));
+                self.boundaries.push_back(Gap {
+                    row: self.next_row,
+                    before,
+                    after: batch.timestamps()[0],
+                    boundary: boundary.clone(),
+                });
             }
         }
         self.latest = batch.generations();
@@ -554,11 +643,7 @@ impl Run {
     /// Forgets the boundaries before the first retained row.
     fn forget_dropped_boundaries(&mut self) {
         let start = self.retained_rows().start;
-        while self
-            .boundaries
-            .front()
-            .is_some_and(|&(row, _, _)| row < start)
-        {
+        while self.boundaries.front().is_some_and(|gap| gap.row < start) {
             self.boundaries.pop_front();
         }
     }
@@ -597,23 +682,36 @@ impl Run {
                     .expect("a nonempty buffered tail"),
             );
         }
-        spans
+        (spans.into_iter())
+            .map(|span| span.in_run(self.ordinal))
+            .collect()
     }
 
     /// Returns the newest retained row as a one-row batch.
     fn last_row(&self) -> Option<SampleBatch> {
         let buffered = self.coalescer.buffered_len();
-        if buffered > 0 {
-            return self.coalescer.buffered_rows(buffered - 1..buffered);
-        }
-        let chunk = self.chunks.back()?;
-        Some(chunk.slice(chunk.len() - 1..chunk.len()))
+        let row = if buffered > 0 {
+            self.coalescer.buffered_rows(buffered - 1..buffered)?
+        } else {
+            let chunk = self.chunks.back()?;
+            chunk.slice(chunk.len() - 1..chunk.len())
+        };
+        Some(row.in_run(self.ordinal))
+    }
+
+    /// Returns the run's ordinal, which no other run of its buffer or of the
+    /// buffer's frozen copies has. It identifies the run. A frozen copy of a
+    /// run has the run's ordinal, and every batch read from the run carries
+    /// it as [`SampleBatch::run`] returns it. A run that opens after a
+    /// stream is forgotten has a new ordinal, though its batches may carry
+    /// the generations of the run before.
+    pub fn ordinal(&self) -> u64 {
+        self.ordinal
     }
 
     /// Returns the continuity generations of the batch that opened this run.
-    /// They identify the run, as a new run opens with newer ones. Batches that
-    /// joined the run across a monotonic boundary carry newer ones, as
-    /// [`latest_generations`](Self::latest_generations) returns.
+    /// Batches that joined the run across a monotonic boundary carry newer
+    /// ones, as [`latest_generations`](Self::latest_generations) returns.
     pub fn generations(&self) -> Generations {
         self.generations
     }
@@ -623,16 +721,16 @@ impl Run {
         self.latest
     }
 
-    /// Returns each retained boundary within the run that is not continuous,
-    /// oldest first, as the logical position and the time of the row after
-    /// it, and the boundary. Every one keeps time monotonic. Most are lost
-    /// samples, others a rate change or an acquisition restart.
-    pub fn boundaries(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (u64, f64, &Boundary)> + ExactSizeIterator + '_ {
-        self.boundaries
-            .iter()
-            .map(|(row, time, b)| (*row, *time, b))
+    /// Returns why the run began, such as a new session or time that moved
+    /// backward. It stays while the run lives, whatever retention drops.
+    pub fn began(&self) -> &RunStart {
+        &self.began
+    }
+
+    /// Returns each retained [`Gap`] within the run, oldest first. A gap is
+    /// retained while the row after it is.
+    pub fn boundaries(&self) -> impl DoubleEndedIterator<Item = &Gap> + ExactSizeIterator + '_ {
+        self.boundaries.iter()
     }
 
     /// Returns the retained rows within `rows`, a range of logical positions,
@@ -988,7 +1086,7 @@ mod tests {
         assert_eq!(run.latest_generations().stream, 2);
         let gaps: Vec<_> = run
             .boundaries()
-            .map(|(row, time, b)| (row, time, b.class()))
+            .map(|gap| (gap.row, gap.after, gap.boundary.class()))
             .collect();
         assert_eq!(
             gaps,
@@ -1092,6 +1190,115 @@ mod tests {
             0,
             "a run's opening boundary is not inside it"
         );
+    }
+
+    #[test]
+    fn a_run_says_why_it_began_while_it_lives() {
+        let mut buffer = Buffer::new(8);
+        let fx = test_fixture(&[DataType::F64]);
+        let began = |buffer: &Buffer| buffer.run(&fx.stream_key).unwrap().began().clone();
+        fx.push_floats(&mut buffer, 1, 0..4);
+        assert_eq!(began(&buffer), RunStart::First);
+        let back = Boundary {
+            change: Some(Change::TimeBackward { gap_seconds: 3.0 }),
+            loss: None,
+        };
+        fx.push_floats_after(&mut buffer, 2, 0..4, back.clone());
+        // Retention drops every row the run began with.
+        fx.push_floats(&mut buffer, 2, 4..20);
+        let run = buffer.run(&fx.stream_key).unwrap();
+        assert_eq!(run.retained_rows(), 12..20);
+        assert_eq!(began(&buffer), RunStart::Boundary(back));
+        assert_eq!(
+            buffer.frozen().run(&fx.stream_key).unwrap().began(),
+            run.began()
+        );
+
+        // A new schema with no boundary, a newer generation with none, and
+        // the first run after the stream was forgotten.
+        let changed = test_fixture(&[DataType::F64, DataType::U64]);
+        let row = vec![ColumnData::F64(1.0), ColumnData::U64(2)];
+        changed.push_rows(&mut buffer, 3, &[(20, row)]);
+        assert_eq!(began(&buffer), RunStart::Schema);
+        fx.push_floats(&mut buffer, 4, 30..32);
+        assert_eq!(began(&buffer), RunStart::Schema);
+        fx.push_floats(&mut buffer, 5, 32..34);
+        assert_eq!(began(&buffer), RunStart::Generation);
+        assert!(buffer.forget(&fx.stream_key));
+        fx.push_floats(&mut buffer, 5, 34..36);
+        assert_eq!(began(&buffer), RunStart::First);
+    }
+
+    /// A gap gives the time of the row before it and of the row after it,
+    /// and keeps the time before once retention drops that row.
+    #[test]
+    fn a_gap_gives_the_times_of_the_rows_on_either_side() {
+        let mut buffer = Buffer::new(8);
+        let fx = test_fixture(&[DataType::F64]);
+        let times = |buffer: &Buffer| -> Vec<(u64, f64, f64)> {
+            let run = buffer.run(&fx.stream_key).unwrap();
+            let gaps = run.boundaries();
+            gaps.map(|gap| (gap.row, gap.before, gap.after)).collect()
+        };
+        fx.push_floats(&mut buffer, 1, 0..4);
+        fx.push_floats_after(&mut buffer, 2, 10..14, loss(6));
+        assert_eq!(times(&buffer), vec![(4, 4.0, 11.0)]);
+        fx.push_floats(&mut buffer, 2, 14..18);
+        let run = buffer.run(&fx.stream_key).unwrap();
+        assert_eq!(run.retained_rows(), 4..12, "the row before the gap went");
+        assert_eq!(times(&buffer), vec![(4, 4.0, 11.0)]);
+    }
+
+    #[test]
+    fn forgetting_a_stream_drops_its_run_and_keeps_what_it_lost() {
+        let mut buffer = Buffer::new(64);
+        let fx = test_fixture(&[DataType::F64]);
+        let other = stream_fixture(2, &[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..4);
+        fx.push_floats_after(&mut buffer, 2, 10..14, loss(6));
+        other.push_floats(&mut buffer, 1, 0..4);
+        let lost = buffer.lost(&fx.stream_key);
+        assert!(buffer.forget(&fx.stream_key));
+        assert!(buffer.run(&fx.stream_key).is_none());
+        assert_eq!(
+            buffer.stream_keys().collect::<Vec<_>>(),
+            [&other.stream_key]
+        );
+        assert_eq!(buffer.bytes(), 4 * ROW);
+        assert_eq!(buffer.lost(&fx.stream_key), lost);
+        assert_eq!(lost.skipped, 6);
+        assert!(!buffer.forget(&fx.stream_key), "there is no run to forget");
+        fx.push_floats(&mut buffer, 3, 20..22);
+        assert_eq!(buffer.run(&fx.stream_key).unwrap().retained_rows(), 0..2);
+    }
+
+    /// A run that opens after its stream is forgotten has an ordinal of its
+    /// own, though its batches carry the generations of the run before. A
+    /// frozen copy keeps the run's ordinal, and every batch read from a run
+    /// carries it.
+    #[test]
+    fn a_run_opened_after_a_forget_has_an_ordinal_of_its_own() {
+        let mut buffer = Buffer::new(64);
+        let fx = test_fixture(&[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..4);
+        let first = buffer.run(&fx.stream_key).unwrap().ordinal();
+        let frozen = buffer.frozen();
+        assert!(buffer.forget(&fx.stream_key));
+        fx.push_floats(&mut buffer, 1, 4..8);
+        let (held, run) = (
+            frozen.run(&fx.stream_key).unwrap(),
+            buffer.run(&fx.stream_key).unwrap(),
+        );
+        assert_eq!(held.generations(), run.generations());
+        assert_eq!(held.ordinal(), first);
+        assert_ne!(run.ordinal(), first);
+        let read = |run: &Run| -> Vec<Option<u64>> {
+            run.rows(0..4).iter().map(SampleBatch::run).collect()
+        };
+        assert_eq!(read(held), [Some(first)]);
+        assert_eq!(read(run), [Some(run.ordinal())]);
+        let latest = buffer.latest_row(&fx.stream_key).unwrap();
+        assert_eq!(latest.run(), Some(run.ordinal()));
     }
 
     #[test]
