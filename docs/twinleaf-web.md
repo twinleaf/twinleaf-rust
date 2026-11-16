@@ -32,9 +32,17 @@ holds up no accept.
 
 ## Security (`guard.rs`)
 
-A page on any site can make the browser send requests to `localhost:7855`,
-and with DNS rebinding read the answers. This page changes device settings,
-so every request passes two checks, or gets a 403 `{"error": ...}`:
+The page answers only to this machine. `tio proxy` listens on every
+interface by default, so the check is made on the connection, where no
+request can forge it: `handler` (`lib.rs`) closes a connection whose peer
+address is not loopback (`127.0.0.0/8`, `::1`, or `::ffff:127.0.0.0/104`)
+before it reads a request, and answers nothing. `guard::answers` is the
+rule.
+
+A page on any site can still make a browser on this machine send requests
+to `localhost:7855`, and with DNS rebinding read the answers. This page
+changes device settings, so every request then passes two checks in the
+`guard` middleware, or gets a 403 `{"error": ...}`:
 
 - `Host` must name loopback: `localhost`, `*.localhost`, `127.0.0.1` or
   `[::1]`, with any port.
@@ -57,7 +65,7 @@ The server sends no CORS headers, and hyper's `header_read_timeout` is set.
 | `firmware` | what each device runs, the catalog of published firmware, and the upgrades pages ask for, one at a time |
 | `routes` | the routes, which hub is current, mount order |
 | `discover` | the device picker's scan |
-| `guard`, `assets` | the checks above, and the built page |
+| `guard`, `assets` | the connection's and the requests' checks above, and the built page |
 | `mcp` | the door for agents at `/mcp`, its tools and the picture a glance draws |
 
 One hub (`Live`) serves every page. It opens with the first request that

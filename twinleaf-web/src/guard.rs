@@ -1,11 +1,17 @@
-//! The checks every request passes before it is served.
+//! The checks a connection and each of its requests pass before a request
+//! is served.
 //!
-//! A page on any site a browser has open can send requests to
-//! `localhost:7855`. One that makes its own name resolve to `127.0.0.1`, a
-//! DNS rebinding, can read the answers too. So a request must name this
-//! machine as its `Host`. A request that carries an `Origin`, as a
-//! browser's WebSocket upgrade and its requests other than GET do, must come
-//! from this server's own origin.
+//! This server answers only to this machine. [`answers`] is checked on each
+//! connection, by the address of its peer, which no request can write. The
+//! handler closes a connection from any other machine before it reads a
+//! request.
+//!
+//! A page on any site a browser on this machine has open can still send
+//! requests to `localhost:7855`. One that makes its own name resolve to
+//! `127.0.0.1`, a DNS rebinding, can read the answers too. So [`guard`]
+//! checks each request. It must name this machine as its `Host`. A request
+//! that carries an `Origin`, as a browser's WebSocket upgrade and its
+//! requests other than GET do, must come from this server's own origin.
 //! A request without one comes from no browser page, and passes. The server
 //! sends no CORS headers, so no other origin may read what it answers.
 
@@ -14,6 +20,14 @@ use axum::extract::Request;
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use std::net::SocketAddr;
+
+/// Whether a connection from `peer` is from this machine. An IPv4 or IPv6
+/// loopback address is, and so is an IPv4 loopback address mapped into
+/// IPv6.
+pub(crate) fn answers(peer: SocketAddr) -> bool {
+    peer.ip().to_canonical().is_loopback()
+}
 
 /// Serves `request` if it passes the checks, and refuses it with 403
 /// otherwise, as a [`Refusal`] like every other.
@@ -74,6 +88,29 @@ mod tests {
     use axum::routing::{get, post};
     use axum::Router;
     use tower::ServiceExt;
+
+    #[test]
+    fn only_loopback_peers_are_answered() {
+        for peer in [
+            "127.0.0.1:50000",
+            "127.255.0.9:50000",
+            "[::1]:50000",
+            "[::ffff:127.0.0.1]:50000",
+        ] {
+            assert!(answers(peer.parse().unwrap()), "{peer} was refused");
+        }
+        for peer in [
+            "192.168.1.5:50000",
+            "10.0.0.1:50000",
+            "0.0.0.0:50000",
+            "[::]:50000",
+            "[::ffff:192.168.1.5]:50000",
+            "[fe80::1]:50000",
+            "[::2]:50000",
+        ] {
+            assert!(!answers(peer.parse().unwrap()), "{peer} was answered");
+        }
+    }
 
     #[test]
     fn loopback_names_pass_and_others_do_not() {
