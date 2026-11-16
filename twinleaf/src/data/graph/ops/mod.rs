@@ -21,5 +21,8 @@ mod welch;
 
 pub use fpcs::Fpcs;
 pub use fpcs_levels::FpcsLevels;
-pub use pyramid::{level_for, Level, Point, Pyramid, Slice, Stretch, BLOCK, FINEST, LEVELS};
+pub(crate) use pyramid::level_for;
+pub use pyramid::{Level, Pyramid, Slice, Stretch};
+#[cfg(test)]
+pub(crate) use pyramid::{Point, BLOCK, FINEST};
 pub use welch::{estimate_white_noise_floor, NoSpectrum, Spectrum, Welch};

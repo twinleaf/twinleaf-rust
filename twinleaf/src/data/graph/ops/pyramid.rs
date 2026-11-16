@@ -1,8 +1,8 @@
 //! Decimations of one column kept so that reading any span of its history
 //! costs by the points asked for, not by the rows the span holds.
 //!
-//! A [`Pyramid`] holds [`LEVELS`] [`Fpcs`] decimations of a column, over
-//! windows of [`FINEST`] rows, twice that, four times, and so on. Every level
+//! A [`Pyramid`] holds 16 [`Fpcs`] decimations of a column, over windows of
+//! 128 rows, twice that, four times, and so on. Every level
 //! is its own FPCS over the column's rows, none a decimation of another, so
 //! each holds what FPCS gives the samples at its ratio. A level's points are
 //! rows of the column, each at its own time.
@@ -14,19 +14,19 @@
 //! holds that for the rows further than two windows from its ends, as the
 //! point that bounds a row nearer may lie outside the stretch.
 //!
-//! A level keeps its points in blocks of [`BLOCK`]. A full block never
+//! A level keeps its points in blocks of 1024. A full block never
 //! changes, and a copy of the level shares it, as a frozen
 //! [`Buffer`](crate::data::Buffer) shares its chunks. So a copy of the levels
 //! taken beside a frozen buffer reads as the levels do, by bisection, and
 //! costs only what the levels drop after it.
 //!
-//! [`Stretch::read`] reads rows of one run of a column for a ratio of rows a
-//! point. It decimates the rows themselves when the ratio is under
-//! [`FINEST`], and reads the run's level of that ratio otherwise.
+//! A [`Stretch`] is a read of rows of one run of a column for a ratio of
+//! rows a point. It decimates the rows themselves when the ratio is under
+//! 128, and reads the run's level of that ratio otherwise.
 //!
 //! A level of windows of `r` rows emits one or two points a window, 16 bytes
 //! each, and the levels' windows double, so a column's pyramid costs at most
-//! 64/[`FINEST`] bytes a row. That is half a byte a row, 9 MB an hour at 5 kHz.
+//! 64/128 bytes a row. That is half a byte a row, 9 MB an hour at 5 kHz.
 
 use crate::data::graph::ops::Fpcs;
 use crate::data::{ColumnArray, ColumnOp, Continuity, Run, SampleBatch};
@@ -36,22 +36,22 @@ use std::ops::Range;
 use std::sync::Arc;
 
 /// A row of a column, as its time and its value.
-pub type Point = (f64, f64);
+pub(crate) type Point = (f64, f64);
 
 /// The rows in a window of the finest level. A read of fewer rows a point
 /// than this decimates the rows themselves.
-pub const FINEST: usize = 128;
+pub(crate) const FINEST: usize = 128;
 /// How many levels a pyramid has, each of windows twice as long as the one
 /// before. The coarsest has windows of `FINEST` times 2¹⁵ rows, over four
 /// million.
-pub const LEVELS: usize = 16;
+const LEVELS: usize = 16;
 /// The points in a full block of a level.
-pub const BLOCK: usize = 1024;
+pub(crate) const BLOCK: usize = 1024;
 
 /// Returns the level whose windows are the longest of no more than `ratio`
 /// rows, and the rows in its windows, or `None` when even the finest level's
 /// are longer.
-pub fn level_for(ratio: usize) -> Option<(usize, usize)> {
+pub(crate) fn level_for(ratio: usize) -> Option<(usize, usize)> {
     let level = (ratio / FINEST).checked_ilog2()? as usize;
     let level = level.min(LEVELS - 1);
     Some((level, FINEST << level))
@@ -151,18 +151,14 @@ impl Level {
     }
 
     /// Returns how many points the level holds.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         let sealed: usize = self.sealed.iter().map(|block| block.len()).sum();
         sealed + self.open.len() + self.unsettled.len()
     }
-
-    /// Returns `true` if the level holds no point.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
-/// FPCS decimations of one column at [`LEVELS`] ratios, each kept whole
+/// FPCS decimations of one column at 16 ratios, each kept whole
 /// until [`drop_before`](Self::drop_before) says how far back the column's
 /// rows still reach.
 #[derive(Debug)]
@@ -230,7 +226,8 @@ impl ColumnOp for Pyramid {
 }
 
 /// A stretch of rows of one run, read for one column at a ratio of rows a
-/// point, to turn into points later.
+/// point, to turn into points later. A [`History`](crate::data::History)
+/// reads it, from the run and the levels of that run's own column.
 ///
 /// A read takes what it needs and copies none of the run's rows, so it is
 /// quick. [`points`](Self::points) does the work of decimating, and needs
@@ -273,7 +270,7 @@ impl Stretch {
     /// by bisection. It reads the rows themselves, to decimate at that
     /// level's ratio, when `levels` is `None` or lacks the level, or `run`
     /// lacks a numeric `column`. A stretch of no rows reads none.
-    pub fn read(
+    pub(crate) fn read(
         run: &Run,
         rows: Range<u64>,
         column: ColumnId,
@@ -292,7 +289,7 @@ impl Stretch {
 
     /// Reads `rows`, positions in `run`, for `column` as the rows themselves,
     /// to decimate by `ratio`, which may be 1.
-    pub fn rows(run: &Run, rows: Range<u64>, column: ColumnId, ratio: usize) -> Stretch {
+    pub(crate) fn rows(run: &Run, rows: Range<u64>, column: ColumnId, ratio: usize) -> Stretch {
         let read = Read::Rows {
             ratio,
             start: rows.start,
@@ -305,9 +302,12 @@ impl Stretch {
         Stretch { column, read }
     }
 
-    /// Returns how many rows or points of the history the stretch is made
-    /// of, the stretch's ends counted among a level's points.
-    pub fn len(&self) -> usize {
+    /// Returns the cost of the read, which is how many rows or level points
+    /// it took. Read from its rows, it is the rows. Read from a level, it is
+    /// the level's points between the stretch's ends and the two ends. It is
+    /// not the number of points the stretch gives, which may be fewer.
+    #[cfg(test)]
+    pub(crate) fn cost(&self) -> usize {
         match &self.read {
             Read::Rows { batches, .. } => batches.iter().map(SampleBatch::len).sum(),
             Read::Points { slices, .. } => {
@@ -316,9 +316,10 @@ impl Stretch {
         }
     }
 
-    /// Returns `true` if the stretch holds no row.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Returns `true` if the stretch took no row, as a stretch of no rows.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cost() == 0
     }
 
     /// Returns the points, split at each of the run's gaps, with the
@@ -615,7 +616,7 @@ mod tests {
         ] {
             let stretch = Stretch::read(run, rows.clone(), column, ratio, Some(&levels));
             let held = &all[rows.start as usize..rows.end as usize];
-            assert_eq!(stretch.len(), held.len(), "{rows:?} read its rows");
+            assert_eq!(stretch.cost(), held.len(), "{rows:?} read its rows");
             assert_eq!(stretch.points(), vec![decimate(held, ratio)], "{rows:?}");
             let raw = Stretch::rows(run, rows.clone(), column, ratio);
             assert_eq!(stretch.points(), raw.points(), "{rows:?}");
@@ -641,7 +642,7 @@ mod tests {
             let stretch = Stretch::read(run, rows.clone(), ColumnId::new(0), ratio, Some(&levels));
             let (first, last) = (all[rows.start as usize], all[rows.end as usize - 1]);
             let leveled = flat(&levels[level].between(first.0, last.0));
-            assert_eq!(stretch.len(), 2 + leveled.len(), "{rows:?} read its level");
+            assert_eq!(stretch.cost(), 2 + leveled.len(), "{rows:?} read its level");
             let mut want = vec![first];
             want.extend(leveled.iter().filter(|p| first.0 < p.0 && p.0 < last.0));
             want.push(last);
@@ -689,27 +690,27 @@ mod tests {
         }
     }
 
-    /// A stretch's `len` counts the rows or points it read. Read from its
+    /// A stretch's cost counts the rows or points it read. Read from its
     /// rows at one row a point, those are its points. Read from a level, it
     /// counts both ends, which the level may also hold, so its points are no
     /// more. A stretch of no rows is empty at any ratio.
     #[test]
-    fn len_counts_what_a_stretch_read_and_a_stretch_of_no_rows_is_empty() {
+    fn the_cost_counts_what_a_stretch_read_and_a_stretch_of_no_rows_is_empty() {
         let (buffer, levels) = history(10_000, 4000..4100);
         let run = buffer.run(&column_key().stream_key()).unwrap();
         let rows = run.retained_rows();
         let column = ColumnId::new(0);
         let read = |rows: Range<u64>, ratio| Stretch::read(run, rows, column, ratio, Some(&levels));
         let every = read(rows.clone(), 1);
-        assert_eq!(every.len(), 9900);
-        assert_eq!(total(&every.points()), every.len());
+        assert_eq!(every.cost(), 9900);
+        assert_eq!(total(&every.points()), every.cost());
         let leveled = read(rows.clone(), 1000);
-        assert!(total(&leveled.points()) <= leveled.len());
+        assert!(total(&leveled.points()) <= leveled.cost());
         for ratio in [1, 10, FINEST, 1000, usize::MAX] {
             for at in [0, 5, 4000, 9900] {
                 let stretch = read(at..at, ratio);
                 assert!(stretch.is_empty(), "ratio {ratio} at {at}");
-                assert_eq!(stretch.len(), 0);
+                assert_eq!(stretch.cost(), 0);
                 assert!(stretch.points().is_empty(), "ratio {ratio} at {at}");
             }
         }

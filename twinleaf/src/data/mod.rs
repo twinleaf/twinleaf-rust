@@ -31,6 +31,10 @@
     doc = "- [`ops`] decimates and estimates spectra (`processing` feature)."
 )]
 #![cfg_attr(
+    feature = "processing",
+    doc = "- [`History`] keeps a buffer with decimations of its columns and a held copy, to read spans of any length (`processing` feature)."
+)]
+#![cfg_attr(
     not(feature = "processing"),
     doc = "- The `processing` feature adds decimation and spectral estimates."
 )]
@@ -168,6 +172,9 @@ pub(crate) mod tests;
 pub use crate::proto::data::DataType;
 pub use decode::parser::{PacketOutcome, PacketParser};
 pub use decode::state::{DataError, StreamDataError};
+#[cfg(feature = "processing")]
+#[cfg_attr(docsrs, doc(cfg(feature = "processing")))]
+pub use graph::history::{History, Window};
 pub use graph::pipeline::{ColumnOp, ColumnProcessor, Continuity};
 pub use logfile::reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
 pub use model::continuity::{Boundary, BoundaryClass, Change, Generations, Loss, Lost};
