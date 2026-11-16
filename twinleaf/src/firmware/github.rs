@@ -6,6 +6,29 @@ use super::{FirmwareCatalog, FirmwareDate, FirmwareError, FirmwareRelease};
 /// The user agent of every request.
 const HTTP_USER_AGENT: &str = concat!("twinleaf/", env!("CARGO_PKG_VERSION"));
 
+/// The HTTP agent for catalog requests. On Apple platforms TLS is the operating
+/// system's (see the `ureq` target dependencies in Cargo.toml), verified against
+/// the system trust store; elsewhere it is ureq's default, rustls.
+fn agent() -> ureq::Agent {
+    #[cfg(target_vendor = "apple")]
+    {
+        use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+        ureq::Agent::config_builder()
+            .tls_config(
+                TlsConfig::builder()
+                    .provider(TlsProvider::NativeTls)
+                    .root_certs(RootCerts::PlatformVerifier)
+                    .build(),
+            )
+            .build()
+            .into()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        ureq::agent()
+    }
+}
+
 /// A [`FirmwareCatalog`] backed by a public GitHub repository laid out as
 /// `{name}/{revision}/{name}-{revision}-firmware-{YYYY-MM-DD}-{hash}.bin`.
 #[derive(Debug)]
@@ -62,7 +85,7 @@ impl FirmwareCatalog for GithubCatalog {
             self.owner, self.repo, name, revision
         );
 
-        let mut response = match ureq::get(&api_url)
+        let mut response = match agent().get(&api_url)
             .header("User-Agent", HTTP_USER_AGENT)
             .header("Accept", "application/vnd.github+json")
             .call()
@@ -104,7 +127,7 @@ impl FirmwareCatalog for GithubCatalog {
     }
 
     fn download(&self, release: &FirmwareRelease) -> Result<Vec<u8>, FirmwareError> {
-        let data = ureq::get(&release.url)
+        let data = agent().get(&release.url)
             .header("User-Agent", HTTP_USER_AGENT)
             .call()
             .map_err(|e| FirmwareError::Catalog(format!("download request failed: {e}")))?
