@@ -1,24 +1,22 @@
 //! The glance: a few lines and a picture of signals over a span. In time,
-//! each signal's rows, extremes and gaps, the extremes read from the window
-//! the page reads at the picture's width and the gaps from the run's own
-//! record. As a spectrum, each signal's amplitude spectral density as the
-//! core's Welch estimate gives it over the span's rows, its largest peaks
-//! and its noise floor.
+//! each signal's rows summed up by the core's `Stats`, its gaps from the
+//! run's own record, and a picture of the window the page reads at the
+//! picture's width. As a spectrum, each signal's amplitude spectral density
+//! as the hub estimates it over the span's rows since their last break,
+//! its largest peaks and its noise floor.
 
 use super::picture::{Axes, Picture, COLOURS, HEIGHT, WIDTH};
-use super::reads::{self, num, retired, rows_of, time, Failed};
+use super::reads::{self, num, retired, time, Failed};
 use super::tools::{Glance, View};
 use crate::hub::Live;
 use twinleaf::data::csv::MergedColumn;
-use twinleaf::data::ops::{NoSpectrum, Spectrum, Welch};
-use twinleaf::data::ColumnOp;
+use twinleaf::data::ops::{largest_peaks, Stats};
+use twinleaf::data::{ColumnOp, Covered};
 
 /// The gaps of a signal a glance names, at most.
 const GAPS: usize = 5;
 /// The largest peaks of a spectrum a glance names.
 const PEAKS: usize = 5;
-/// The newest rows of a span a spectrum is estimated from, at most.
-const SPECTRUM_ROWS: usize = 1 << 20;
 
 /// The text and the PNG of a glance.
 pub(crate) async fn glance(live: &Live, args: Glance) -> Result<(String, Vec<u8>), Failed> {
@@ -36,6 +34,21 @@ fn after(units: &str) -> String {
         String::new()
     } else {
         format!(" {units:?}")
+    }
+}
+
+/// The rows a result covers, as `covered` says, after the count of the
+/// span's rows: their count and the times of the first and the last, and
+/// `done`, what the result did of them.
+fn covering(covered: Option<Covered>, done: &str) -> String {
+    match covered {
+        Some(covered) => format!(
+            ", {} from {} to {} s {done}",
+            covered.rows,
+            time(covered.first),
+            time(covered.last)
+        ),
+        None => String::new(),
     }
 }
 
@@ -69,10 +82,23 @@ async fn time_view(
             .ok_or_else(|| retired(()))?;
         gaps_of.push(gaps.iter().map(|gap| (gap.before, gap.after)).collect());
     }
+    let (columns, stats) = tokio::task::spawn_blocking(move || {
+        let stats: Vec<(Stats, Option<Covered>)> = (columns.iter())
+            .map(|column| {
+                let mut stats = Stats::new();
+                let (_, covered) = stats.feed_rows(&column.batches, column.column);
+                (stats, covered)
+            })
+            .collect();
+        (columns, stats)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     let mut text = format!("{} to {} s\n", time(t0), time(t1));
     let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
     let mut runs_of = Vec::new();
-    for ((column, window), gaps) in columns.iter().zip(&windows).zip(&gaps_of) {
+    let read = columns.iter().zip(&stats).zip(&windows).zip(&gaps_of);
+    for (((column, (stats, covered)), window), gaps) in read {
         // The window splits its points at each loss of samples, and where
         // the held history meets the buffer.
         let runs: Vec<Vec<(f64, f64)>> = (window.chunks.iter())
@@ -85,18 +111,19 @@ async fn time_view(
                     .collect()
             })
             .collect();
-        let values = runs.iter().flatten().map(|p| p.1).filter(|y| y.is_finite());
-        let (min, max) = values.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), y| {
-            (a.min(y), b.max(y))
-        });
         let units = after(&column.units);
-        let rows = rows_of(column);
+        let rows = column.rows();
+        let summed = (stats.min().zip(stats.max())).zip(stats.mean().zip(stats.std_dev()));
+        let name = &column.name;
         if rows == 0 {
-            text += &format!("{}: no rows\n", column.name);
-        } else {
+            text += &format!("{name:?}: no rows\n");
+        } else if let Some(((min, max), (mean, deviation))) = summed {
             let (min_text, max_text) = (num(min), num(max));
-            let name = &column.name;
-            text += &format!("{name}: {rows} rows, min {min_text}{units}, max {max_text}{units}");
+            let summed = covering(*covered, "summed");
+            text += &format!("{name:?}: {rows} rows in the span{summed}");
+            text += &format!(", min {min_text}{units}, max {max_text}{units}");
+            let (mean, deviation) = (num(mean), num(deviation));
+            text += &format!(", mean {mean}{units}, standard deviation {deviation}{units}");
             if gaps.is_empty() {
                 text += ", no gaps\n";
             } else {
@@ -113,11 +140,11 @@ async fn time_view(
             }
             low = low.min(min);
             high = high.max(max);
+        } else {
+            text += &format!("{name:?}: {rows} rows, none of them a number\n");
         }
         runs_of.push(runs);
     }
-    text += "min and max are the envelope's, which holds every row's extremes. \
-             Mean and standard deviation are not available yet.\n";
     let axes = Axes::new((t0, t1), (low, high));
     let mut picture = Picture::new();
     for (place, runs) in runs_of.iter().enumerate() {
@@ -146,7 +173,7 @@ async fn spectrum_view(
     t1: f64,
 ) -> Result<(String, Vec<u8>), Failed> {
     let (columns, spectra) = tokio::task::spawn_blocking(move || {
-        let spectra: Vec<_> = columns.iter().map(spectrum_of).collect();
+        let spectra: Vec<_> = (columns.iter()).map(crate::hub::spectrum_of_rows).collect();
         (columns, spectra)
     })
     .await
@@ -155,7 +182,7 @@ async fn spectrum_view(
     let mut runs_of = Vec::new();
     let mut x = (f64::INFINITY, f64::NEG_INFINITY);
     let mut y = (f64::INFINITY, f64::NEG_INFINITY);
-    for (column, spectrum) in columns.iter().zip(&spectra) {
+    for (column, (spectrum, covered)) in columns.iter().zip(&spectra) {
         let units = if column.units.is_empty() {
             "1".to_string()
         } else {
@@ -173,12 +200,13 @@ async fn spectrum_view(
             format!("{} {units}/rtHz", num(f))
         });
         text += &format!(
-            "{:?}: {} rows at {} Hz, noise floor {floor}\n",
+            "{:?}: {} rows in the span{} at {} Hz, noise floor {floor}\n",
             column.name,
-            spectrum.sample_count,
+            column.rows(),
+            covering(*covered, "estimated"),
             num(spectrum.sampling_hz)
         );
-        let peaks: Vec<String> = (peaks(&spectrum.points).into_iter())
+        let peaks: Vec<String> = (largest_peaks(&spectrum.points, PEAKS).into_iter())
             .map(|(f, d)| format!("{} Hz at {} {units}/rtHz", num(f), num(d)))
             .collect();
         if !peaks.is_empty() {
@@ -210,35 +238,4 @@ async fn spectrum_view(
         legend(&columns)
     );
     Ok((text, picture.png()))
-}
-
-/// The Welch estimate of the newest rows of `column`, at most
-/// SPECTRUM_ROWS, or why there is none, in words.
-fn spectrum_of(column: &MergedColumn) -> Result<Spectrum, String> {
-    let rate = (column.batches.first()).map_or(0.0, |batch| batch.metadata().rate_hz());
-    let mut welch = Welch::new(rows_of(column).min(SPECTRUM_ROWS), rate);
-    for batch in &column.batches {
-        if let Some(values) = batch.column(column.column) {
-            welch.update_batch(batch.timestamps(), values);
-        }
-    }
-    welch.output().clone().map_err(|why| match why {
-        NoSpectrum::TooFewSamples { have, need } => {
-            format!("it has {have} rows and an estimate needs {need}")
-        }
-        NoSpectrum::InvalidSampleRate => format!("its rate {rate} Hz is no rate"),
-        other => format!("{other:?}"),
-    })
-}
-
-/// The PEAKS largest local maxima of a spectrum's `(frequency, density)`
-/// bins, largest first.
-fn peaks(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let mut peaks: Vec<(f64, f64)> = (points.windows(3))
-        .filter(|w| w[1].1 > w[0].1 && w[1].1 >= w[2].1)
-        .map(|w| w[1])
-        .collect();
-    peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
-    peaks.truncate(PEAKS);
-    peaks
 }

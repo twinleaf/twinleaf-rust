@@ -1071,6 +1071,87 @@ mod tests {
         assert_eq!(count, 1000 + 1990 + 100 + 90);
     }
 
+    /// The values of every row it is fed since it was last reset, in order.
+    /// It needs its rows continuous.
+    #[derive(Default)]
+    struct Collect(Vec<f64>);
+
+    impl crate::data::ColumnOp for Collect {
+        type Output = Vec<f64>;
+        fn reset(&mut self) {
+            self.0.clear();
+        }
+        fn update_batch(&mut self, _times: &[f64], values: &crate::data::ColumnArray) {
+            self.0.extend(values.to_f64().iter());
+        }
+        fn output(&self) -> &Vec<f64> {
+            &self.0
+        }
+    }
+
+    /// An op fed the rows of a read of a span is reset where its continuity
+    /// needs it. A continuous op starts over after each gap and each new
+    /// run, and a monotonic one is fed every row, in the held copy's part
+    /// and the buffer's alike.
+    #[test]
+    fn an_op_fed_a_spans_rows_is_reset_where_its_continuity_needs() {
+        use crate::data::ColumnOp;
+        let mut history = fresh();
+        let mut parser = parser_at(100);
+        let column = ColumnId::new(0);
+        // Samples 1000 to 1009 are lost, then 3000 to 3004.
+        let numbered = |history: &mut History, parser: &mut PacketParser, first, n| {
+            for batch in valued(parser, 100, first, n, |i| i as f32) {
+                history.process_batch(&batch);
+            }
+        };
+        numbered(&mut history, &mut parser, 0, 1000);
+        numbered(&mut history, &mut parser, 1010, 1990);
+        history.hold();
+        numbered(&mut history, &mut parser, 3005, 995);
+        let rows = history.rows(&stream_key(), 0.0, 1e9);
+        let mut collect = Collect::default();
+        // At 100 Hz, sample n stands at (n + 1) / 100 s.
+        let at = |sample: u32| f64::from(sample + 1) / 100.0;
+        let covers = |covered: Option<crate::data::Covered>, rows: usize, first: u32, last: u32| {
+            let covered = covered.expect("rows were fed");
+            assert_eq!(covered.rows, rows);
+            assert!((covered.first - at(first)).abs() < 1e-9, "{covered:?}");
+            assert!((covered.last - at(last)).abs() < 1e-9, "{covered:?}");
+        };
+        let (fed, covered) = collect.feed_rows(&rows, column);
+        assert_eq!(fed, &samples(3005..4000));
+        covers(covered, 995, 3005, 3999);
+        let mut stats = ops::Stats::new();
+        let (stats, covered) = stats.feed_rows(&rows, column);
+        assert_eq!(stats.count(), 1000 + 1990 + 995);
+        covers(covered, 1000 + 1990 + 995, 0, 3999);
+        assert_eq!((stats.min(), stats.max()), (Some(0.0), Some(3999.0)));
+        // A span with no gap in it is fed whole, across the held copy's
+        // part and the buffer's.
+        let within = history.rows(&stream_key(), 10.2, 29.9);
+        assert_eq!(collect.feed_rows(&within, column).0, &samples(1019..2989));
+        // A run that opens after the stream is forgotten starts over too,
+        // though the stream goes on with no loss and the same generation.
+        history.hold();
+        assert!(history.forget(&stream_key()));
+        numbered(&mut history, &mut parser, 4000, 10);
+        let rows = history.rows(&stream_key(), 0.0, 1e9);
+        let seam = (rows.windows(2))
+            .find(|pair| pair[0].run() != pair[1].run())
+            .expect("the held copy's run, then the new run");
+        assert_eq!(seam[0].generations(), seam[1].generations());
+        assert!(seam[1].is_continuous());
+        let (fed, covered) = collect.feed_rows(&rows, column);
+        assert_eq!(fed, &samples(4000..4010));
+        covers(covered, 10, 4000, 4009);
+        let mut stats = ops::Stats::new();
+        assert_eq!(
+            stats.feed_rows(&rows, column).0.count(),
+            1000 + 1990 + 995 + 10
+        );
+    }
+
     /// A window's rows and points are bounded by its width, whatever its
     /// span. Under FINEST rows a point it reads the rows themselves, and
     /// otherwise the points of a level, at most two a window.

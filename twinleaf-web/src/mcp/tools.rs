@@ -163,7 +163,7 @@ impl Door {
     }
 
     #[tool(
-        description = "Sums up signals over a span and draws them. The span is the newest `seconds` (10 by default) or `t0` to `t1` in the stream's own seconds. With view `time`: each signal's rows, extremes and gaps, and a picture of their envelopes. With view `spectrum`: each signal's amplitude spectral density as its largest peaks and noise floor, and a picture of it. Gives no raw samples. Use read_rows or export for those."
+        description = "Sums up signals over a span and draws them. The span is the newest `seconds` (10 by default) or `t0` to `t1` in the stream's own seconds. With view `time`: each signal's rows, minimum, maximum, mean, standard deviation and gaps, and a picture of their envelopes. With view `spectrum`: each signal's amplitude spectral density as its largest peaks and noise floor, and a picture of it. A result covers the part of the span after its last break, and says how many rows that is and from when to when: statistics start over where time goes back, and a spectrum also where rows were lost or a new run began, and covers the newest 1048576 rows at most. Gives no raw samples. Use read_rows or export for those."
     )]
     async fn glance(
         &self,

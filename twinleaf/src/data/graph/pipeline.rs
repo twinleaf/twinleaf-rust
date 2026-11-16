@@ -1,8 +1,9 @@
 //! Incremental per-column computation driven by a [`Buffer`].
 
-use crate::data::model::sample::ColumnArray;
+use crate::data::model::sample::{ColumnArray, SampleBatch};
 use crate::data::model::schema::ColumnKey;
 use crate::data::store::buffer::{Buffer, Run};
+use crate::proto::ColumnId;
 use std::ops::Range;
 
 /// What a [`ColumnOp`] needs of the rows it is fed between two resets.
@@ -20,6 +21,18 @@ pub enum Continuity {
     /// Time that never moves backward, rows possibly missing, as a plot
     /// decimator, a running extreme or a time-windowed statistic needs.
     Monotonic,
+}
+
+/// The rows a result of [`ColumnOp::feed_rows`] covers, those fed since the
+/// op was last reset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Covered {
+    /// How many rows the result covers.
+    pub rows: usize,
+    /// The time of the first row it covers.
+    pub first: f64,
+    /// The time of the last row it covers.
+    pub last: f64,
 }
 
 /// An incremental computation over one column's sample stream, such as
@@ -43,6 +56,70 @@ pub trait ColumnOp {
     fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray);
     /// Returns the current result, reflecting every row fed so far.
     fn output(&self) -> &Self::Output;
+
+    /// Resets the op, feeds it the values of `column` in `rows`, and returns
+    /// its output and the rows it covers, or `None` for none. `rows` are the batches of a read of a span, in order, as
+    /// a history's read of a span returns them, and a batch without the
+    /// column is passed over.
+    ///
+    /// The op is reset again where its [`continuity`](Self::continuity)
+    /// needs it. Either op is reset before a batch whose time goes back
+    /// before the batch fed before it, or whose boundary turns time back. A
+    /// [`Continuous`](Continuity::Continuous) op is also reset before a
+    /// batch that does not go on from the one before it without a loss,
+    /// which is a batch whose boundary is not continuous or one of another
+    /// run. A batch is of another run when its stream generation is
+    /// another, or when it was read from another run of a buffer, as
+    /// [`SampleBatch::run`] says.
+    ///
+    /// The output describes the rows fed since the last reset, so over rows
+    /// with a break in them a result describes only the part after the last
+    /// break. [`Covered`] says which rows those are.
+    fn feed_rows(
+        &mut self,
+        rows: &[SampleBatch],
+        column: ColumnId,
+    ) -> (&Self::Output, Option<Covered>) {
+        self.reset();
+        let mut covered: Option<Covered> = None;
+        let mut before: Option<&SampleBatch> = None;
+        for batch in rows {
+            let (Some(values), Some(&first)) = (batch.column(column), batch.timestamps().first())
+            else {
+                continue;
+            };
+            if let Some(before) = before {
+                let back = before.timestamps().last().is_some_and(|&last| first < last);
+                let broken = !batch.is_continuous()
+                    || batch.generations().stream != before.generations().stream
+                    || batch.run() != before.run();
+                let reset = back
+                    || !batch.is_monotonic()
+                    || (self.continuity() == Continuity::Continuous && broken);
+                if reset {
+                    self.reset();
+                    covered = None;
+                }
+            }
+            self.update_batch(batch.timestamps(), values);
+            let times = batch.timestamps();
+            let last = times[times.len() - 1];
+            covered = Some(match covered {
+                None => Covered {
+                    rows: times.len(),
+                    first,
+                    last,
+                },
+                Some(was) => Covered {
+                    rows: was.rows + times.len(),
+                    last,
+                    ..was
+                },
+            });
+            before = Some(batch);
+        }
+        (self.output(), covered)
+    }
 }
 
 /// Drives a [`ColumnOp`] from a [`Buffer`], feeding only new rows and replaying
@@ -266,6 +343,17 @@ mod tests {
             segment: SegmentRecord,
             rows: &[(u32, f64)],
         ) {
+            buffer.process_batch(&self.batch_in_segment(stream_generation, segment, rows));
+        }
+
+        /// A batch of `f64` rows in `segment`, of a stream generation and
+        /// sample numbers of the test's own.
+        fn batch_in_segment(
+            &self,
+            stream_generation: u32,
+            segment: SegmentRecord,
+            rows: &[(u32, f64)],
+        ) -> SampleBatch {
             let mut builder = SampleBatchBuilder::new(
                 BatchContext {
                     metadata: StreamMetadataSnapshot::new(
@@ -288,8 +376,7 @@ mod tests {
                     [ColumnData::F64(value)],
                 );
             }
-            let batch = builder.finish();
-            buffer.process_batch(&batch);
+            builder.finish()
         }
 
         /// Push a contiguous run of samples numbered `0..values.len()`.
@@ -354,6 +441,36 @@ mod tests {
         let out = processor.catch_up(&buffer).clone();
         assert_eq!(out, vec![(3.0, 2.0), (4.0, 3.0), (5.0, 4.0)]);
         assert_eq!(processor.op().reset_count, 2);
+    }
+
+    /// An op fed rows whose time goes back is reset there, though no
+    /// boundary says so, and its result covers the rows after.
+    #[test]
+    fn feed_rows_resets_where_time_goes_back() {
+        let fx = fixture();
+        let segment = |start_time| {
+            SegmentRecord::encode(wire::Segment {
+                start_time,
+                ..fx.metadata.segment().fields()
+            })
+            .unwrap()
+        };
+        let later = fx.batch_in_segment(1, segment(10), &[(0, 0.0), (1, 1.0)]);
+        let earlier = fx.batch_in_segment(1, segment(2), &[(0, 2.0), (1, 3.0), (2, 4.0)]);
+        assert!(earlier.timestamps()[0] < later.timestamps()[1]);
+        let mut recorder = Recorder::default();
+        let rows = [later, earlier.clone()];
+        let (fed, covered) = recorder.feed_rows(&rows, fx.column_key.column_id);
+        let values: Vec<f64> = fed.iter().map(|&(_, value)| value).collect();
+        assert_eq!(values, [2.0, 3.0, 4.0]);
+        let times = earlier.timestamps();
+        let covers = Covered {
+            rows: 3,
+            first: times[0],
+            last: times[2],
+        };
+        assert_eq!(covered, Some(covers));
+        assert_eq!(recorder.reset_count, 2);
     }
 
     #[test]

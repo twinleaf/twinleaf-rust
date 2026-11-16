@@ -62,11 +62,6 @@ pub(super) fn retired<T>(_: T) -> Failed {
     "the hub retired as it was asked, so call again".into()
 }
 
-/// The rows of `column`.
-pub(super) fn rows_of(column: &MergedColumn) -> usize {
-    column.batches.iter().map(|batch| batch.len()).sum()
-}
-
 /// The hub, started when none lives.
 pub(super) async fn live(door: &Door) -> Result<Arc<Live>, Failed> {
     (door.hubs.live().await)

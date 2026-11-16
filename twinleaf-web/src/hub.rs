@@ -64,8 +64,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 use twinleaf::data::csv::MergedColumn;
-use twinleaf::data::ops::{FpcsLevels, Stretch, Welch};
-use twinleaf::data::{ColumnKey, ColumnOp, ColumnProcessor, Gap, History, Run};
+use twinleaf::data::ops::{FpcsLevels, NoSpectrum, Stretch, Welch};
+use twinleaf::data::{ColumnKey, ColumnOp, ColumnProcessor, Covered, Gap, History, Run};
 use twinleaf::flume::{self, select::SelectError, Selector};
 use twinleaf::proxy::Layout;
 use twinleaf::{ColumnId, Connection, DeviceRoute, DeviceTree, Receiver, RecvError, SampleBatch};
@@ -101,6 +101,9 @@ const MEMORY_EVERY: Duration = Duration::from_secs(1);
 const SLOW_JOB: Duration = Duration::from_millis(50);
 /// Samples per Welch estimate, at most.
 const WELCH_WINDOW: usize = 16384;
+/// The newest rows of a span a reader's spectrum is estimated from, at
+/// most.
+const SPAN_SPECTRUM_ROWS: usize = 1 << 20;
 /// The span a reader's read takes when it names none, in seconds before
 /// the newest row.
 const SPAN_SECONDS: f64 = 10.0;
@@ -1172,6 +1175,38 @@ pub(crate) type Spanned = (Vec<u16>, f64, f64);
 /// device and the name of its stream, each group in the order of its
 /// traces.
 pub(crate) type Signals = BTreeMap<(String, String), Vec<Signal>>;
+
+/// The Welch estimate of the newest rows of `column` since its last break,
+/// at most [`SPAN_SPECTRUM_ROWS`] of them, or why there is none, and the
+/// rows it covers. The estimate is over every row it is fed.
+pub(crate) fn spectrum_of_rows(
+    column: &MergedColumn,
+) -> (
+    Result<twinleaf::data::ops::Spectrum, NoSpectrum>,
+    Option<Covered>,
+) {
+    let rate = (column.batches.first()).map_or(0.0, |batch| batch.metadata().rate_hz());
+    let rows = newest_rows(&column.batches, SPAN_SPECTRUM_ROWS);
+    let mut welch = Welch::new(rows.iter().map(SampleBatch::len).sum(), rate);
+    let (estimate, covered) = welch.feed_rows(&rows, column.column);
+    (estimate.clone(), covered)
+}
+
+/// The newest `n` rows of `batches`, in order.
+fn newest_rows(batches: &[SampleBatch], n: usize) -> Vec<SampleBatch> {
+    let mut left = n;
+    let mut newest = Vec::new();
+    for batch in batches.iter().rev() {
+        if left == 0 {
+            break;
+        }
+        let taken = batch.len().min(left);
+        newest.push(batch.slice(batch.len() - taken..batch.len()));
+        left -= taken;
+    }
+    newest.reverse();
+    newest
+}
 
 /// A trace as a reader of the hub names it.
 pub(crate) struct Signal {

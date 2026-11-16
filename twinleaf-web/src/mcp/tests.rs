@@ -320,11 +320,37 @@ async fn glance_reports_a_dropped_sample_as_a_gap() {
     let text = content[0]["text"].as_str().unwrap();
     println!("{text}");
     assert!(!failed, "{text}");
-    assert!(text.contains(&format!("{signal}: ")), "{text}");
+    assert!(text.contains(&format!("{signal:?}: ")), "{text}");
     assert!(text.contains(", 1 gap at "), "{text}");
+    let summed = |word: &str| -> f64 {
+        let after = text.split(word).nth(1).unwrap_or_default();
+        let number = after.split([' ', ',']).next().unwrap_or_default();
+        number.parse().unwrap_or(f64::NAN)
+    };
+    let (min, max) = (summed(", min "), summed(", max "));
+    let (mean, deviation) = (summed(", mean "), summed(", standard deviation "));
+    assert!(min < mean && mean < max, "{text}");
+    assert!(deviation > 0.0 && deviation < max - min, "{text}");
     assert!(text.ends_with(", dashed grey lines at the gaps"), "{text}");
     assert_eq!(content[1]["type"], "image");
     assert_eq!(content[1]["mimeType"], "image/png");
+    // The statistics cover every row of the span, as time never goes back
+    // in it.
+    let (rows, summed) = (summed(": "), summed(" rows in the span, "));
+    assert_eq!(rows, summed, "{text}");
+    // A spectrum of the span covers only its rows after the gap.
+    let across =
+        json!({ "signals": [signal], "t0": before - 0.5, "t1": before + 1.5, "view": "spectrum" });
+    let text = bench.text("glance", across).await;
+    let count = |word: &str| -> f64 {
+        let after = text.split(word).nth(1).unwrap_or_default();
+        let number = after.split([' ', ',']).next().unwrap_or_default();
+        number.parse().unwrap_or(f64::NAN)
+    };
+    let (rows, estimated) = (count(": "), count(" rows in the span, "));
+    assert!(estimated < rows, "{text}");
+    let from = count(&format!(" rows in the span, {estimated} from "));
+    assert!(from > before, "the spectrum begins after the gap: {text}");
     let spectrum = json!({ "signals": [signal], "seconds": 1.0, "view": "spectrum" });
     let text = bench.text("glance", spectrum).await;
     let peak = text

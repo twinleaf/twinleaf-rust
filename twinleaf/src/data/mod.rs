@@ -175,7 +175,7 @@ pub use decode::state::{DataError, StreamDataError};
 #[cfg(feature = "processing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "processing")))]
 pub use graph::history::{History, Window};
-pub use graph::pipeline::{ColumnOp, ColumnProcessor, Continuity};
+pub use graph::pipeline::{ColumnOp, ColumnProcessor, Continuity, Covered};
 pub use logfile::reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
 pub use model::continuity::{Boundary, BoundaryClass, Change, Generations, Loss, Lost};
 pub use model::filter::ColumnFilter;
