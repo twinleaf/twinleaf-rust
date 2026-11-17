@@ -1,0 +1,53 @@
+error[E0403]: `n` of `decimate` is a whole number of at least 2, written out
+ --> argument_value.tsl:5:23
+  |
+5 | let v1 = a | decimate(1.5)
+  |                       ^^^
+  |
+  = note: it fixes the shape of the graph, so it cannot be a param or be computed
+
+error[E0403]: `n` of `decimate` is a whole number of at least 2, written out
+ --> argument_value.tsl:6:23
+  |
+6 | let v2 = a | decimate(n)
+  |                       ^
+  |
+  = note: it fixes the shape of the graph, so it cannot be a param or be computed
+
+error[E0403]: `mode` of `detrend` is one of: mean, linear, quadratic
+ --> argument_value.tsl:7:22
+  |
+7 | let v3 = a | detrend(cubic)
+  |                      ^^^^^
+
+error[E0403]: `f` of `notch` must be positive
+ --> argument_value.tsl:8:20
+  |
+8 | let v4 = a | notch(zero)
+  |                    ^^^^ this is 0
+
+error[E0403]: `f` of `lowpass` must be positive
+ --> argument_value.tsl:9:22
+  |
+9 | let v5 = a | lowpass(f)
+  |                      ^ this can be as low as -10
+
+error[E0403]: `lo` of `bandpass` must be below `hi`
+  --> argument_value.tsl:10:14
+   |
+10 | let v6 = a | bandpass(40, 10)
+   |              ^^^^^^^^^^^^^^^^ 40 Hz is not below 10 Hz
+
+error[E0403]: `rate` of `resample` is a rate written out, such as `500` or `1kHz`
+  --> argument_value.tsl:11:23
+   |
+11 | let v7 = a | resample(f)
+   |                       ^
+   |
+   = note: it fixes the shape of the graph, so it cannot be a param or be computed
+
+error[E0403]: `window` of `rms` must be positive
+  --> argument_value.tsl:12:18
+   |
+12 | let v8 = a | rms(-1s)
+   |                  ^^^ this is -1

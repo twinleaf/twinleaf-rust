@@ -1,0 +1,65 @@
+error[E0402]: `notch` has no argument called `width`
+ --> arguments.tsl:3:24
+  |
+3 | let n1 = a | notch(60, width = 2)
+  |                        ^^^^^ not an argument
+  |
+  = help: it is written `notch(f, q = 30, harmonics = 1, phase = causal)`
+
+error[E0402]: `notch` takes no more arguments
+ --> arguments.tsl:4:39
+  |
+4 | let n2 = a | notch(60, 30, 2, causal, 9)
+  |                                       ^ one too many
+  |
+  = help: it is written `notch(f, q = 30, harmonics = 1, phase = causal)`
+
+error[E0402]: `f` is given twice
+ --> arguments.tsl:5:24
+  |
+5 | let n3 = a | notch(60, f = 50)
+  |                        ^^^^^^ given again here
+  |
+  = help: it is written `notch(f, q = 30, harmonics = 1, phase = causal)`
+
+error[E0402]: `bandpass` needs `lo` and `hi`
+ --> arguments.tsl:6:14
+  |
+6 | let n4 = a | bandpass(order = 2)
+  |              ^^^^^^^^^^^^^^^^^^^ not given
+  |
+  = help: it is written `bandpass(lo, hi, order = 4, phase = causal)`
+
+error[E0402]: `align` takes at least two signals
+ --> arguments.tsl:7:10
+  |
+7 | let n5 = align(a)
+  |          ^^^^^^^^ only 1 given
+  |
+  = help: it is written `align(a, b, …)`
+
+error[E0402]: this arm of `align` has no name
+ --> arguments.tsl:8:16
+  |
+8 | let n6 = align(a - a, b)
+  |                ^^^^^ what are its channels called?
+  |
+  = note: an arm's channels are named after it, as in `left.x`
+  = help: name it: `align(left = …, right = …)`
+
+error[E0402]: two arms of `align` are called `a`
+ --> arguments.tsl:9:33
+  |
+9 | let n7 = align(a | lowpass(10), a)
+  |                --------------- the first
+  |                                 ^ the second
+  |
+  = help: name them apart: `align(a = …, b = …)`
+
+error[E0402]: `decorrelate` needs `ref` and `window`
+  --> arguments.tsl:10:10
+   |
+10 | let n8 = decorrelate(a, method = ls)
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not given
+   |
+   = help: it is written `decorrelate(x, ref = …, window = …, method = ls, taps = 1)`

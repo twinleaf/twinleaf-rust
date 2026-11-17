@@ -1,0 +1,19 @@
+error[E0201]: `a` is defined twice
+ --> defined_twice.tsl:2:7
+  |
+1 | source a = /0/field @rate(1000) @channels(x, y, z) @unit(nT)
+  |        - first defined here
+2 | param a = 3
+  |       ^ defined again here
+  |
+  = note: sources, params, lets, outs and functions share one set of names
+
+error[E0201]: `y` is defined twice
+ --> defined_twice.tsl:4:5
+  |
+3 | out y = a | lowpass(10)
+  |     - first defined here
+4 | out y = a | highpass(10)
+  |     ^ defined again here
+  |
+  = note: sources, params, lets, outs and functions share one set of names

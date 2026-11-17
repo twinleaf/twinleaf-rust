@@ -1,0 +1,20 @@
+# gradiometer.tsl — software gradiometer from two vector magnetometers.
+#
+# Checked without a device, a source states its own rate and channels.
+
+source a = /0/field  @rate(1000) @channels(x, y, z) @unit(nT)
+source b = /1/field  @rate(500)  @channels(x, y, z) @unit(nT)
+
+param line : Hz = 60        [45 .. 65]
+param lo   : Hz = 1         [0.1 .. 10]
+param hi   : Hz = 40        [10 .. 200]
+
+# One domain, six channels: a.x a.y a.z b.x b.y b.z.
+# Rate is matched explicitly before align; align refuses to guess.
+let fr = align(a | decimate(2), b)
+
+# One filter chain over all six channels — identical coefficients by
+# construction, so the two arms cannot drift in phase.
+let clean = fr | notch(line, q = 30) | bandpass(lo, hi, order = 4)
+
+out gradient : nT = clean.a - clean.b

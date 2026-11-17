@@ -1,0 +1,9 @@
+error[E0421]: `-` pairs channels by name, and these do not pair
+ --> unpaired_channels.tsl:4:16
+  |
+4 | out gradient = fr.a - fr.b
+  |                ^^^^^^^^^^^
+  |                ---- has x, y, z
+  |                       ---- has x, y, t
+  |
+  = note: without a partner: z, t

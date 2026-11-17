@@ -1,0 +1,25 @@
+error[E0303]: `f` is declared in Hz and given in s
+ --> param.tsl:1:16
+  |
+1 | param f : Hz = 10s
+  |           -- declared in Hz
+  |                ^^^ in s
+
+error[E0303]: the range of `g` is empty
+ --> param.tsl:2:19
+  |
+2 | param g : Hz = 60 [65 .. 45]
+  |                   ^^^^^^^^^^ 65 is not below 45
+
+error[E0303]: `h` starts outside its range
+ --> param.tsl:3:16
+  |
+3 | param h : Hz = 70 [45 .. 65]
+  |                ^^ 70 is not within
+  |                   ---------- this range
+
+error[E0303]: the range of `k` is in another unit
+ --> param.tsl:4:26
+  |
+4 | param k : Hz = 60 [45 .. 65s]
+  |                          ^^^ in s, and `k` is in Hz

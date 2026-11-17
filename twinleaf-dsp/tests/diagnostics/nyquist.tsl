@@ -1,0 +1,6 @@
+source a = /0/field @rate(500) @channels(x, y, z) @unit(nT)
+param hi : Hz = 40 [10 .. 300]
+let above = a | lowpass(250)
+let tunable = a | bandpass(1, hi)
+let slowed = a | decimate(5) | notch(60)
+let kilo = a | lowpass(1kHz)

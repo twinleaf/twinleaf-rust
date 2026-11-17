@@ -1,0 +1,4 @@
+param f : Hz = 10s
+param g : Hz = 60 [65 .. 45]
+param h : Hz = 70 [45 .. 65]
+param k : Hz = 60 [45 .. 65s]

@@ -1,0 +1,47 @@
+error[E0002]: expected an expression
+ --> syntax.tsl:3:14
+  |
+3 | let missing =
+  |              ^ the definition stops here
+
+error[E0002]: expected `,` or `)`
+ --> syntax.tsl:4:28
+  |
+4 | let unclosed = a | notch(60
+  |                            ^ the definition stops here
+
+error[E0002]: a pipeline stage is a function call
+ --> syntax.tsl:5:17
+  |
+5 | let stage = a | lowpass
+  |                 ^^^^^^^ write `lowpass(…)`
+
+error[E0002]: expected an operator or a new definition, found `a`
+ --> syntax.tsl:6:18
+  |
+6 | let trailing = a a
+  |                  ^
+  |
+  = help: a definition begins with `source`, `param`, `let`, `out` or `fn`
+
+error[E0002]: an operator cannot follow a pipeline stage
+ --> syntax.tsl:7:31
+  |
+7 | let chained = a | lowpass(10) - a
+  |                               ^
+  |
+  = help: put the pipeline in parentheses: `(x | f()) - y`
+
+error[E0002]: expected a number, found `[`
+ --> syntax.tsl:8:11
+  |
+8 | param p = [1 .. 2]
+  |           ^
+
+error[E0002]: expected an operator or a new definition, found `notch`
+  --> syntax.tsl:10:1
+   |
+10 | notch(60)
+   | ^^^^^
+   |
+   = help: a definition begins with `source`, `param`, `let`, `out` or `fn`

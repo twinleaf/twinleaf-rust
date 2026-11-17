@@ -1,0 +1,19 @@
+error[E0413]: cannot subtract signals in different rate domains
+ --> domains.tsl:3:20
+  |
+3 | out gradient = a - b
+  |                - 1 kHz (from /0/field)
+  |                    ^ 1 kHz (from /1/field)
+  |
+  = note: signals in different domains share no sample instants, even at
+          the same rate
+  = help: bring them into one domain first, with `align(…)`
+
+error[E0413]: cannot decorrelate signals in different rate domains
+ --> domains.tsl:4:36
+  |
+4 | out cleaned = decorrelate(a, ref = b | decimate(2), window = 10s)
+  |                           - 1 kHz (from /0/field)
+  |                                    ^^^^^^^^^^^^^^^ 500 Hz (from /1/field, decimated by 2)
+  |
+  = help: bring them into one domain first, with `align(…)`

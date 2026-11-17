@@ -1,0 +1,4 @@
+source a = /0/field @rate(1000) @channels(x, y, z) @unit(nT)
+param a = 3
+out y = a | lowpass(10)
+out y = a | highpass(10)

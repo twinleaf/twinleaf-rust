@@ -1,0 +1,35 @@
+error[E0414]: `f` of `lowpass` reaches the Nyquist frequency of its signal
+ --> nyquist.tsl:3:25
+  |
+3 | let above = a | lowpass(250)
+  |             - sampled at 500 Hz, so the limit is 250 Hz
+  |                         ^^^ this is 250 Hz
+  |
+  = help: lower the frequency or its range, or filter ahead of `decimate`
+
+error[E0414]: `hi` of `bandpass` reaches the Nyquist frequency of its signal
+ --> nyquist.tsl:4:31
+  |
+4 | let tunable = a | bandpass(1, hi)
+  |               - sampled at 500 Hz, so the limit is 250 Hz
+  |                               ^^ this can be as high as 300 Hz
+  |
+  = help: lower the frequency or its range, or filter ahead of `decimate`
+
+error[E0414]: `f` of `notch` reaches the Nyquist frequency of its signal
+ --> nyquist.tsl:5:38
+  |
+5 | let slowed = a | decimate(5) | notch(60)
+  |              --------------- sampled at 100 Hz, so the limit is 50 Hz
+  |                                      ^^ this is 60 Hz
+  |
+  = help: lower the frequency or its range, or filter ahead of `decimate`
+
+error[E0414]: `f` of `lowpass` reaches the Nyquist frequency of its signal
+ --> nyquist.tsl:6:24
+  |
+6 | let kilo = a | lowpass(1kHz)
+  |            - sampled at 500 Hz, so the limit is 250 Hz
+  |                        ^^^^ this is 1 kHz
+  |
+  = help: lower the frequency or its range, or filter ahead of `decimate`

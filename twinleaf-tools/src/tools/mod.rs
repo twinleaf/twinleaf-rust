@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod dsp;
 pub mod dump;
 pub mod health;
 pub mod log;

@@ -1,6 +1,6 @@
 # Twinleaf I/O Tools in Rust
 
-This repository contains four Rust crates: a library ([`twinleaf`](https://crates.io/crates/twinleaf)), a set of tools ([`twinleaf-tools`](https://crates.io/crates/twinleaf-tools)) that are useful for working with Twinleaf quantum sensors and accessories, a Rust protocol implementation ([`twinleaf-proto`](https://crates.io/crates/twinleaf-proto)) of TIO, and the device side of that protocol for firmware ([`twinleaf-device`](https://crates.io/crates/twinleaf-device)).
+This repository contains five Rust crates: a library ([`twinleaf`](https://crates.io/crates/twinleaf)), a set of tools ([`twinleaf-tools`](https://crates.io/crates/twinleaf-tools)) that are useful for working with Twinleaf quantum sensors and accessories, a Rust protocol implementation ([`twinleaf-proto`](https://crates.io/crates/twinleaf-proto)) of TIO, the device side of that protocol for firmware ([`twinleaf-device`](https://crates.io/crates/twinleaf-device)), and signal graphs that filter and combine sensor streams ([`twinleaf-dsp`](twinleaf-dsp/README.md)), which the tools run as `tio dsp`.
 
 It is highly recommended to install `twinleaf-tools` when using the `twinleaf` library.
 

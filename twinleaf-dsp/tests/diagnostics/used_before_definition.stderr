@@ -1,0 +1,17 @@
+error[E0204]: `clean` is used before it is defined
+ --> used_before_definition.tsl:2:9
+  |
+2 | out y = clean | lowpass(10)
+  |         ^^^^^ used here
+3 | let clean = a | notch(60)
+  |     ----- defined here
+  |
+  = help: move the definition above its first use
+
+error[E0204]: `loop` is used in its own definition
+ --> used_before_definition.tsl:4:12
+  |
+4 | let loop = loop | lowpass(1)
+  |            ^^^^ used here
+  |
+  = note: a graph has no feedback paths

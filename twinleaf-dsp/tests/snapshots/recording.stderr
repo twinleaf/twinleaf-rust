@@ -1,0 +1,13 @@
+error[E0501]: `a` is declared at 1 kHz, and the recording has `/0/field` at 500 Hz
+ --> gradiometer.tsl:5:1
+  |
+5 | source a = /0/field  @rate(1000) @channels(x, y, z) @unit(nT)
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0501]: the recording's `/1/field` has no column `z`
+ --> gradiometer.tsl:6:1
+  |
+6 | source b = /1/field  @rate(500)  @channels(x, y, z) @unit(nT)
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: it has: x, y, w

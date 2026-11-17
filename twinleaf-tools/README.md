@@ -21,6 +21,7 @@ place of `tio-tool {toolname}`.
 | `tio rpc`         | Execute a device RPC                               |
 | `tio capture`     | Trigger and read a capture RPC                     |
 | `tio upgrade`     | Upgrade device firmware                            |
+| `tio dsp`         | Check, draw, run and serve signal graphs           |
 | `tio simulate`    | Run a simulated sine wave device over UDP          |
 | `tio completions` | Generate shell completions for `tio`               |
 
@@ -180,6 +181,36 @@ heartbeats.
 tio health
 tio health --warnings-only
 ```
+
+## Signal graphs
+
+A signal graph is a text file that says how sensor streams become derived
+ones, by filtering, resampling, aligning and combining them.
+[`twinleaf-dsp`](https://crates.io/crates/twinleaf-dsp) has the language and
+its functions.
+
+```sh
+tio dsp check {spec}                          # check a spec
+tio dsp functions                             # the functions a spec may call
+tio dsp graph {spec} --dot                    # draw it
+tio dsp run {spec} --log {file} --csv {file}  # run it over a recording
+tio dsp serve {spec} --mount {url} --port 7900
+```
+
+`tio dsp serve` mounts sensors at `/0`, `/1` and so on, and puts the graph
+beside them at `/255`. The graph's outputs are streams there, and each of its
+params is an RPC, so the other tools work on it as on a sensor:
+
+```sh
+tio monitor -r tcp://localhost:7900 -s /255
+tio rpc list -r tcp://localhost:7900 -s /255
+```
+
+It listens on loopback. `--listen all` lets other machines connect. With no
+`--port` it takes any free port and prints it.
+
+`tio dsp graph --pdf` and `--svg` compile a figure with the `typst` on the
+`PATH`. Building with `--features typst` compiles it in `tio` itself.
 
 ## Simulation
 

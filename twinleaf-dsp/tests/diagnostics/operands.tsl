@@ -1,0 +1,4 @@
+source a = /0/field @rate(1000) @channels(x, y, z) @unit(nT)
+let squared = a * a
+let offset = a + 1
+let inverse = 2 / a

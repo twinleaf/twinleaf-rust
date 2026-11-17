@@ -3,6 +3,7 @@
 members = [
     "twinleaf",
     "twinleaf-device",
+    "twinleaf-dsp",
     "twinleaf-proto",
     "twinleaf-tools",
 ]

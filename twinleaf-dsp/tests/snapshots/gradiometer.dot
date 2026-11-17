@@ -1,0 +1,25 @@
+digraph "gradiometer" {
+  rankdir=LR;
+  node [shape=box, fontname="Helvetica"];
+  edge [fontname="Helvetica", fontsize=10];
+  n0 [label="/0/field\n3 ch · 1 kHz", style=rounded];
+  n1 [label="/1/field\n3 ch · 500 Hz", style=rounded];
+  n2 [label="decimate(2)"];
+  n3 [label="align"];
+  n4 [label="notch(line, q = 30)"];
+  n5 [label="bandpass(lo, hi, order = 4)"];
+  n6 [label=".a"];
+  n7 [label=".b"];
+  n8 [label="−"];
+  out0 [label="/255/gradient\n3 ch · nT", style="rounded,bold"];
+  n0 -> n2 [label="D0 · 1 kHz · 3 ch"];
+  n2 -> n3 [label="D2 · 500 Hz · 3 ch"];
+  n1 -> n3 [label="D1 · 500 Hz · 3 ch"];
+  n3 -> n4 [label="D3 · 500 Hz · 6 ch"];
+  n4 -> n5 [label="D3 · 500 Hz · 6 ch"];
+  n5 -> n6 [label="D3 · 500 Hz · 6 ch"];
+  n5 -> n7 [label="D3 · 500 Hz · 6 ch"];
+  n6 -> n8 [label="D3 · 500 Hz · 3 ch"];
+  n7 -> n8 [label="D3 · 500 Hz · 3 ch"];
+  n8 -> out0 [label="D3 · 500 Hz · 3 ch"];
+}

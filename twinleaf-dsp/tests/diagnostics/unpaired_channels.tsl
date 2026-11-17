@@ -1,0 +1,4 @@
+source a = /0/field @rate(500) @channels(x, y, z) @unit(nT)
+source b = /0/aux @rate(500) @channels(x, y, t) @unit(nT)
+let fr = align(a, b)
+out gradient = fr.a - fr.b

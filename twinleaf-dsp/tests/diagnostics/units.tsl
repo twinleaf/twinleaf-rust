@@ -1,0 +1,16 @@
+source a = /0/field @rate(500) @channels(x, y, z) @unit(nT)
+source v = /0/coil @rate(500) @channels(x, y, z) @unit(V)
+param window : s = 10
+param line : Hz = 60
+let fr = align(a, v)
+out volts : V = a | lowpass(10)
+out micro : µT = a | lowpass(10)
+out mixed = fr.a - fr.v
+out norm = fr | magnitude()
+let timed = a | notch(window)
+let sum = a * (line + window)
+let quality = a | notch(line, q = 30Hz)
+let long = a | rms(line)
+out wrong = a in V
+out both = fr in nT
+out odd : 2x = a

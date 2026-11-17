@@ -1,0 +1,35 @@
+source a = /0/field @rate(1000) @channels(x, y, z) @unit(nT)
+param gain = 2
+
+# A call above the definition.
+let early = a | smooth()
+
+fn smooth(s) = s | lowpass(10 Hz)
+fn scale(s, k) = s * k
+
+# Too few, too many, a name it does not have, and one given twice.
+let f1 = scale(a)
+let f2 = a | scale(gain, 3)
+let f3 = scale(a, factor = 2)
+let f4 = a | scale(2, s = a)
+
+# A name that is taken: by a public function, by a let, by itself.
+fn lowpass(s) = s
+fn early(s) = s
+fn pair(s, s) = s
+
+# A body that goes wrong, which is reported for the call it went wrong in.
+fn narrow(s) = s | bandpass(40 Hz, 10 Hz)
+let f5 = a | narrow()
+
+# A body sees the names above it, and not the ones below.
+fn later(s) = s * after
+param after = 3
+let f6 = a | later()
+
+# A function that calls itself, and one nothing calls.
+fn again(s) = s | again()
+let f7 = a | again()
+fn spare(s) = s
+
+out y = smooth(a) | scale(gain)

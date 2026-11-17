@@ -1,0 +1,4 @@
+source a = /0/field @rate(1000) @channels(x, y, z) @unit(nT)
+out y = clean | lowpass(10)
+let clean = a | notch(60)
+let loop = loop | lowpass(1)

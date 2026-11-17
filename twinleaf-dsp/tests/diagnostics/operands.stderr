@@ -1,0 +1,29 @@
+error[E0405]: `*` does not combine two signals
+ --> operands.tsl:2:15
+  |
+2 | let squared = a * a
+  |               ^^^^^
+  |               - a signal
+  |                   - a signal
+  |
+  = help: a signal is scaled by a number or a param; signals add and subtract
+
+error[E0405]: `+` does not combine a signal with a number
+ --> operands.tsl:3:14
+  |
+3 | let offset = a + 1
+  |              ^^^^^
+  |              - a signal
+  |                  - a number
+  |
+  = help: an offset is not offered; `detrend(mean)` removes one
+
+error[E0405]: `/` does not combine a number with a signal
+ --> operands.tsl:4:15
+  |
+4 | let inverse = 2 / a
+  |               ^^^^^
+  |               - a number
+  |                   - a signal
+  |
+  = help: write the signal first, as in `x * 2` or `x / 2`

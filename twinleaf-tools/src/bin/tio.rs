@@ -4,6 +4,7 @@
 use clap::{CommandFactory, Parser};
 use twinleaf_tools::tools::{
     capture::run_capture,
+    dsp::run_dsp,
     dump::run_dump,
     health::run_health,
     log::run_log,
@@ -25,6 +26,7 @@ fn main() -> eyre::Result<()> {
         Commands::List(list_cli) => run_list(list_cli),
         Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),
         Commands::Simulate(simulate_cli) => run_simulate(simulate_cli),
+        Commands::Dsp(dsp_cli) => run_dsp(dsp_cli),
         Commands::Monitor(monitor_cli) => run_monitor(monitor_cli),
         Commands::Health(health_cli) => run_health(health_cli),
         Commands::Rpc(rpc_cli) => run_rpc(rpc_cli),

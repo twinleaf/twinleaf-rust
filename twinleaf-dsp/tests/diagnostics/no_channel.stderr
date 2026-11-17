@@ -1,0 +1,23 @@
+error[E0420]: `fr` has no channel or group called `c`
+ --> no_channel.tsl:4:26
+  |
+4 | out gradient = fr.a - fr.c
+  |                          ^ not found
+  |
+  = help: it has: a, b
+
+error[E0420]: `a` has no channel or group called `w`
+ --> no_channel.tsl:5:11
+  |
+5 | out w = a.w
+  |           ^ not found
+  |
+  = help: it has: x, y, z
+
+error[E0420]: `/0/field/q` has no channel or group called `q`
+ --> no_channel.tsl:6:11
+  |
+6 | out col = /0/field/q
+  |           ^^^^^^^^^^ not found
+  |
+  = help: it has: x, y, z
