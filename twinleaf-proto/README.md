@@ -19,7 +19,7 @@
 | Field          | Size   | Value                  |
 |----------------|--------|------------------------|
 | Type           | u8     | Packet type, see below |
-| TTL            | 4 bits | Hops remaining, 0 to 15 |
+| TTL            | 4 bits | Reserved, senders write 0 |
 | R              | 4 bits | Routing length, 0 to 8 |
 | Payload Length | u16    | 0 to 500               |
 
@@ -44,14 +44,14 @@ it removes the last routing byte and forwards the packet to that port.
 | 12      | `SETTING`    | Setting change, [`settings`]             |
 | 62      | `SYNC`       | Time reference, [`sync`]                 |
 | 63      | `TEXT`       | Console text                             |
-| 64      | `USER`       | Application defined                      |
+| 64      | `USER`       | Legacy proxy link status                 |
 | 66      | `PROXY_TX`   | Proxy control request, host only         |
 | 67      | `PROXY_RX`   | Proxy control reply or link status, host only |
 | 128 + n | `STREAM` n   | Samples of stream n, [`data`]            |
 
 Values 0, 9, 10, and 13 are invalid. Value 65 was `RPC_UPDATE` and is unused.
-Proxies older than 2.0 send their link status as a `USER` packet, which
-parsers still read.
+Nothing sends an application packet of type 64. A host reads every packet of
+this type as a legacy proxy link status.
 
 ## RPC Formats
 

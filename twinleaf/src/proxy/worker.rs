@@ -924,8 +924,8 @@ impl Worker {
     /// error.
     async fn port_packet(&mut self, port: u64, pkt: Packet) {
         // A control packet talks to the proxy itself, never to a device.
-        // Type 64 is also USER, which apps may send, so it is forwarded like
-        // any other packet.
+        // Only PROXY_TX and PROXY_RX talk to the proxy, so a packet of type
+        // 64 from a port is forwarded like any other packet.
         if matches!(pkt.ptype(), PacketType::PROXY_TX | PacketType::PROXY_RX) {
             log::debug!("dropping a control packet from port {port}: {pkt:?}");
             return;
@@ -1766,8 +1766,8 @@ mod tests {
     }
 
     /// A control packet talks to the proxy, so neither control type a port
-    /// sends reaches the device. Type 64 is also `USER`, which apps may send,
-    /// so it still does.
+    /// sends reaches the device. A packet of type 64 is no control packet, so
+    /// it still does.
     #[test]
     fn a_ports_control_packets_never_reach_the_device() {
         use std::io::Read;

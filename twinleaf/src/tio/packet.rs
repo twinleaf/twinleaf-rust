@@ -391,7 +391,8 @@ impl Packet {
             .expect("the route was checked when the packet was made")
     }
 
-    /// Returns the hops left before a hub drops the packet.
+    /// Returns the header's TTL field. The field is reserved, and a sender
+    /// writes 0.
     pub fn ttl(&self) -> u8 {
         self.framing().header.ttl
     }

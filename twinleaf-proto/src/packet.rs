@@ -199,7 +199,8 @@ pub struct Header {
     pub ptype: PacketType,
     /// Number of routing bytes, 0 to 8.
     pub routing_size: u8,
-    /// Hops remaining, 0 to 15.
+    /// Reserved, 0 to 15. A sender writes 0, and forwarding passes the field
+    /// through unchanged. Nothing reads it.
     pub ttl: u8,
     /// Payload length, 0 to 500.
     pub payload_size: u16,
@@ -208,7 +209,7 @@ pub struct Header {
 impl Header {
     /// Header length, 4 bytes.
     pub const SIZE: usize = 4;
-    /// Largest TTL, 15.
+    /// Largest value the TTL field holds, 15.
     pub const MAX_TTL: u8 = 15;
 
     /// Creates a header with no routing and a TTL of 0.

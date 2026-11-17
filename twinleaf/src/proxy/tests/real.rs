@@ -634,8 +634,8 @@ fn a_proxy_refuses_to_mount_itself() {
     assert!(proxy.links.urls().is_empty(), "a link to the proxy opened");
 }
 
-/// Type 64 is also `USER`, which a device and an app may send. Such a
-/// packet is no status of the proxy's, so it passes untouched both
+/// Type 64 is also `USER`. A packet of this type from a device or a port
+/// is no status of the proxy's, so it passes untouched both
 /// ways, but for its route.
 #[test]
 fn a_user_packet_passes_through_untouched() {
