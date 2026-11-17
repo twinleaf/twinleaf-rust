@@ -27,6 +27,9 @@ pub const METADATA_HEADER_SIZE: usize = 2;
 /// Size of the `[first sample number u24le][segment id]` header before a
 /// packet's samples.
 pub const SAMPLE_HEADER_SIZE: usize = 4;
+/// Shortest sample payload, the sample header and one sample byte. A sample
+/// packet always carries at least one sample byte.
+pub const MIN_SAMPLE_PAYLOAD: usize = SAMPLE_HEADER_SIZE + 1;
 /// Largest sample number on the wire. Sample numbers wrap at 24 bits.
 pub const MAX_SAMPLE_NUMBER: u32 = crate::SampleNumber::MAX;
 
@@ -1164,7 +1167,9 @@ impl<'a> Iterator for MetadataReply<'a> {
     }
 }
 
-/// A run of consecutive samples from one stream segment.
+/// A run of consecutive samples from one stream segment. It holds at least
+/// one sample byte, and the codec neither writes nor reads a sample packet
+/// with none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Samples<'a> {
     /// Stream id.
@@ -1182,7 +1187,7 @@ impl<'a> Samples<'a> {
     pub const DATA_OFFSET: usize = Header::SIZE + SAMPLE_HEADER_SIZE;
 
     /// Writes a full sample packet into `buf`. Returns its length, or `None` if
-    /// the sample number or samples do not fit.
+    /// `data` is empty or the sample number or samples do not fit.
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         let total = Self::write_header(
             buf,
@@ -1197,7 +1202,7 @@ impl<'a> Samples<'a> {
 
     /// Writes the headers of a packet carrying `data_len` bytes of samples
     /// already in place at [`Self::DATA_OFFSET`]. Returns the packet length, or
-    /// `None` if the sample number or samples do not fit.
+    /// `None` if `data_len` is 0 or the sample number or samples do not fit.
     pub fn write_header(
         buf: &mut [u8],
         stream_id: StreamId,
@@ -1205,7 +1210,7 @@ impl<'a> Samples<'a> {
         first: SampleNumber,
         data_len: usize,
     ) -> Option<usize> {
-        if !first.fits_stream_packet() {
+        if !first.fits_stream_packet() || data_len == 0 {
             return None;
         }
         let payload_len = SAMPLE_HEADER_SIZE + data_len;
@@ -1221,10 +1226,14 @@ impl<'a> Samples<'a> {
     }
 
     /// Parses a sample packet from its header and payload. Returns `None` if it
-    /// is not a sample packet of streams 1 to 127 or the payload is truncated.
+    /// is not a sample packet of streams 1 to 127, or if the payload is shorter
+    /// than [`MIN_SAMPLE_PAYLOAD`] and so carries no sample byte.
     pub fn parse(header: Header, payload: &'a [u8]) -> Option<Self> {
         let stream_id = header.ptype.sample_stream()?;
         let (head, data) = payload.split_at_checked(SAMPLE_HEADER_SIZE)?;
+        if data.is_empty() {
+            return None;
+        }
         Some(Self {
             stream_id,
             segment_id: SegmentId::new(head[3]),
@@ -2099,11 +2108,12 @@ mod tests {
     }
 
     proptest! {
-        /// Samples whose first number fits 24 bits and whose data fits a
-        /// packet write a sample packet of exactly its length for their
-        /// stream, whose payload parses back to them. Writing the headers in
-        /// front of data already in place gives the same packet. Both are the
-        /// same whatever the buffer held before.
+        /// Samples whose first number fits 24 bits and whose data holds at
+        /// least one byte and fits a packet write a sample packet of exactly
+        /// its length for their stream, whose payload parses back to them.
+        /// Writing the headers in front of data already in place gives the
+        /// same packet. Both are the same whatever the buffer held before.
+        /// Empty data is refused by both.
         #[test]
         fn samples_decode_as_they_were_encoded(
             stream_id in stream_id(),
@@ -2114,6 +2124,14 @@ mod tests {
             let samples = Samples { stream_id, segment_id, first: SampleNumber::new(first), data: &data };
             let payload_len = SAMPLE_HEADER_SIZE + data.len();
             let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| samples.write(buf))?;
+            if data.is_empty() {
+                prop_assert_eq!(len, None);
+                let (len, _) = write_over_any(buf.len(), |in_place| {
+                    Samples::write_header(in_place, stream_id, segment_id, samples.first, 0)
+                })?;
+                prop_assert_eq!(len, None);
+                return Ok(());
+            }
             prop_assert_eq!(len, Some(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             let ptype = PacketType::new(128 + stream_id.value());
@@ -2128,9 +2146,10 @@ mod tests {
             prop_assert_eq!(in_place, buf);
         }
 
-        /// Samples are written when the first number fits 24 bits, the
-        /// payload is at most [`Packet::MAX_PAYLOAD`] bytes, and the buffer
-        /// holds the packet, and refused otherwise.
+        /// Samples are written when the first number fits 24 bits, there is at
+        /// least one sample byte, the payload is at most
+        /// [`Packet::MAX_PAYLOAD`] bytes, and the buffer holds the packet, and
+        /// refused otherwise.
         #[test]
         fn samples_are_written_only_when_they_fit(
             first in prop_oneof![
@@ -2152,6 +2171,7 @@ mod tests {
             let needed = Samples::DATA_OFFSET + data_len;
             let mut buf = buffer(needed, slack);
             let fits = first <= MAX_SAMPLE_NUMBER
+                && data_len > 0
                 && data_len <= MAX_SAMPLE_DATA
                 && buf.len() >= needed;
             prop_assert_eq!(samples.write(&mut buf), fits.then_some(needed));
@@ -2161,9 +2181,10 @@ mod tests {
             );
         }
 
-        /// A payload parses as samples when its packet type carries a stream
-        /// from 1 to 127 and it holds the four-byte head. Writing what was
-        /// parsed gives back the same packet, whatever the buffer held before.
+        /// A payload parses as samples exactly when its packet type carries a
+        /// stream from 1 to 127 and it holds the four-byte head and at least
+        /// one more byte. Writing what was parsed gives back the same packet,
+        /// whatever the buffer held before.
         #[test]
         fn any_payload_parses_as_samples_when_it_holds_the_head(
             ptype in prop_oneof![
@@ -2179,11 +2200,12 @@ mod tests {
             ],
         ) {
             let header = Header::new(ptype, payload.len() as u16);
+            let parses = ptype.value() > 128 && payload.len() >= MIN_SAMPLE_PAYLOAD;
             let Some(samples) = Samples::parse(header, &payload) else {
-                prop_assert!(ptype.value() <= 128 || payload.len() < SAMPLE_HEADER_SIZE);
+                prop_assert!(!parses);
                 return Ok(());
             };
-            prop_assert!(ptype.value() > 128);
+            prop_assert!(parses);
             let (len, buf) = write_over_any(Header::SIZE + payload.len(), |buf| samples.write(buf))?;
             prop_assert_eq!(len, Some(buf.len()));
             let mut head = [0u8; Header::SIZE];

@@ -49,10 +49,15 @@ impl PacketType {
     pub const SYNC: Self = Self(62);
     /// Console text.
     pub const TEXT: Self = Self(63);
-    /// First application defined type.
+    /// First application defined type. It is the same byte as
+    /// [`PROXY_STATUS`](Self::PROXY_STATUS). Nothing sends an application
+    /// packet of this type, and a host reads every packet of this type as a
+    /// legacy link status.
     pub const USER: Self = Self(64);
-    /// Legacy proxy link status, a `USER` packet. Hosts still decode it, and
-    /// proxies send it only to clients that predate `PROXY_RX`.
+    /// Legacy proxy link status. It is the same byte as [`USER`](Self::USER).
+    /// Nothing sends an application packet of this type, and a host reads
+    /// every packet of this type as a legacy link status. Proxies send it
+    /// only to clients that predate `PROXY_RX`.
     pub const PROXY_STATUS: Self = Self(64);
     /// Proxy control request, from a client to its proxy. Host only, and not
     /// routed to devices.
@@ -60,7 +65,9 @@ impl PacketType {
     /// Proxy control reply or link status, from a proxy to its client. Host
     /// only, and not routed to devices.
     pub const PROXY_RX: Self = Self(67);
-    /// Samples of stream 0. Stream n is `STREAM0 + n`.
+    /// The type byte that stream numbers count from. Stream n from 1 to 127
+    /// is `STREAM0 + n`. By itself it is legacy stream data, which this
+    /// protocol does not read. It travels the data lane.
     pub const STREAM0: Self = Self(128);
 
     /// Creates a packet type from its byte. Returns `None` for 0, 9, 10, and 13.
@@ -134,7 +141,8 @@ pub enum Lane {
 }
 
 /// The lane `packet` travels from a device or a hub, the same at every hop, or `None` for a
-/// request, a time reference, console text, a legacy descriptor or an application packet.
+/// request, a time reference, console text, a legacy descriptor or an application packet. The
+/// legacy stream types travel the data lane and are not read as samples.
 pub fn lane_of(packet: PacketView<'_>) -> Option<Lane> {
     match packet.header.ptype {
         PacketType::SETTING
@@ -149,9 +157,9 @@ pub fn lane_of(packet: PacketView<'_>) -> Option<Lane> {
                 Some(MetadataType::Segment | MetadataType::Unknown(_)) | None => Some(Lane::Data),
             }
         }
-        PacketType::LEGACY_STREAM => Some(Lane::Data),
+        PacketType::LEGACY_STREAM | PacketType::STREAM0 => Some(Lane::Data),
         PacketType::LOG => Some(Lane::Event),
-        ptype if ptype.stream_id().is_some() => Some(Lane::Data),
+        ptype if ptype.sample_stream().is_some() => Some(Lane::Data),
         _ => None,
     }
 }
@@ -444,9 +452,6 @@ pub fn write_routing(buf: &mut [u8], len: usize, routing: DeviceRoute) -> Option
     Some(total)
 }
 
-/// The shortest data payload a host accepts, the sample header plus one byte.
-const MIN_SAMPLE_PAYLOAD: usize = data::SAMPLE_HEADER_SIZE + 1;
-
 /// Borrowed view of a packet's payload, read as the type its header names.
 ///
 /// Text fields are `&str` only where the payload codec validated them as
@@ -518,7 +523,7 @@ fn parse_payload(header: Header, payload: &[u8]) -> Result<Payload<'_>, PacketEr
         PacketType::PROXY_RX => Payload::ProxyRx(ProxyRx::parse(payload).ok_or(too_short)?),
         _ => match ptype.sample_stream() {
             Some(_) => {
-                if payload.len() < MIN_SAMPLE_PAYLOAD {
+                if payload.len() < data::MIN_SAMPLE_PAYLOAD {
                     return Err(too_short);
                 }
                 Payload::Samples(
@@ -687,6 +692,26 @@ mod tests {
             PacketView::parse_prefix(&[PacketType::HEARTBEAT.value(), 0, 4, 0, 1]),
             Err(PacketError::NeedMore)
         );
+    }
+
+    /// Type 128 is legacy stream data. It travels the data lane beside the
+    /// samples, is no sample packet, and reads as unknown.
+    #[test]
+    fn type_128_is_a_legacy_stream_on_the_data_lane() {
+        let legacy = [PacketType::STREAM0.value(), 0, 5, 0, 1, 2, 3, 4, 5];
+        let mut sample = legacy;
+        sample[0] = PacketType::stream(1).unwrap().value();
+        for raw in [&legacy, &sample] {
+            assert_eq!(
+                lane_of(PacketView::parse_exact(raw).unwrap()),
+                Some(Lane::Data)
+            );
+        }
+        assert_eq!(PacketType::STREAM0.sample_stream(), None);
+        assert!(matches!(
+            Checked::exact(&legacy).unwrap().payload(),
+            Payload::Unknown(PacketType::STREAM0, body) if body == &legacy[4..]
+        ));
     }
 
     #[test]
@@ -1008,19 +1033,19 @@ mod tests {
         }
     }
 
-    /// The sample codec writes a packet with no sample bytes, which the check
-    /// refuses as too short.
+    /// The sample codec refuses to write a packet with no sample bytes, and
+    /// the check refuses such bytes as too short.
     #[test]
-    fn a_sample_packet_with_no_samples_is_written_but_refused() {
+    fn a_sample_packet_with_no_samples_is_refused() {
         let samples = data::Samples {
             stream_id: crate::StreamId::new(1),
             segment_id: crate::SegmentId::new(0),
             first: crate::SampleNumber::new(5),
             data: &[],
         };
-        let (buf, len) = written(|buf| samples.write(buf));
+        assert_eq!(samples.write(&mut [0; Packet::MAX_SIZE]), None);
         assert_eq!(
-            Checked::exact(&buf[..len]).unwrap_err(),
+            Checked::exact(&[129, 0, 4, 0, 5, 0, 0, 0]).unwrap_err(),
             PacketError::PayloadTooShort
         );
     }

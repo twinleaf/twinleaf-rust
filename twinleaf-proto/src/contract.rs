@@ -15,7 +15,8 @@
 //! checked alone. Its control starts over at its first heartbeat and at each naming a new session, as what came before may be of another, and each stream's
 //! data at a [`SegmentFlags::START`] record opening another segment, as each begins its lane
 //! afresh while the other lanes may still carry what came before. A device keeps the laws of the [`Law::revision`] its record declares and those before.
-//! A packet whose payload does not parse is not checked.
+//! A packet whose payload does not parse is not checked, except against [`Law::F2`], which reads
+//! only its header and payload length.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -23,7 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::num::NonZeroU16;
 
-use crate::data::{self, FilterType, Metadata, Samples, SegmentFlags};
+use crate::data::{self, FilterType, Metadata, Samples, SegmentFlags, MIN_SAMPLE_PAYLOAD};
 use crate::heartbeat::{Heartbeat, SESSION_PAYLOAD_SIZE, SETTINGS_PAYLOAD_SIZE};
 use crate::packet::{lane_of, Header, Lane, PacketType, PacketView};
 use crate::rpc::{ErrorReply, Reply, Request};
@@ -58,6 +59,8 @@ pub struct Observed<'a> {
 pub enum Law {
     /// Every packet a device sends has a TTL of 0.
     F1,
+    /// Every sample packet a device sends carries at least one sample byte.
+    F2,
     /// Every heartbeat a device sends is its session, alone in 4 bytes or with
     /// its settings sequence in 8.
     I1,
@@ -96,7 +99,8 @@ impl Law {
     pub const fn revision(self) -> u8 {
         match self {
             Self::F1 | Self::I1 | Self::A1 | Self::A2 => 0,
-            Self::S1
+            Self::F2
+            | Self::S1
             | Self::S2
             | Self::S3
             | Self::S4
@@ -130,13 +134,22 @@ pub fn check(trace: &[Observed<'_>]) -> Vec<Violation> {
             let broken = match seen.sender {
                 Sender::Host => {
                     route.control.asked(seen.packet);
-                    [None, None]
+                    [None, None, None]
                 }
                 Sender::Device => [
                     (!f1(seen.packet.header)).then(|| {
                         (
                             Law::F1,
                             format!("a packet of TTL {}", seen.packet.header.ttl),
+                        )
+                    }),
+                    (!f2(seen.packet.header)).then(|| {
+                        (
+                            Law::F2,
+                            format!(
+                                "a sample packet of {} payload bytes",
+                                seen.packet.header.payload_size
+                            ),
                         )
                     }),
                     route.heard(seen.packet),
@@ -154,6 +167,10 @@ pub fn check(trace: &[Observed<'_>]) -> Vec<Violation> {
 
 fn f1(header: Header) -> bool {
     header.ttl == 0
+}
+
+fn f2(header: Header) -> bool {
+    header.ptype.sample_stream().is_none() || usize::from(header.payload_size) >= MIN_SAMPLE_PAYLOAD
 }
 
 fn i1(payload: &[u8]) -> bool {
@@ -981,6 +998,25 @@ mod tests {
             breaking(vec![declare(1)]),
             [(Law::S1, 2), (Law::F1, 3), (Law::S1, 3)]
         );
+    }
+
+    /// A sample packet with no sample bytes breaks `F2` for a device of revision 1, and a device of
+    /// revision 0 is not held to it.
+    #[test]
+    fn a_sample_packet_with_no_samples_breaks_f2_from_revision_1() {
+        let empty = device(vec![
+            PacketType::stream(1).unwrap().value(),
+            0,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        let trace = |declared: Step| broken(&[declared, stream(), record(0, 100), empty.clone()]);
+        assert_eq!(trace(declare(1)), [(Law::F2, 3)]);
+        assert_eq!(trace(declare(0)), []);
     }
 
     /// A heartbeat of the next session that overtakes the last session's rows, as a hop that keeps
