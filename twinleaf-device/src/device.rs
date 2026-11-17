@@ -332,6 +332,11 @@ impl<S: Group> Device<S> {
     /// then what `settings` declares, and `dev.priv` taking `password` until
     /// `dev.priv.password` overrides it. Its session opens on control with a
     /// heartbeat and then the device record.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ids of `streams` are not 1, 2 and on up to their count, in order, which is
+    /// how a host asks for each stream the device record counts.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: Identity,
@@ -343,6 +348,10 @@ impl<S: Group> Device<S> {
         streams: &(impl Streams + ?Sized),
         lanes: &mut (impl Lanes + ?Sized),
     ) -> Self {
+        assert!(
+            streams.ids().map(usize::from).eq(1..=streams.ids().count()),
+            "a device's streams are numbered 1 to their count, in order"
+        );
         let mut device = Self {
             identity,
             session,
@@ -1643,6 +1652,45 @@ mod tests {
             logged: Vec::new(),
             loglevel: DEFAULT_LOGLEVEL,
         }
+    }
+
+    /// A device comes up only with streams numbered 1 to their count, in order.
+    #[test]
+    fn a_device_takes_only_streams_numbered_one_to_their_count() {
+        let numbered = |ids: &[u8]| {
+            let streams: Vec<DataStream<4>> = ids
+                .iter()
+                .map(|&id| {
+                    let params = Params {
+                        rate: NonZeroU32::new(10).unwrap(),
+                        decimation: NonZeroU32::MIN,
+                        enabled: true,
+                    };
+                    let filter = Box::leak(Box::new(Butterworth4::<1>::new()));
+                    DataStream::new(StreamId::new(id), &AUX, filter, params).unwrap()
+                })
+                .collect();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let identity = identity().hardware("COMM-USB", "STM32G484xE", &[0xAB; 12], 8);
+                let mut nowhere = OneLane(Sent::default());
+                Device::new(
+                    identity,
+                    SESSION,
+                    table(),
+                    Board::new(),
+                    PASSWORD,
+                    BOOT,
+                    &streams[..],
+                    &mut nowhere,
+                );
+            }))
+            .is_ok()
+        };
+        assert!(numbered(&[]));
+        assert!(numbered(&[1, 2, 3]));
+        assert!(!numbered(&[2]));
+        assert!(!numbered(&[1, 3]));
+        assert!(!numbered(&[2, 1]));
     }
 
     /// One request, as `tio-tool` sends it.

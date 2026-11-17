@@ -3,7 +3,8 @@
 //!
 //! A device sends each packet on the lane [`lane_of`] names. Each lane keeps its write order and
 //! lanes keep none between them, so each law reads one lane of one route, its control or one
-//! stream's data, and takes from control only the sample size a stream's record fixes for the session.
+//! stream's data, and takes from control only what a device fixes for a session, the sample size
+//! of a stream's record and the stream count of its device record.
 //!
 //! A trace is every packet a host exchanged with a tree of devices since it
 //! first heard them, in the order it saw them. A row is a sample packet, and
@@ -85,6 +86,10 @@ pub enum Law {
     /// A record that moves a segment id's start or reference between two of its rows, with no
     /// record of another id between them, restarts the count, so the next row numbers no higher.
     S5,
+    /// A segment's first active record without [`SegmentFlags::START`], on the time reference of
+    /// the segment its stream's last row was in, starts no earlier than that segment, whose rows
+    /// number below the whole output periods between the two starts at its rate and decimation.
+    S6,
     /// No row of a segment comes after its closing record, one without [`SegmentFlags::ACTIVE`].
     D1,
     /// A segment's closing record is its opening record with [`SegmentFlags::ACTIVE`] cleared.
@@ -92,6 +97,9 @@ pub enum Law {
     /// A record opening a segment while its stream has none open carries [`SegmentFlags::START`],
     /// and one with it while a segment is open ends that segment unclosed.
     D3,
+    /// Every stream a record or a row names is numbered at most the `n_streams` of the device's
+    /// latest device record.
+    M1,
 }
 
 impl Law {
@@ -105,9 +113,11 @@ impl Law {
             | Self::S3
             | Self::S4
             | Self::S5
+            | Self::S6
             | Self::D1
             | Self::D2
-            | Self::D3 => 1,
+            | Self::D3
+            | Self::M1 => 1,
         }
     }
 }
@@ -260,6 +270,35 @@ fn d3(stream: &Stream, record: &Record) -> bool {
     stream.latest.is_none() || !record.active() || stream.open().is_some() || record.starts()
 }
 
+/// The rows of a segment with no rate or decimation number against nothing, so only the order of
+/// the two starts is read.
+fn s6(stream: &Stream, record: &Record) -> bool {
+    let next = &record.segment;
+    let Some(before) = stream.last_row.as_ref() else {
+        return true;
+    };
+    let same_reference = before.epoch == next.epoch
+        && before.timeref_session == next.timeref_session
+        && before.timeref_serial == next.timeref_serial;
+    if !record.active() || record.starts() || stream.runs.contains_key(next) || !same_reference {
+        return true;
+    }
+    let Some(seconds) = next.start_time.checked_sub(before.start_time) else {
+        return false;
+    };
+    let (Some(last), Some(&(rate, decimation))) = (stream.last(before), stream.periods.get(before))
+    else {
+        return true;
+    };
+    rate == 0
+        || decimation == 0
+        || u64::from(last) < u64::from(seconds) * u64::from(rate) / u64::from(decimation)
+}
+
+fn m1(n_streams: Option<u8>, stream: StreamId) -> bool {
+    n_streams.is_none_or(|n_streams| stream.value() <= n_streams)
+}
+
 /// A segment as a row names it, its id with the start and time reference of its latest record.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Segment {
@@ -307,6 +346,8 @@ struct Stream {
     latest: Option<Segment>,
     /// Every segment recorded, with the last sample number of its rows.
     runs: BTreeMap<Segment, Option<u32>>,
+    /// Every segment recorded, with the sampling rate and decimation of its latest record.
+    periods: BTreeMap<Segment, (u32, u32)>,
     last_row: Option<Segment>,
     /// Whether a record of another segment id came since the last row.
     crossed: bool,
@@ -364,10 +405,16 @@ impl Stream {
                 ..Self::default()
             };
         }
-        let broken = [(Law::D2, d2(self, &record)), (Law::D3, d3(self, &record))]
-            .into_iter()
-            .find_map(|(law, holds)| (!holds).then_some(law));
+        let broken = [
+            (Law::D2, d2(self, &record)),
+            (Law::D3, d3(self, &record)),
+            (Law::S6, s6(self, &record)),
+        ]
+        .into_iter()
+        .find_map(|(law, holds)| (!holds).then_some(law));
         let segment = record.segment.clone();
+        self.periods
+            .insert(segment.clone(), (record.sampling_rate, record.decimation));
         self.crossed |= self
             .last_row
             .as_ref()
@@ -423,6 +470,8 @@ struct Control {
     session: Option<SessionId>,
     /// The protocol revision the device's record declares, 0 until it declares one.
     protocol: u8,
+    /// The stream count of the device's latest record, unknown until it sends one.
+    n_streams: Option<u8>,
     /// The highest settings sequence the device has shown.
     shown: Option<u32>,
     /// Requests not yet answered, with the sequence shown before each.
@@ -456,6 +505,17 @@ impl Control {
         broken.map(|law| {
             let name = String::from_utf8_lossy(setting.name);
             (law, format!("{name} announced as setting {seq}"))
+        })
+    }
+
+    /// Whether a packet naming `stream` breaks [`Law::M1`].
+    fn named(&self, stream: StreamId) -> Option<(Law, String)> {
+        (!m1(self.n_streams, stream)).then(|| {
+            let (stream, n_streams) = (stream.value(), self.n_streams.unwrap_or_default());
+            (
+                Law::M1,
+                format!("stream {stream} of a device of {n_streams} streams"),
+            )
         })
     }
 }
@@ -495,6 +555,7 @@ impl Route {
             PacketType::METADATA => match Metadata::parse(packet.payload)?.0 {
                 Metadata::Device(record) => {
                     self.control.protocol = record.protocol;
+                    self.control.n_streams = Some(record.n_streams);
                     None
                 }
                 Metadata::Stream(record) => {
@@ -502,9 +563,10 @@ impl Route {
                         .entry(record.stream_id)
                         .or_default()
                         .sample_size = NonZeroU16::new(record.sample_size);
-                    None
+                    self.control.named(record.stream_id)
                 }
-                Metadata::Segment(_) | Metadata::Column(_) => None,
+                Metadata::Column(record) => self.control.named(record.stream_id),
+                Metadata::Segment(_) => None,
             },
             PacketType::RPC_REP => {
                 let reply = Reply::parse(packet.payload)?;
@@ -524,19 +586,26 @@ impl Route {
     fn data(&mut self, packet: PacketView<'_>) -> Option<(Law, String)> {
         match packet.header.ptype {
             PacketType::METADATA => match Metadata::parse(packet.payload)?.0 {
-                Metadata::Segment(record) => self
-                    .streams
-                    .entry(record.stream_id)
-                    .or_default()
-                    .recorded(record),
+                Metadata::Segment(record) => {
+                    let named = self.control.named(record.stream_id);
+                    let broken = self
+                        .streams
+                        .entry(record.stream_id)
+                        .or_default()
+                        .recorded(record);
+                    named.or(broken)
+                }
                 Metadata::Device(_) | Metadata::Stream(_) | Metadata::Column(_) => None,
             },
             _ => {
                 let samples = Samples::parse(packet.header, packet.payload)?;
-                self.streams
+                let named = self.control.named(samples.stream_id);
+                let broken = self
+                    .streams
                     .entry(samples.stream_id)
                     .or_default()
-                    .row(samples)
+                    .row(samples);
+                named.or(broken)
             }
         }
     }
@@ -548,6 +617,7 @@ impl Route {
             None => {
                 self.control = Control {
                     protocol: self.control.protocol,
+                    n_streams: self.control.n_streams,
                     ..Control::default()
                 }
             }
@@ -648,8 +718,13 @@ mod tests {
 
     /// The record of stream 1, two bytes a sample, so that each row carries two.
     fn stream() -> Step {
+        stream_of(1)
+    }
+
+    /// The record of stream `stream`, two bytes a sample.
+    fn stream_of(stream: u8) -> Step {
         let record = Metadata::Stream(data::Stream {
-            stream_id: StreamId::new(1),
+            stream_id: StreamId::new(stream),
             n_columns: 1,
             n_segments: 4,
             sample_size: 2,
@@ -660,8 +735,13 @@ mod tests {
     }
 
     fn row(segment: u8, first: u32) -> Step {
+        row_of(1, segment, first)
+    }
+
+    /// A row of stream `stream`, two bytes for each of two samples.
+    fn row_of(stream: u8, segment: u8, first: u32) -> Step {
         let samples = Samples {
-            stream_id: StreamId::new(1),
+            stream_id: StreamId::new(stream),
             segment_id: SegmentId::new(segment),
             first: SampleNumber::new(first),
             data: &[0; 4],
@@ -714,6 +794,19 @@ mod tests {
             .into_iter()
             .map(|violation| (violation.law, violation.index))
             .collect()
+    }
+
+    /// Rows 0 to 29 of a segment at 10 rows a second from second 100, then `next`, and its row 0.
+    fn held(next: Step) -> Vec<Step> {
+        vec![
+            declare(1),
+            stream(),
+            record(0, 100),
+            row(0, 0),
+            row(0, 28),
+            next,
+            row(1, 0),
+        ]
     }
 
     /// Each law holds of a trace that keeps it and names the one packet of a
@@ -969,6 +1062,28 @@ mod tests {
                 ],
                 vec![v1(), start(0, 100), close(0, 100), record(1, 101)],
                 3,
+            ),
+            (Law::S6, held(record(1, 103)), held(record(1, 102)), 5),
+            (Law::S6, held(start(1, 102)), held(record(1, 102)), 5),
+            (Law::S6, held(record_on(1, 102, 4)), held(record(1, 102)), 5),
+            (
+                Law::M1,
+                vec![
+                    row_of(2, 0, 0),
+                    stream_of(2),
+                    v1(),
+                    stream(),
+                    record(0, 100),
+                    row(0, 0),
+                ],
+                vec![v1(), stream_of(2)],
+                1,
+            ),
+            (
+                Law::M1,
+                vec![row_of(2, 0, 0), v1(), record(0, 100), row(0, 0)],
+                vec![v1(), record(0, 100), row_of(2, 0, 0)],
+                2,
             ),
         ];
         for (law, lawful, breaking, index) in cases {

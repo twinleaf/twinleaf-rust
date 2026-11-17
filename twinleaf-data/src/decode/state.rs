@@ -358,6 +358,9 @@ impl StreamTracker {
     /// So the whole output periods from the last segment's start to the new
     /// one's are the rows the last segment held, and a split group leaves no
     /// gap of a whole period. The count is below 1 when no row was missed.
+    ///
+    /// The count rests on law `S6` of the contract in `twinleaf_proto::contract`, which says
+    /// how far a segment's rows number before the next segment.
     fn missing_before(&self, segment: wire::SegmentView<'_>, first: SampleNumber) -> i128 {
         let Some(last) = self.last_segment.as_ref().map(SegmentRecord::get) else {
             return 0;
@@ -958,6 +961,8 @@ impl DeviceState {
     }
 
     /// Returns selectors for every piece of metadata this route still lacks.
+    /// It asks for streams 1 to `n_streams`, which law `M1` of the contract in
+    /// `twinleaf_proto::contract` says are the streams a device names.
     fn missing_metadata(&self) -> Vec<wire::MetadataSelector> {
         match self.metadata.as_ref() {
             Some(device) => (1..=device.get().n_streams())
