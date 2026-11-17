@@ -5,6 +5,7 @@ use crate::DumpCli;
 use std::time::Instant;
 use twinleaf::data::{ColumnFilter, SampleBatch};
 use twinleaf::proto::data;
+use twinleaf::proto::packet::Checked;
 use twinleaf::tio::{self, packet::Payload};
 use twinleaf::DeviceRoute;
 use twinleaf::{Connection, Receiver, RecvError};
@@ -31,7 +32,7 @@ pub fn run_dump(cli: DumpCli) -> eyre::Result<()> {
     } else {
         let packets = tree.packets();
         while let Some(packet) = recv_before(&packets, deadline, "packets")? {
-            printer.print_packet(&packet);
+            printer.print_packet(packet.checked());
         }
     }
 
@@ -77,7 +78,7 @@ impl Printer {
     }
 
     /// Returns `true` if [`print_packet`](Self::print_packet) prints `packet`.
-    pub(crate) fn shows_packet(&self, packet: &tio::Packet) -> bool {
+    pub(crate) fn shows_packet(&self, packet: Checked<'_>) -> bool {
         match self {
             Printer::Packets => true,
             Printer::Metadata => matches!(packet.payload(), Payload::Metadata(..)),
@@ -86,9 +87,9 @@ impl Printer {
     }
 
     /// Prints `packet` if this printer shows it. Returns `true` if it did.
-    pub(crate) fn print_packet(&self, packet: &tio::Packet) -> bool {
+    pub(crate) fn print_packet(&self, packet: Checked<'_>) -> bool {
         match (self, packet.payload()) {
-            (Printer::Packets, _) => println!("{:?}", packet),
+            (Printer::Packets, _) => println!("{:?}", tio::Packet::from(packet)),
             (Printer::Metadata, Payload::Metadata(record, _)) => {
                 print_metadata_record(&packet.route(), record)
             }

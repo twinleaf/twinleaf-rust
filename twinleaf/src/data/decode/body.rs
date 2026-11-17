@@ -12,20 +12,19 @@ use crate::proto::data as wire;
 macro_rules! define_decoders {
     ($($variant:ident $native:ty),* $(,)?) => {
         /// Returns `true` if this build decodes columns of `data_type`.
-        pub(crate) fn decodes(data_type: wire::DataType) -> bool {
+        pub(in crate::data) fn decodes(data_type: wire::DataType) -> bool {
             matches!(data_type, $(wire::DataType::$variant)|*)
         }
 
         impl ColumnData {
-            /// Decodes the value of `data_type` at the front of `data`, or
-            /// returns [`ColumnData::Unknown`] for a type this build cannot
-            /// decode.
+            /// Returns the value of `data_type` at the front of `data`, read
+            /// little endian, or [`ColumnData::Unknown`] for a type this build
+            /// cannot decode.
             ///
             /// # Panics
             ///
             /// Panics if `data` is shorter than the type's size.
-            #[cfg(feature = "host")]
-            pub(crate) fn from_le_bytes(data: &[u8], data_type: wire::DataType) -> ColumnData {
+            pub fn from_le_bytes(data: &[u8], data_type: wire::DataType) -> ColumnData {
                 match data_type {
                     $(
                         wire::DataType::$variant => Self::$variant(<$native>::from_le_bytes(
@@ -89,7 +88,8 @@ mod tests {
     use crate::proto::data::DataType;
 
     /// No device sends 24-bit columns, so they are not decoded. Their type
-    /// codes still parse, and the parser steps over their bytes.
+    /// codes still parse, and the parser refuses a stream with such a column
+    /// whole.
     #[test]
     fn int24_values_are_not_decoded() {
         for data_type in [DataType::I24, DataType::U24] {

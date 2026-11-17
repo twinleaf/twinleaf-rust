@@ -1,25 +1,22 @@
 //! The host's [`Packet`], one validated wire buffer read through the
-//! [`proto`](crate::proto) codecs, and the [`Payload`] it decodes to.
+//! [`proto`](crate::proto) codecs into the [`Payload`] it carries.
 
 use crate::proto::data as wire;
 use crate::proto::heartbeat::Heartbeat;
-use crate::proto::log::LogMessage;
 use crate::proto::packet::Packet as WirePacket;
-use crate::proto::packet::{Header, PacketError, PacketView};
+use crate::proto::packet::{write_routing, Checked, Header, PacketError, PacketView};
 use crate::proto::rpc as wire_rpc;
-use crate::proto::settings::Setting;
 use crate::proto::RpcRequestId;
 use crate::proto::SessionId as WireSessionId;
 use bytes::Bytes;
-use num_enum::{FromPrimitive, IntoPrimitive};
 use std::fmt;
 
 use crate::proto::data::MAX_SAMPLE_NUMBER;
 use crate::proto::packet::PacketType;
 use crate::proto::DeviceRoute;
 
-/// The shortest data payload a host accepts, the sample header plus one byte.
-const MIN_SAMPLE_PAYLOAD: usize = wire::SAMPLE_HEADER_SIZE + 1;
+pub use crate::proto::packet::Payload;
+pub use crate::proto::proxy::{LinkStatus, ProxyRx};
 
 /// One complete, validated TIO packet.
 ///
@@ -28,103 +25,6 @@ const MIN_SAMPLE_PAYLOAD: usize = wire::SAMPLE_HEADER_SIZE + 1;
 #[derive(Clone)]
 pub struct Packet {
     raw: Bytes,
-}
-
-/// Borrowed view of a packet's payload.
-///
-/// Text fields are `&str` only where the wire codec validated them as UTF-8.
-/// Everything else stays bytes, and callers convert at the point of use.
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub enum Payload<'a> {
-    /// A device log line.
-    Log(LogMessage<'a>),
-    /// An RPC request, from a host or a hub.
-    RpcRequest(wire_rpc::Request<'a>),
-    /// A successful RPC reply.
-    RpcReply(wire_rpc::Reply<'a>),
-    /// An RPC refused with an error code.
-    RpcError(wire_rpc::ErrorReply<'a>),
-    /// A keepalive, with the device's session id when it carries one.
-    Heartbeat(Heartbeat<'a>),
-    /// One metadata record and the flags describing it.
-    Metadata(wire::Metadata<'a>, wire::MetadataFlags),
-    /// A run of samples from one stream.
-    Samples(wire::Samples<'a>),
-    /// A device announcing that one of its settings changed.
-    Setting(Setting<'a>),
-    /// A proxy's link status in the legacy form, type 64, which old proxies
-    /// and old recordings still carry.
-    LegacyStatus(LinkStatus),
-    /// A control request from a client to its proxy, an RPC request naming its
-    /// method.
-    ProxyTx(wire_rpc::Request<'a>),
-    /// A control reply or a link status from a proxy to its client.
-    ProxyRx(ProxyRx<'a>),
-    /// A packet type this build does not interpret, kept whole for forwarding
-    /// and logging.
-    Unknown(PacketType, &'a [u8]),
-}
-
-/// What a proxy tells its client in a `PROXY_RX` packet. The payload leads
-/// with a kind byte, and the body that follows depends on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ProxyRx<'a> {
-    /// The answer to a control request, kind 0.
-    Reply(wire_rpc::Reply<'a>),
-    /// A control request refused, kind 1. Its message may say why.
-    Error(wire_rpc::ErrorReply<'a>),
-    /// The link status of the subtree the packet's route names, kind 2.
-    Link(LinkStatus),
-    /// A sign that the proxy is alive, kind 3, sent when nothing else was.
-    Alive,
-    /// The proxy dropped sample packets from its queue for this client,
-    /// which read too slowly, kind 4. They were `packets` packets of stream
-    /// `stream_id` of the device the packet's route names, and the samples
-    /// that stream sends next come after them.
-    Dropped {
-        /// The stream the packets were of.
-        stream_id: u8,
-        /// How many of its packets were dropped.
-        packets: u32,
-    },
-    /// A kind this build does not know, with the body after its kind byte.
-    Unknown(u8, &'a [u8]),
-}
-
-/// `PROXY_RX` kind byte of a reply.
-const PROXY_RX_REPLY: u8 = 0;
-/// `PROXY_RX` kind byte of an error.
-const PROXY_RX_ERROR: u8 = 1;
-/// `PROXY_RX` kind byte of a link status.
-const PROXY_RX_LINK: u8 = 2;
-/// `PROXY_RX` kind byte of a sign of life.
-const PROXY_RX_ALIVE: u8 = 3;
-/// `PROXY_RX` kind byte of a count of dropped sample packets. Its body is
-/// the stream id, one byte, and the count, a little endian `u32`.
-const PROXY_RX_DROPPED: u8 = 4;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-#[derive(FromPrimitive, IntoPrimitive)]
-/// The link status a proxy announces to its clients. [`Packet::link_status`]
-/// reads it from either form of status packet.
-#[non_exhaustive]
-pub enum LinkStatus {
-    /// The device went quiet or its transport closed.
-    SensorDisconnected = 0,
-    /// The device is answering again after a disconnect.
-    SensorReconnected = 1,
-    /// The proxy gave up reconnecting.
-    FailedToReconnect = 2,
-    /// The transport did not open.
-    FailedToConnect = 3,
-    /// The proxy stopped. The client must not reconnect.
-    Stopped = 4,
-    /// A status code this build does not know.
-    #[num_enum(catch_all)]
-    Unknown(u8),
 }
 
 /// Why a buffer is not one packet. Transports count and log these.
@@ -167,6 +67,9 @@ impl From<PacketError> for DecodeError {
             PacketError::InvalidPacketType => Self::InvalidPacketType,
             PacketError::PayloadTooBig => Self::PayloadTooBig,
             PacketError::RoutingTooBig => Self::RoutingTooBig,
+            PacketError::PayloadTooShort => Self::PayloadTooShort,
+            PacketError::InvalidPayload => Self::InvalidPayload,
+            PacketError::TrailingBytes => Self::PacketTooBig,
         }
     }
 }
@@ -197,91 +100,9 @@ pub enum EncodeError {
     /// The sample number does not fit the 24 bits it has on the wire.
     #[error("sample number {0} does not fit in the 24-bit packet field")]
     SampleNumberTooLarge(u32),
-}
-
-fn parse_payload<'a>(header: Header, payload: &'a [u8]) -> Result<Payload<'a>, DecodeError> {
-    let ptype = header.ptype;
-    let too_short = DecodeError::PayloadTooShort;
-    Ok(match ptype {
-        PacketType::LOG => Payload::Log(LogMessage::parse(payload).ok_or(too_short)?),
-        PacketType::RPC_REQ => {
-            Payload::RpcRequest(wire_rpc::Request::parse(payload).ok_or(too_short)?)
-        }
-        PacketType::RPC_REP => Payload::RpcReply(wire_rpc::Reply::parse(payload).ok_or(too_short)?),
-        PacketType::RPC_ERROR => {
-            Payload::RpcError(wire_rpc::ErrorReply::parse(payload).ok_or(too_short)?)
-        }
-        PacketType::HEARTBEAT => {
-            Payload::Heartbeat(Heartbeat::parse(payload).ok_or(DecodeError::InvalidPayload)?)
-        }
-        PacketType::METADATA => parse_metadata(ptype, payload)?,
-        PacketType::SETTING => Payload::Setting(Setting::parse(payload).ok_or(too_short)?),
-        PacketType::PROXY_STATUS => {
-            Payload::LegacyStatus(legacy_link_status(*payload.first().ok_or(too_short)?))
-        }
-        PacketType::PROXY_TX => {
-            Payload::ProxyTx(wire_rpc::Request::parse(payload).ok_or(too_short)?)
-        }
-        PacketType::PROXY_RX => Payload::ProxyRx(parse_proxy_rx(payload)?),
-        _ => match ptype.stream_id() {
-            Some(stream_id) if stream_id >= wire::FIRST_STREAM_ID => {
-                if payload.len() < MIN_SAMPLE_PAYLOAD {
-                    return Err(too_short);
-                }
-                Payload::Samples(
-                    wire::Samples::parse(header, payload).ok_or(DecodeError::InvalidPayload)?,
-                )
-            }
-            // Legacy metadata and stream types, and anything this build
-            // predates, ride along whole so a proxy can forward them.
-            _ => Payload::Unknown(ptype, payload),
-        },
-    })
-}
-
-/// Returns the status a legacy type 64 packet carries. The legacy form has no
-/// stop, and code 4 there reads as [`LinkStatus::Unknown`].
-fn legacy_link_status(code: u8) -> LinkStatus {
-    match LinkStatus::from(code) {
-        LinkStatus::Stopped => LinkStatus::Unknown(code),
-        status => status,
-    }
-}
-
-/// Parses a `PROXY_RX` payload, a kind byte followed by that kind's body. A
-/// kind this build does not know becomes [`ProxyRx::Unknown`].
-fn parse_proxy_rx(payload: &[u8]) -> Result<ProxyRx<'_>, DecodeError> {
-    let too_short = DecodeError::PayloadTooShort;
-    let (&kind, body) = payload.split_first().ok_or(too_short)?;
-    Ok(match kind {
-        PROXY_RX_REPLY => ProxyRx::Reply(wire_rpc::Reply::parse(body).ok_or(too_short)?),
-        PROXY_RX_ERROR => ProxyRx::Error(wire_rpc::ErrorReply::parse(body).ok_or(too_short)?),
-        PROXY_RX_LINK => ProxyRx::Link(LinkStatus::from(*body.first().ok_or(too_short)?)),
-        PROXY_RX_ALIVE => ProxyRx::Alive,
-        PROXY_RX_DROPPED => {
-            let (&stream_id, count) = body.split_first().ok_or(too_short)?;
-            let count = count.first_chunk::<4>().ok_or(too_short)?;
-            ProxyRx::Dropped {
-                stream_id,
-                packets: u32::from_le_bytes(*count),
-            }
-        }
-        _ => ProxyRx::Unknown(kind, body),
-    })
-}
-
-/// Parses a metadata payload. A record kind this build does not know has its
-/// framing checked and is kept whole as [`Payload::Unknown`].
-fn parse_metadata(ptype: PacketType, payload: &[u8]) -> Result<Payload<'_>, DecodeError> {
-    let (kind, _, record) = wire::split_metadata(payload).ok_or(DecodeError::PayloadTooShort)?;
-    match wire::Metadata::parse(payload) {
-        Some((record, flags)) => Ok(Payload::Metadata(record, flags)),
-        None if wire::Metadata::defines(kind) => Err(DecodeError::InvalidPayload),
-        None => {
-            wire::split_record(record).ok_or(DecodeError::InvalidPayload)?;
-            Ok(Payload::Unknown(ptype, payload))
-        }
-    }
+    /// A sample packet carries no sample bytes.
+    #[error("a sample packet needs at least one sample byte")]
+    NoSamples,
 }
 
 impl Packet {
@@ -291,12 +112,7 @@ impl Packet {
     ///
     /// Returns a [`DecodeError`] if `raw` is not exactly one valid packet.
     pub fn from_wire(raw: Bytes) -> Result<Packet, DecodeError> {
-        let (view, len) = PacketView::parse_prefix(&raw)?;
-        if len != raw.len() {
-            return Err(DecodeError::PacketTooBig);
-        }
-        DeviceRoute::from_wire(view.routing).map_err(|_| DecodeError::RoutingTooBig)?;
-        parse_payload(view.header, view.payload)?;
+        Checked::exact(&raw)?;
         Ok(Packet { raw })
     }
 
@@ -308,8 +124,13 @@ impl Packet {
     /// Returns [`DecodeError::NeedMore`] if `raw` ends before the packet
     /// does, and another [`DecodeError`] if the packet is invalid.
     pub fn from_wire_prefix(raw: &Bytes) -> Result<(Packet, usize), DecodeError> {
-        let len = PacketView::parse_prefix(raw)?.1;
-        Ok((Self::from_wire(raw.slice(..len))?, len))
+        let len = Checked::prefix(raw)?.1;
+        Ok((
+            Packet {
+                raw: raw.slice(..len),
+            },
+            len,
+        ))
     }
 
     /// Parses one packet from the start of `raw` as
@@ -319,8 +140,8 @@ impl Packet {
     ///
     /// Returns the errors of [`from_wire_prefix`](Self::from_wire_prefix).
     pub fn from_slice_prefix(raw: &[u8]) -> Result<(Packet, usize), DecodeError> {
-        let len = PacketView::parse_prefix(raw)?.1;
-        Ok((Self::from_wire(Bytes::copy_from_slice(&raw[..len]))?, len))
+        let (checked, len) = Checked::prefix(raw)?;
+        Ok((Packet::from(checked), len))
     }
 
     /// Creates an RPC request for `name` with encoded `arg`, addressed to
@@ -394,15 +215,7 @@ impl Packet {
     // A one byte payload always fits a packet.
     #[allow(clippy::missing_panics_doc)]
     pub fn legacy_status(status: LinkStatus) -> Packet {
-        let code = match status {
-            LinkStatus::Stopped => LinkStatus::FailedToReconnect,
-            status => status,
-        };
-        routeless(PacketType::PROXY_STATUS, 1, |payload| {
-            payload[0] = u8::from(code);
-            Some(1)
-        })
-        .expect("a legacy status always fits")
+        build(1, DeviceRoute::root(), |buf| status.write(buf)).expect("a legacy status always fits")
     }
 
     /// Creates a link status as a `PROXY_RX` packet. The status concerns the
@@ -411,11 +224,7 @@ impl Packet {
     // A two byte payload always fits a packet.
     #[allow(clippy::missing_panics_doc)]
     pub fn link(status: LinkStatus) -> Packet {
-        proxy_rx(PROXY_RX_LINK, 1, |body| {
-            body[0] = u8::from(status);
-            Some(1)
-        })
-        .expect("a link status always fits")
+        proxy_rx(ProxyRx::Link(status)).expect("a link status always fits")
     }
 
     /// Creates the sign of life a proxy sends a client. The packet has no
@@ -423,7 +232,7 @@ impl Packet {
     // An empty body always fits a packet.
     #[allow(clippy::missing_panics_doc)]
     pub fn alive() -> Packet {
-        proxy_rx(PROXY_RX_ALIVE, 0, |_| Some(0)).expect("a sign of life always fits")
+        proxy_rx(ProxyRx::Alive).expect("a sign of life always fits")
     }
 
     /// Creates the count of `packets` sample packets of stream `stream_id`
@@ -432,12 +241,8 @@ impl Packet {
     // A six byte payload always fits a packet.
     #[allow(clippy::missing_panics_doc)]
     pub fn dropped(stream_id: u8, packets: u32) -> Packet {
-        proxy_rx(PROXY_RX_DROPPED, 5, |body| {
-            body[0] = stream_id;
-            body[1..5].copy_from_slice(&packets.to_le_bytes());
-            Some(5)
-        })
-        .expect("a count of dropped packets always fits")
+        proxy_rx(ProxyRx::Dropped { stream_id, packets })
+            .expect("a count of dropped packets always fits")
     }
 
     /// Creates a control request to the proxy itself, calling `name` with
@@ -449,8 +254,8 @@ impl Packet {
     pub fn proxy_request(name: &str, arg: &[u8], id: u16) -> Result<Packet, EncodeError> {
         let method = wire_rpc::Method::ByName(name.as_bytes());
         let payload_len = request_payload_len(name, arg)?;
-        routeless(PacketType::PROXY_TX, payload_len, |payload| {
-            wire_rpc::write_request_payload(payload, RpcRequestId::new(id), method, arg)
+        build(payload_len, DeviceRoute::root(), |buf| {
+            wire_rpc::write_proxy_request(buf, RpcRequestId::new(id), method, arg)
         })
     }
 
@@ -462,10 +267,10 @@ impl Packet {
     /// Returns [`EncodeError::PayloadTooLarge`] if `value` does not fit a
     /// packet.
     pub fn proxy_reply(id: u16, value: &[u8]) -> Result<Packet, EncodeError> {
-        let body_len = wire_rpc::REPLY_HEADER_SIZE + value.len();
-        proxy_rx(PROXY_RX_REPLY, body_len, |body| {
-            wire_rpc::write_reply_payload(body, RpcRequestId::new(id), value)
-        })
+        proxy_rx(ProxyRx::Reply(wire_rpc::Reply {
+            req_id: RpcRequestId::new(id),
+            value,
+        }))
     }
 
     /// Creates the proxy's refusal of control request `id` with `code` and a
@@ -480,15 +285,11 @@ impl Packet {
         code: wire_rpc::RpcError,
         message: &str,
     ) -> Result<Packet, EncodeError> {
-        let body_len = 4 + message.len();
-        proxy_rx(PROXY_RX_ERROR, body_len, |body| {
-            wire_rpc::write_error_payload(
-                body,
-                RpcRequestId::new(id),
-                code.value(),
-                message.as_bytes(),
-            )
-        })
+        proxy_rx(ProxyRx::Error(wire_rpc::ErrorReply {
+            req_id: RpcRequestId::new(id),
+            code: code.value(),
+            message: message.as_bytes(),
+        }))
     }
 
     /// Creates a packet of one metadata `record` with its `flags`, addressed
@@ -507,33 +308,14 @@ impl Packet {
         build(payload_len, routing, |buf| record.write(flags, buf))
     }
 
-    /// Creates a metadata packet as [`Self::metadata`] does, from a `record`
-    /// already in its wire form. `kind` is the record's wire type byte.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EncodeError::PayloadTooLarge`] if the record does not fit a
-    /// packet.
-    pub fn metadata_record(
-        kind: u8,
-        flags: wire::MetadataFlags,
-        record: &[u8],
-        routing: DeviceRoute,
-    ) -> Result<Packet, EncodeError> {
-        let payload_len = wire::METADATA_HEADER_SIZE + record.len();
-        build(payload_len, routing, |buf| {
-            wire::write_metadata_record(buf, kind, flags, record)
-        })
-    }
-
     /// Creates a packet of packed sample `data` for stream `stream_id`,
     /// starting at sample `first_sample_n`.
     ///
     /// # Errors
     ///
     /// Returns an [`EncodeError`] if `stream_id` is outside 1 to 127, if
-    /// `first_sample_n` does not fit 24 bits, or if `data` does not fit a
-    /// packet.
+    /// `first_sample_n` does not fit 24 bits, or if `data` is empty or does
+    /// not fit a packet.
     pub fn samples(
         stream_id: u8,
         segment_id: u8,
@@ -543,6 +325,9 @@ impl Packet {
     ) -> Result<Packet, EncodeError> {
         if first_sample_n > MAX_SAMPLE_NUMBER {
             return Err(EncodeError::SampleNumberTooLarge(first_sample_n));
+        }
+        if data.is_empty() {
+            return Err(EncodeError::NoSamples);
         }
         let samples = wire::Samples {
             stream_id: crate::proto::StreamId::try_new(stream_id)
@@ -555,52 +340,66 @@ impl Packet {
         build(payload_len, routing, |buf| samples.write(buf))
     }
 
+    /// Returns the packet's checked bytes.
+    // Every packet holds bytes that pass the check. `from_wire` and the
+    // prefix readers check them, and `finish` asserts it of the constructors.
+    #[allow(clippy::missing_panics_doc)]
+    pub fn checked(&self) -> Checked<'_> {
+        Checked::exact(&self.raw).expect("a packet holds checked bytes")
+    }
+
+    /// Returns the framing of the packet's bytes, which were checked whole
+    /// when the packet was made.
+    fn framing(&self) -> PacketView<'_> {
+        PacketView::parse_exact(&self.raw).expect("the bytes were checked when the packet was made")
+    }
+
     /// Returns the payload, parsed from the packet's bytes.
-    // Every packet holds a payload that parses. `from_wire` checks it and the
-    // constructors write it.
+    // Every packet holds a payload that parses. It was checked when the
+    // packet was made.
     #[allow(clippy::missing_panics_doc)]
     pub fn payload(&self) -> Payload<'_> {
-        let view = self.view();
-        parse_payload(view.header, view.payload).expect("payload validated in from_wire")
+        self.framing()
+            .payload()
+            .expect("the payload was checked when the packet was made")
     }
 
     /// Returns the link status this packet announces in either form, or
     /// `None` if it announces none.
     pub fn link_status(&self) -> Option<LinkStatus> {
-        match self.payload() {
-            Payload::LegacyStatus(status) | Payload::ProxyRx(ProxyRx::Link(status)) => Some(status),
-            _ => None,
-        }
+        self.payload().link_status()
     }
 
     /// Returns the payload's raw bytes, for a caller that keeps part of them
     /// as they are.
     pub fn payload_bytes(&self) -> &[u8] {
-        self.view().payload
+        self.framing().payload
     }
 
     /// Returns the packet type from the header.
     pub fn ptype(&self) -> PacketType {
-        self.view().header.ptype
+        self.framing().header.ptype
     }
 
     /// Returns the route the packet is addressed to or came from.
-    // Every packet holds a valid route. `from_wire` checks it and the
-    // constructors write it.
+    // Every packet holds a route that reads. It was checked when the packet
+    // was made.
     #[allow(clippy::missing_panics_doc)]
     pub fn route(&self) -> DeviceRoute {
-        DeviceRoute::from_wire(self.view().routing).expect("routing validated in from_wire")
+        self.framing()
+            .route()
+            .expect("the route was checked when the packet was made")
     }
 
     /// Returns the hops left before a hub drops the packet.
     pub fn ttl(&self) -> u8 {
-        self.view().header.ttl
+        self.framing().header.ttl
     }
 
-    /// Returns `true` if the packet carries stream samples, legacy encodings
-    /// included.
+    /// Returns `true` if the packet carries the samples of a stream from 1 to
+    /// 127.
     pub fn is_data(&self) -> bool {
-        self.ptype().stream_id().is_some()
+        self.ptype().sample_stream().is_some()
     }
 
     /// Returns the whole packet as it travels the wire.
@@ -619,9 +418,8 @@ impl Packet {
         if route == self.route() {
             return self.clone();
         }
-        let view = self.view();
         let mut buf = [0u8; WirePacket::MAX_SIZE];
-        let payload_end = Header::SIZE + view.payload.len();
+        let payload_end = Header::SIZE + self.payload_bytes().len();
         buf[..payload_end].copy_from_slice(&self.raw[..payload_end]);
         finish(&mut buf, payload_end, route)
     }
@@ -629,25 +427,33 @@ impl Packet {
     /// Returns a copy of an RPC request, reply or error with its request id
     /// set to `id`. Returns any other packet unchanged.
     pub fn with_rpc_id(&self, id: u16) -> Packet {
-        let view = self.view();
+        let header = self.framing().header;
         if !matches!(
-            view.header.ptype,
+            header.ptype,
             PacketType::RPC_REQ | PacketType::RPC_REP | PacketType::RPC_ERROR
         ) {
             return self.clone();
         }
         let mut raw = self.raw.to_vec();
-        let payload = &mut raw[view.header.payload_range()];
+        let payload = &mut raw[header.payload_range()];
         if !wire_rpc::set_req_id(payload, RpcRequestId::new(id)) {
             return self.clone();
         }
         Packet { raw: raw.into() }
     }
+}
 
-    fn view(&self) -> PacketView<'_> {
-        PacketView::parse_prefix(&self.raw)
-            .expect("bytes validated in from_wire")
-            .0
+impl<'a> From<&'a Packet> for Checked<'a> {
+    fn from(packet: &'a Packet) -> Self {
+        packet.checked()
+    }
+}
+
+impl From<Checked<'_>> for Packet {
+    fn from(checked: Checked<'_>) -> Self {
+        Packet {
+            raw: Bytes::copy_from_slice(checked.as_bytes()),
+        }
     }
 }
 
@@ -681,48 +487,18 @@ fn build(
     Ok(finish(&mut buf, len, routing))
 }
 
-/// Builds a packet of type `ptype` with no route, whose `len` byte payload
-/// `write` fills. Returns [`EncodeError::PayloadTooLarge`] before `write` runs
-/// if `len` exceeds the maximum.
-fn routeless(
-    ptype: PacketType,
-    len: usize,
-    write: impl FnOnce(&mut [u8]) -> Option<usize>,
-) -> Result<Packet, EncodeError> {
-    build(len, DeviceRoute::root(), |buf| {
-        let end = Header::SIZE + len;
-        Header::new(ptype, len as u16).write((&mut buf[..Header::SIZE]).try_into().unwrap());
-        write(&mut buf[Header::SIZE..end])?;
-        Some(end)
-    })
-}
-
-/// Builds a `PROXY_RX` packet of `kind` with no route. `write` fills the
-/// `len` byte body after the kind byte.
-fn proxy_rx(
-    kind: u8,
-    len: usize,
-    write: impl FnOnce(&mut [u8]) -> Option<usize>,
-) -> Result<Packet, EncodeError> {
-    routeless(PacketType::PROXY_RX, 1 + len, |payload| {
-        let (head, body) = payload.split_first_mut()?;
-        *head = kind;
-        write(body).map(|written| 1 + written)
-    })
+/// Builds a `PROXY_RX` packet carrying `rx` with no route.
+fn proxy_rx(rx: ProxyRx<'_>) -> Result<Packet, EncodeError> {
+    build(rx.payload_len(), DeviceRoute::root(), |buf| rx.write(buf))
 }
 
 /// Writes `routing` after the first `len` bytes of `buf`, a header and
 /// payload with no route, and returns the packet. Any valid payload plus the
 /// longest route fits in `buf`.
 fn finish(buf: &mut [u8; WirePacket::MAX_SIZE], len: usize, routing: DeviceRoute) -> Packet {
-    let mut header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap())
-        .expect("a wire writer stamped this header");
-    header.routing_size = routing.len() as u8;
-    header.write((&mut buf[..Header::SIZE]).try_into().unwrap());
-    let total = len + routing.len();
-    routing
-        .write_wire(&mut buf[len..total])
-        .expect("a route fits behind its payload");
+    let total = write_routing(buf, len, routing)
+        .expect("a wire writer stamped this header and a route fits behind its payload");
+    debug_assert!(Checked::exact(&buf[..total]).is_ok());
     Packet {
         raw: Bytes::copy_from_slice(&buf[..total]),
     }
@@ -745,6 +521,19 @@ mod tests {
 
     fn route(value: &str) -> DeviceRoute {
         value.parse().unwrap()
+    }
+
+    /// The check refuses a sample packet with no sample bytes, so the host
+    /// constructor never builds one.
+    #[test]
+    fn a_sample_packet_needs_samples() {
+        assert_eq!(
+            Packet::samples(1, 0, 0, &[], DeviceRoute::root()).unwrap_err(),
+            EncodeError::NoSamples
+        );
+        assert!(Packet::samples(1, 0, 0, &[0], DeviceRoute::root())
+            .unwrap()
+            .is_data());
     }
 
     #[test]

@@ -20,7 +20,7 @@ mod payload;
 pub mod route;
 pub mod serial;
 
-pub use payload::{capture, data, heartbeat, log, rpc, settings, sync};
+pub use payload::{capture, data, heartbeat, log, proxy, rpc, settings, sync};
 
 pub use identifiers::{
     BoardId, ColumnId, DeviceSerial, FirmwareMagic, FirmwareSerial, HwRev, RpcMethodId,

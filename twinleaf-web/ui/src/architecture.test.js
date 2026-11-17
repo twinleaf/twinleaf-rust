@@ -58,9 +58,6 @@ import { COMMANDS } from './lib/commands.js';
 /** Svelte's PROPS_IS_UPDATED and PROPS_IS_BINDABLE flags (svelte/src/constants.js). */
 const UPDATED = 1 << 2, BINDABLE = 1 << 3;
 
-/** The writes the page still makes, as `file prop`, each with what it writes. */
-const PENDING = new Map([]);
-
 /** State one module owns: `writes` matches a line that changes it, and `once`, where there is one, the owner's one line that sets it. */
 const OWNED = [
   {
@@ -144,11 +141,8 @@ describe('props', () => {
     expect(written(c('let { node } = $props(); const f = () => node.ratio;'), 'b.svelte')).toEqual([]);
     expect(written(c('let { node = $bindable() } = $props(); const f = () => (node = 1);'), 'c.svelte')).toEqual([]);
   });
-  it('are written only through $bindable, or by a write the page still makes', () => {
-    expect(found.filter((w) => !PENDING.has(w))).toEqual([]);
-  });
-  it('the page still writes are still written, so the list shrinks as each goes', () => {
-    expect([...PENDING.keys()].filter((w) => !found.includes(w))).toEqual([]);
+  it('are written only through $bindable', () => {
+    expect(found).toEqual([]);
   });
 });
 

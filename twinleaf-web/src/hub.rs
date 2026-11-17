@@ -1289,7 +1289,6 @@ impl Gathered {
 mod tests {
     use super::*;
     use crate::wire::decode;
-    use proptest::prelude::*;
     use twinleaf::data::ops::Fpcs;
     use twinleaf::data::PacketParser;
     use twinleaf::data::StreamKey;
@@ -1543,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn an_export_writes_every_raw_row_in_range_as_csv() {
+    fn an_export_gives_each_traces_column_and_its_raw_rows_in_range() {
         let mut hub = Hub::new();
         let mut parser = parser();
         for batch in samples(&mut parser, 0, 1000) {
@@ -1552,14 +1551,22 @@ mod tests {
         let traces = hub.export(&[0, 99], 1.0, 1.05);
         // The id of no trace is passed over.
         assert_eq!(traces.len(), 1);
-        let mut out = Vec::new();
-        twinleaf::data::csv::write_merged(&traces, &mut out).unwrap();
-        let csv = String::from_utf8(out).unwrap();
-        let lines: Vec<&str> = csv.lines().collect();
-        assert!(lines[0].starts_with("time (Unix s),"));
+        let trace = &traces[0];
+        assert_eq!(trace.name, "field.x");
+        assert_eq!(trace.units, "nT");
+        assert!(trace.unix);
+        assert_eq!(trace.column, ColumnId::new(0));
         // At 100 Hz, rows 99 to 104 stand at 1.00 to 1.05 s.
-        assert_eq!(lines.len(), 1 + 6);
-        assert_eq!(lines[1], "1,99");
+        assert_eq!(trace.rows(), 6);
+        let (times, values): (Vec<f64>, Vec<f64>) = (trace.batches.iter())
+            .flat_map(|batch| {
+                let values = batch.column(trace.column).unwrap().to_f64().into_owned();
+                batch.timestamps().to_vec().into_iter().zip(values)
+            })
+            .unzip();
+        assert_eq!(values, [99.0, 100.0, 101.0, 102.0, 103.0, 104.0]);
+        assert_eq!(times.first(), Some(&1.0));
+        assert!(times.last().is_some_and(|&t| (t - 1.05).abs() < 1e-9));
     }
 
     /// The simulated device, which streams 5000 rows a second and drops
@@ -2446,46 +2453,6 @@ mod tests {
         (i as f32 * 1e-3).sin() + 0.2 * (hash as f32 / (1 << 24) as f32 - 0.5) + spike
     }
 
-    /// The window of [t0, t1] made by decimating every row of the range for
-    /// a view `width` pixels wide, or of every row itself for no width,
-    /// which a window read from the levels is held against. The range is
-    /// one run with no gap, as `window_read_times` feeds it.
-    fn of_rows(hub: &Hub, t0: f64, t1: f64, width: Option<usize>) -> Window {
-        let rows = hub.gather(0, t0, t1).unwrap().rows(usize::MAX);
-        let ratio = width.map_or(1, |width| rows.count.div_ceil((2 * width).max(64)));
-        let ratio = ratio.max(1);
-        let mut chunks = Vec::new();
-        if let (Some(&first), Some(&last)) = (rows.x.first(), rows.x.last()) {
-            let mut fpcs = Fpcs::new(ratio, 0.0);
-            let values = twinleaf::data::ColumnArray::F64(rows.y.clone().into());
-            fpcs.update_batch(&rows.x, &values);
-            let mut points = vec![(first, rows.y[0])];
-            points.extend(fpcs.output().iter().filter(|point| point.0 > first));
-            if points.last().unwrap().0 < last {
-                points.push((last, rows.y[rows.y.len() - 1]));
-            }
-            chunks.push(WindowChunk {
-                x: points.iter().map(|p| p.0).collect(),
-                y: points.iter().map(|p| p.1).collect(),
-            });
-        }
-        Window {
-            t0,
-            t1,
-            ratio,
-            chunks,
-        }
-    }
-
-    /// Feeds the hub samples `first..first + n` at 100 Hz, as `spiky` values
-    /// them, and flushes it.
-    fn feed(hub: &mut Hub, parser: &mut PacketParser, first: u32, n: u32, seed: u32) {
-        for batch in valued(parser, 100, first, n, |i| spiky(i, seed)) {
-            hub.ingest(&batch);
-        }
-        hub.flush();
-    }
-
     #[test]
     fn while_a_page_holds_the_history_a_window_reads_what_the_buffer_dropped() {
         let mut hub = Hub::new();
@@ -2554,219 +2521,74 @@ mod tests {
             .last()
     }
 
-    /// The key of the stream `parser` describes.
-    fn stream_key() -> StreamKey {
-        StreamKey::new(DeviceRoute::root(), StreamId::new(1))
+    /// The last `memory` message the pages were told, which must be what
+    /// `hub.memory()` says now.
+    fn told(hub: &Hub, rx: &mut broadcast::Receiver<Arc<Frame>>) -> serde_json::Value {
+        let mut told = last_memory(rx).expect("the pages were told");
+        told.as_object_mut().unwrap().remove("seq");
+        assert_eq!(told, serde_json::to_value(hub.memory()).unwrap());
+        told
     }
 
-    /// Where the history of the one trace begins, as `memory` says.
-    fn oldest(hub: &Hub) -> f64 {
-        let Message::Memory { oldest, .. } = hub.memory() else {
-            unreachable!()
-        };
-        oldest[&0]
-    }
-
-    /// Lowering History while a page holds the history cuts the held
-    /// history by the buffer's rule, from its own newest row, and frees what
-    /// it held, and the pages are told so. Raising History again brings
-    /// nothing back.
+    /// The pages are told the `memory` message the hub says, with what is
+    /// held, on a new History setting, on a hold, as the held history grows,
+    /// on a new setting while held, and on a release.
     #[test]
-    fn lowering_the_history_while_held_cuts_the_held_history_too() {
+    fn a_page_is_told_the_memory_the_hub_says_with_what_is_held() {
         let mut hub = Hub::new();
         let mut parser = parser();
         let (_, mut rx) = hub.feed.subscribe();
-        // At 100 Hz, row n stands at (n + 1) / 100 s: held at 2000 s, the
-        // buffer on to 3000 s, all of it within History.
-        hub.set_history(3000.0, RAW_BYTES);
-        for start in (0..200_000).step_by(10_000) {
-            feed(&mut hub, &mut parser, start, 10_000, 3);
+        hub.set_history(10.0, 40_000);
+        assert!(told(&hub, &mut rx)["held"].is_null());
+        // At 100 Hz, row n stands at (n + 1) / 100 s.
+        for batch in samples(&mut parser, 0, 1000) {
+            hub.ingest(&batch);
         }
-        hub.hold(1, true);
-        for start in (200_000..300_000).step_by(10_000) {
-            feed(&mut hub, &mut parser, start, 10_000, 3);
+        hub.hold(7, true);
+        assert!(told(&hub, &mut rx)["held"].is_object());
+        for batch in samples(&mut parser, 1000, 3000) {
+            hub.ingest(&batch);
         }
-        assert_eq!(oldest(&hub), 0.01);
-
-        hub.set_history(100.0, RAW_BYTES);
-        let first = oldest(&hub);
-        let from = 2000.0 - 100.0 - HISTORY_HEADROOM;
-        assert!((from..from + 0.011).contains(&first), "{first}");
-        let live = hub.history.run(&stream_key()).unwrap();
-        let live_first = live.first_timestamp().unwrap();
-        assert!((2898.0..2898.011).contains(&live_first), "{live_first}");
-        // What it holds beyond the buffer is its 102 s at 16 bytes a row,
-        // and the pages are told so.
-        let Message::Memory { held, seconds, .. } = hub.memory() else {
-            unreachable!()
-        };
-        let held = held.unwrap();
-        assert!((160_000..=165_000).contains(&held.bytes), "{held:?}");
-        assert_eq!((seconds, held.seconds), (100.0, 100.0));
-        let told = last_memory(&mut rx).unwrap();
-        assert_eq!(told["held"]["bytes"].as_u64(), Some(held.bytes));
-        assert_eq!(told["held"]["seconds"].as_f64(), Some(100.0));
-        assert_eq!(told["seconds"].as_f64(), Some(100.0));
-
-        hub.set_history(3000.0, RAW_BYTES);
-        assert_eq!(oldest(&hub), first, "nothing comes back");
-        let live = hub.history.run(&stream_key()).unwrap();
-        assert_eq!(live.first_timestamp(), Some(live_first));
-        let told = last_memory(&mut rx).unwrap();
-        assert_eq!(told["held"]["bytes"].as_u64(), Some(held.bytes));
-        assert_eq!(told["max_age"].as_f64(), Some(3000.0));
+        hub.send_memory();
+        let held = told(&hub, &mut rx)["held"]["bytes"].as_u64().unwrap();
+        assert!(held > 0, "the held history keeps what the buffer dropped");
+        hub.set_history(5.0, 40_000);
+        let said = told(&hub, &mut rx);
+        assert_eq!(said["seconds"].as_f64(), Some(5.0));
+        assert_eq!(said["held"]["seconds"].as_f64(), Some(5.0));
+        hub.hold(7, false);
+        assert!(told(&hub, &mut rx)["held"].is_null());
     }
 
-    /// What a hub holds after a History setting: where the buffer's rows
-    /// begin and end, where its history begins, and the bytes of the buffer
-    /// and of the held history.
-    #[derive(Debug, PartialEq)]
-    struct Kept {
-        live: (f64, f64),
-        oldest: f64,
-        bytes: u64,
-        held_bytes: Option<u64>,
-    }
-
-    /// Sets History on `hub` and checks that the buffer and the held
-    /// history keep no more than the setting leaves, and that the pages were
-    /// told what `memory` says.
-    fn set_and_check(
-        hub: &mut Hub,
-        rx: &mut broadcast::Receiver<Arc<Frame>>,
-        seconds: f64,
-        bytes: usize,
-    ) -> Result<Kept, TestCaseError> {
-        hub.set_history(seconds, bytes);
-        let memory = hub.memory();
-        let mut told = last_memory(rx).unwrap();
-        told.as_object_mut().unwrap().remove("seq");
-        let json = serde_json::to_string(&memory).unwrap();
-        prop_assert_eq!(
-            told,
-            serde_json::from_str::<serde_json::Value>(&json).unwrap()
-        );
+    /// The seconds a page is told of the buffer and of the held history go
+    /// up to the History setting, though both keep the headroom beyond it.
+    #[test]
+    fn the_seconds_a_page_is_told_go_up_to_the_history_setting() {
+        let mut hub = Hub::new();
+        let mut parser = parser();
+        hub.set_history(10.0, RAW_BYTES);
+        for batch in samples(&mut parser, 0, 3000) {
+            hub.ingest(&batch);
+        }
+        hub.hold(7, true);
+        assert!(hub.history.seconds() > 10.0);
+        assert!(hub.history.held_seconds().is_some_and(|held| held > 10.0));
         let Message::Memory {
-            bytes: live_bytes,
-            seconds: said,
+            seconds,
+            max_age,
             held,
-            ref oldest,
             ..
-        } = memory
+        } = hub.memory()
         else {
             unreachable!()
         };
-        let run = hub.history.run(&stream_key()).unwrap();
-        let live = (
-            run.first_timestamp().unwrap(),
-            run.last_timestamp().unwrap(),
-        );
-        prop_assert!(
-            live.1 - live.0 <= seconds + HISTORY_HEADROOM + 1e-9,
-            "{live:?}"
-        );
-        prop_assert_eq!(said, (live.1 - live.0).min(seconds));
-        prop_assert!(live_bytes + held.map_or(0, |h| h.bytes) <= bytes as u64);
-        let held_seconds = hub.history.held_seconds();
-        prop_assert_eq!(
-            held.map(|held| held.seconds),
-            held_seconds.map(|held| held.min(seconds))
-        );
-        prop_assert!(oldest[&0] <= live.0);
-        Ok(Kept {
-            live,
-            oldest: oldest[&0],
-            bytes: live_bytes,
-            held_bytes: held.map(|h| h.bytes),
-        })
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(32))]
-
-        /// From any History setting and fill, held or not, a new setting
-        /// holds the buffer and the held history to it at once, a lower one
-        /// frees what they held beyond it, and setting the old one again
-        /// brings nothing back.
-        #[test]
-        fn a_new_history_setting_holds_the_buffer_and_the_held_history_to_it(
-            history in 10.0..300.0f64,
-            budget in 300_000usize..2_000_000,
-            new_history in 10.0..300.0f64,
-            new_budget in 300_000usize..2_000_000,
-            fill in 0.2..2.5f64,
-            held_for in prop::option::of(0.0..2.0f64),
-        ) {
-            let mut hub = Hub::new();
-            let mut parser = parser();
-            let (_, mut rx) = hub.feed.subscribe();
-            // At 100 Hz, row n stands at (n + 1) / 100 s, 16 bytes a row.
-            let rows = |seconds: f64| ((seconds * 100.0).round() as u32).max(1);
-            let mut fed = 0;
-            let mut feed_to = |hub: &mut Hub, until: u32| {
-                for batch in samples(&mut parser, fed, until - fed) {
-                    hub.ingest(&batch);
-                }
-                fed = until;
-            };
-            hub.set_history(history, budget);
-            feed_to(&mut hub, rows(fill * history));
-            if let Some(held_for) = held_for {
-                hub.hold(1, true);
-                feed_to(&mut hub, rows((fill + held_for) * history));
-            }
-            let before = set_and_check(&mut hub, &mut rx, history, budget)?;
-            let after = set_and_check(&mut hub, &mut rx, new_history, new_budget)?;
-            if new_history <= history && new_budget <= budget {
-                // The held history counts a chunk whole once the buffer
-                // has dropped any of its rows, so the chunk where the
-                // buffer now begins may count in both.
-                let together = |kept: &Kept| kept.bytes + kept.held_bytes.unwrap_or(0);
-                prop_assert!(together(&after) <= together(&before) + CHUNK);
-            }
-            // The old setting again gets back nothing, and where it raises
-            // both limits drops nothing either.
-            let again = set_and_check(&mut hub, &mut rx, history, budget)?;
-            prop_assert!(again.live.0 >= after.live.0, "the buffer gets back nothing");
-            if history >= new_history && budget >= new_budget {
-                prop_assert_eq!(again.live, after.live);
-                prop_assert_eq!(again.oldest, after.oldest);
-            }
-        }
-    }
-
-    /// The lowest and the highest the line through `window`'s points goes
-    /// in each of `columns` equal columns of its range, as a plot that wide
-    /// shows it.
-    fn drawn(window: &Window, columns: usize) -> Vec<(f64, f64)> {
-        let mut drawn = vec![(f64::INFINITY, f64::NEG_INFINITY); columns];
-        let scale = columns as f64 / (window.t1 - window.t0);
-        let column = |t: f64| (((t - window.t0) * scale) as usize).min(columns - 1);
-        let mut mark = |column: usize, y: f64| {
-            let (low, high) = drawn[column];
-            drawn[column] = (low.min(y), high.max(y));
-        };
-        for chunk in &window.chunks {
-            for (i, (&x, &y)) in chunk.x.iter().zip(&chunk.y).enumerate() {
-                mark(column(x), y);
-                let Some((&next_x, &next_y)) = chunk.x.get(i + 1).zip(chunk.y.get(i + 1)) else {
-                    continue;
-                };
-                // Where the line to the next point crosses into each column.
-                for crossed in column(x) + 1..=column(next_x) {
-                    let at = window.t0 + crossed as f64 / scale;
-                    let height = y + (next_y - y) * (at - x) / (next_x - x);
-                    mark(crossed - 1, height);
-                    mark(crossed, height);
-                }
-            }
-        }
-        drawn
+        assert_eq!((seconds, max_age), (10.0, 10.0));
+        assert_eq!(held.map(|held| held.seconds), Some(10.0));
     }
 
     /// Prints what a window read costs at each span of `WINDOW_HOURS` hours
-    /// (one by default) of a 5 kHz signal, and how far what a plot draws of
-    /// it lies from what it draws of every row. Run it in a release build, as
+    /// (one by default) of a 5 kHz signal, read through `Hub::window`. Run it
+    /// in a release build, as
     /// `cargo test --release -p twinleaf-web -- --ignored --nocapture window_read_times`.
     #[test]
     #[ignore = "a measurement, not a check"]
@@ -2793,8 +2615,6 @@ mod tests {
             hub.flush();
             flush += start.elapsed();
         }
-        let run = hub.history.run(&stream_key()).unwrap();
-        assert_eq!(run.boundaries().len(), 0, "of_rows reads one run whole");
         println!("{rows} rows: ingest {ingest:?}, flush {flush:?}");
         println!("the buffer holds {} bytes", hub.history.bytes());
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
@@ -2830,254 +2650,6 @@ mod tests {
                 ms(reduce),
                 ms(encode)
             );
-        }
-        // What a plot 1420 px wide draws of each window, against what it
-        // draws of every row: the furthest and the mean distance of a
-        // column's lowest and highest, for the rows decimated for the window
-        // and for the window read from the levels.
-        println!("span s | decimated: worst, mean, ms | from the levels: worst, mean");
-        for span in spans.into_iter().filter(|&span| span <= end.min(14400.0)) {
-            let t0 = (end - span) / 2.0;
-            let every = drawn(&of_rows(&hub, t0, t0 + span, None), 1420);
-            let off = |window: &Window| {
-                let columns = drawn(window, 1420);
-                let apart = (columns.iter().zip(&every))
-                    .filter(|(_, every)| every.0 <= every.1)
-                    .map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs()));
-                let (worst, sum, n) = apart.fold((0.0f64, 0.0, 0), |(worst, sum, n), d| {
-                    (worst.max(d), sum + d, n + 1)
-                });
-                format!("{worst:.4}, {:.5}", sum / f64::from(n))
-            };
-            let start = Instant::now();
-            let decimated = of_rows(&hub, t0, t0 + span, Some(width));
-            let took = start.elapsed();
-            let window = hub.window(0, t0, t0 + span, width).unwrap().window();
-            println!(
-                "{span} | {}, {:.1} | {}",
-                off(&decimated),
-                ms(took),
-                off(&window)
-            );
-        }
-    }
-
-    /// The most bytes one chunk of the buffer holds, which is how far from
-    /// its room the held history may be after giving up a chunk.
-    const CHUNK: u64 = 256 * 1024;
-
-    /// One moment of a hub, as its `memory` message says it then, and the
-    /// held bytes of the last `memory` message it sent.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    struct Moment {
-        seconds: f64,
-        bytes: u64,
-        held: Option<u64>,
-        oldest: f64,
-        told: Option<u64>,
-    }
-
-    /// A pause: a hub of `budget` bytes and `history` seconds fed a `rate`
-    /// Hz stream for `fill` seconds, held for `held_for` and then let go for
-    /// `after`, beside a twin that is never held.
-    struct Pause {
-        budget: usize,
-        history: f64,
-        rate: u32,
-        fill: f64,
-        held_for: f64,
-        after: f64,
-        step: f64,
-    }
-
-    impl Pause {
-        /// Every `step` seconds of the pause and after it, whether the hub
-        /// was held, its moment and its twin's.
-        fn run(&self) -> Vec<(bool, Moment, Moment)> {
-            let mut hubs = [Hub::new(), Hub::new()];
-            let mut parsers = [parser_at(self.rate), parser_at(self.rate)];
-            let mut rxs = hubs.each_mut().map(|hub| hub.feed.subscribe().1);
-            let mut told = [None, None];
-            for hub in &mut hubs {
-                hub.set_history(self.history, self.budget);
-            }
-            let rows = |seconds: f64| (seconds * f64::from(self.rate)).round() as u32;
-            let mut fed = 0;
-            let mut feed = |hubs: &mut [Hub; 2], until: u32| {
-                for (hub, parser) in hubs.iter_mut().zip(&mut parsers) {
-                    for batch in valued(parser, self.rate, fed, until - fed, |i| i as f32) {
-                        hub.ingest(&batch);
-                    }
-                    hub.send_memory();
-                }
-                fed = until;
-            };
-            let mut moments = Vec::new();
-            let mut record = |hubs: &[Hub; 2], held: bool| {
-                let [moment, twin] = [0, 1].map(|i| {
-                    let last = std::iter::from_fn(|| rxs[i].try_recv().ok())
-                        .filter_map(|frame| match &*frame {
-                            Frame::Text(text) => serde_json::from_str(text).ok(),
-                            Frame::Binary(_) => None,
-                        })
-                        .filter(|message: &serde_json::Value| message["type"] == "memory")
-                        .last();
-                    if let Some(message) = last {
-                        told[i] = message["held"]["bytes"].as_u64();
-                    }
-                    let Message::Memory {
-                        seconds,
-                        bytes,
-                        held,
-                        oldest,
-                        ..
-                    } = hubs[i].memory()
-                    else {
-                        unreachable!()
-                    };
-                    Moment {
-                        seconds,
-                        bytes,
-                        held: held.map(|held| held.bytes),
-                        oldest: oldest[&0],
-                        told: told[i],
-                    }
-                });
-                moments.push((held, moment, twin));
-            };
-            feed(&mut hubs, rows(self.fill));
-            hubs[0].hold(1, true);
-            record(&hubs, true);
-            let mut t = 0.0;
-            while t < self.held_for {
-                t = (t + self.step).min(self.held_for);
-                feed(&mut hubs, rows(self.fill + t));
-                record(&hubs, true);
-            }
-            hubs[0].hold(1, false);
-            record(&hubs, false);
-            let mut t = 0.0;
-            while t < self.after {
-                t = (t + self.step).min(self.after);
-                feed(&mut hubs, rows(self.fill + self.held_for + t));
-                record(&hubs, false);
-            }
-            moments
-        }
-    }
-
-    /// The pause the hub was seen in, at a 130th of its size: an hour of
-    /// History that needs three quarters of the budget, the hub full, held
-    /// for four hours, then let go for an hour and a half.
-    fn seen() -> Vec<(bool, Moment, Moment)> {
-        Pause {
-            budget: 7_680_000,
-            history: 3600.0,
-            rate: 100,
-            fill: 5400.0,
-            held_for: 4.0 * 3600.0,
-            after: 5400.0,
-            step: 300.0,
-        }
-        .run()
-    }
-
-    /// Checks the rules a pause keeps at every moment of `moments`, of a hub
-    /// of `budget` bytes and `history` seconds, as its `memory` messages say
-    /// them.
-    fn check_pause(
-        moments: &[(bool, Moment, Moment)],
-        budget: u64,
-        history: f64,
-    ) -> Result<(), TestCaseError> {
-        for &(held, moment, twin) in moments {
-            // A pause never shortens the history the buffer keeps.
-            prop_assert_eq!((moment.seconds, moment.bytes), (twin.seconds, twin.bytes));
-            prop_assert!(moment.seconds <= history);
-            // Together they hold no more than the budget.
-            let beyond = moment.held.unwrap_or(0);
-            prop_assert!(moment.bytes + beyond <= budget, "{:?}", moment);
-            // The pages were last told what the held history holds now.
-            prop_assert_eq!(moment.told, moment.held);
-            if !held {
-                prop_assert_eq!(moment.held, None);
-                prop_assert_eq!(moment.oldest, twin.oldest);
-                continue;
-            }
-            // Where a paused view's history begins is no later than where
-            // the buffer begins.
-            prop_assert!(moment.oldest <= twin.oldest);
-        }
-        Ok(())
-    }
-
-    /// While a page holds the history, the buffer keeps the whole History
-    /// setting, as a twin hub never held does.
-    #[test]
-    fn a_pause_never_shortens_the_history_the_buffer_keeps() {
-        let moments = seen();
-        for &(_, moment, _) in &moments {
-            assert_eq!(moment.seconds, 3600.0, "{moment:?}");
-        }
-        check_pause(&moments, 7_680_000, 3600.0).unwrap();
-    }
-
-    /// The held history and the buffer hold no more than the budget
-    /// together, and once the buffer has moved past it the held history
-    /// fills what the buffer leaves, as the last `memory` message says.
-    #[test]
-    fn a_held_history_takes_only_the_room_the_buffer_leaves() {
-        let moments = seen();
-        let together = |moment: &Moment| moment.bytes + moment.held.unwrap_or(0);
-        assert!(moments.iter().all(|(_, m, _)| together(m) <= 7_680_000));
-        let (_, end, _) = moments.iter().rev().find(|(held, ..)| *held).unwrap();
-        assert!(together(end) + 2 * CHUNK > 7_680_000, "{end:?}");
-    }
-
-    /// The held history gives up its oldest rows first, so a paused view's
-    /// history begins later, as `memory` says. Let go, what it alone held
-    /// is gone.
-    #[test]
-    fn a_held_history_gives_up_its_oldest_first_and_goes_when_let_go() {
-        let moments = seen();
-        let paused = moments[0].1;
-        let (_, end, twin) = moments.iter().rev().find(|(held, ..)| *held).unwrap();
-        assert!(end.oldest > paused.oldest + 1.0, "it gave up its oldest");
-        assert!(
-            end.oldest < twin.oldest,
-            "and holds what the buffer dropped"
-        );
-        let (_, let_go, twin) = moments.iter().find(|(held, ..)| !*held).unwrap();
-        assert_eq!((let_go.held, let_go.oldest), (None, twin.oldest));
-        check_pause(&moments, 7_680_000, 3600.0).unwrap();
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(24))]
-
-        /// Whatever the budget, rate, History setting and length of the
-        /// pause, a pause keeps the rules `check_pause` checks.
-        #[test]
-        fn a_pause_of_any_length_keeps_the_history_and_the_budget(
-            budget in 300_000usize..2_000_000,
-            rate in prop::sample::select(vec![50u32, 100, 400]),
-            need in 0.2..1.5f64,
-            fill in 0.5..2.0f64,
-            held_for in 0.2..4.0f64,
-            steps in 4.0..16.0f64,
-        ) {
-            // 16 bytes a row.
-            let history = (need * budget as f64 / (16.0 * f64::from(rate))).round().max(10.0);
-            let pause = Pause {
-                budget,
-                history,
-                rate,
-                fill: fill * history,
-                held_for: held_for * history,
-                after: history,
-                step: history / steps,
-            };
-            check_pause(&pause.run(), budget as u64, history)?;
         }
     }
 }

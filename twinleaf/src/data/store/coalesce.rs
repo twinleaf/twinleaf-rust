@@ -17,7 +17,7 @@ use std::ops::Range;
 /// target or once rows that cannot share a batch with it arrive. Completed
 /// batches come back out in push order through
 /// [`BatchCoalescer::next_completed_batch`].
-pub(crate) struct BatchCoalescer {
+pub(in crate::data) struct BatchCoalescer {
     /// Rows to accumulate before completing a batch. `None` completes every
     /// pushed batch on its own.
     target_rows: Option<usize>,
@@ -105,10 +105,10 @@ impl BatchCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::fixtures;
     use crate::data::model::continuity::{Boundary, Loss};
     use crate::data::model::sample::{BatchContext, ColumnArray, ColumnData};
     use crate::data::model::schema::StreamMetadataSnapshot;
-    use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;

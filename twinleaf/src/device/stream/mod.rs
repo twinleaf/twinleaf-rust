@@ -235,18 +235,19 @@ impl Pump {
     }
 
     /// Drops every watch, as the session's socket is lost, and makes every
-    /// device lost. The raw taps and the parser get a disconnect status at
-    /// the root, as a link's loss gives them. The parser learns each device's
-    /// metadata again and keeps its last rows, so the samples after report
-    /// what the outage lost, or a new session, against them. The watches go
-    /// out again at once, and the session sends them once it is open again.
+    /// device lost. The raw taps get a disconnect status at the root, as a
+    /// link's loss gives them, and the parser is told the link at the root
+    /// was lost. The parser learns each device's metadata again and keeps its
+    /// last rows, so the samples after report what the outage lost, or a new
+    /// session, against them. The watches go out again at once, and the
+    /// session sends them once it is open again.
     fn lose(&mut self) {
         // A recording marks the outage as it marks a link's loss.
-        let lost = Packet::link(LinkStatus::SensorDisconnected);
-        self.tap(&lost);
+        self.tap(&Packet::link(LinkStatus::SensorDisconnected));
         lock(&self.store).mark_lost();
         self.watches.clear();
-        self.parse(&lost);
+        self.parser.note_link_lost(DeviceRoute::root());
+        self.offer_batches();
     }
 
     /// Takes a reply to one of the pump's watches, a part of an update or a
@@ -345,6 +346,11 @@ impl Pump {
         if let Err(error) = self.parser.push_packet(packet) {
             log::warn!("dropping invalid stream packet: {error}");
         }
+        self.offer_batches();
+    }
+
+    /// Offers each batch the parser completed to the batch sinks.
+    fn offer_batches(&mut self) {
         while let Some(batch) = self.parser.pop_batch() {
             let scope = Scope::point(batch.route());
             self.batches

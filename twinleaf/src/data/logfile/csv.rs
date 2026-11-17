@@ -281,9 +281,9 @@ pub fn write_merged(columns: &[MergedColumn], out: &mut impl Write) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::fixtures;
     use crate::data::model::continuity::Generations;
     use crate::data::model::sample::{BatchContext, SampleBatchBuilder};
-    use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::{DeviceRoute, SampleNumber};

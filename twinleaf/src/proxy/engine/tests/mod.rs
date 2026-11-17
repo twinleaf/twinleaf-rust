@@ -1,15 +1,14 @@
 mod settings_sim;
 
 use super::*;
-use crate::data::tests::fixtures::{
-    announcement, broadcast, description, device_reply, samples, segment_record,
-};
+use crate::data::fixtures::segment_record;
 use crate::data::DeviceMetadataSnapshot;
 use crate::proto::data as wire;
 use crate::proto::rpc as wire_rpc;
 use crate::proto::SessionId;
 use crate::rt::Supervisor;
 use crate::session::rpc::RpcValue;
+use crate::session::tests::packets::{announcement, broadcast, description, device_reply, samples};
 use crate::session::tests::wait_for;
 use crate::session::Joined;
 use crate::session::RegistryState;

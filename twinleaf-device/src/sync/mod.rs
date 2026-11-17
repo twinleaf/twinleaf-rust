@@ -2973,9 +2973,10 @@ mod synchronizer_tests {
     }
 
     /// A GPS-grade PPS, on frequency with 20 ns of jitter, locks by its fifth
-    /// second and is held to 20.6 ns RMS, as the fixed ±1 µs gate did.
+    /// second, stays locked from its sixtieth, and is held there to 20.6 ns
+    /// RMS over every one of the 240 seconds after.
     #[test]
-    fn a_gps_pps_locks_as_fast_and_as_tightly_as_a_fixed_gate_did() {
+    fn a_gps_pps_locks_by_its_fifth_second_and_holds_to_twenty_ns_rms() {
         let trace = sandi_following(0.0, 20.0, 300);
         let first_lock = trace.iter().position(|status| status.pulse.is_locked());
         let (rms, measured) = phase_rms(&trace[60..]);

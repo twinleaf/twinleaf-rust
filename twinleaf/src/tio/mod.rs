@@ -7,9 +7,10 @@
 //! link among its clients.
 //!
 //! - [`packet`] provides [`Packet`], one validated wire buffer read through
-//!   the proto codecs. It also has the types a host adds,
-//!   [`Payload`](packet::Payload), [`LinkStatus`](packet::LinkStatus), and
-//!   [`ProxyRx`](packet::ProxyRx) for the proxy's control replies.
+//!   the proto codecs. It re-exports [`Payload`](packet::Payload) from
+//!   [`proto::packet`](crate::proto::packet), and
+//!   [`LinkStatus`](packet::LinkStatus) and [`ProxyRx`](packet::ProxyRx) from
+//!   [`proto::proxy`](crate::proto::proxy) for the proxy's control replies.
 //! - The codec of RPC arguments and replies is internal, and
 //!   [`device::rpc`](crate::device::rpc) re-exports it. The proxy's control
 //!   requests use it too.

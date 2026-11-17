@@ -296,8 +296,7 @@ mod tests {
         }
     }
 
-    /// The branch quotes a droop of -0.1 dB at a quarter of the output rate,
-    /// against -1.9 dB for the two chained single poles it replaced. At
+    /// The passband droops by 0.1 dB at a quarter of the output rate. At
     /// decimation 16 a period of 640 input samples puts that quarter on cycle
     /// 10.
     #[test]
@@ -310,11 +309,10 @@ mod tests {
         );
     }
 
-    /// The branch quotes a worst alias leakage of -28 dB for signals landing
-    /// in the lower tenth of the output band, against -12 dB before it: an
-    /// input `offset` below a multiple of the output rate folds onto `offset`
-    /// when the decimated sample is picked. At decimation 16 a period of 800
-    /// input samples puts the output rate on cycle 50.
+    /// An input that folds into the lower tenth of the output band leaks by
+    /// -28 dB at worst. An input `offset` below a multiple of the output rate
+    /// folds onto `offset` when the decimated sample is picked. At decimation
+    /// 16 a period of 800 input samples puts the output rate on cycle 50.
     #[test]
     fn an_aliasing_input_leaks_by_twenty_eight_decibels() {
         let worst = (1..=3)

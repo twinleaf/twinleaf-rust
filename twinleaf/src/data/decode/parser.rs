@@ -9,8 +9,9 @@ use crate::data::model::continuity::LossSite;
 use crate::data::model::sample::{RowSource, SampleBatch};
 use crate::data::model::schema::{DeviceMetadataSnapshot, MetadataQuery, StreamKey};
 use crate::data::store::coalesce::BatchCoalescer;
-use crate::proto::DeviceRoute;
-use crate::tio;
+use crate::proto::packet::{Checked, Payload};
+use crate::proto::proxy::{LinkStatus, ProxyRx};
+use crate::proto::{DeviceRoute, StreamId};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
@@ -58,10 +59,9 @@ use std::collections::VecDeque;
 /// # use std::io::Write;
 /// # use twinleaf::proto::data::{self as wire, DataType};
 /// # use twinleaf::proto::sync::Epoch;
-/// # use twinleaf::tio::Packet;
-/// # use twinleaf::{ColumnId, DeviceRoute, SegmentId, SessionId, StreamId};
+/// # use twinleaf::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # let (id, route) = (StreamId::new(1), DeviceRoute::root());
+/// # let (id, mut buf) = (StreamId::new(1), [0u8; 512]);
 /// # let mut file = tempfile::NamedTempFile::new()?;
 /// # for record in [
 /// #     wire::Metadata::Device(wire::Device { session: SessionId::new(1), n_streams: 1, name: "sensor", serial: "S1", firmware: "1", protocol: 0 }),
@@ -69,15 +69,20 @@ use std::collections::VecDeque;
 /// #     wire::Metadata::Segment(wire::Segment { stream_id: id, segment_id: SegmentId::new(0), flags: wire::SegmentFlags::default(), epoch: Epoch::UNIX, timeref_serial: "", timeref_session: SessionId::new(1), start_time: 0, sampling_rate: 10, decimation: 1, filter_cutoff: 0.0, filter_type: wire::FilterType::NONE }),
 /// #     wire::Metadata::Column(wire::Column { stream_id: id, index: ColumnId::new(0), data_type: DataType::F32, name: "x", units: "nT", description: "" }),
 /// # ] {
-/// #     file.write_all(Packet::metadata(record, wire::MetadataFlags::UPDATE, route)?.as_bytes())?;
+/// #     let len = record.write(wire::MetadataFlags::UPDATE, &mut buf).ok_or("a record fits")?;
+/// #     file.write_all(&buf[..len])?;
 /// # }
 /// # let data: Vec<u8> = [1.0f32, 2.0, 3.0].iter().flat_map(|x| x.to_le_bytes()).collect();
-/// # file.write_all(Packet::samples(1, 0, 0, &data, route)?.as_bytes())?;
+/// # let samples = wire::Samples { stream_id: id, segment_id: SegmentId::new(0), first: SampleNumber::new(0), data: &data };
+/// # let len = samples.write(&mut buf).ok_or("the samples fit")?;
+/// # file.write_all(&buf[..len])?;
 /// # let path = file.path();
+/// let log = LogFile::open(path)?;
 /// let mut parser = PacketParser::new(false);
 /// let mut rows = 0;
-/// for packet in LogFile::open(path)?.packets() {
-///     parser.push_packet(&packet?)?;
+/// for packet in log.packets() {
+///     let (_offset, packet) = packet?;
+///     parser.push_packet(packet)?;
 ///     while let Some(batch) = parser.pop_batch() {
 ///         println!("{}: {} rows", batch.stream_key(), batch.len());
 ///         rows += batch.len();
@@ -143,7 +148,7 @@ impl PacketOutcome {
 /// Taken with [`PacketParser::checkpoint`] and resumed with
 /// [`PacketParser::replay_from`] to decode a log from the middle.
 #[derive(Clone)]
-pub(crate) struct ParserCheckpoint(ParseState);
+pub(in crate::data) struct ParserCheckpoint(ParseState);
 
 impl PacketParser {
     fn from_state(state: ParseState) -> Self {
@@ -184,16 +189,17 @@ impl PacketParser {
     /// Returns a [`DataError`] if stream data contradicts the metadata
     /// retained for its stream. The packet's rows are dropped, and the
     /// metadata stays for later packets.
-    pub fn push_packet(&mut self, packet: &tio::Packet) -> Result<PacketOutcome, DataError> {
-        Ok(match self.state.apply_packet(packet)? {
+    pub fn push_packet<'a>(
+        &mut self,
+        packet: impl Into<Checked<'a>>,
+    ) -> Result<PacketOutcome, DataError> {
+        let Self { state, batcher } = self;
+        Ok(match apply(state, batcher, packet.into())? {
             PacketEvent::Applied => PacketOutcome::Applied,
             PacketEvent::WaitingForMetadata => PacketOutcome::WaitingForMetadata,
             PacketEvent::Unsupported => PacketOutcome::Unsupported,
-            PacketEvent::Reset => {
-                self.flush();
-                PacketOutcome::Reset
-            }
-            PacketEvent::Rows(rows) => PacketOutcome::Rows(self.batcher.queue(rows)),
+            PacketEvent::Reset => PacketOutcome::Reset,
+            PacketEvent::Rows(rows) => PacketOutcome::Rows(batcher.queue(rows)),
         })
     }
 
@@ -202,11 +208,11 @@ impl PacketParser {
     ///
     /// The scanning counterpart of [`push_packet`](Self::push_packet). It
     /// produces no batches and returns the same errors.
-    pub(crate) fn scan_packet<'a>(
+    pub(in crate::data) fn scan_packet<'a>(
         &'a mut self,
-        packet: &'a tio::Packet,
+        packet: Checked<'a>,
     ) -> Result<Option<ScannedRows<'a>>, DataError> {
-        Ok(match self.state.apply_packet(packet)? {
+        Ok(match apply(&mut self.state, &mut self.batcher, packet)? {
             PacketEvent::Rows(rows) => Some(rows),
             PacketEvent::Applied
             | PacketEvent::WaitingForMetadata
@@ -216,13 +222,13 @@ impl PacketParser {
     }
 
     /// Captures the decoding state reached so far.
-    pub(crate) fn checkpoint(&self) -> ParserCheckpoint {
+    pub(in crate::data) fn checkpoint(&self) -> ParserCheckpoint {
         ParserCheckpoint(self.state.clone())
     }
 
     /// Creates a parser from a captured state, as if it had read every packet
     /// before the checkpoint.
-    pub(crate) fn replay_from(checkpoint: &ParserCheckpoint) -> Self {
+    pub(in crate::data) fn replay_from(checkpoint: &ParserCheckpoint) -> Self {
         Self::from_state(checkpoint.0.clone())
     }
 
@@ -260,12 +266,20 @@ impl PacketParser {
         self.state.blame(LossSite::Receiver, |_| true);
     }
 
+    /// Tells the parser that the link serving the absolute route `subtree`
+    /// was lost. The routes at and below it learn their metadata again, the
+    /// rows each of their streams loses before its next rows count as lost
+    /// by the link, and every partial batch ends, as
+    /// [`PacketOutcome::Reset`] says.
+    pub fn note_link_lost(&mut self, subtree: DeviceRoute) {
+        lose_link(&mut self.state, &mut self.batcher, subtree);
+    }
+
     /// Drops the device metadata of the absolute route `route` alone to learn
     /// it again, as a disconnect does for its subtree. Each stream keeps its
     /// last rows, so the rows after report what was lost, or a new session,
     /// against them, as [`PacketOutcome::Reset`] says.
-    #[cfg(feature = "host")]
-    pub(crate) fn relearn_route(&mut self, route: DeviceRoute) {
+    pub fn relearn_route(&mut self, route: DeviceRoute) {
         self.flush();
         self.state.relearn(|device| *device == route);
     }
@@ -300,15 +314,14 @@ impl PacketParser {
 
     /// Returns the route's current metadata revision without building a
     /// snapshot.
-    #[cfg(feature = "host")]
-    pub(crate) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
+    fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
         self.state.metadata_revision(route)
     }
 
-    /// Returns the route's complete metadata and its revision, or `None` if
-    /// the revision is still `seen` or the metadata is incomplete.
-    #[cfg(feature = "host")]
-    pub(crate) fn revised_metadata(
+    /// Returns the complete metadata of the absolute route `route` and its
+    /// revision, which changes each time the route's metadata does. Returns
+    /// `None` if the revision is still `seen` or the metadata is incomplete.
+    pub fn revised_metadata(
         &self,
         route: DeviceRoute,
         seen: Option<u32>,
@@ -324,6 +337,49 @@ impl PacketParser {
     pub fn routes(&self) -> Vec<DeviceRoute> {
         self.state.routes()
     }
+}
+
+/// Applies `packet` to `state`. A proxy's marker packet becomes a note. A
+/// link status of a disconnect or a stop loses the link of the subtree its
+/// route names, as [`PacketParser::note_link_lost`] does, and any other link
+/// status changes nothing. A count of dropped packets blames the proxy for
+/// what its stream loses. Every other packet goes to the state machine.
+fn apply<'a>(
+    state: &'a mut ParseState,
+    batcher: &mut Batcher,
+    packet: Checked<'a>,
+) -> Result<PacketEvent<'a>, DataError> {
+    let route = packet.route();
+    let payload = packet.payload();
+    if let Some(status) = payload.link_status() {
+        if !matches!(status, LinkStatus::SensorDisconnected | LinkStatus::Stopped) {
+            return Ok(PacketEvent::Applied);
+        }
+        lose_link(state, batcher, route);
+        return Ok(PacketEvent::Reset);
+    }
+    match payload {
+        Payload::ProxyRx(ProxyRx::Dropped { stream_id, .. }) => {
+            note_proxy_dropped(state, route, StreamId::new(stream_id));
+            Ok(PacketEvent::Applied)
+        }
+        _ => state.apply_packet(route, payload, packet.payload_bytes()),
+    }
+}
+
+/// Loses the link of the absolute route `subtree`, as
+/// [`PacketParser::note_link_lost`] says.
+fn lose_link(state: &mut ParseState, batcher: &mut Batcher, subtree: DeviceRoute) {
+    state.relearn(|device| device.starts_with(&subtree));
+    state.blame(LossSite::Link, |device| device.starts_with(&subtree));
+    batcher.flush();
+}
+
+/// Tells `state` that the proxy dropped packets of stream `stream_id` of
+/// `route`. The rows the stream loses before its next rows count as dropped
+/// by the proxy.
+fn note_proxy_dropped(state: &mut ParseState, route: DeviceRoute, stream_id: StreamId) {
+    state.blame_stream(route, stream_id, LossSite::Proxy);
 }
 
 /// The batching half of the parser. It is not part of a [`ParserCheckpoint`],
@@ -397,25 +453,28 @@ impl Batcher {
 mod tests {
     use super::*;
     use crate::data::decode::state::StreamDataError;
+    use crate::data::fixtures;
+    use crate::data::fixtures::{checked, packet};
     use crate::data::model::continuity::{Boundary, Change, Generations, Loss};
     use crate::data::model::sample::ColumnData;
     use crate::data::store::buffer::Buffer;
-    use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};
     use crate::proto::SampleNumber;
-    use crate::tio::packet::LinkStatus;
 
     const STREAM_ID: u8 = 1;
 
-    fn metadata_packet(record: wire::Metadata<'_>) -> tio::Packet {
-        tio::Packet::metadata(record, wire::MetadataFlags::default(), DeviceRoute::root())
-            .expect("a valid metadata record")
+    fn metadata_packet(record: wire::Metadata<'_>) -> Vec<u8> {
+        metadata_packet_at(record, DeviceRoute::root())
+    }
+
+    fn metadata_packet_at(record: wire::Metadata<'_>, route: DeviceRoute) -> Vec<u8> {
+        packet::metadata(record, wire::MetadataFlags::default(), route)
     }
 
     fn announce(parser: &mut PacketParser, record: wire::Metadata<'_>) {
         parser
-            .push_packet(&metadata_packet(record))
+            .push_packet(checked(&metadata_packet(record)))
             .expect("valid metadata");
     }
 
@@ -505,8 +564,8 @@ mod tests {
         }
     }
 
-    /// Announce a device with `n_streams` single-`Float32`-column streams,
-    /// numbered from 1.
+    /// Announce a device with `n_streams` streams of one `DataType::F32`
+    /// column each, numbered from 1.
     fn parser_with_streams(n_streams: u8) -> PacketParser {
         let mut parser = PacketParser::new(true);
         announce(
@@ -536,33 +595,31 @@ mod tests {
         parser
     }
 
-    fn stream_data_packet_for(stream_id: u8, first_sample_n: u32, rows: usize) -> tio::Packet {
-        tio::Packet::samples(
+    fn stream_data_packet_for(stream_id: u8, first_sample_n: u32, rows: usize) -> Vec<u8> {
+        packet::samples(
             stream_id,
             0,
             first_sample_n,
             &vec![0; 4 * rows],
             DeviceRoute::root(),
         )
-        .expect("valid samples")
     }
 
     fn stream_data_packet_in_segment(
         segment_id: u8,
         first_sample_n: u32,
         data: Vec<u8>,
-    ) -> tio::Packet {
-        tio::Packet::samples(
+    ) -> Vec<u8> {
+        packet::samples(
             STREAM_ID,
             segment_id,
             first_sample_n,
             &data,
             DeviceRoute::root(),
         )
-        .expect("valid samples")
     }
 
-    fn stream_data_packet(first_sample_n: u32, data: Vec<u8>) -> tio::Packet {
+    fn stream_data_packet(first_sample_n: u32, data: Vec<u8>) -> Vec<u8> {
         stream_data_packet_in_segment(0, first_sample_n, data)
     }
 
@@ -574,13 +631,13 @@ mod tests {
         let route = DeviceRoute::root();
         let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
         parser
-            .push_packet(&stream_data_packet_in_segment(0, 0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet_in_segment(0, 0, vec![0; 4])))
             .expect("valid samples");
         assert!(parser.metadata(route).is_some());
         let before = parser.metadata_revision(route);
 
         parser
-            .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet_in_segment(1, 0, vec![0; 4])))
             .expect("valid samples");
 
         assert_ne!(parser.metadata_revision(route), before);
@@ -589,19 +646,6 @@ mod tests {
             take_query(&mut parser).selectors,
             [wire::MetadataSelector::segment(STREAM_ID, 1)]
         );
-    }
-
-    /// One `dev.metadata` reply carrying `records`, in wire framing.
-    fn metadata_reply(records: &[wire::Metadata<'_>]) -> Vec<u8> {
-        let mut reply = vec![0u8; wire::MAX_METADATA_REPLY_SIZE];
-        let mut written = 0;
-        for record in records {
-            written += record
-                .write_reply_frame(&mut reply[written..])
-                .expect("the fixtures fit one reply");
-        }
-        reply.truncate(written);
-        reply
     }
 
     /// Take the query for the root route, asserting there is exactly one.
@@ -628,7 +672,7 @@ mod tests {
         };
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[
+            &fixtures::metadata_reply(&[
                 wire::Metadata::Device(fixtures::device()),
                 wire::Metadata::Stream(wire::Stream {
                     n_segments: 4,
@@ -643,7 +687,11 @@ mod tests {
         let batches: Vec<SampleBatch> = [5, 6]
             .map(|first| {
                 parser
-                    .push_packet(&stream_data_packet_in_segment(2, first, vec![0; 4]))
+                    .push_packet(checked(&stream_data_packet_in_segment(
+                        2,
+                        first,
+                        vec![0; 4],
+                    )))
                     .expect("valid rows");
                 parser.pop_batch().expect("rows that decode at once")
             })
@@ -682,14 +730,14 @@ mod tests {
 
         parser.apply_metadata_reply(
             query.clone(),
-            &metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
+            &fixtures::metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
         );
         let next = take_query(&mut parser);
         assert_eq!(next.selectors, [wire::MetadataSelector::stream(STREAM_ID)]);
 
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
+            &fixtures::metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
         );
         assert!(
             parser
@@ -713,7 +761,7 @@ mod tests {
 
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
+            &fixtures::metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
         );
         assert!(
             parser.metadata(DeviceRoute::root()).is_none(),
@@ -731,7 +779,7 @@ mod tests {
         let bootstrap = take_query(&mut parser);
         parser.apply_metadata_reply(
             bootstrap,
-            &metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
+            &fixtures::metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
         );
         let query = take_query(&mut parser);
         assert_eq!(query.selectors, [wire::MetadataSelector::stream(STREAM_ID)]);
@@ -745,7 +793,7 @@ mod tests {
         );
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[
+            &fixtures::metadata_reply(&[
                 wire::Metadata::Stream(fixtures::stream(STREAM_ID)),
                 wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
                 wire::Metadata::Column(fixtures::column(STREAM_ID, 0, DataType::F32)),
@@ -766,7 +814,7 @@ mod tests {
 
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[
+            &fixtures::metadata_reply(&[
                 wire::Metadata::Device(fixtures::device()),
                 wire::Metadata::Stream(fixtures::stream(STREAM_ID)),
                 wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
@@ -786,7 +834,7 @@ mod tests {
         let query = take_query(&mut parser);
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[wire::Metadata::Device(wire::Device {
+            &fixtures::metadata_reply(&[wire::Metadata::Device(wire::Device {
                 n_streams: 40,
                 ..fixtures::device()
             })]),
@@ -819,7 +867,7 @@ mod tests {
             let mut parser = parser_with_schema(&[DataType::F32, unknown, DataType::I16], 9);
             assert_eq!(
                 parser
-                    .push_packet(&stream_data_packet(0, vec![0; 18]))
+                    .push_packet(checked(&stream_data_packet(0, vec![0; 18])))
                     .unwrap(),
                 PacketOutcome::Unsupported
             );
@@ -833,7 +881,7 @@ mod tests {
         // The stream advertises a single segment, so any other id is corrupt and
         // must not become the state the next packet is validated against.
         assert!(matches!(
-            parser.push_packet(&stream_data_packet_in_segment(255, 0, vec![0; 4])),
+            parser.push_packet(checked(&stream_data_packet_in_segment(255, 0, vec![0; 4]))),
             Err(DataError::Stream {
                 source: StreamDataError::SegmentOutOfRange { .. },
                 ..
@@ -841,7 +889,7 @@ mod tests {
         ));
         assert_eq!(
             parser
-                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
                 .unwrap(),
             PacketOutcome::Rows(1)
         );
@@ -853,7 +901,7 @@ mod tests {
         let mut parser = parser_with_schema(&[DataType::F32], 4);
 
         assert!(matches!(
-            parser.push_packet(&stream_data_packet(MAX_SAMPLE_NUMBER, vec![0; 8])),
+            parser.push_packet(checked(&stream_data_packet(MAX_SAMPLE_NUMBER, vec![0; 8]))),
             Err(DataError::Stream {
                 source: StreamDataError::SampleNumberOverflow { .. },
                 ..
@@ -861,7 +909,7 @@ mod tests {
         ));
 
         parser
-            .push_packet(&stream_data_packet(MAX_SAMPLE_NUMBER, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(MAX_SAMPLE_NUMBER, vec![0; 4])))
             .expect("the largest representable sample itself is valid");
         let batch = parser.pop_batch().expect("a batch is ready");
         assert_eq!(batch.sample_numbers(), [MAX_SAMPLE_NUMBER]);
@@ -873,12 +921,12 @@ mod tests {
     fn rows_without_their_record_wait_for_it() {
         let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 10, 2);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4 * 5]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4 * 5])))
             .expect("valid rows");
         parser.pop_batch().expect("the first batch");
         assert_eq!(
             parser
-                .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet_in_segment(1, 0, vec![0; 4])))
                 .expect("valid rows"),
             PacketOutcome::WaitingForMetadata
         );
@@ -897,14 +945,14 @@ mod tests {
     fn rows_numbered_back_in_their_segment_wait_for_its_new_record() {
         let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4 * 5]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4 * 5])))
             .expect("valid rows");
         parser.pop_batch().expect("the first batch");
 
         for first in [2, 4] {
             assert_eq!(
                 parser
-                    .push_packet(&stream_data_packet(first, vec![0; 4]))
+                    .push_packet(checked(&stream_data_packet(first, vec![0; 4])))
                     .expect("valid rows"),
                 PacketOutcome::WaitingForMetadata,
                 "the rows at {first}"
@@ -924,7 +972,7 @@ mod tests {
             }),
         );
         parser
-            .push_packet(&stream_data_packet(5, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(5, vec![0; 4])))
             .expect("valid rows");
         let after = parser.pop_batch().expect("the new acquisition's rows");
         assert_eq!(
@@ -954,7 +1002,7 @@ mod tests {
         }
         assert_eq!(
             parser
-                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
                 .expect("valid rows"),
             PacketOutcome::WaitingForMetadata
         );
@@ -964,7 +1012,7 @@ mod tests {
         );
         announce(&mut parser, segment(0, 4));
         parser
-            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(1, vec![0; 4])))
             .expect("valid rows");
 
         let batch = parser.pop_batch().expect("the stream's first batch");
@@ -977,7 +1025,7 @@ mod tests {
     fn a_rollover_continues_the_current_run() {
         let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 10, 2);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4 * 5]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4 * 5])))
             .expect("valid rows");
         parser.pop_batch().expect("the first batch");
         announce(
@@ -991,7 +1039,7 @@ mod tests {
             }),
         );
         parser
-            .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet_in_segment(1, 0, vec![0; 4])))
             .expect("valid rows");
         let batch = parser.pop_batch().expect("the rollover batch");
         assert_eq!(
@@ -1021,7 +1069,7 @@ mod tests {
     ) -> Option<Boundary> {
         let mut parser = parser_with_clock(&[DataType::F32], 4, 4, sampling_rate, decimation);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4 * outputs]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4 * outputs])))
             .expect("valid rows");
         parser.pop_batch().expect("the first batch");
         announce(
@@ -1035,7 +1083,11 @@ mod tests {
             }),
         );
         parser
-            .push_packet(&stream_data_packet_in_segment(next, first, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet_in_segment(
+                next,
+                first,
+                vec![0; 4],
+            )))
             .expect("valid rows");
         parser
             .pop_batch()
@@ -1085,7 +1137,7 @@ mod tests {
             };
             announce_schema_for(&mut parser, device, &[DataType::F32], 4, 4, 1, 1);
             parser
-                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
                 .unwrap();
             parser.pop_batch().expect("the first batch");
             let next = wire::Segment {
@@ -1096,7 +1148,7 @@ mod tests {
             };
             announce(&mut parser, wire::Metadata::Segment(next));
             parser
-                .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet_in_segment(1, 0, vec![0; 4])))
                 .unwrap();
             parser
                 .pop_batch()
@@ -1140,13 +1192,11 @@ mod tests {
         let boundary = |segment_id: u8, start_time: u32, first: u32| {
             let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
             parser
-                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
                 .unwrap();
             parser.pop_batch().expect("the first batch");
-            let lost = tio::Packet::link(LinkStatus::SensorDisconnected);
-            parser
-                .push_packet(&lost.with_route(DeviceRoute::root()))
-                .unwrap();
+            let lost = packet::link(LinkStatus::SensorDisconnected, DeviceRoute::root());
+            parser.push_packet(checked(&lost)).unwrap();
             announce_schema(&mut parser, &[DataType::F32], 4, 4, 1, 1);
             announce(
                 &mut parser,
@@ -1157,11 +1207,11 @@ mod tests {
                 }),
             );
             parser
-                .push_packet(&stream_data_packet_in_segment(
+                .push_packet(checked(&stream_data_packet_in_segment(
                     segment_id,
                     first,
                     vec![0; 4],
-                ))
+                )))
                 .unwrap();
             parser
                 .pop_batch()
@@ -1212,15 +1262,14 @@ mod tests {
         let lost = |told: &[Told]| {
             let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
             parser
-                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
                 .unwrap();
             for told in told {
                 match *told {
                     Told::Link => {
-                        let lost = tio::Packet::link(LinkStatus::SensorDisconnected);
-                        parser
-                            .push_packet(&lost.with_route(DeviceRoute::root()))
-                            .unwrap();
+                        let lost =
+                            packet::link(LinkStatus::SensorDisconnected, DeviceRoute::root());
+                        parser.push_packet(checked(&lost)).unwrap();
                         announce_schema(&mut parser, &[DataType::F32], 4, 4, 1, 1);
                         announce(
                             &mut parser,
@@ -1229,16 +1278,14 @@ mod tests {
                     }
                     Told::Receiver => parser.note_dropped_packets(),
                     Told::Proxy(stream) => {
-                        let dropped = tio::Packet::dropped(stream, 2);
-                        parser
-                            .push_packet(&dropped.with_route(DeviceRoute::root()))
-                            .unwrap();
+                        let dropped = packet::dropped(stream, 2, DeviceRoute::root());
+                        parser.push_packet(checked(&dropped)).unwrap();
                     }
                 }
             }
             for first in [3, 6] {
                 parser
-                    .push_packet(&stream_data_packet(first, vec![0; 4]))
+                    .push_packet(checked(&stream_data_packet(first, vec![0; 4])))
                     .unwrap();
             }
             parser.flush();
@@ -1270,6 +1317,72 @@ mod tests {
         assert_eq!(lost(&[Told::Link, Told::Proxy(STREAM_ID)]), (0, 2, 0, 0));
     }
 
+    /// A parser told of a lost link, or of the packets a proxy dropped, by
+    /// the proxy's marker packet gives the same batches with the same
+    /// boundaries as one told by a call.
+    #[test]
+    fn a_marker_packet_and_a_call_tell_the_parser_alike() {
+        // The sample numbers, generations and boundary of each batch, with
+        // the parser told by packet or by call between two runs of rows.
+        let batches = |by_packet: bool, link: bool| {
+            let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
+            parser
+                .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
+                .unwrap();
+            parser
+                .push_packet(checked(&stream_data_packet(1, vec![0; 4])))
+                .unwrap();
+            let root = DeviceRoute::root();
+            match (link, by_packet) {
+                (true, true) => {
+                    let lost = packet::link(LinkStatus::SensorDisconnected, root);
+                    let outcome = parser.push_packet(checked(&lost)).unwrap();
+                    assert_eq!(outcome, PacketOutcome::Reset);
+                }
+                (true, false) => parser.note_link_lost(root),
+                (false, true) => {
+                    let dropped = packet::dropped(STREAM_ID, 2, root);
+                    let outcome = parser.push_packet(checked(&dropped)).unwrap();
+                    assert_eq!(outcome, PacketOutcome::Applied);
+                }
+                (false, false) => {
+                    note_proxy_dropped(&mut parser.state, root, StreamId::new(STREAM_ID))
+                }
+            }
+            if link {
+                announce_schema(&mut parser, &[DataType::F32], 4, 4, 1, 1);
+                announce(
+                    &mut parser,
+                    wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+                );
+            }
+            for first in [4, 5] {
+                parser
+                    .push_packet(checked(&stream_data_packet(first, vec![0; 4])))
+                    .unwrap();
+            }
+            parser
+                .finish()
+                .iter()
+                .map(|batch| {
+                    (
+                        batch.sample_numbers().to_vec(),
+                        batch.generations(),
+                        batch.boundary().cloned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for link in [true, false] {
+            let by_packet = batches(true, link);
+            assert!(
+                by_packet.iter().any(|(_, _, boundary)| boundary.is_some()),
+                "the rows after carry a boundary"
+            );
+            assert_eq!(by_packet, batches(false, link), "link {link}");
+        }
+    }
+
     /// A device that declares a revision may send its next session's heartbeat and record ahead
     /// of its last session's rows, which still decode under the records they came after.
     #[test]
@@ -1282,15 +1395,15 @@ mod tests {
         };
         announce_schema_for(&mut parser, device(42), &[DataType::F32], 4, 4, 1, 1);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .unwrap();
         parser.pop_batch().expect("the first batch");
         parser
-            .push_packet(&tio::Packet::heartbeat_session(43, DeviceRoute::root()))
+            .push_packet(checked(&packet::heartbeat_session(43, DeviceRoute::root())))
             .unwrap();
         announce(&mut parser, wire::Metadata::Device(device(43)));
         parser
-            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(1, vec![0; 4])))
             .unwrap();
         let late = parser.pop_batch().expect("the last session's rows decode");
         assert_eq!(late.boundary(), None);
@@ -1308,7 +1421,7 @@ mod tests {
     fn rows_after_a_broadcast_of_another_segment_wait_for_their_record_and_roll_over() {
         let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid rows");
         parser.pop_batch().expect("the first batch");
         announce(
@@ -1320,7 +1433,7 @@ mod tests {
             }),
         );
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid rows");
         assert!(
             parser.pop_batch().is_none(),
@@ -1333,13 +1446,13 @@ mod tests {
         );
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[wire::Metadata::Segment(wire::Segment {
+            &fixtures::metadata_reply(&[wire::Metadata::Segment(wire::Segment {
                 start_time: 2,
                 ..fixtures::segment(STREAM_ID)
             })]),
         );
         parser
-            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(1, vec![0; 4])))
             .expect("valid rows");
 
         let batch = parser.pop_batch().expect("the rows after the reply");
@@ -1366,7 +1479,7 @@ mod tests {
         // Contiguous samples, then a gap the timeline confirms as data loss.
         for first_sample_n in [0, 1, 10] {
             parser
-                .push_packet(&stream_data_packet(first_sample_n, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet(first_sample_n, vec![0; 4])))
                 .expect("valid rows");
             generations.push(parser.pop_batch().expect("a batch is ready").generations());
         }
@@ -1397,7 +1510,7 @@ mod tests {
         let mut parser = parser_with_schema(&[DataType::F32], 4).with_batch_rows(4);
         for first_sample_n in [0, 2, 4] {
             parser
-                .push_packet(&stream_data_packet(first_sample_n, vec![0; 8]))
+                .push_packet(checked(&stream_data_packet(first_sample_n, vec![0; 8])))
                 .expect("valid rows");
         }
         // The boundary ends a batch, so the last two packets are the ones that
@@ -1419,18 +1532,18 @@ mod tests {
     fn pending_batches_never_straddle_a_shared_generation_bump() {
         let mut parser = parser_with_streams(2).with_batch_rows(4);
         parser
-            .push_packet(&stream_data_packet_for(2, 0, 2))
+            .push_packet(checked(&stream_data_packet_for(2, 0, 2)))
             .expect("valid rows");
         assert_eq!(std::iter::from_fn(|| parser.pop_batch()).count(), 1);
         parser
-            .push_packet(&stream_data_packet_for(2, 2, 2))
+            .push_packet(checked(&stream_data_packet_for(2, 2, 2)))
             .expect("valid rows");
         assert!(parser.pop_batch().is_none(), "stream 2 holds half a batch");
 
         // Stream 1's startup boundary leaves the shared generations alone, so
         // stream 2 keeps accumulating.
         parser
-            .push_packet(&stream_data_packet_for(1, 0, 2))
+            .push_packet(checked(&stream_data_packet_for(1, 0, 2)))
             .expect("valid rows");
         let initial = parser.pop_batch().expect("the initial batch");
         assert_eq!(
@@ -1442,7 +1555,7 @@ mod tests {
         // A gap on stream 1 bumps the shared generations: stream 2's held rows
         // emit first with their older stamps, then the boundary batch.
         parser
-            .push_packet(&stream_data_packet_for(1, 10, 2))
+            .push_packet(checked(&stream_data_packet_for(1, 10, 2)))
             .expect("valid rows");
         let held = parser.pop_batch().expect("the flushed pre-bump batch");
         assert_eq!(
@@ -1477,18 +1590,21 @@ mod tests {
     fn a_reconnect_cannot_restamp_the_generations_it_used_before() {
         let mut parser = parser_with_schema(&[DataType::F32], 4);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid rows");
         let before = parser.pop_batch().expect("the first batch").generations();
 
         parser
-            .push_packet(&tio::Packet::legacy_status(LinkStatus::SensorDisconnected))
+            .push_packet(checked(&packet::legacy_status(
+                LinkStatus::SensorDisconnected,
+                DeviceRoute::root(),
+            )))
             .expect("the disconnect");
 
         // The device comes back and re-announces exactly the same schema.
         announce_schema(&mut parser, &[DataType::F32], 4, 1, 1, 1);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid rows");
         let after = parser.pop_batch().expect("the first batch after reconnect");
 
@@ -1526,8 +1642,8 @@ mod tests {
     /// and one from an old proxy as a legacy status.
     #[test]
     fn a_routed_disconnect_relearns_only_its_subtree() {
-        let forms: [fn(LinkStatus) -> tio::Packet; 2] =
-            [tio::Packet::link, tio::Packet::legacy_status];
+        let forms: [fn(LinkStatus, DeviceRoute) -> Vec<u8>; 2] =
+            [packet::link, packet::legacy_status];
         for form in forms {
             let mut parser = PacketParser::new(true);
             let steady: DeviceRoute = "/1".parse().unwrap();
@@ -1540,25 +1656,25 @@ mod tests {
                     wire::Metadata::Column(fixtures::column(STREAM_ID, 0, DataType::F32)),
                 ] {
                     parser
-                        .push_packet(&metadata_packet(record).with_route(route))
+                        .push_packet(checked(&metadata_packet_at(record, route)))
                         .expect("valid metadata");
                 }
             }
 
-            let marker = form(LinkStatus::SensorDisconnected).with_route(bounced);
+            let marker = form(LinkStatus::SensorDisconnected, bounced);
             parser
-                .push_packet(&marker)
+                .push_packet(checked(&marker))
                 .expect("a routed disconnect applies");
 
             assert!(
                 parser.metadata(steady).is_some(),
                 "{:?}: the steady mount kept its description",
-                marker.ptype()
+                checked(&marker).header().ptype
             );
             assert!(
                 parser.metadata(bounced).is_none(),
                 "{:?}: the bounced mount rediscovers",
-                marker.ptype()
+                checked(&marker).header().ptype
             );
         }
     }
@@ -1578,13 +1694,13 @@ mod tests {
                 wire::Metadata::Column(fixtures::column(STREAM_ID, 0, DataType::F32)),
             ] {
                 parser
-                    .push_packet(&metadata_packet(record).with_route(route))
+                    .push_packet(checked(&metadata_packet_at(record, route)))
                     .expect("valid metadata");
             }
         }
 
         parser
-            .push_packet(&tio::Packet::link(LinkStatus::Stopped).with_route(stopped))
+            .push_packet(checked(&packet::link(LinkStatus::Stopped, stopped)))
             .expect("a routed stop applies");
 
         assert!(
@@ -1602,7 +1718,7 @@ mod tests {
         let mut parser = parser_with_schema(&[DataType::F32], 4);
         let mut buffer = Buffer::new(128);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid rows");
         let before = parser.pop_batch().expect("the first device's batch");
         let before_generations = before.generations();
@@ -1623,7 +1739,7 @@ mod tests {
             1,
         );
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid replacement rows");
         let after = parser.pop_batch().expect("the replacement device's batch");
 
@@ -1656,7 +1772,7 @@ mod tests {
     fn firmware_change_without_a_session_change_opens_a_new_run() {
         let mut parser = parser_with_schema(&[DataType::F32], 4);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid rows");
         let before = parser.pop_batch().expect("the old firmware's batch");
 
@@ -1673,7 +1789,7 @@ mod tests {
             1,
         );
         parser
-            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(1, vec![0; 4])))
             .expect("valid rows under the new firmware");
         let after = parser.pop_batch().expect("the new firmware's batch");
 
@@ -1687,7 +1803,7 @@ mod tests {
     fn session_change_keeps_its_specific_boundary_and_opens_a_new_run() {
         let mut parser = parser_with_schema(&[DataType::F32], 4);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid rows");
         let before = parser.pop_batch().expect("the old session's batch");
 
@@ -1704,7 +1820,7 @@ mod tests {
             1,
         );
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid rows in the new session");
         let after = parser.pop_batch().expect("the new session's batch");
 
@@ -1731,7 +1847,7 @@ mod tests {
             }),
         );
         parser
-            .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet_in_segment(1, 0, vec![0; 4])))
             .unwrap();
         let before = parser.pop_batch().unwrap();
         announce_schema_for(
@@ -1749,7 +1865,7 @@ mod tests {
         let revision = parser.metadata_revision(route);
         for first in 0..10 {
             parser
-                .push_packet(&stream_data_packet(first, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet(first, vec![0; 4])))
                 .unwrap();
             let batch = parser
                 .pop_batch()
@@ -1809,11 +1925,11 @@ mod tests {
             wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
         );
         parser
-            .push_packet(&stream_data_packet(1000, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(1000, vec![0; 4])))
             .unwrap();
         parser.pop_batch().unwrap();
         parser
-            .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet_in_segment(1, 1, vec![0; 4])))
             .unwrap();
         assert!(parser.pop_batch().is_none());
         let query = take_query(&mut parser);
@@ -1823,14 +1939,14 @@ mod tests {
         );
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[wire::Metadata::Segment(wire::Segment {
+            &fixtures::metadata_reply(&[wire::Metadata::Segment(wire::Segment {
                 segment_id: crate::proto::SegmentId::new(1),
                 start_time: 1000,
                 ..fixtures::segment(STREAM_ID)
             })]),
         );
         parser
-            .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet_in_segment(1, 1, vec![0; 4])))
             .unwrap();
         assert!(parser.pop_batch().is_some());
     }
@@ -1850,7 +1966,7 @@ mod tests {
         );
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[wire::Metadata::Segment(fixtures::segment(STREAM_ID))]),
+            &fixtures::metadata_reply(&[wire::Metadata::Segment(fixtures::segment(STREAM_ID))]),
         );
         assert_eq!(
             parser
@@ -1870,7 +1986,7 @@ mod tests {
         let mut parser = parser_with_schema(&[DataType::F32], 4);
         let mut buffer = Buffer::new(128);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
             .expect("valid rows");
         let before = parser.pop_batch().expect("the old schema's batch");
         let before_generations = before.generations();
@@ -1879,14 +1995,16 @@ mod tests {
         // Contradicting an already-used column invalidates the route. The
         // device then re-announces the complete replacement schema.
         parser
-            .push_packet(&metadata_packet(wire::Metadata::Column(wire::Column {
-                name: "wide",
-                ..fixtures::column(STREAM_ID, 0, DataType::F64)
-            })))
+            .push_packet(checked(&metadata_packet(wire::Metadata::Column(
+                wire::Column {
+                    name: "wide",
+                    ..fixtures::column(STREAM_ID, 0, DataType::F64)
+                },
+            ))))
             .expect("the changed column triggers rediscovery");
         announce_schema(&mut parser, &[DataType::F64], 8, 1, 1, 1);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 8]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 8])))
             .expect("valid rows under the new schema");
         let after = parser.pop_batch().expect("the new schema's batch");
 
@@ -1913,7 +2031,7 @@ mod tests {
         let mut parser = PacketParser::new(true);
         assert_eq!(
             parser
-                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
                 .unwrap(),
             PacketOutcome::WaitingForMetadata
         );
@@ -1953,7 +2071,7 @@ mod tests {
         let mut parser = parser_with_schema(&types, 7);
         let rows = 4;
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 7 * rows]))
+            .push_packet(checked(&stream_data_packet(0, vec![0; 7 * rows])))
             .expect("valid rows");
         let first = parser.pop_batch().expect("the first batch");
 
@@ -1961,7 +2079,10 @@ mod tests {
         for packet in 1..=10 {
             let first_sample = packet * rows as u32;
             parser
-                .push_packet(&stream_data_packet(first_sample, vec![0; 7 * rows]))
+                .push_packet(checked(&stream_data_packet(
+                    first_sample,
+                    vec![0; 7 * rows],
+                )))
                 .expect("valid rows");
             let batch = parser.pop_batch().expect("a batch per packet");
             assert_eq!(batch.schema().columns().len(), types.len());
@@ -1983,7 +2104,10 @@ mod tests {
     fn rows_after_a_reboot_decode_with_the_new_layout() {
         let mut parser = parser_with_schema(&[DataType::F32, DataType::I16], 6);
         parser
-            .push_packet(&stream_data_packet(0, first_layout_sample(1.5, -7)))
+            .push_packet(checked(&stream_data_packet(
+                0,
+                first_layout_sample(1.5, -7),
+            )))
             .expect("valid rows");
         let before = parser.pop_batch().expect("the first session's batch");
         assert_eq!(
@@ -2007,7 +2131,7 @@ mod tests {
         sample.extend_from_slice(&2.25f64.to_le_bytes());
         sample.push(200);
         parser
-            .push_packet(&stream_data_packet(0, sample))
+            .push_packet(checked(&stream_data_packet(0, sample)))
             .expect("valid rows in the new session");
         let after = parser.pop_batch().expect("the new session's batch");
 
@@ -2028,20 +2152,24 @@ mod tests {
     fn rows_after_a_disconnect_decode_with_the_reannounced_layout() {
         let mut parser = parser_with_schema(&[DataType::F32, DataType::I16], 6);
         parser
-            .push_packet(&stream_data_packet(0, first_layout_sample(1.5, -7)))
+            .push_packet(checked(&stream_data_packet(
+                0,
+                first_layout_sample(1.5, -7),
+            )))
             .expect("valid rows");
         let before = parser.pop_batch().expect("the first batch").generations();
 
         parser
-            .push_packet(
-                &tio::Packet::link(LinkStatus::SensorDisconnected).with_route(DeviceRoute::root()),
-            )
+            .push_packet(checked(&packet::link(
+                LinkStatus::SensorDisconnected,
+                DeviceRoute::root(),
+            )))
             .expect("the disconnect");
         announce_schema(&mut parser, &[DataType::U16, DataType::F32], 6, 1, 1, 1);
         let mut sample = 513u16.to_le_bytes().to_vec();
         sample.extend_from_slice(&(-0.5f32).to_le_bytes());
         parser
-            .push_packet(&stream_data_packet(0, sample))
+            .push_packet(checked(&stream_data_packet(0, sample)))
             .expect("valid rows under the new layout");
         let after = parser.pop_batch().expect("the batch after the reconnect");
 
@@ -2061,21 +2189,23 @@ mod tests {
         let mut sample = 1.0f32.to_le_bytes().to_vec();
         sample.extend_from_slice(&2.0f32.to_le_bytes());
         parser
-            .push_packet(&stream_data_packet(0, sample))
+            .push_packet(checked(&stream_data_packet(0, sample)))
             .expect("valid rows");
         parser.pop_batch().expect("the old layout's batch");
 
         parser
-            .push_packet(&metadata_packet(wire::Metadata::Column(wire::Column {
-                name: "col_0",
-                ..fixtures::column(STREAM_ID, 0, DataType::F64)
-            })))
+            .push_packet(checked(&metadata_packet(wire::Metadata::Column(
+                wire::Column {
+                    name: "col_0",
+                    ..fixtures::column(STREAM_ID, 0, DataType::F64)
+                },
+            ))))
             .expect("the changed column triggers rediscovery");
         announce_schema(&mut parser, &[DataType::F64, DataType::F32], 12, 1, 1, 1);
         let mut sample = 3.5f64.to_le_bytes().to_vec();
         sample.extend_from_slice(&4.0f32.to_le_bytes());
         parser
-            .push_packet(&stream_data_packet(0, sample))
+            .push_packet(checked(&stream_data_packet(0, sample)))
             .expect("valid rows under the new layout");
         let after = parser.pop_batch().expect("the new layout's batch");
 
@@ -2097,21 +2227,27 @@ mod tests {
                 .collect()
         };
         parser
-            .push_packet(&stream_data_packet(0, samples(&[10, 11])))
+            .push_packet(checked(&stream_data_packet(0, samples(&[10, 11]))))
             .expect("valid rows at the full rate");
         let before = parser.pop_batch().expect("the full rate batch");
         assert_eq!(decoded(&before), named(&[("col_0", &[10.0, 11.0])]));
 
         parser
-            .push_packet(&metadata_packet(wire::Metadata::Segment(wire::Segment {
-                segment_id: crate::proto::SegmentId::new(1),
-                sampling_rate: 1000,
-                decimation: 10,
-                ..fixtures::segment(STREAM_ID)
-            })))
+            .push_packet(checked(&metadata_packet(wire::Metadata::Segment(
+                wire::Segment {
+                    segment_id: crate::proto::SegmentId::new(1),
+                    sampling_rate: 1000,
+                    decimation: 10,
+                    ..fixtures::segment(STREAM_ID)
+                },
+            ))))
             .expect("the decimated segment");
         parser
-            .push_packet(&stream_data_packet_in_segment(1, 0, samples(&[-20, -21])))
+            .push_packet(checked(&stream_data_packet_in_segment(
+                1,
+                0,
+                samples(&[-20, -21]),
+            )))
             .expect("valid rows at the decimated rate");
         let after = parser.pop_batch().expect("the decimated batch");
 
@@ -2133,7 +2269,10 @@ mod tests {
     fn announcements_and_heartbeats_keep_the_layout() {
         let mut parser = parser_with_schema(&[DataType::F32, DataType::I16], 6);
         parser
-            .push_packet(&stream_data_packet(0, first_layout_sample(1.5, -7)))
+            .push_packet(checked(&stream_data_packet(
+                0,
+                first_layout_sample(1.5, -7),
+            )))
             .expect("valid rows");
         parser.pop_batch().expect("the first batch");
 
@@ -2145,21 +2284,17 @@ mod tests {
         }
         .write(&mut raw)
         .expect("the announcement fits");
-        let announcement = tio::Packet::from_slice_prefix(&raw[..len])
-            .expect("a valid packet")
-            .0
-            .with_route(DeviceRoute::root());
         parser
-            .push_packet(&announcement)
+            .push_packet(checked(&raw[..len]))
             .expect("an announcement applies");
         parser
-            .push_packet(&tio::Packet::heartbeat_session(
+            .push_packet(checked(&packet::heartbeat_session(
                 fixtures::device().session.value(),
                 DeviceRoute::root(),
-            ))
+            )))
             .expect("a heartbeat applies");
         parser
-            .push_packet(&stream_data_packet(1, first_layout_sample(2.5, 8)))
+            .push_packet(checked(&stream_data_packet(1, first_layout_sample(2.5, 8))))
             .expect("valid rows");
         let after = parser.pop_batch().expect("the next batch");
 
@@ -2198,7 +2333,7 @@ mod tests {
             }));
             for record in records {
                 parser
-                    .push_packet(&metadata_packet(record).with_route(route))
+                    .push_packet(checked(&metadata_packet_at(record, route)))
                     .expect("valid metadata");
             }
         }
@@ -2221,9 +2356,8 @@ mod tests {
         ];
         let mut values: HashMap<DeviceRoute, Vec<Decoded>> = HashMap::new();
         for (route, first, data) in packets {
-            let packet =
-                tio::Packet::samples(STREAM_ID, 0, first, &data, route).expect("valid samples");
-            parser.push_packet(&packet).expect("valid rows");
+            let samples = packet::samples(STREAM_ID, 0, first, &data, route);
+            parser.push_packet(checked(&samples)).expect("valid rows");
             let batch = parser.pop_batch().expect("a batch per packet");
             assert_eq!(batch.stream_key().route, route);
             values.entry(route).or_default().push(decoded(&batch));
@@ -2282,7 +2416,7 @@ mod tests {
             let mut parser = parser_with_schema(&types, sample_size as u16);
             let data = bytes[..rows * sample_size].to_vec();
             parser
-                .push_packet(&stream_data_packet(0, data.clone()))
+                .push_packet(checked(&stream_data_packet(0, data.clone())))
                 .expect("valid rows");
             let batch = parser.pop_batch().expect("a batch");
 

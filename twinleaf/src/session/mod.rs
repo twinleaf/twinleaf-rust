@@ -958,6 +958,8 @@ impl Session {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub(crate) mod packets;
+
     use super::*;
     use crate::proto::rpc::{Method, RpcError};
     use crate::proto::PacketType;

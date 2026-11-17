@@ -95,7 +95,7 @@
 //! between. A start there sends its record first, as the parser has no
 //! other sign that the slot moved on.
 
-use crate::data::tests::fixtures;
+use crate::data::fixtures;
 use crate::data::{PacketParser, SampleBatch};
 use crate::proto::data as wire;
 use crate::proto::data::DataType;
@@ -911,13 +911,18 @@ struct Reader {
     /// per stream run, one per device run and one per run of the whole
     /// parse.
     #[cfg(feature = "hdf5")]
-    tables: [crate::data::export::RunTables; 3],
+    tables: [TableSteps; 3],
 }
+
+/// The table numbering of an export, which returns how many tables each
+/// batch moves its stream on.
+#[cfg(feature = "hdf5")]
+type TableSteps = Box<dyn FnMut(&SampleBatch) -> u64>;
 
 impl Reader {
     fn new(room: usize) -> Reader {
         #[cfg(feature = "hdf5")]
-        use crate::data::export::{RunSplitLevel, RunTables, SplitPolicy};
+        use crate::data::export::RunSplitLevel;
         let (lane, queue) = BatchLane::new(room);
         Reader {
             parser: PacketParser::new(false),
@@ -934,7 +939,7 @@ impl Reader {
                 RunSplitLevel::PerDevice,
                 RunSplitLevel::Global,
             ]
-            .map(|level| RunTables::new(SplitPolicy::Continuous, level)),
+            .map(fixtures::table_steps),
         }
     }
 
@@ -972,7 +977,6 @@ impl Reader {
     /// stream's run, or the stream starts over after batches before.
     #[cfg(feature = "hdf5")]
     fn split(&mut self, batch: &SampleBatch) {
-        let key = batch.stream_key();
         let breaks = batch
             .boundary()
             .is_some_and(|boundary| match boundary.is_initial() {
@@ -980,11 +984,8 @@ impl Reader {
                 false => !boundary.is_continuous(),
             });
         for tables in &mut self.tables {
-            let before = tables.index(key).expect("tables split by run");
-            tables.observe(key, batch.generations(), batch.boundary());
-            let after = tables.index(key).expect("tables split by run");
             assert_eq!(
-                after - before,
+                tables(batch),
                 u64::from(breaks),
                 "the table of the batch from sample {} after {:?}",
                 batch.sample_numbers()[0].value(),

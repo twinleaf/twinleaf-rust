@@ -9,9 +9,9 @@
 //!                    metadata + runs
 //! ```
 //!
-//! Live connections expose this pipeline through
-//! [`Device::samples`](crate::device::Device::samples). Most applications
-//! receive batches from there and do not construct a parser.
+//! Live connections expose this pipeline through a `Device`'s `samples`.
+//! Most applications receive batches from there and do not construct a
+//! parser.
 //!
 //! Restarts, rate changes, and the packet loss the parser finds start a new
 //! run. The run's first batch carries a [`Boundary`], as does each batch
@@ -165,8 +165,9 @@ pub use logfile::export;
 #[cfg_attr(docsrs, doc(cfg(feature = "processing")))]
 pub use graph::ops;
 
-#[cfg(test)]
-pub(crate) mod tests;
+#[cfg(any(test, feature = "test-util"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+pub mod fixtures;
 
 #[doc(no_inline)]
 pub use crate::proto::data::DataType;
@@ -176,11 +177,11 @@ pub use decode::state::{DataError, StreamDataError};
 #[cfg_attr(docsrs, doc(cfg(feature = "processing")))]
 pub use graph::history::{History, Window};
 pub use graph::pipeline::{ColumnOp, ColumnProcessor, Continuity, Covered};
-pub use logfile::reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
+pub use logfile::reader::{LogError, LogFile, LogIndex, LogSummary, StreamSummary};
+pub use logfile::writer::{LogWriter, RecordMode};
+pub use model::carried::Carried;
 pub use model::continuity::{Boundary, BoundaryClass, Change, Generations, Loss, Lost};
 pub use model::filter::ColumnFilter;
-#[cfg(feature = "host")]
-pub(crate) use model::sample::RowSource;
 pub use model::sample::{ColumnArray, ColumnData, SampleBatch, SampleRow, ScalarBuffer};
 pub use model::schema::{
     ColumnKey, DeviceMetadataSnapshot, MetadataQuery, StreamKey, StreamMetadataSnapshot,

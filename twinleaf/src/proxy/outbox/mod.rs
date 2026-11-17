@@ -68,7 +68,6 @@
 
 use crate::chan::lock;
 use crate::chan::Notify;
-use crate::proto::data::FIRST_STREAM_ID;
 use crate::proto::DeviceRoute;
 use crate::session::{decode, parts, Part, Update};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
@@ -184,7 +183,7 @@ impl Queues {
     /// Takes `packet` out of the byte counts, as it leaves the outbox.
     fn uncount(&mut self, packet: &Packet) {
         let size = packet.as_bytes().len();
-        if is_sample(packet) {
+        if packet.is_data() {
             self.sample_bytes -= size;
         } else {
             self.other_bytes -= size;
@@ -193,20 +192,16 @@ impl Queues {
 
     /// Drops the oldest sample on the stream, and counts it.
     fn drop_oldest_sample(&mut self) {
-        let at = self.stream.iter().position(is_sample);
+        let at = self.stream.iter().position(Packet::is_data);
         let at = at.expect("a sample on the stream past the budget");
         let oldest = self.stream.remove(at).expect("the sample found");
         self.sample_bytes -= oldest.as_bytes().len();
-        let stream = oldest.ptype().stream_id().expect("a sample's stream");
-        *self.dropped.entry((oldest.route(), stream)).or_default() += 1;
+        let stream = oldest.ptype().sample_stream().expect("a sample's stream");
+        *self
+            .dropped
+            .entry((oldest.route(), stream.value()))
+            .or_default() += 1;
     }
-}
-
-/// Returns `true` if `packet` holds samples, as its type says. It reads the
-/// type alone, as the eviction scans the stream with it.
-fn is_sample(packet: &Packet) -> bool {
-    let stream = packet.ptype().stream_id();
-    stream.is_some_and(|stream| stream >= FIRST_STREAM_ID)
 }
 
 /// Returns the watch id and the part of the update that `packet` carries,
@@ -229,7 +224,7 @@ impl Outbox {
     /// Queues `packet`, an answer or a status, on the urgent queue, ahead of
     /// the stream.
     pub(super) fn urgent(&self, packet: Packet) {
-        debug_assert!(!is_sample(&packet), "a sample is never urgent");
+        debug_assert!(!packet.is_data(), "a sample is never urgent");
         self.queue([packet], Queue::Urgent);
     }
 
@@ -254,7 +249,7 @@ impl Outbox {
         }
         for packet in packets {
             let size = packet.as_bytes().len();
-            if is_sample(&packet) {
+            if packet.is_data() {
                 queues.sample_bytes += size;
             } else {
                 queues.other_bytes += size;
@@ -346,7 +341,7 @@ impl Outbox {
         let (mut sample_bytes, mut other_bytes, mut others) = (0, 0, 0);
         for packet in queues.urgent.iter().chain(&queues.stream) {
             let size = packet.as_bytes().len();
-            if is_sample(packet) {
+            if packet.is_data() {
                 sample_bytes += size;
             } else {
                 other_bytes += size;

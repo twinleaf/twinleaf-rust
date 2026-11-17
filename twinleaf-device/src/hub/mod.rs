@@ -642,10 +642,12 @@ mod tests {
         );
     }
 
-    /// The bytes on both wires, as the hub that rebuilt every packet wrote
-    /// them: forwarding in place may not move a byte it did not have to.
+    /// The bytes a forwarded packet has on each wire. A request goes down its
+    /// port with that hop gone and the hub's request id in place of the
+    /// host's. The reply goes up with the host's request id and the port's
+    /// hop added. Every other byte is the byte that came in.
     #[test]
-    fn a_forwarded_packet_is_byte_for_byte_what_it_always_was() {
+    fn a_forwarded_packet_differs_only_in_its_hops_and_request_id() {
         let mut hub = hub();
         let mut packet = request(7, b"dev.name", &[3, 1]);
         let out = deliver(&mut hub, Input::FromHost(&mut packet), NOW);

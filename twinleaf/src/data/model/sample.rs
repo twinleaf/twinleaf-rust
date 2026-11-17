@@ -13,25 +13,25 @@ use std::sync::Arc;
 
 /// A segment's map from sample number to time, read once per batch.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SampleClock {
+pub(in crate::data) struct SampleClock {
     start_time: f64,
     period: f64,
 }
 
 impl SampleClock {
-    pub(crate) fn of(segment: wire::SegmentView<'_>) -> Self {
+    pub(in crate::data) fn of(segment: wire::SegmentView<'_>) -> Self {
         Self {
             start_time: f64::from(segment.start_time()),
             period: f64::from(segment.decimation()) / f64::from(segment.sampling_rate()),
         }
     }
 
-    pub(crate) fn time_at(&self, n: u32) -> f64 {
+    pub(in crate::data) fn time_at(&self, n: u32) -> f64 {
         self.start_time + self.period * f64::from(n)
     }
 }
 
-pub(crate) fn sample_time(segment: wire::SegmentView<'_>, n: u32) -> f64 {
+pub(in crate::data) fn sample_time(segment: wire::SegmentView<'_>, n: u32) -> f64 {
     SampleClock::of(segment).time_at(n)
 }
 
@@ -101,7 +101,7 @@ macro_rules! native_types {
         }
     };
 }
-pub(crate) use native_types;
+pub(in crate::data) use native_types;
 
 macro_rules! define_columns {
     ($($variant:ident $native:ty),* $(,)?) => {
@@ -139,7 +139,7 @@ macro_rules! define_columns {
         /// One column's values while they are still being accumulated, in the
         /// column's native type.
         #[derive(Debug, Clone)]
-        pub(crate) enum ColumnBuilder {
+        pub(in crate::data) enum ColumnBuilder {
             $($variant(Vec<$native>),)*
         }
 
@@ -147,7 +147,7 @@ macro_rules! define_columns {
             /// Returns an empty column for values of `data_type`, with room
             /// for `capacity` of them, or `None` for a type this build cannot
             /// decode.
-            pub(crate) fn for_type(data_type: wire::DataType, capacity: usize) -> Option<Self> {
+            pub(in crate::data) fn for_type(data_type: wire::DataType, capacity: usize) -> Option<Self> {
                 Some(match data_type {
                     $(wire::DataType::$variant => Self::$variant(Vec::with_capacity(capacity)),)*
                     _ => return None,
@@ -303,7 +303,7 @@ pub struct SampleBatch {
 
 /// Rows that can enter a batch coalescer. They describe the batch they would
 /// form and append themselves onto an accumulating builder.
-pub(crate) trait RowSource {
+pub(in crate::data) trait RowSource {
     fn len(&self) -> usize;
     fn boundary(&self) -> Option<&Boundary>;
     fn generations(&self) -> Generations;
@@ -320,7 +320,7 @@ pub(crate) trait RowSource {
 
 /// Accumulates decoded rows into a [`SampleBatch`], one row or one batch at a
 /// time.
-pub(crate) struct SampleBatchBuilder {
+pub(in crate::data) struct SampleBatchBuilder {
     context: BatchContext,
     sample_numbers: Vec<SampleNumber>,
     /// Each row's end-of-sample time, carried alongside its sample number.
@@ -558,8 +558,7 @@ impl SampleBatch {
 
     /// Returns this batch with `boundary` in place of its own, and the same
     /// rows, metadata and generations.
-    #[cfg(feature = "host")]
-    pub(crate) fn with_boundary(mut self, boundary: Option<Boundary>) -> SampleBatch {
+    pub(in crate::data) fn with_boundary(mut self, boundary: Option<Boundary>) -> SampleBatch {
         self.context.boundary = boundary;
         self
     }
@@ -731,8 +730,8 @@ impl std::fmt::Display for SampleRow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::fixtures::{self, column, device, segment, stream};
     use crate::data::model::continuity::Change;
-    use crate::data::tests::fixtures::{self, column, device, segment, stream};
     use crate::proto::data::DataType;
 
     fn metadata(stream_id: u8, column_name: &str) -> StreamMetadataSnapshot {

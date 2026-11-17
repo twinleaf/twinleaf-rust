@@ -147,9 +147,10 @@
 
 use super::{ClientError, Outbox, Taken, HARD_LIMIT, SAMPLE_BUDGET, TAKE_LIMIT};
 use crate::chan::lock;
-use crate::data::tests::fixtures::{broadcast, segment_record};
+use crate::data::fixtures::segment_record;
 use crate::proto::data::Metadata;
 use crate::proto::DeviceRoute;
+use crate::session::tests::packets::broadcast;
 use crate::session::{decode, parts, Part, Update};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use futures_util::FutureExt;

@@ -14,10 +14,9 @@ use crate::data::model::schema::{
 use crate::proto::data as wire;
 use crate::proto::data::MAX_SAMPLE_NUMBER;
 use crate::proto::heartbeat::Heartbeat;
+use crate::proto::packet::Payload;
 use crate::proto::DeviceRoute;
 use crate::proto::{SampleNumber, SegmentId, SessionId, StreamId};
-use crate::tio;
-use crate::tio::packet;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -840,11 +839,17 @@ impl DeviceState {
     }
 
     /// Applies a packet that updates decoding state but carries no sample rows.
-    fn apply_control_packet(&mut self, packet: &tio::Packet, global_generation: &mut u32) {
-        match packet.payload() {
-            packet::Payload::Metadata(..) => {
-                let (kind, _, record) = wire::split_metadata(packet.payload_bytes())
-                    .expect("a metadata payload was framed when the packet was validated");
+    /// `bytes` are the payload's bytes.
+    fn apply_control_packet(
+        &mut self,
+        payload: Payload<'_>,
+        bytes: &[u8],
+        global_generation: &mut u32,
+    ) {
+        match payload {
+            Payload::Metadata(..) => {
+                let (kind, _, record) = wire::split_metadata(bytes)
+                    .expect("a metadata payload was framed when it was read");
                 self.apply_metadata(
                     kind.into(),
                     record,
@@ -852,7 +857,7 @@ impl DeviceState {
                     global_generation,
                 );
             }
-            packet::Payload::Heartbeat(Heartbeat::Session { session, .. }) => {
+            Payload::Heartbeat(Heartbeat::Session { session, .. }) => {
                 if let Some(device) = &self.metadata {
                     let device = device.get();
                     if device.session() != session && device.protocol() == 0 && !self.ignore_session
@@ -1032,38 +1037,16 @@ impl ParseState {
         self.devices.iter().find(|device| device.route == route)
     }
 
+    /// Applies one packet from `route` that carries `payload`, whose bytes
+    /// are `bytes`.
     pub(in crate::data) fn apply_packet<'a>(
         &'a mut self,
-        packet: &'a tio::Packet,
+        route: DeviceRoute,
+        payload: Payload<'a>,
+        bytes: &[u8],
     ) -> Result<PacketEvent<'a>, DataError> {
-        let route = packet.route();
-
-        if let Some(status) = packet.link_status() {
-            if matches!(
-                status,
-                packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped
-            ) {
-                self.relearn(|device| device.starts_with(&route));
-                self.blame(LossSite::Link, |device| device.starts_with(&route));
-                return Ok(PacketEvent::Reset);
-            }
-            return Ok(PacketEvent::Applied);
-        }
-
-        // The proxy dropped packets of one stream, whose next rows come
-        // after them.
-        if let packet::Payload::ProxyRx(packet::ProxyRx::Dropped { stream_id, .. }) =
-            packet.payload()
-        {
-            let index = self.device_index(route);
-            self.devices[index]
-                .stream_mut(StreamId::new(stream_id))
-                .blame(LossSite::Proxy);
-            return Ok(PacketEvent::Applied);
-        }
-
-        match packet.payload() {
-            packet::Payload::Samples(data) => {
+        match payload {
+            Payload::Samples(data) => {
                 let index = self.device_index(route);
                 self.devices[index]
                     .validate_stream_data(data, &mut self.global_generation)
@@ -1075,7 +1058,11 @@ impl ParseState {
             }
             _ => {
                 let index = self.device_index(route);
-                self.devices[index].apply_control_packet(packet, &mut self.global_generation);
+                self.devices[index].apply_control_packet(
+                    payload,
+                    bytes,
+                    &mut self.global_generation,
+                );
                 Ok(PacketEvent::Applied)
             }
         }
@@ -1091,6 +1078,18 @@ impl ParseState {
                 }
             }
         }
+    }
+
+    /// Blames `site` for the rows stream `stream_id` of `route` loses before
+    /// its next rows, creating the route's state if it has none.
+    pub(in crate::data) fn blame_stream(
+        &mut self,
+        route: DeviceRoute,
+        stream_id: StreamId,
+        site: LossSite,
+    ) {
+        let index = self.device_index(route);
+        self.devices[index].stream_mut(stream_id).blame(site);
     }
 
     /// Drops the metadata of every route `routes` accepts, to learn it again,
@@ -1144,7 +1143,6 @@ impl ParseState {
         self.device(route)?.metadata_snapshot()
     }
 
-    #[cfg(feature = "host")]
     pub(in crate::data) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
         self.device(route).map(|device| device.metadata_revision)
     }
@@ -1156,7 +1154,7 @@ impl ParseState {
 
 /// Stream bytes validated against the metadata and continuity state in effect
 /// at their position in the packet sequence, described without decoding them.
-pub(crate) struct ScannedRows<'a> {
+pub(in crate::data) struct ScannedRows<'a> {
     schema: &'a Arc<StreamSchema>,
     device: DeviceRecord,
     segment: SegmentRecord,
@@ -1169,16 +1167,16 @@ pub(crate) struct ScannedRows<'a> {
 }
 
 impl ScannedRows<'_> {
-    pub(crate) fn stream_key(&self) -> StreamKey {
+    pub(in crate::data) fn stream_key(&self) -> StreamKey {
         self.schema.stream_key()
     }
 
-    pub(crate) fn device(&self) -> &DeviceRecord {
+    pub(in crate::data) fn device(&self) -> &DeviceRecord {
         &self.device
     }
 
     /// Returns the metadata these rows carry, as a batch of them would.
-    pub(crate) fn metadata(&self) -> StreamMetadataSnapshot {
+    pub(in crate::data) fn metadata(&self) -> StreamMetadataSnapshot {
         StreamMetadataSnapshot::new(
             self.schema.clone(),
             self.device.clone(),
@@ -1186,7 +1184,7 @@ impl ScannedRows<'_> {
         )
     }
 
-    pub(crate) fn sample_number_bounds(&self) -> (SampleNumber, SampleNumber) {
+    pub(in crate::data) fn sample_number_bounds(&self) -> (SampleNumber, SampleNumber) {
         (self.first_sample_n, self.last_sample_n)
     }
 }

@@ -36,22 +36,22 @@ use std::ops::Range;
 use std::sync::Arc;
 
 /// A row of a column, as its time and its value.
-pub(crate) type Point = (f64, f64);
+pub(in crate::data) type Point = (f64, f64);
 
 /// The rows in a window of the finest level. A read of fewer rows a point
 /// than this decimates the rows themselves.
-pub(crate) const FINEST: usize = 128;
+pub(in crate::data) const FINEST: usize = 128;
 /// How many levels a pyramid has, each of windows twice as long as the one
 /// before. The coarsest has windows of `FINEST` times 2¹⁵ rows, over four
 /// million.
 const LEVELS: usize = 16;
 /// The points in a full block of a level.
-pub(crate) const BLOCK: usize = 1024;
+pub(in crate::data) const BLOCK: usize = 1024;
 
 /// Returns the level whose windows are the longest of no more than `ratio`
 /// rows, and the rows in its windows, or `None` when even the finest level's
 /// are longer.
-pub(crate) fn level_for(ratio: usize) -> Option<(usize, usize)> {
+pub(in crate::data) fn level_for(ratio: usize) -> Option<(usize, usize)> {
     let level = (ratio / FINEST).checked_ilog2()? as usize;
     let level = level.min(LEVELS - 1);
     Some((level, FINEST << level))
@@ -152,7 +152,7 @@ impl Level {
 
     /// Returns how many points the level holds.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    pub(in crate::data) fn len(&self) -> usize {
         let sealed: usize = self.sealed.iter().map(|block| block.len()).sum();
         sealed + self.open.len() + self.unsettled.len()
     }
@@ -270,7 +270,7 @@ impl Stretch {
     /// by bisection. It reads the rows themselves, to decimate at that
     /// level's ratio, when `levels` is `None` or lacks the level, or `run`
     /// lacks a numeric `column`. A stretch of no rows reads none.
-    pub(crate) fn read(
+    pub(in crate::data) fn read(
         run: &Run,
         rows: Range<u64>,
         column: ColumnId,
@@ -289,7 +289,12 @@ impl Stretch {
 
     /// Reads `rows`, positions in `run`, for `column` as the rows themselves,
     /// to decimate by `ratio`, which may be 1.
-    pub(crate) fn rows(run: &Run, rows: Range<u64>, column: ColumnId, ratio: usize) -> Stretch {
+    pub(in crate::data) fn rows(
+        run: &Run,
+        rows: Range<u64>,
+        column: ColumnId,
+        ratio: usize,
+    ) -> Stretch {
         let read = Read::Rows {
             ratio,
             start: rows.start,
@@ -307,7 +312,7 @@ impl Stretch {
     /// the level's points between the stretch's ends and the two ends. It is
     /// not the number of points the stretch gives, which may be fewer.
     #[cfg(test)]
-    pub(crate) fn cost(&self) -> usize {
+    pub(in crate::data) fn cost(&self) -> usize {
         match &self.read {
             Read::Rows { batches, .. } => batches.iter().map(SampleBatch::len).sum(),
             Read::Points { slices, .. } => {
@@ -318,7 +323,7 @@ impl Stretch {
 
     /// Returns `true` if the stretch took no row, as a stretch of no rows.
     #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(in crate::data) fn is_empty(&self) -> bool {
         self.cost() == 0
     }
 
@@ -459,9 +464,9 @@ fn leveled(first: Point, last: Point, slices: &[Slice], gaps: &[f64]) -> Vec<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::fixtures;
     use crate::data::model::continuity::{Boundary, Generations, Loss};
     use crate::data::model::sample::{BatchContext, ColumnData, SampleBatchBuilder};
-    use crate::data::tests::fixtures;
     use crate::data::{Buffer, ColumnKey, ColumnProcessor, StreamMetadataSnapshot};
     use crate::proto::data::{self as wire, DataType};
     use crate::proto::{DeviceRoute, SampleNumber, StreamId};

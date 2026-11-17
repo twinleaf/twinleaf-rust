@@ -2,8 +2,8 @@
 //! [`Sink`], and a [`Scope`] filters what passes between them.
 
 use crate::chan::oneshot;
-use crate::data::{Boundary, Change, Loss, SampleBatch, StreamKey, StreamMetadataSnapshot};
-use crate::proto::{DeviceRoute, SampleNumber};
+use crate::data::{Carried, SampleBatch, StreamKey};
+use crate::proto::DeviceRoute;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -363,63 +363,13 @@ impl<T> Lane<T> {
 /// A FIFO lane of sample batches, which carries what each batch it drops
 /// changed and lost onto the next batch of that stream it queues.
 ///
-/// For each stream it keeps the last batch it queued, and what the batches
-/// it dropped since then changed and lost. A batch after drops names the
-/// higher ranked of their change and its own, with the `old` values of the
-/// last batch queued and the `new` values of its own, and a [`Loss`] that
-/// counts every row dropped. Any other batch goes in as the parser made it.
-/// The first batch of each stream the lane queues says [`Change::Initial`],
-/// as its reader starts there, with a [`Loss`] that names no sample due when
-/// the lane dropped the batches before it. The gaps it reports still count
-/// the batches it dropped, across all streams. Each batch keeps the
-/// generations the parser gave it.
+/// For each stream it keeps a [`Carried`], which gives each batch it queues
+/// the boundary that names what the batches it dropped since the last one
+/// changed and lost. The gaps it reports still count the batches it dropped,
+/// across all streams.
 pub(crate) struct BatchLane {
     lane: Lane<SampleBatch>,
     streams: HashMap<StreamKey, Carried>,
-}
-
-/// What a batch lane keeps of one stream.
-#[derive(Default)]
-struct Carried {
-    /// The metadata and last sample number of the last batch queued.
-    last: Option<(StreamMetadataSnapshot, SampleNumber)>,
-    /// What the batches dropped since then changed and lost.
-    pending: Option<Pending>,
-}
-
-/// What the batches of one stream that a lane dropped changed and lost.
-struct Pending {
-    change: Option<Change>,
-    /// The batches dropped and their rows, and the rows those batches said
-    /// were lost before them.
-    dropped: u64,
-    rows: u64,
-    lost: Lost,
-}
-
-/// The rows the losses of some batches count, in all and at each place a
-/// [`Loss`] tells apart.
-#[derive(Clone, Copy, Default)]
-struct Lost {
-    samples: u64,
-    dropped: u64,
-    link: u64,
-    proxy: u64,
-}
-
-impl Lost {
-    /// Returns these rows and those `batch` says were lost before it.
-    fn with(self, batch: &SampleBatch) -> Lost {
-        let Some(loss) = batch.boundary().and_then(|b| b.loss.as_ref()) else {
-            return self;
-        };
-        Lost {
-            samples: self.samples + loss.samples,
-            dropped: self.dropped + loss.dropped_samples,
-            link: self.link + loss.link_samples,
-            proxy: self.proxy + loss.proxy_samples,
-        }
-    }
 }
 
 impl BatchLane {
@@ -456,118 +406,6 @@ impl BatchLane {
     /// Ends the queue saying why.
     pub(crate) fn end(self, end: End) {
         self.lane.end(end);
-    }
-}
-
-impl Carried {
-    /// Keeps what `batch`, which the lane dropped, changed and lost.
-    fn miss(&mut self, batch: &SampleBatch) {
-        let pending = self.pending.get_or_insert(Pending {
-            change: None,
-            dropped: 0,
-            rows: 0,
-            lost: Lost::default(),
-        });
-        pending.dropped += 1;
-        pending.rows += batch.len() as u64;
-        pending.lost = pending.lost.with(batch);
-        let change = batch.boundary().and_then(|b| b.change.clone());
-        pending.change = higher(pending.change.take(), change);
-    }
-
-    /// Returns `batch` as the lane queues it, and keeps it as the last one.
-    fn queue(&mut self, batch: SampleBatch) -> SampleBatch {
-        let batch = match (self.pending.take(), &self.last) {
-            (None, Some(_)) => batch,
-            (None, None) if batch.is_initial() => batch,
-            (None, None) => batch.with_boundary(Some(Boundary::of(Change::Initial))),
-            (Some(pending), last) => {
-                let boundary = pending.onto(&batch, last.as_ref());
-                batch.with_boundary(Some(boundary))
-            }
-        };
-        if let Some(&n) = batch.sample_numbers().last() {
-            self.last = Some((batch.metadata().clone(), n));
-        }
-        batch
-    }
-}
-
-impl Pending {
-    /// Returns the boundary of `batch`, the first one queued after these
-    /// drops, where `last` is the metadata and last sample number of the
-    /// batch queued before them.
-    fn onto(
-        self,
-        batch: &SampleBatch,
-        last: Option<&(StreamMetadataSnapshot, SampleNumber)>,
-    ) -> Boundary {
-        let own = batch.boundary().and_then(|b| b.change.clone());
-        let change = match last {
-            Some((metadata, _)) => {
-                higher(self.change, own).map(|change| restate(change, metadata, batch.metadata()))
-            }
-            None => Some(Change::Initial),
-        };
-        let expected = last
-            .filter(|_| change.as_ref().is_none_or(Change::is_continuous))
-            .map(|&(_, n)| SampleNumber::new(n.value() + 1));
-        let lost = self.lost.with(batch);
-        Boundary {
-            change,
-            loss: Some(Loss {
-                samples: self.rows + lost.samples,
-                expected,
-                dropped_batches: self.dropped,
-                dropped_samples: self.rows + lost.dropped,
-                link_samples: lost.link,
-                proxy_samples: lost.proxy,
-            }),
-        }
-    }
-}
-
-/// Returns the higher ranked of two changes a reader learns of at once. Two
-/// backward steps in time add up.
-fn higher(first: Option<Change>, then: Option<Change>) -> Option<Change> {
-    let (first, then) = match (first, then) {
-        (Some(first), Some(then)) => (first, then),
-        (first, then) => return first.or(then),
-    };
-    Some(match (first, then) {
-        (Change::TimeBackward { gap_seconds: a }, Change::TimeBackward { gap_seconds: b }) => {
-            Change::TimeBackward { gap_seconds: a + b }
-        }
-        (first, then) if then.rank() > first.rank() => then,
-        (first, _) => first,
-    })
-}
-
-/// Returns `change` naming the values of `old`, the metadata of the last
-/// batch queued, and `new`, that of the batch it goes on.
-fn restate(change: Change, old: &StreamMetadataSnapshot, new: &StreamMetadataSnapshot) -> Change {
-    match change {
-        Change::SessionChanged { .. } => Change::SessionChanged {
-            old: old.device().session(),
-            new: new.device().session(),
-        },
-        Change::TimeRefSessionChanged { .. } => Change::TimeRefSessionChanged {
-            old: old.segment().timeref_session(),
-            new: new.segment().timeref_session(),
-        },
-        Change::RateChanged { .. } => Change::RateChanged {
-            old_rate: old.rate_hz(),
-            new_rate: new.rate_hz(),
-        },
-        Change::Restarted { .. } => Change::Restarted {
-            old_id: old.segment().segment_id(),
-            new_id: new.segment().segment_id(),
-        },
-        Change::SegmentRollover { .. } => Change::SegmentRollover {
-            old_id: old.segment().segment_id(),
-            new_id: new.segment().segment_id(),
-        },
-        change @ (Change::Initial | Change::TimeBackward { .. }) => change,
     }
 }
 

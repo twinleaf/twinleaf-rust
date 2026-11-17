@@ -3,11 +3,9 @@
 //! data type decodes to.
 
 use crate::proto::data as wire;
-use crate::proto::packet::Packet as WirePacket;
+use crate::proto::packet::{write_routing, Packet as WirePacket, PacketError};
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, StreamId};
-use crate::tio;
-use crate::tio::packet::{EncodeError, Packet};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -82,7 +80,7 @@ thread_local! {
 /// Returns how many records this thread has checked to retain, so tests can
 /// bound the checks a packet costs.
 #[cfg(test)]
-pub(crate) fn record_parses() -> u64 {
+pub(in crate::data) fn record_parses() -> u64 {
     RECORD_PARSES.with(std::cell::Cell::get)
 }
 
@@ -94,12 +92,12 @@ macro_rules! metadata_record {
         /// Equality is byte equality, so a field a newer device adds still
         /// counts as a change.
         #[derive(Clone, PartialEq, Eq)]
-        pub(crate) struct $record(Arc<[u8]>);
+        pub(in crate::data) struct $record(Arc<[u8]>);
 
         impl $record {
             /// Copies `record` if it parses as this descriptor, or returns
             /// `None`.
-            pub(crate) fn new(record: &[u8]) -> Option<Self> {
+            pub(in crate::data) fn new(record: &[u8]) -> Option<Self> {
                 #[cfg(test)]
                 RECORD_PARSES.with(|parses| parses.set(parses.get() + 1));
                 wire::$view::new_checked(record)?;
@@ -108,8 +106,8 @@ macro_rules! metadata_record {
 
             /// Encodes `fields` as a retained record. Returns `None` if the
             /// record does not fit in a packet.
-            #[allow(dead_code)]
-            pub(crate) fn encode(fields: wire::$kind<'_>) -> Option<Self> {
+            #[cfg(any(test, feature = "test-util"))]
+            pub(in crate::data) fn encode(fields: wire::$kind<'_>) -> Option<Self> {
                 let record = wire::Metadata::$kind(fields);
                 let mut buf = [0u8; WirePacket::MAX_PAYLOAD];
                 let (_, len) = record.write_record(buf.get_mut(..record.record_len())?)?;
@@ -117,19 +115,29 @@ macro_rules! metadata_record {
             }
 
             /// Returns a view that reads the record's fields in place.
-            pub(crate) fn get(&self) -> wire::$view<'_> {
+            pub(in crate::data) fn get(&self) -> wire::$view<'_> {
                 wire::$view::new_unchecked(&self.0)
             }
 
-            /// Encodes the descriptor as an UPDATE broadcast to `routing`,
-            /// carrying the record exactly as retained.
-            pub(crate) fn update(&self, routing: DeviceRoute) -> Result<Packet, EncodeError> {
-                Packet::metadata_record(
+            /// Encodes the descriptor as the bytes of an UPDATE broadcast to
+            /// `routing`, carrying the record exactly as retained. Returns
+            /// [`PacketError::PayloadTooBig`] if the record does not fit a
+            /// packet.
+            pub(in crate::data) fn update(
+                &self,
+                routing: DeviceRoute,
+            ) -> Result<Vec<u8>, PacketError> {
+                let mut buf = [0u8; WirePacket::MAX_SIZE];
+                let len = wire::write_metadata_record(
+                    &mut buf,
                     wire::MetadataType::$kind.into(),
                     wire::MetadataFlags::UPDATE,
                     &self.0,
-                    routing,
                 )
+                .ok_or(PacketError::PayloadTooBig)?;
+                let len = write_routing(&mut buf, len, routing)
+                    .expect("any payload and the longest route fit a packet");
+                Ok(buf[..len].to_vec())
             }
         }
 
@@ -148,7 +156,7 @@ metadata_record!(ColumnRecord, Column, ColumnView);
 
 /// Returns the sample rate in hertz after decimation,
 /// `sampling_rate / decimation`, or `None` if either is zero.
-pub(crate) fn rate_hz(segment: &wire::SegmentView<'_>) -> Option<f64> {
+pub(in crate::data) fn rate_hz(segment: &wire::SegmentView<'_>) -> Option<f64> {
     let (sampling_rate, decimation) = (segment.sampling_rate(), segment.decimation());
     (sampling_rate != 0 && decimation != 0)
         .then(|| f64::from(sampling_rate) / f64::from(decimation))
@@ -344,22 +352,26 @@ impl StreamMetadataSnapshot {
         &self.segment
     }
 
-    /// Encodes the retained descriptors as byte-faithful UPDATE packets, in the
-    /// order device, stream, segment, then columns.
+    /// Encodes the retained descriptors as byte-faithful UPDATE packets
+    /// addressed to `routing`, in the order device, stream, segment, then
+    /// columns. Each item holds the bytes of one packet.
     ///
     /// # Errors
     ///
-    /// Returns an [`EncodeError`] if a record is too large for a packet.
-    pub fn metadata_packets(&self) -> Result<Vec<tio::Packet>, EncodeError> {
-        std::iter::once(self.device.update(self.route()))
-            .chain(self.stream_packets())
+    /// Returns [`PacketError::PayloadTooBig`] if a record is too large for a
+    /// packet.
+    pub fn metadata_packets(&self, routing: DeviceRoute) -> Result<Vec<Vec<u8>>, PacketError> {
+        std::iter::once(self.device.update(routing))
+            .chain(self.stream_packets(routing))
             .collect()
     }
 
-    /// Encodes the stream's own descriptors, without the device record it
-    /// shares with its peers.
-    fn stream_packets(&self) -> impl Iterator<Item = Result<tio::Packet, EncodeError>> + '_ {
-        let routing = self.route();
+    /// Encodes the stream's own descriptors addressed to `routing`, without
+    /// the device record it shares with its peers.
+    fn stream_packets(
+        &self,
+        routing: DeviceRoute,
+    ) -> impl Iterator<Item = Result<Vec<u8>, PacketError>> + '_ {
         [
             self.schema.stream.update(routing),
             self.segment.update(routing),
@@ -419,19 +431,27 @@ impl DeviceMetadataSnapshot {
         self.0.streams.iter().map(|(&id, stream)| (id, stream))
     }
 
-    /// Encodes every retained descriptor as a byte-faithful UPDATE packet, with
-    /// the device record once ahead of its streams, which go in order of id.
+    /// Returns the route of the device the snapshot describes.
+    pub fn route(&self) -> DeviceRoute {
+        self.0.route
+    }
+
+    /// Encodes every retained descriptor as a byte-faithful UPDATE packet
+    /// addressed to `routing`, with the device record once ahead of its
+    /// streams, which go in order of id. Each item holds the bytes of one
+    /// packet.
     ///
     /// # Errors
     ///
-    /// Returns an [`EncodeError`] if a record is too large for a packet.
-    pub fn metadata_packets(&self) -> Result<Vec<tio::Packet>, EncodeError> {
-        std::iter::once(self.0.device.update(self.0.route))
+    /// Returns [`PacketError::PayloadTooBig`] if a record is too large for a
+    /// packet.
+    pub fn metadata_packets(&self, routing: DeviceRoute) -> Result<Vec<Vec<u8>>, PacketError> {
+        std::iter::once(self.0.device.update(routing))
             .chain(
                 self.0
                     .streams
                     .values()
-                    .flat_map(StreamMetadataSnapshot::stream_packets),
+                    .flat_map(|stream| stream.stream_packets(routing)),
             )
             .collect()
     }
@@ -440,7 +460,8 @@ impl DeviceMetadataSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::tests::fixtures;
+    use crate::data::fixtures;
+    use crate::data::fixtures::packet;
     use crate::proto::SessionId;
 
     /// A segment's rate is its sampling rate over its decimation, and a zero
@@ -479,28 +500,12 @@ mod tests {
 
         assert_eq!(record.get().fields(), fields);
         assert_eq!(
-            record.update(route("/1")).unwrap().as_bytes(),
-            Packet::metadata(
+            record.update(route("/1")).unwrap(),
+            packet::metadata(
                 wire::Metadata::Device(fields),
                 wire::MetadataFlags::UPDATE,
                 route("/1"),
             )
-            .unwrap()
-            .as_bytes()
         );
-    }
-
-    #[test]
-    fn a_record_too_long_for_a_payload_cannot_be_retained() {
-        let long = "n".repeat(200);
-        assert!(DeviceRecord::encode(wire::Device {
-            session: SessionId::new(42),
-            n_streams: 1,
-            name: &long,
-            serial: &long,
-            firmware: &long,
-            protocol: 0,
-        })
-        .is_none());
     }
 }

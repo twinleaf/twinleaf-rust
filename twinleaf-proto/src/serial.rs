@@ -495,8 +495,8 @@ mod tests {
     }
 }
 
-/// The byte-at-a-time codec the run-copying one replaced, kept as the model it
-/// must agree with.
+/// A model of the codec that works a byte at a time. The properties below
+/// compare the codec against it.
 #[cfg(test)]
 mod bytewise {
     use super::*;

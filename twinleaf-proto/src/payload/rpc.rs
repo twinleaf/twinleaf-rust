@@ -203,12 +203,35 @@ pub fn write_request(
     method: Method<'_>,
     args: &[u8],
 ) -> Option<usize> {
+    write_request_packet(buf, PacketType::RPC_REQ, id, method, args)
+}
+
+/// Writes a full `PROXY_TX` packet with no routing into `buf`, a control
+/// request to a proxy whose payload is a request payload. Returns its
+/// length, or `None` if it does not fit.
+pub fn write_proxy_request(
+    buf: &mut [u8],
+    id: RpcRequestId,
+    method: Method<'_>,
+    args: &[u8],
+) -> Option<usize> {
+    write_request_packet(buf, PacketType::PROXY_TX, id, method, args)
+}
+
+/// Writes a packet of type `ptype` whose payload is a request payload.
+fn write_request_packet(
+    buf: &mut [u8],
+    ptype: PacketType,
+    id: RpcRequestId,
+    method: Method<'_>,
+    args: &[u8],
+) -> Option<usize> {
     let payload_len = request_payload_len(method, args)?;
     let total = Header::SIZE + payload_len;
     if buf.len() < total || payload_len > Packet::MAX_PAYLOAD {
         return None;
     }
-    let hdr = Header::new(PacketType::RPC_REQ, payload_len as u16);
+    let hdr = Header::new(ptype, payload_len as u16);
     hdr.write(buf.first_chunk_mut()?);
     write_request_payload(&mut buf[Header::SIZE..total], id, method, args)?;
     Some(total)

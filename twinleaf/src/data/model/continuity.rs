@@ -100,7 +100,7 @@ pub struct Boundary {
 
 impl Boundary {
     /// Returns a boundary that names `change` and no loss.
-    pub(crate) fn of(change: Change) -> Boundary {
+    pub(in crate::data) fn of(change: Change) -> Boundary {
         Boundary {
             change: Some(change),
             loss: None,
@@ -265,8 +265,7 @@ impl Change {
     /// told of two at once learns what the parser tells of both at once. A
     /// restart ranks below a backward step in time, which it does not stand
     /// for, and above the rollover it stands for.
-    #[cfg(feature = "host")]
-    pub(crate) fn rank(&self) -> u8 {
+    pub(in crate::data) fn rank(&self) -> u8 {
         match self {
             Change::Initial => 7,
             Change::SessionChanged { .. } => 6,
@@ -301,8 +300,8 @@ pub struct Loss {
     pub expected: Option<SampleNumber>,
     /// The batches of this stream that this receiver's queue dropped, and 0
     /// when only the device or the link lost samples. For each stream, these
-    /// add up over its batches to that stream's share of the counts
-    /// [`RecvError::Lagged`](crate::RecvError::Lagged) reports.
+    /// add up over its batches to that stream's share of the counts a
+    /// receiver's `RecvError::Lagged` reports.
     pub dropped_batches: u64,
     /// The rows of `samples` that reached the receiver's connection and that
     /// it dropped. They are the rows of the batches its queue dropped, and
@@ -367,7 +366,7 @@ impl Lost {
 /// told since the stream's last rows. The later a place is listed, the
 /// more it explains, so the latest listed of those told is the one blamed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub(crate) enum LossSite {
+pub(in crate::data) enum LossSite {
     /// Nothing was told, so the device sent none or a live link lost them.
     #[default]
     Device,
@@ -382,7 +381,11 @@ pub(crate) enum LossSite {
 impl Loss {
     /// Returns the loss of `samples` rows before the row `expected`, lost
     /// at `site`.
-    pub(crate) fn at(site: LossSite, samples: u64, expected: Option<SampleNumber>) -> Loss {
+    pub(in crate::data) fn at(
+        site: LossSite,
+        samples: u64,
+        expected: Option<SampleNumber>,
+    ) -> Loss {
         let of = |blamed: LossSite| if site == blamed { samples } else { 0 };
         Loss {
             samples,

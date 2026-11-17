@@ -29,7 +29,7 @@ use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::proto::packet::{Packet, PacketView};
+use twinleaf::proto::packet::{Packet, PacketError, PacketView};
 use twinleaf::proto::DeviceRoute;
 
 // In raw mode, '\n' does not reliably return the cursor to column 0.
@@ -390,13 +390,13 @@ impl Simulator {
                     if !self.accept_packet_from(addr)? {
                         continue;
                     }
-                    match PacketView::parse_prefix(&buf[..size]) {
-                        Ok((_, len)) if len == size => {
+                    match PacketView::parse_exact(&buf[..size]) {
+                        Ok(_) => {
                             let mut sent = Queue::default();
                             self.tree.route_down(&mut buf, self.now_ns(), &mut sent);
                             self.send(sent)?;
                         }
-                        Ok(_) => {
+                        Err(PacketError::TrailingBytes) => {
                             terminal_eprintln!(
                                 "Ignoring UDP datagram with trailing bytes from {addr}"
                             );

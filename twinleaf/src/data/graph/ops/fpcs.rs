@@ -225,7 +225,7 @@ impl Fpcs {
 
     /// Consumes the next span of samples, their values already `f64`, as
     /// [`ColumnOp::update_batch`] does a column's.
-    pub(crate) fn update_f64(&mut self, timestamps: &[f64], values: &[f64]) {
+    pub(in crate::data) fn update_f64(&mut self, timestamps: &[f64], values: &[f64]) {
         for (&t, &v) in timestamps.iter().zip(values) {
             self.add_point(t, v);
         }

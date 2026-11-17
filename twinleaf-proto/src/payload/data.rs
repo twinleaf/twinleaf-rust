@@ -1223,13 +1223,10 @@ impl<'a> Samples<'a> {
     /// Parses a sample packet from its header and payload. Returns `None` if it
     /// is not a sample packet of streams 1 to 127 or the payload is truncated.
     pub fn parse(header: Header, payload: &'a [u8]) -> Option<Self> {
-        let stream_id = header.ptype.stream_id()?;
-        if stream_id < FIRST_STREAM_ID {
-            return None;
-        }
+        let stream_id = header.ptype.sample_stream()?;
         let (head, data) = payload.split_at_checked(SAMPLE_HEADER_SIZE)?;
         Some(Self {
-            stream_id: StreamId::try_new(stream_id)?,
+            stream_id,
             segment_id: SegmentId::new(head[3]),
             first: SampleNumber::new(u32::from_le_bytes([head[0], head[1], head[2], 0])),
             data,

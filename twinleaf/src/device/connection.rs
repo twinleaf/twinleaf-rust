@@ -1036,10 +1036,11 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::tests::fixtures::{announcement, broadcast, metadata_records, samples};
+    use crate::data::fixtures::metadata_records;
     use crate::device::tests::fixtures::{self, open_through};
     use crate::proto::rpc as wire_rpc;
     use crate::proxy::Proxy;
+    use crate::session::tests::packets::{announcement, broadcast, samples};
     use crate::session::tests::wait_for;
     use crate::session::TestProxy;
     use crate::tio::tests::device::FakeDevice;

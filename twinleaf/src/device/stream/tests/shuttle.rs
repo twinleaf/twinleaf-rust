@@ -3,13 +3,14 @@
 //! proxy and readers as shuttle threads and tasks.
 
 use crate::chan::lock;
-use crate::data::tests::fixtures::{broadcast, metadata_records, segment_record};
+use crate::data::fixtures::{metadata_records, segment_record};
 use crate::data::SampleBatch;
 use crate::device::stream::Stream;
 use crate::proto::data as wire;
 use crate::proto::{DeviceRoute, SegmentId, SessionId};
 use crate::rt::Supervisor;
 use crate::seam::shuttle::{check, replaying};
+use crate::session::tests::packets::broadcast;
 use crate::session::{decode, parts, Update, Watch, WATCH};
 use crate::session::{Handle, Session, TestProxy};
 use crate::session::{MetadataState, Presence, SettingChange};

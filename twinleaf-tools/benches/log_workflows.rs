@@ -113,8 +113,8 @@ fn discover_csv_target(input: &Path) -> eyre::Result<String> {
     let mut parser = PacketParser::new(false);
 
     for packet in input.packets() {
-        let packet = packet?;
-        parser.push_packet(&packet)?;
+        let (_, packet) = packet?;
+        parser.push_packet(packet)?;
         if let Some(batch) = parser.pop_batch() {
             let stream_id = batch.stream_key().stream_id;
             return Ok(if batch.route().is_empty() {
@@ -134,9 +134,9 @@ fn run_decode(input: &Path) -> eyre::Result<RunStats> {
     let mut stats = RunStats::default();
 
     for packet in input.packets() {
-        let packet = packet?;
+        let (_, packet) = packet?;
         stats.packets += 1;
-        parser.push_packet(&packet)?;
+        parser.push_packet(packet)?;
         while let Some(batch) = parser.pop_batch() {
             stats.batches += 1;
             stats.rows += batch.len() as u64;

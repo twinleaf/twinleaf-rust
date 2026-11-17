@@ -325,15 +325,15 @@ impl Update {
     /// does not fit a packet.
     pub(crate) fn metadata(state: &MetadataState) -> Option<Update> {
         let packets = match state {
-            MetadataState::Ready(snapshot) => snapshot.metadata_packets().ok()?,
+            MetadataState::Ready(snapshot) => {
+                snapshot.metadata_packets(DeviceRoute::root()).ok()?
+            }
             MetadataState::Pending => Vec::new(),
             MetadataState::Unsupported => return Some(Update::Metadata(None)),
         };
-        let root = DeviceRoute::root();
-        let records = packets
-            .iter()
-            .map(|packet| packet.with_route(root).as_bytes().to_vec());
-        Some(Update::Metadata(Some(records.map(ByteVec::from).collect())))
+        Some(Update::Metadata(Some(
+            packets.into_iter().map(ByteVec::from).collect(),
+        )))
     }
 
     /// Returns the update of an RPC table as loaded, or of why it did not
@@ -1221,5 +1221,60 @@ mod tests {
         let unknown = Update::Link("tcp://device".to_string(), Some(200));
         store.apply(route, unknown, &mut parser);
         assert_eq!(store.value(route, LINK).and_then(|link| link.lost), None);
+    }
+
+    /// The replies that carry `update` to watch 1, as their values.
+    fn parts_of(update: &Update) -> Vec<Vec<u8>> {
+        parts(1, update)
+            .iter()
+            .map(|packet| match packet.payload() {
+                Payload::ProxyRx(ProxyRx::Reply(reply)) => reply.value.to_vec(),
+                other => panic!("a part is a reply, not {other:?}"),
+            })
+            .collect()
+    }
+
+    fn watched() -> Joined {
+        Joined::default()
+    }
+
+    fn large_table(entries: usize) -> Update {
+        let entries = (0..entries).map(|index| (format!("test.entry{index}"), 0x8140));
+        Update::Table(Ok((Some(1), None, entries.collect())))
+    }
+
+    /// An update too large for one reply arrives in parts, and is whole once
+    /// its last part is in. An update that lost a part is dropped, and the
+    /// next one joins whole.
+    #[test]
+    fn a_watched_update_joins_from_its_parts_and_one_missing_a_part_is_dropped() {
+        let update = large_table(100);
+        let parts = parts_of(&update);
+        assert!(parts.len() > 2, "the table takes several replies");
+        let mut watched = watched();
+
+        let lost_one = parts.iter().enumerate().filter(|(index, _)| *index != 1);
+        let joined: Vec<_> = lost_one
+            .filter_map(|(_, part)| watched.join(part))
+            .collect();
+        assert!(joined.is_empty(), "an update that lost a part is dropped");
+        let joined: Vec<_> = parts.iter().filter_map(|part| watched.join(part)).collect();
+        assert_eq!(joined.len(), 1, "only the last part completes the update");
+        assert_eq!(joined[0], update);
+    }
+
+    /// An update starts at its first part. The tail of a later one whose
+    /// first parts were lost is never spliced onto the one before.
+    #[test]
+    fn the_tail_of_an_update_is_never_joined_without_its_head() {
+        let (first, second) = (large_table(100), large_table(101));
+        let (first, second) = (parts_of(&first), parts_of(&second));
+        let mut watched = watched();
+        let joined: Vec<_> = first.iter().filter_map(|part| watched.join(part)).collect();
+        assert_eq!(joined.len(), 1);
+
+        let tail = second.iter().skip(1);
+        let spliced: Vec<_> = tail.filter_map(|part| watched.join(part)).collect();
+        assert!(spliced.is_empty(), "a tail was joined without its head");
     }
 }

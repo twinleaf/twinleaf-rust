@@ -465,7 +465,7 @@ fault, and drops them if that stops holding.
   1 s and `d`, also while its open waits for an unreachable device.
   Source the hung up item of the section When the proxy lets a client go
   in the module doc of `proxy`, with the promptness taken from the doc of
-  the test `a_client_that_hangs_up_mid_wait_is_let_go` in `proxy/mod.rs`,
+  the test `a_client_that_hangs_up_mid_wait_is_let_go` in `proxy/tests/real.rs`,
   open question 4.
 - (d) Once no app has held the device open for 5 s, on an untainted and
   usable device link, the device logs the end of the proxy's connection
@@ -895,29 +895,29 @@ is heard in its new session and its new table is loaded. Generated cases
 reach this too seldom to hold the engine to the heartbeat's session, and
 this example does, through L1.
 
-One fixed example holds a regression of the proxy, and is ignored until
-the proxy is fixed. With `reconnect_timeout` of 10 s and three apps, a
-device killed for 20 s, the kill placed 860 to 960 ms into the chaos.
-Every app hears `FailedToReconnect` 10 s to 10.6 s after the kill and the
-laws hold. An app whose request reaches a port the worker has closed,
-before the engine hears the worker gave up, has its connection closed
-with `ForwardFailed` in `proxy/client.rs`, without the status, and opens
-again and again.
+One fixed example lands a device given up against every app's calls.
+With `reconnect_timeout` of 10 s and three apps, a device killed for
+20 s, the kill placed 860 to 960 ms into the chaos, one case for each
+millisecond. Every app hears `FailedToReconnect` 10 s to 10.6 s after the
+kill, and every law not in `OPEN` holds. An app whose request reaches a
+port the worker has closed, before the engine hears the worker gave up,
+keeps its connection, as `proxy/client.rs` drops the packet, and hears
+the status.
 
 The suite covers two real socket tests, which stay beside it.
 - The test `a_client_that_hangs_up_mid_wait_is_let_go` in
-  `proxy/mod.rs`, by L6 (c) and class C10. Its probe half is covered only
+  `proxy/tests/real.rs`, by L6 (c) and class C10. Its probe half is covered only
   if an app also probes.
 - The test `a_slow_reply_within_the_calls_timeout_arrives` in
   `device/connection.rs`, by L9 and S6 under `SlowLink`.
 
 The suite does not reach the tests of threads, panics, ports and
-loopback in `proxy/mod.rs`, the task leak test
+loopback in `proxy/tests/real.rs`, the task leak test
 `a_dropped_connection_and_proxy_leave_no_task` and the handles a close
 ends in `a_close_ends_every_handle_on_the_connection`, both in
 `device/connection.rs`, and the proxy behind a proxy in
 `a_device_lost_behind_a_mounted_proxy_is_a_status_at_its_mount` in
-`proxy/mod.rs` and `clients_of_a_proxy_behind_a_proxy_share_its_state`
+`proxy/tests/real.rs` and `clients_of_a_proxy_behind_a_proxy_share_its_state`
 in `device/connection.rs`.
 
 # Running

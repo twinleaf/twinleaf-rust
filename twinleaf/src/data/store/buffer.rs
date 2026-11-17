@@ -48,8 +48,7 @@ use std::time::Instant;
 ///
 /// # Examples
 ///
-/// Batches usually come from
-/// [`Device::samples`](crate::device::Device::samples). This example replays a
+/// Batches usually come from a `Device`'s `samples`. This example replays a
 /// recorded log of three samples into a buffer that keeps two.
 ///
 /// ```
@@ -57,10 +56,9 @@ use std::time::Instant;
 /// # use std::io::Write;
 /// # use twinleaf::proto::data::{self as wire, DataType};
 /// # use twinleaf::proto::sync::Epoch;
-/// # use twinleaf::tio::Packet;
-/// # use twinleaf::{ColumnId, DeviceRoute, SegmentId, SessionId, StreamId};
+/// # use twinleaf::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # let (id, route) = (StreamId::new(1), DeviceRoute::root());
+/// # let (id, mut buf) = (StreamId::new(1), [0u8; 512]);
 /// # let mut file = tempfile::NamedTempFile::new()?;
 /// # for record in [
 /// #     wire::Metadata::Device(wire::Device { session: SessionId::new(1), n_streams: 1, name: "sensor", serial: "S1", firmware: "1", protocol: 0 }),
@@ -68,10 +66,13 @@ use std::time::Instant;
 /// #     wire::Metadata::Segment(wire::Segment { stream_id: id, segment_id: SegmentId::new(0), flags: wire::SegmentFlags::default(), epoch: Epoch::UNIX, timeref_serial: "", timeref_session: SessionId::new(1), start_time: 0, sampling_rate: 10, decimation: 1, filter_cutoff: 0.0, filter_type: wire::FilterType::NONE }),
 /// #     wire::Metadata::Column(wire::Column { stream_id: id, index: ColumnId::new(0), data_type: DataType::F32, name: "x", units: "nT", description: "" }),
 /// # ] {
-/// #     file.write_all(Packet::metadata(record, wire::MetadataFlags::UPDATE, route)?.as_bytes())?;
+/// #     let len = record.write(wire::MetadataFlags::UPDATE, &mut buf).ok_or("a record fits")?;
+/// #     file.write_all(&buf[..len])?;
 /// # }
 /// # let data: Vec<u8> = [1.0f32, 2.0, 3.0].iter().flat_map(|x| x.to_le_bytes()).collect();
-/// # file.write_all(Packet::samples(1, 0, 0, &data, route)?.as_bytes())?;
+/// # let samples = wire::Samples { stream_id: id, segment_id: SegmentId::new(0), first: SampleNumber::new(0), data: &data };
+/// # let len = samples.write(&mut buf).ok_or("the samples fit")?;
+/// # file.write_all(&buf[..len])?;
 /// # let path = file.path();
 /// let mut buffer = Buffer::new(2);
 /// for batch in LogFile::open(path)?.scan(false).batches(4096) {
@@ -832,11 +833,11 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::fixtures;
     use crate::data::graph::pipeline::{ColumnOp, ColumnProcessor, Continuity};
     use crate::data::model::continuity::{BoundaryClass, Change, Loss};
     use crate::data::model::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
     use crate::data::model::schema::{ColumnKey, DeviceRecord, SegmentRecord};
-    use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::ColumnId;
