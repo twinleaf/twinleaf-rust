@@ -250,7 +250,7 @@ sample numbers the app receives strictly increase across all its
 connections, and step by one within a batch. The checker compares the
 numbers themselves, since a repeat of the last sample makes no boundary
 at all (the gap and step back checks of `StreamTracker::detect_boundary`
-in `data/decode/state.rs` see neither a gap nor a step back).
+in `twinleaf-data/src/decode/state.rs` see neither a gap nor a step back).
 - Safety invariant, checked at every batch.
 - Source the module doc of `proxy`, where a client that falls behind
   loses samples and nothing else, and its section How a packet reaches a
@@ -266,9 +266,9 @@ last, the second has no boundary at all. When it is not, the boundary's
 change is none and its `Loss` counts exactly the missing numbers. The fake
 device sends one segment, so no rollover or other change is due.
 - Safety postcondition, checked at every batch.
-- Source the doc of `Boundary` in `data/model/continuity.rs` (no boundary when
-  nothing changed or was lost), the doc of `Loss::samples`, and the
-  section How a packet reaches a client in the module doc of `proxy`,
+- Source the doc of `Boundary` in `twinleaf-data/src/model/continuity.rs`
+  (no boundary when nothing changed or was lost), the doc of `Loss::samples`,
+  and the section How a packet reaches a client in the module doc of `proxy`,
   where each place a sample can be lost counts what it lost.
 - It rules out a count off by one, a phantom loss, a boundary with nothing
   behind it, and a gap after a link loss told as `Restarted`, which counts

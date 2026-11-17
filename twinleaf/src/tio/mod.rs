@@ -25,11 +25,9 @@
 #[cfg(feature = "mdns")]
 pub(crate) mod mdns;
 pub mod packet;
-#[cfg(feature = "host")]
 pub(crate) mod rpc;
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 pub(crate) mod tests;
-#[cfg(feature = "host")]
 pub(crate) mod transport;
 
 pub use packet::Packet;

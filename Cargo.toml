@@ -2,6 +2,7 @@
 
 members = [
     "twinleaf",
+    "twinleaf-data",
     "twinleaf-device",
     "twinleaf-proto",
     "twinleaf-tools",

@@ -17,7 +17,10 @@ wire types and codecs.
 - Call [typed or dynamic RPCs], subscribe to [`SampleBatch`]es or raw
   [`Packet`]s, and follow each device's presence, metadata, RPC table and
   settings.
-- Buffer and process live data or read recorded `tio` logs with the [data module].
+- Buffer and process live data or read recorded `tio` logs with the [data module],
+  which is the crate [`twinleaf-data`](https://docs.rs/twinleaf-data) re-exported.
+  It depends on `twinleaf-proto` alone and builds for `wasm32-unknown-unknown`,
+  where a log is read with `LogFile::from_bytes`.
 - Query and update device firmware through the [firmware module].
 
 ## API model
@@ -58,11 +61,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Cargo features
 
-- `host` (default): connections, the proxy, firmware, and memory-mapped log
-  files, everything that runs tasks or reaches the operating system. Without
-  it the crate is the packet codec and the `data` layer, which build for
-  `wasm32-unknown-unknown`; a log is then read with `LogFile::from_bytes`.
-  `serial`, `firmware-update`, `mdns` and `json` turn it on.
+`twinleaf` is the host library. The crate `twinleaf-data`, re-exported as
+`twinleaf::data`, is the part that also builds for `wasm32-unknown-unknown`.
+
 - `serial` (default): serial connections and serial-device discovery.
 - `firmware-update` (default): the [GitHub-backed firmware catalog]. Firmware
   queries and flashing are always available without this feature.

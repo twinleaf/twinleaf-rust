@@ -11,8 +11,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The source folders the rules read, from the workspace root.
-const ROOTS: [&str; 6] = [
+const ROOTS: [&str; 7] = [
     "twinleaf/src",
+    "twinleaf-data/src",
     "twinleaf-tools/src",
     "twinleaf-tools/benches",
     "twinleaf-web/src",
@@ -70,12 +71,12 @@ const RULES: &[Rule] = &[
     // The text for a recorded file that does not decode.
     Rule {
         patterns: &["could not decode packet at byte offset"],
-        allowed: &["twinleaf/src/data/logfile/reader.rs"],
+        allowed: &["twinleaf-data/src/logfile/reader.rs"],
     },
     // The text for a recorded packet the data state refuses.
     Rule {
         patterns: &["invalid data at byte offset"],
-        allowed: &["twinleaf/src/data/logfile/reader.rs"],
+        allowed: &["twinleaf-data/src/logfile/reader.rs"],
     },
     // A capture selector as a bare argument value, which `capture::Selector`
     // owns.
@@ -98,6 +99,13 @@ const RULES: &[Rule] = &[
     Rule {
         patterns: &["_ENVELOPE: usize = 32"],
         allowed: &["twinleaf-proto/"],
+    },
+    // A host feature, which no crate has. The host library is `twinleaf`
+    // whole, and `twinleaf-data` is the part that builds without an
+    // operating system.
+    Rule {
+        patterns: &["feature = \"host\""],
+        allowed: &[],
     },
 ];
 
@@ -228,4 +236,112 @@ fn the_scanner_reports_a_pattern_outside_its_home_only() {
     let findings = violations(&rules, &sources);
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert!(findings[0].starts_with("away/b.rs:2: "), "{}", findings[0]);
+}
+
+/// The crates the data layer may not depend on. It reads packets through the
+/// protocol crate and knows nothing of devices, transports or tasks.
+const DATA_FORBIDDEN_DEPENDENCIES: [&str; 4] = ["twinleaf", "twinleaf-device", "tokio", "flume"];
+
+#[test]
+fn the_data_crate_depends_on_the_protocol_crate_alone() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest.join("../twinleaf-data/Cargo.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    let named: Vec<String> = dependency_names(&text)
+        .into_iter()
+        .filter(|name| DATA_FORBIDDEN_DEPENDENCIES.contains(&name.as_str()))
+        .collect();
+    assert!(
+        named.is_empty(),
+        "twinleaf-data/Cargo.toml depends on {named:?}"
+    );
+}
+
+/// Returns the package names that the dependency tables of a manifest name,
+/// in every section whose name ends in `dependencies`, and every package a
+/// dependency renames with `package`. Underscores read as hyphens.
+fn dependency_names(manifest: &str) -> Vec<String> {
+    let unquote = |text: &str| {
+        text.trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .replace('_', "-")
+    };
+    // A dependency table reads each key as a dependency. The table of one
+    // dependency, `[dependencies.name]`, holds its fields as keys.
+    let mut in_table = false;
+    let mut in_single = false;
+    let mut names = Vec::new();
+    for line in manifest.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(header) = line.strip_prefix('[') {
+            let header = header.trim_start_matches('[').trim_end_matches(']').trim();
+            in_table = header.ends_with("dependencies");
+            in_single = false;
+            if let Some((table, name)) = header.rsplit_once('.') {
+                if table.ends_with("dependencies") {
+                    in_single = true;
+                    names.push(unquote(name));
+                }
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if in_single && key == "package" {
+            names.push(unquote(value));
+        }
+        if !in_table {
+            continue;
+        }
+        names.push(unquote(key.split('.').next().unwrap_or(key)));
+        if let Some((_, renamed)) = value.split_once("package") {
+            if let Some((_, package)) = renamed.split_once('=') {
+                let package = package.split([',', '}']).next().unwrap_or("");
+                names.push(unquote(package));
+            }
+        }
+    }
+    names
+}
+
+#[test]
+fn the_manifest_reader_finds_each_way_of_naming_a_dependency() {
+    let manifest = r#"
+[package]
+name = "tokio"
+
+[dependencies]
+bytes = "1"
+twinleaf-proto = { path = "../twinleaf-proto" }
+other = { version = "1", package = "flume" }
+
+[dependencies.twinleaf_device]
+path = "../twinleaf-device"
+
+[dependencies.renamed]
+version = "1"
+package = "tokio"
+
+[target.'cfg(unix)'.dev-dependencies]
+twinleaf.workspace = true
+
+[features]
+host = ["dep:memmap2"]
+"#;
+    assert_eq!(
+        dependency_names(manifest),
+        [
+            "bytes",
+            "twinleaf-proto",
+            "other",
+            "flume",
+            "twinleaf-device",
+            "renamed",
+            "tokio",
+            "twinleaf",
+        ]
+    );
 }

@@ -4442,20 +4442,16 @@ dependencies = [
  "directories",
  "flume",
  "futures-util",
- "glob",
- "hdf5-pure",
  "if-addrs",
  "libc",
  "log",
  "mdns-sd",
- "memmap2",
  "minicbor",
  "objc2",
  "objc2-foundation",
  "proc-macro2",
  "proptest",
  "proptest-state-machine",
- "rustfft",
  "serde_json",
  "serialport",
  "shuttle",
@@ -4470,10 +4466,27 @@ dependencies = [
  "tokio-util",
  "tracing",
  "turmoil",
+ "twinleaf-data",
  "twinleaf-device",
  "twinleaf-proto",
  "ureq",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "twinleaf-data"
+version = "2.0.0"
+dependencies = [
+ "bytes",
+ "glob",
+ "hdf5-pure",
+ "log",
+ "memmap2",
+ "proptest",
+ "rustfft",
+ "tempfile",
+ "thiserror 2.0.20",
+ "twinleaf-proto",
 ]
 
 [[package]]
