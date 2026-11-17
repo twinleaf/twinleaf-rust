@@ -1,0 +1,104 @@
+error[E0204]: `smooth` is used before it is defined
+ --> functions.tsl:5:17
+  |
+5 | let early = a | smooth()
+  |                 ^^^^^^ used here
+ ...
+7 | fn smooth(s) = s | lowpass(10 Hz)
+  |    ------ defined here
+  |
+  = help: move the definition above its first use
+
+error[E0402]: `scale` needs `k`
+  --> functions.tsl:11:10
+   |
+11 | let f1 = scale(a)
+   |          ^^^^^^^^ not given
+   |
+   = help: it is written `scale(s, k)`
+
+error[E0402]: `scale` takes no more
+  --> functions.tsl:12:26
+   |
+12 | let f2 = a | scale(gain, 3)
+   |                          ^ one too many
+   |
+   = help: it is written `scale(s, k)`
+
+error[E0402]: `scale` is given nothing called `factor`
+  --> functions.tsl:13:19
+   |
+13 | let f3 = scale(a, factor = 2)
+   |                   ^^^^^^ not one of its names
+   |
+   = help: it is written `scale(s, k)`
+
+error[E0402]: `s` is given twice
+  --> functions.tsl:14:23
+   |
+14 | let f4 = a | scale(2, s = a)
+   |                       ^ given again here
+   |
+   = help: it is written `scale(s, k)`
+
+error[E0201]: there is already a function `lowpass`
+  --> functions.tsl:17:4
+   |
+17 | fn lowpass(s) = s
+   |    ^^^^^^^ this name is taken
+   |
+   = help: it is written `lowpass(f, order = 4, phase = causal)`
+
+error[E0201]: `early` is defined twice
+  --> functions.tsl:18:4
+   |
+ 5 | let early = a | smooth()
+   |     ----- first defined here
+  ...
+18 | fn early(s) = s
+   |    ^^^^^ defined again here
+   |
+   = note: sources, params, lets, outs and functions share one set of names
+
+error[E0201]: `pair` is given two things called `s`
+  --> functions.tsl:19:12
+   |
+19 | fn pair(s, s) = s
+   |         - first named here
+   |            ^ named again here
+
+error[E0403]: `lo` of `bandpass` must be below `hi`
+  --> functions.tsl:22:20
+   |
+22 | fn narrow(s) = s | bandpass(40 Hz, 10 Hz)
+   |                    ^^^^^^^^^^^^^^^^^^^^^^ 40 Hz is not below 10 Hz
+23 | let f5 = a | narrow()
+   |              ------ in this call of `narrow`
+
+error[E0204]: `after` is used before it is defined
+  --> functions.tsl:26:19
+   |
+26 | fn later(s) = s * after
+   |                   ^^^^^ used here
+27 | param after = 3
+   |       ----- defined here
+28 | let f6 = a | later()
+   |              ----- in this call of `later`
+   |
+   = help: move the definition above its first use
+
+error[E0204]: `again` is used in its own definition
+  --> functions.tsl:31:19
+   |
+31 | fn again(s) = s | again()
+   |                   ^^^^^ used here
+32 | let f7 = a | again()
+   |              ----- in this call of `again`
+   |
+   = note: a graph has no feedback paths
+
+warning[W0001]: `spare` is never used
+  --> functions.tsl:33:4
+   |
+33 | fn spare(s) = s
+   |    ^^^^^ nothing calls this function

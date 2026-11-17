@@ -1,0 +1,6 @@
+source a = /0/field @rate(500) @channels(x, y, z) @unit(nT)
+source b = /1/field @rate(500) @channels(x, y, z) @unit(nT)
+let fr = align(a, b)
+out gradient = fr.a - fr.c
+out w = a.w
+out col = /0/field/q

@@ -1,0 +1,5 @@
+source a = /0/field @rate(500) @channels(x, y, z) @unit(nT)
+source b = /1/field @rate(500) @channels(x, y, z) @unit(nT)
+param spare = 3
+let filtered = a | lowpass(10)
+out y = a | highpass(1)

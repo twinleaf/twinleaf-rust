@@ -1,0 +1,11 @@
+error[E0001]: unknown character `$`
+ --> unknown_character.tsl:2:11
+  |
+2 | out y = a $ | lowpass(10) ¤¤
+  |           ^
+
+error[E0001]: unknown characters `¤¤`
+ --> unknown_character.tsl:2:27
+  |
+2 | out y = a $ | lowpass(10) ¤¤
+  |                           ^^

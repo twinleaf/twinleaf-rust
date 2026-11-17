@@ -1,0 +1,33 @@
+error[E0412]: cannot align signals in different rate domains
+ --> align_rates.tsl:6:19
+  |
+6 | let fr = align(a, b)
+  |                - 1 kHz (from /0/field)
+  |                   ^ 500 Hz (from /1/field)
+  |
+  = note: alignment never resamples on its own — interpolating without
+          being asked would change your numbers invisibly.
+  = help: match the rate first, ahead of any filtering:
+            let fr = align(a | decimate(2), b)
+  = note: decimating after the filters would compile, but the arms would
+          carry different coefficients and mismatched phase.
+
+error[E0412]: cannot align signals in different rate domains
+  --> align_rates.tsl:9:5
+   |
+ 8 |     slow = b | lowpass(10),
+   |            --------------- 500 Hz (from /1/field)
+ 9 |     a,
+   |     ^ 1 kHz (from /0/field)
+10 |     c)
+   |     - 44.1 kHz (from /2/field)
+   |
+   = note: alignment never resamples on its own — interpolating without
+           being asked would change your numbers invisibly.
+   = help: match the rate first, ahead of any filtering:
+             let three = align(
+                 slow = b | lowpass(10),
+                 a | decimate(2),
+                 c | resample(500))
+   = note: decimating after the filters would compile, but the arms would
+           carry different coefficients and mismatched phase.

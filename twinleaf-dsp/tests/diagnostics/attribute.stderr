@@ -1,0 +1,46 @@
+error[E0302]: unknown attribute `@gain`
+ --> attribute.tsl:1:53
+  |
+1 | source a = /0/field @rate(1000) @channels(x, y, z) @gain(2)
+  |                                                     ^^^^
+  |
+  = help: a source takes `@rate`, `@channels`, `@unit` and `@pos`
+
+error[E0302]: `@rate` is written `@rate(1000)`
+ --> attribute.tsl:2:21
+  |
+2 | source b = /1/field @rate(fast) @channels(x)
+  |                     ^^^^^^^^^^^
+
+error[E0302]: `@channels` does not apply to a single column
+ --> attribute.tsl:3:35
+  |
+3 | source c = /2/field/x @rate(1000) @channels(x)
+  |            ---------- this path names one column
+  |                                   ^^^^^^^^^^^^
+
+error[E0302]: channel `x` appears twice, and channels are matched by name
+ --> attribute.tsl:4:33
+  |
+4 | source d = /3/field @rate(1000) @channels(x, y, x)
+  |                                 ^^^^^^^^^^^^^^^^^^
+
+warning[W0001]: `e` is never used
+ --> attribute.tsl:5:8
+  |
+5 | source e = /4/field/x @rate(1000)
+  |        ^ nothing refers to this source
+
+error[E0302]: `/4/field` is given two rates
+ --> attribute.tsl:6:12
+  |
+5 | source e = /4/field/x @rate(1000)
+  |            ---------- 1 kHz here
+6 | source f = /4/field/y @rate(500)
+  |            ^^^^^^^^^^ 500 Hz here
+
+error[E0302]: `@rate` is written `@rate(1000)`
+ --> attribute.tsl:7:21
+  |
+7 | source g = /5/field @rate(10s) @channels(x)
+  |                     ^^^^^^^^^^ cannot convert s to Hz

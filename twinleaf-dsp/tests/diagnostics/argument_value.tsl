@@ -1,0 +1,12 @@
+source a = /0/field @rate(1000) @channels(x, y, z) @unit(nT)
+param n = 2
+param zero : Hz = 0
+param f : Hz = 50 [-10 .. 100]
+let v1 = a | decimate(1.5)
+let v2 = a | decimate(n)
+let v3 = a | detrend(cubic)
+let v4 = a | notch(zero)
+let v5 = a | lowpass(f)
+let v6 = a | bandpass(40, 10)
+let v7 = a | resample(f)
+let v8 = a | rms(-1s)

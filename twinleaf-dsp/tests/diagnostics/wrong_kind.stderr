@@ -1,0 +1,32 @@
+error[E0401]: `number` is a number, and an output is a signal
+ --> wrong_kind.tsl:3:14
+  |
+3 | out number = k * 3
+  |              ^^^^^ a number
+  |
+  = note: an output is published as a stream of samples
+
+error[E0401]: a number has no channels to select
+ --> wrong_kind.tsl:4:14
+  |
+4 | let picked = k.x
+  |              ^ a number
+  |                - selects a channel
+
+error[E0401]: `f` of `notch` takes a number, and this is a signal
+ --> wrong_kind.tsl:5:26
+  |
+5 | let filtered = a | notch(a)
+  |                          ^ a signal
+
+error[E0401]: `align` takes signals, and this is a number
+ --> wrong_kind.tsl:6:23
+  |
+6 | let joined = align(a, k)
+  |                       ^ a number
+
+error[E0401]: `ref` of `decorrelate` takes a signal, and this is a number
+ --> wrong_kind.tsl:7:36
+  |
+7 | let cleaned = decorrelate(a, ref = 4, window = 10s)
+  |                                    ^ a number

@@ -1,0 +1,34 @@
+error[E0403]: `window` of `psd` is a duration written out, such as `2 s` or `500ms`
+ --> spectrum.tsl:5:18
+  |
+5 | out s1 = a | psd(long)
+  |                  ^^^^
+  |
+  = note: it fixes the shape of the graph, so it cannot be a param or be computed
+
+error[E0403]: `window` of `psd` is too short for a spectrum
+ --> spectrum.tsl:6:14
+  |
+6 | out s2 = a | psd(20 ms)
+  |              ^^^^^^^^^^ 20 samples at 1 kHz
+  |
+  = help: a spectrum takes at least 60 samples
+
+error[E0413]: `lowpass` works on a signal in time, and this is a spectrum
+  --> spectrum.tsl:11:10
+   |
+11 | out s3 = spectrum | lowpass(10 Hz)
+   |          ^^^^^^^^ the spectrum of /0/field
+   |
+   = help: apply it before `psd`
+
+error[E0413]: cannot subtract signals in different rate domains
+  --> spectrum.tsl:12:21
+   |
+12 | out s4 = spectrum - a
+   |          -------- 255 bins of 1.953125 Hz (from the spectrum of /0/field)
+   |                     ^ 1 kHz (from /0/field)
+   |
+   = note: signals in different domains share no sample instants, even at
+           the same rate
+   = help: bring them into one domain first, with `align(…)`

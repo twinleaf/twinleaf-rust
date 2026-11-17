@@ -1,0 +1,27 @@
+warning[W0001]: `clean` is never used
+ --> unknown_name.tsl:2:5
+  |
+2 | let clean = a | lowpass(10)
+  |     ^^^^^ nothing refers to this let
+
+error[E0202]: cannot find `claen`
+ --> unknown_name.tsl:3:9
+  |
+3 | out y = claen.x
+  |         ^^^^^ not a source, param, let or out
+  |
+  = help: did you mean `clean`?
+
+error[E0202]: cannot find `b`
+ --> unknown_name.tsl:4:9
+  |
+4 | out z = b
+  |         ^ not a source, param, let or out
+
+error[E0202]: cannot find `notch`
+ --> unknown_name.tsl:5:13
+  |
+5 | out w = a - notch
+  |             ^^^^^ not a source, param, let or out
+  |
+  = help: `notch` is a function, written `notch(f, q = 30, harmonics = 1, phase = causal)`

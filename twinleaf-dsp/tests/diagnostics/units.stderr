@@ -1,0 +1,83 @@
+error[E0430]: `volts` is declared in V, and its value is in nT
+ --> units.tsl:6:13
+  |
+6 | out volts : V = a | lowpass(10)
+  |             ^ declared here
+  |                 --------------- `x` is in nT
+
+error[E0430]: `micro` is declared in µT, and its value is in nT
+ --> units.tsl:7:13
+  |
+7 | out micro : µT = a | lowpass(10)
+  |             ^^ declared here
+  |                  --------------- `x` is in nT
+  |
+  = help: convert it: `… in µT`
+
+error[E0430]: `-` combines `x` in nT with `x` in V
+ --> units.tsl:8:13
+  |
+8 | out mixed = fr.a - fr.v
+  |             ^^^^^^^^^^^
+  |             ---- in nT
+  |                    ---- in V
+
+error[E0430]: `magnitude` combines channels that share a unit
+ --> units.tsl:9:12
+  |
+9 | out norm = fr | magnitude()
+  |            ^^ `a.x` is in nT, and `v.x` is in V
+
+error[E0430]: `f` of `notch` is a frequency: cannot convert s to Hz
+  --> units.tsl:10:23
+   |
+10 | let timed = a | notch(window)
+   |                       ^^^^^^ in s
+   |
+   = help: write `60`, `60Hz` or `1.5kHz`
+
+error[E0430]: `+` combines Hz with s
+  --> units.tsl:11:16
+   |
+11 | let sum = a * (line + window)
+   |                ^^^^^^^^^^^^^
+   |                ---- in Hz
+   |                       ------ in s
+
+error[E0430]: `q` of `notch` is a plain number: cannot convert Hz to a plain number
+  --> units.tsl:12:35
+   |
+12 | let quality = a | notch(line, q = 30Hz)
+   |                                   ^^^^ in Hz
+   |
+   = help: write a number without a unit
+
+error[E0430]: `window` of `rms` is a duration: cannot convert Hz to s
+  --> units.tsl:13:20
+   |
+13 | let long = a | rms(line)
+   |                    ^^^^ in Hz
+   |
+   = help: write `10s` or `250ms`
+
+error[E0430]: cannot convert nT to V
+  --> units.tsl:14:18
+   |
+14 | out wrong = a in V
+   |             - `x` is in nT
+   |                  ^ asked for in V
+
+error[E0430]: cannot convert V to nT
+  --> units.tsl:15:18
+   |
+15 | out both = fr in nT
+   |            -- `v.x` is in V
+   |                  ^^ asked for in nT
+
+error[E0430]: `2x` does not read as a unit
+  --> units.tsl:16:11
+   |
+16 | out odd : 2x = a
+   |           ^^
+   |
+   = help: a unit is written like `nT`, `nT/V` or `m/s^2`

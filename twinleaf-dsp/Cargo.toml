@@ -1,0 +1,44 @@
+[package]
+name = "twinleaf-dsp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Signal graphs for Twinleaf sensors: a DSP flow graph written as text and served as a TIO device."
+homepage = "https://twinleaf.com"
+repository = "https://github.com/twinleaf/twinleaf-rust"
+readme = "README.md"
+keywords = ["twinleaf", "sensor", "dsp", "filter", "tio"]
+categories = ["science", "hardware-support"]
+
+[lints.clippy]
+self_named_module_files = "deny"
+
+[features]
+default = ["serial", "cli"]
+# Sensors on serial ports, for `serve`.
+serial = ["twinleaf/serial"]
+# The command line that `tio dsp` and a private build's binary both run.
+cli = ["dep:clap"]
+# Lets an editor take a spec's outline as JSON.
+serde = ["dep:serde"]
+# Compiles a spec's figure to PDF or SVG in this process, with no Typst
+# installed. It is a large dependency, and only `graph --pdf` and `--svg`
+# use it. Without it they run the `typst` on the PATH.
+typst = ["dep:typst", "dep:typst-layout", "dep:typst-pdf", "dep:typst-svg", "dep:typst-kit"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"], optional = true }
+num-complex = "0.4"
+rayon = "1"
+twinleaf = { version = "2.0", path = "../twinleaf", default-features = false, features = ["processing"] }
+# Already part of `twinleaf`. Named here for the reply to a metadata request,
+# which a device and this crate must build alike.
+twinleaf-device = { version = "0.1", path = "../twinleaf-device" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+typst = { version = "0.15", optional = true }
+typst-layout = { version = "0.15", optional = true }
+typst-pdf = { version = "0.15", optional = true }
+typst-svg = { version = "0.15", optional = true }
+typst-kit = { version = "0.15", optional = true, features = ["embedded-fonts", "system-packages", "system-downloader"] }

@@ -16,9 +16,13 @@ self_named_module_files = "deny"
 
 [features]
 default = ["serial", "mdns", "hdf5"]
-serial = ["dep:serialport", "twinleaf/serial"]
+serial = ["dep:serialport", "twinleaf/serial", "twinleaf-dsp/serial"]
 mdns = ["twinleaf/mdns", "dep:gethostname", "dep:mdns-sd"]
 hdf5 = ["twinleaf/hdf5"]
+# Lets `tio dsp graph --pdf` and `--svg` compile a figure with no Typst
+# installed. It is a large dependency, so it is off by default, and they run
+# the `typst` on the PATH.
+typst = ["twinleaf-dsp/typst"]
 
 [[bench]]
 name = "log_workflows"
@@ -32,6 +36,7 @@ serialport = { version = "4.5", optional = true }
 toml_edit = {version = "0.25", features = ["parse"]}
 twinleaf = { version = "2.0.1", path = "../twinleaf", default-features = false, features = ["firmware-update", "processing"] }
 twinleaf-device = { version = "0.1", path = "../twinleaf-device", features = ["sim"] }
+twinleaf-dsp = { version = "0.1", path = "../twinleaf-dsp", default-features = false, features = ["cli"] }
 clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30"
 tui-prompts = "0.6"

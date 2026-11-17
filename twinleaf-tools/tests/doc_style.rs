@@ -1,10 +1,10 @@
 //! Checks the prose of doc comments in the workspace crates.
 //!
 //! The test reads every `///` and `//!` line of the `twinleaf`,
-//! `twinleaf-proto` and `twinleaf-tools` sources. It fails on a semicolon, a
-//! colon, an em or en dash, or a spaced hyphen in prose, the docs of tests
-//! included. Code blocks, headings, code spans, link targets and URLs are not
-//! prose.
+//! `twinleaf-proto`, `twinleaf-dsp` and `twinleaf-tools` sources. It fails on
+//! a semicolon, a colon, an em or en dash, or a spaced hyphen in prose, the
+//! docs of tests included. Code blocks, headings, code spans, link targets
+//! and URLs are not prose.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,12 @@ fn doc_prose_has_no_semicolons_colons_or_dashes() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest.parent().unwrap_or(manifest);
     let mut files = Vec::new();
-    for root in ["../twinleaf/src", "../twinleaf-proto/src", "src"] {
+    for root in [
+        "../twinleaf/src",
+        "../twinleaf-proto/src",
+        "../twinleaf-dsp/src",
+        "src",
+    ] {
         if let Ok(root) = manifest.join(root).canonicalize() {
             collect_sources(&root, &mut files);
         }

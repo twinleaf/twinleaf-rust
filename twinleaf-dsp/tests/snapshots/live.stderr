@@ -1,0 +1,17 @@
+error[E0502]: `lowpass` with `phase = zero` needs a whole run, and a live graph never has one
+ --> dsp.spec:3:16
+  |
+3 | out low : nT = a | lowpass(40 Hz, phase = zero)
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot run live
+  |
+  = note: it works over a recording: `tio dsp run --log`
+  = help: here, use the filter without it, running forwards only
+
+error[E0502]: `detrend` needs a whole run, and a live graph never has one
+ --> dsp.spec:6:18
+  |
+6 | out level : nT = a | detrend(mean)
+  |                  ^^^^^^^^^^^^^^^^^ cannot run live
+  |
+  = note: it works over a recording: `tio dsp run --log`
+  = help: to take a drift out as it arrives, use `highpass`

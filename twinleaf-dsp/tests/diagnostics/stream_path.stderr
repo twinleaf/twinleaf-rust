@@ -1,0 +1,34 @@
+error[E0003]: `/0` names a device, not one of its streams
+ --> stream_path.tsl:1:17
+  |
+1 | source device = /0 @rate(1000) @channels(x)
+  |                 ^^
+  |
+  = help: a stream path is `/route/stream` or `/route/stream/column`,
+          such as `/0/field` or `/0/field/x`
+
+error[E0003]: `/0/field/x/y` has parts after its column
+ --> stream_path.tsl:2:15
+  |
+2 | source deep = /0/field/x/y @rate(1000)
+  |               ^^^^^^^^^^^^
+  |
+  = help: a stream path is `/route/stream` or `/route/stream/column`,
+          such as `/0/field` or `/0/field/x`
+
+error[E0003]: `300` is not a route hop, which is a number from 0 to 255
+ --> stream_path.tsl:3:14
+  |
+3 | source hop = /300/field @rate(1000) @channels(x)
+  |              ^^^^^^^^^^
+  |
+  = help: a stream path is `/route/stream` or `/route/stream/column`,
+          such as `/0/field` or `/0/field/x`
+
+error[E0003]: a stream path names something after each `/`
+ --> stream_path.tsl:4:17
+  |
+4 | source gap = /0/ field @rate(1000) @channels(x)
+  |                 ^
+  |
+  = help: write a path without spaces, such as `/0/field` or `/0/field/x`

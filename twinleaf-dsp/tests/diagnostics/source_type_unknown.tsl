@@ -1,0 +1,4 @@
+source a = /0/field
+source b = /1/field @unit(nT) @channels(x, y, z)
+source c = /2/field/x
+out y = /3/field | lowpass(10)

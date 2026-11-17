@@ -1,0 +1,12 @@
+source a = /0/field @rate(1000) @channels(x, y, z) @unit(nT)
+param long : s = 2
+
+# A window that is not written out, and one too short to say anything.
+out s1 = a | psd(long)
+out s2 = a | psd(20 ms)
+
+# A spectrum is not a signal in time: nothing that filters or reduces one
+# applies to it, and it does not mix with one.
+let spectrum = a | psd(1 s)
+out s3 = spectrum | lowpass(10 Hz)
+out s4 = spectrum - a

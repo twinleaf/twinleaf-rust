@@ -1,0 +1,7 @@
+source a = /0/field @rate(1000) @channels(x, y, z) @gain(2)
+source b = /1/field @rate(fast) @channels(x)
+source c = /2/field/x @rate(1000) @channels(x)
+source d = /3/field @rate(1000) @channels(x, y, x)
+source e = /4/field/x @rate(1000)
+source f = /4/field/y @rate(500)
+source g = /5/field @rate(10s) @channels(x)

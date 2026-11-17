@@ -1,0 +1,41 @@
+error[E0301]: the sample rate and channels of `a` are not known
+ --> source_type_unknown.tsl:1:12
+  |
+1 | source a = /0/field
+  |            ^^^^^^^^ there is no device here to ask
+  |
+  = help: state them on the source, for example:
+            source a = /0/field @rate(1000) @channels(x, y, z)
+  = note: a spec checked without a device takes rates and channel names
+          from its attributes
+
+error[E0301]: the sample rate of `b` is not known
+ --> source_type_unknown.tsl:2:12
+  |
+2 | source b = /1/field @unit(nT) @channels(x, y, z)
+  |            ^^^^^^^^ there is no device here to ask
+  |
+  = help: state it on the source, for example:
+            source b = /1/field @unit(nT) @channels(x, y, z) @rate(1000)
+  = note: a spec checked without a device takes rates and channel names
+          from its attributes
+
+error[E0301]: the sample rate of `c` is not known
+ --> source_type_unknown.tsl:3:12
+  |
+3 | source c = /2/field/x
+  |            ^^^^^^^^^^ there is no device here to ask
+  |
+  = help: state it on the source, for example:
+            source c = /2/field/x @rate(1000)
+  = note: a spec checked without a device takes rates and channel names
+          from its attributes
+
+error[E0301]: the sample rate and channels of `/3/field` are not known
+ --> source_type_unknown.tsl:4:9
+  |
+4 | out y = /3/field | lowpass(10)
+  |         ^^^^^^^^ no source names this stream
+  |
+  = help: declare it first, for example:
+            source s = /3/field @rate(1000) @channels(x, y, z)

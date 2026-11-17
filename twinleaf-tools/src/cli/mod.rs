@@ -27,6 +27,10 @@ pub use rpc::{RPCSubcommands, RpcCli};
 pub use simulate::{SimulateCli, UploadKind};
 pub use upgrade::UpgradeCli;
 
+// `tio dsp` is the command line of `twinleaf-dsp`, which a private build of
+// that crate runs under its own name.
+pub use twinleaf_dsp::cli::DspCli;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::net::Ipv4Addr;
@@ -128,6 +132,11 @@ pub enum Commands {
 
     /// Multiplex a sensor over TCP
     Proxy(ProxyCli),
+
+    /// Check, draw, run and serve signal graphs
+    ///
+    /// A signal graph is a text file that says how sensor streams become derived ones, by filtering, resampling, aligning and combining them. `tio dsp serve` runs one as a device beside the sensors it reads, with its outputs at `/255`, so they plot and log like any other stream.
+    Dsp(DspCli),
 
     /// Run a simulated sine wave Twinleaf device over UDP
     Simulate(SimulateCli),

@@ -1,0 +1,18 @@
+error[E0203]: there is no function `nothc`
+ --> unknown_function.tsl:2:13
+  |
+2 | out y = a | nothc(60)
+  |             ^^^^^ not a function
+  |
+  = help: did you mean `notch`?
+
+error[E0203]: there is no function `fourier`
+ --> unknown_function.tsl:3:13
+  |
+3 | out z = a | fourier(8)
+  |             ^^^^^^^ not a function
+  |
+  = help: the functions are:
+          align, decimate, resample, notch, bandpass, lowpass,
+          highpass, detrend, magnitude, decorrelate, psd, rms,
+          integrate, derivative

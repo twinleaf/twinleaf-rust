@@ -1,0 +1,11 @@
+# Each broken definition is reported once, and the next one is still read.
+source a = /0/field @rate(1000) @channels(x, y, z) @unit(nT)
+let missing =
+let unclosed = a | notch(60
+let stage = a | lowpass
+let trailing = a a
+let chained = a | lowpass(10) - a
+param p = [1 .. 2]
+out fine = a | lowpass(10)
+notch(60)
+out also_fine = unclosed - trailing

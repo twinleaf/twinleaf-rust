@@ -1,0 +1,16 @@
+error[E0404]: `notch` works on a signal, and none was given
+ --> no_signal.tsl:2:9
+  |
+2 | let y = notch(60)
+  |         ^^^^^
+  |               -- this is a number
+  |
+  = help: pipe a signal into it: `x | notch(60)`
+
+error[E0404]: `integrate` works on a signal, and none was given
+ --> no_signal.tsl:3:9
+  |
+3 | let z = integrate()
+  |         ^^^^^^^^^
+  |
+  = help: pipe a signal into it: `x | integrate()`

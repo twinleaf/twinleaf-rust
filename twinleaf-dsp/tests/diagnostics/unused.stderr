@@ -1,0 +1,17 @@
+warning[W0001]: `b` is never used
+ --> unused.tsl:2:8
+  |
+2 | source b = /1/field @rate(500) @channels(x, y, z) @unit(nT)
+  |        ^ nothing refers to this source
+
+warning[W0001]: `spare` is never used
+ --> unused.tsl:3:7
+  |
+3 | param spare = 3
+  |       ^^^^^ nothing refers to this param
+
+warning[W0001]: `filtered` is never used
+ --> unused.tsl:4:5
+  |
+4 | let filtered = a | lowpass(10)
+  |     ^^^^^^^^ nothing refers to this let
