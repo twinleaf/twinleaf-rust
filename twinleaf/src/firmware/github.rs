@@ -85,7 +85,8 @@ impl FirmwareCatalog for GithubCatalog {
             self.owner, self.repo, name, revision
         );
 
-        let mut response = match agent().get(&api_url)
+        let mut response = match agent()
+            .get(&api_url)
             .header("User-Agent", HTTP_USER_AGENT)
             .header("Accept", "application/vnd.github+json")
             .call()
@@ -127,7 +128,8 @@ impl FirmwareCatalog for GithubCatalog {
     }
 
     fn download(&self, release: &FirmwareRelease) -> Result<Vec<u8>, FirmwareError> {
-        let data = agent().get(&release.url)
+        let data = agent()
+            .get(&release.url)
             .header("User-Agent", HTTP_USER_AGENT)
             .call()
             .map_err(|e| FirmwareError::Catalog(format!("download request failed: {e}")))?
