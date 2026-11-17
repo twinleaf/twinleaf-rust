@@ -525,7 +525,12 @@ pub fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::AtomicBool>)
 mod tests {
     use super::*;
     use clap::Parser;
+    use twinleaf::proto::capture::{Selector, Status};
     use twinleaf::proto::rpc::RpcError;
+    use twinleaf::proto::update::{
+        PackageHeader, FLAG_DEVELOPMENT, FORMAT_VERSION, HEADER_SIZE, IMAGE_CHUNK_ENVELOPE,
+        IMAGE_CHUNK_SIZE, PACKAGE_OFFSET_SIZE,
+    };
     use twinleaf::tio::packet;
 
     /// Returns the simulator `args` start on a free port of loopback, and a
@@ -799,27 +804,27 @@ mod tests {
     #[test]
     fn a_capture_serves_its_blocks_once_taken() {
         let (mut simulator, host) = start_simulator(&[]);
-        let selector = |value: i16| value.to_le_bytes();
+        let capture = |simulator: &mut Simulator, selector: Selector| {
+            let arg = selector.arg().expect("the selector has an argument");
+            call(simulator, &host, "test.capture", &arg, "/")
+        };
 
+        assert_eq!(capture(&mut simulator, Selector::Trigger), Ok(Vec::new()));
         assert_eq!(
-            call(&mut simulator, &host, "test.capture", &selector(-1), "/"),
-            Ok(Vec::new())
+            capture(&mut simulator, Selector::Status),
+            Ok(vec![Status::Capturing.code()])
         );
         assert_eq!(
-            call(&mut simulator, &host, "test.capture", &selector(-2), "/"),
-            Ok(vec![1])
-        );
-        assert_eq!(
-            call(&mut simulator, &host, "test.capture", &selector(0), "/"),
+            capture(&mut simulator, Selector::Block(0)),
             Err(RpcError::Busy.value())
         );
 
         std::thread::sleep(Duration::from_nanos(device::CAPTURE_DELAY_NS));
         assert_eq!(
-            call(&mut simulator, &host, "test.capture", &selector(-2), "/"),
-            Ok(vec![2])
+            capture(&mut simulator, Selector::Status),
+            Ok(vec![Status::Done.code()])
         );
-        let block = call(&mut simulator, &host, "test.capture", &selector(0), "/").unwrap();
+        let block = capture(&mut simulator, Selector::Block(0)).unwrap();
         assert_eq!(block.len(), 256);
     }
 
@@ -951,10 +956,18 @@ mod tests {
         let (mut simulator, host) = start_simulator(&[]);
         let session = simulator.tree.devices()[0].session();
 
-        call(&mut simulator, &host, "dev.firmware.upload", &[0; 288], "/").unwrap();
+        call(
+            &mut simulator,
+            &host,
+            "dev.firmware.upload",
+            &[0; IMAGE_CHUNK_SIZE],
+            "/",
+        )
+        .unwrap();
+        let image_bytes = (IMAGE_CHUNK_SIZE - IMAGE_CHUNK_ENVELOPE) as u32;
         assert_eq!(
             call(&mut simulator, &host, "dev.firmware.upload", &[], "/"),
-            Ok(256u32.to_le_bytes().to_vec())
+            Ok(image_bytes.to_le_bytes().to_vec())
         );
         call(&mut simulator, &host, "dev.firmware.upgrade", &[], "/").unwrap();
 
@@ -973,15 +986,19 @@ mod tests {
     /// The header of a signed package for the simulator, around an image of
     /// `len` bytes.
     fn package_header(len: u32) -> Vec<u8> {
-        let mut header = vec![0u8; 288];
-        header[..8].copy_from_slice(device::PACKAGE.magic.as_bytes());
-        header[8..10].copy_from_slice(&1u16.to_le_bytes());
-        header[10..12].copy_from_slice(&288u16.to_le_bytes());
-        header[12..20].copy_from_slice(device::PACKAGE.board_id.as_bytes());
-        header[20..22].copy_from_slice(&device::PACKAGE.hw_rev.to_le_bytes());
-        header[22..24].copy_from_slice(&1u16.to_le_bytes());
-        header[24..28].copy_from_slice(&len.to_le_bytes());
-        header
+        let mut header = [0; HEADER_SIZE];
+        PackageHeader {
+            magic: device::PACKAGE.magic.as_bytes(),
+            format: FORMAT_VERSION,
+            header_size: HEADER_SIZE as u16,
+            board_id: device::PACKAGE.board_id.as_bytes(),
+            hw_rev: device::PACKAGE.hw_rev.value(),
+            flags: FLAG_DEVELOPMENT,
+            image_len: len,
+            signature: &[0; 64],
+        }
+        .write(&mut header);
+        header.to_vec()
     }
 
     /// With `--upload signed`, the simulator takes a package as a device built
@@ -995,12 +1012,12 @@ mod tests {
         };
         let chunk = |offset: u32, len: usize| {
             let mut chunk = offset.to_le_bytes().to_vec();
-            chunk.resize(4 + len, 0xa5);
+            chunk.resize(PACKAGE_OFFSET_SIZE + len, 0xa5);
             chunk
         };
 
         assert_eq!(
-            upload(&mut simulator, &[0; 288]),
+            upload(&mut simulator, &[0; HEADER_SIZE]),
             Err(RpcError::Invalid.value()),
             "an image chunk is no package header"
         );

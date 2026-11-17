@@ -11,6 +11,10 @@
 
 use crate::device::Device;
 use crate::proto::rpc as wire_rpc;
+use crate::proto::update::{
+    PackageHeader, FORMAT_VERSION, HEADER_SIZE, IMAGE_CHUNK_ENVELOPE, IMAGE_CHUNK_SIZE,
+    PACKAGE_OFFSET_SIZE,
+};
 use crate::session::rpc::{pipelined, CallError};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,16 +22,6 @@ use std::time::Duration;
 #[cfg(feature = "firmware-update")]
 pub mod github;
 
-/// The size of the chunks a firmware image is uploaded in.
-const UPLOAD_CHUNK_SIZE: usize = 288;
-/// The bytes of every chunk that are envelope, not image data. They are the
-/// AES IV and the size, offset, CRC and id header the device checks before
-/// appending.
-const CHUNK_ENVELOPE: usize = 32;
-/// The header a signed package opens with, in the layout `twinleaf-device`
-/// reads in `storage::update`, and the version of that layout.
-const PACKAGE_HEADER_SIZE: usize = 288;
-const PACKAGE_FORMAT_VERSION: u16 = 1;
 /// The image bytes in each chunk of a signed package, behind the four bytes
 /// of offset the chunk opens with. A power of two, so a chunk is a whole
 /// number of flash writes.
@@ -588,14 +582,14 @@ pub fn flash(
 /// and size `twinleaf-device` reads, and exactly the image behind it, which an
 /// image matches only by chance in eight bytes.
 fn is_package(data: &[u8]) -> bool {
-    if data.len() <= PACKAGE_HEADER_SIZE {
+    let Some((header, image)) = data.split_first_chunk::<HEADER_SIZE>() else {
         return false;
-    }
-    let word = |at: usize| u16::from_le_bytes([data[at], data[at + 1]]);
-    let image_len = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-    word(8) == PACKAGE_FORMAT_VERSION
-        && usize::from(word(10)) == PACKAGE_HEADER_SIZE
-        && image_len as usize == data.len() - PACKAGE_HEADER_SIZE
+    };
+    let header = PackageHeader::parse(header);
+    !image.is_empty()
+        && header.format == FORMAT_VERSION
+        && usize::from(header.header_size) == HEADER_SIZE
+        && header.image_len as usize == image.len()
 }
 
 /// Whether `device` takes signed packages, which it says by answering
@@ -624,12 +618,12 @@ fn upload_image(
     firmware_data: &[u8],
     on_event: &mut impl FnMut(FlashEvent),
 ) -> Result<(), FirmwareError> {
-    let total_chunks = firmware_data.len().div_ceil(UPLOAD_CHUNK_SIZE);
+    let total_chunks = firmware_data.len().div_ceil(IMAGE_CHUNK_SIZE);
     let mut resume_at = 0;
     let mut stalls = 0;
     loop {
         let sends = firmware_data
-            .chunks(UPLOAD_CHUNK_SIZE)
+            .chunks(IMAGE_CHUNK_SIZE)
             .skip(resume_at)
             .map(|data| device.submit("dev.firmware.upload", data));
         let outcome = pipelined(sends, MAX_CHUNKS_IN_FLIGHT)
@@ -686,7 +680,7 @@ fn upload_package(
     package: &[u8],
     on_event: &mut impl FnMut(FlashEvent),
 ) -> Result<(), FirmwareError> {
-    let (header, image) = package.split_at(PACKAGE_HEADER_SIZE);
+    let (header, image) = package.split_at(HEADER_SIZE);
     let total_chunks = 1 + image.len().div_ceil(PACKAGE_CHUNK_DATA);
     // The chunk number, counted from one, of what starts at image `offset`.
     let chunk_of = |offset: usize| match offset {
@@ -703,7 +697,8 @@ fn upload_package(
             .enumerate()
             .map(|(index, data)| {
                 let offset = (resume_at + index * PACKAGE_CHUNK_DATA) as u32;
-                let mut chunk = offset.to_le_bytes().to_vec();
+                let mut chunk = Vec::with_capacity(PACKAGE_OFFSET_SIZE + data.len());
+                chunk.extend_from_slice(&offset.to_le_bytes());
                 chunk.extend_from_slice(data);
                 chunk
             });
@@ -769,9 +764,11 @@ fn upload_package(
 /// Returns the chunk count if the cursor is at the image's end, and `None` if
 /// the image has no chunk boundary there.
 fn chunk_at(cursor: u32, image: &[u8]) -> Option<usize> {
-    let total_chunks = image.len().div_ceil(UPLOAD_CHUNK_SIZE);
-    let data_per_chunk = UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE;
-    let data = image.len().saturating_sub(total_chunks * CHUNK_ENVELOPE);
+    let total_chunks = image.len().div_ceil(IMAGE_CHUNK_SIZE);
+    let data_per_chunk = IMAGE_CHUNK_SIZE - IMAGE_CHUNK_ENVELOPE;
+    let data = image
+        .len()
+        .saturating_sub(total_chunks * IMAGE_CHUNK_ENVELOPE);
     let cursor = cursor as usize;
     if cursor == data {
         Some(total_chunks)
@@ -968,8 +965,8 @@ mod tests {
     /// first four bytes, so the fake device can check it as the real one does.
     fn image(len: usize) -> Vec<u8> {
         let mut image = vec![0xa5u8; len];
-        for (index, chunk) in image.chunks_mut(UPLOAD_CHUNK_SIZE).enumerate() {
-            let offset = (index * (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE)) as u32;
+        for (index, chunk) in image.chunks_mut(IMAGE_CHUNK_SIZE).enumerate() {
+            let offset = (index * (IMAGE_CHUNK_SIZE - IMAGE_CHUNK_ENVELOPE)) as u32;
             chunk[..4].copy_from_slice(&offset.to_le_bytes());
         }
         image
@@ -1014,8 +1011,8 @@ mod tests {
                     continue;
                 }
                 let offset = u32::from_le_bytes(request.args[..4].try_into().unwrap());
-                let data = (request.args.len() - CHUNK_ENVELOPE) as u32;
-                let chunk = offset as usize / (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE);
+                let data = (request.args.len() - IMAGE_CHUNK_ENVELOPE) as u32;
+                let chunk = offset as usize / (IMAGE_CHUNK_SIZE - IMAGE_CHUNK_ENVELOPE);
                 sent.push(chunk);
                 if offset != cursor {
                     proxy.refuse(id, wire_rpc::RpcError::Invalid, route);
@@ -1049,8 +1046,8 @@ mod tests {
     }
 
     /// Three chunks, two full ones and a short tail.
-    const THREE_CHUNKS: usize = 2 * UPLOAD_CHUNK_SIZE + 64;
-    const THREE_CHUNKS_DATA: u32 = (THREE_CHUNKS - 3 * CHUNK_ENVELOPE) as u32;
+    const THREE_CHUNKS: usize = 2 * IMAGE_CHUNK_SIZE + 64;
+    const THREE_CHUNKS_DATA: u32 = (THREE_CHUNKS - 3 * IMAGE_CHUNK_ENVELOPE) as u32;
 
     fn acked(events: &[FlashEvent]) -> Vec<usize> {
         events
@@ -1125,7 +1122,7 @@ mod tests {
     /// resumes from wherever the cursor is by then.
     #[test]
     fn a_partial_upload_resumes_where_the_device_left_off() {
-        let first_chunk = (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE) as u32;
+        let first_chunk = (IMAGE_CHUNK_SIZE - IMAGE_CHUNK_ENVELOPE) as u32;
         let (result, events, sent, cursor) =
             flash_against(image(THREE_CHUNKS), first_chunk, |_| Fault::Deliver);
 
@@ -1162,7 +1159,7 @@ mod tests {
     #[test]
     fn the_cursor_maps_to_a_chunk_only_on_a_boundary_of_this_image() {
         let image = image(THREE_CHUNKS);
-        let data_per_chunk = (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE) as u32;
+        let data_per_chunk = (IMAGE_CHUNK_SIZE - IMAGE_CHUNK_ENVELOPE) as u32;
 
         assert_eq!(chunk_at(0, &image), Some(0));
         assert_eq!(chunk_at(data_per_chunk, &image), Some(1));
@@ -1171,6 +1168,7 @@ mod tests {
         assert_eq!(chunk_at(THREE_CHUNKS_DATA + 256, &image), None);
     }
 
+    use crate::proto::update::FLAG_DEVELOPMENT;
     use twinleaf_device::storage::update::{self as device_update, Take};
 
     /// The board the package fake takes packages for.
@@ -1187,14 +1185,19 @@ mod tests {
     /// A signed package for `board`, the signature left blank, around an
     /// image of `len` bytes.
     fn package(board: &device_update::Package, len: usize) -> Vec<u8> {
-        let mut data = vec![0u8; PACKAGE_HEADER_SIZE];
-        data[..8].copy_from_slice(board.magic.as_bytes());
-        data[8..10].copy_from_slice(&PACKAGE_FORMAT_VERSION.to_le_bytes());
-        data[10..12].copy_from_slice(&(PACKAGE_HEADER_SIZE as u16).to_le_bytes());
-        data[12..20].copy_from_slice(board.board_id.as_bytes());
-        data[20..22].copy_from_slice(&board.hw_rev.to_le_bytes());
-        data[22..24].copy_from_slice(&1u16.to_le_bytes());
-        data[24..28].copy_from_slice(&(len as u32).to_le_bytes());
+        let mut header = [0; HEADER_SIZE];
+        PackageHeader {
+            magic: board.magic.as_bytes(),
+            format: FORMAT_VERSION,
+            header_size: HEADER_SIZE as u16,
+            board_id: board.board_id.as_bytes(),
+            hw_rev: board.hw_rev.value(),
+            flags: FLAG_DEVELOPMENT,
+            image_len: len as u32,
+            signature: &[0; 64],
+        }
+        .write(&mut header);
+        let mut data = header.to_vec();
         data.extend((0..len).map(|byte| byte as u8));
         data
     }
@@ -1239,13 +1242,14 @@ mod tests {
                         answer(Ok(upload.cursor(now).to_le_bytes().to_vec()))
                     }
                     b"dev.firmware.upload" => {
-                        let chunk = match request.args.len() == PACKAGE_HEADER_SIZE
+                        let chunk = match request.args.len() == HEADER_SIZE
                             && request.args[..8] == *board.magic.as_bytes()
                         {
                             true => 0,
                             false => {
-                                let offset =
-                                    u32::from_le_bytes(request.args[..4].try_into().unwrap());
+                                let offset = u32::from_le_bytes(
+                                    request.args[..PACKAGE_OFFSET_SIZE].try_into().unwrap(),
+                                );
                                 1 + offset as usize / PACKAGE_CHUNK_DATA
                             }
                         };

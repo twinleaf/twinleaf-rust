@@ -3,7 +3,9 @@
 //! The test reads the workspace's Rust sources as text. Each rule names a
 //! pattern and the path prefixes allowed to contain it. A source outside
 //! those prefixes that contains the pattern fails the test, which names the
-//! file and the line.
+//! file and the line. A pattern that opens with a letter matches only where
+//! a name starts, so `Header::parse(` does not match `PackageHeader::parse(`.
+//! A pattern that opens with any other character matches anywhere.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,6 +77,28 @@ const RULES: &[Rule] = &[
         patterns: &["invalid data at byte offset"],
         allowed: &["twinleaf/src/data/logfile/reader.rs"],
     },
+    // A capture selector as a bare argument value, which `capture::Selector`
+    // owns.
+    Rule {
+        patterns: &["_INDEX: i16 = -"],
+        allowed: &[],
+    },
+    // The code of a capture status, which `capture::Status` owns.
+    Rule {
+        patterns: &["4 => Self::Error"],
+        allowed: &["twinleaf-proto/"],
+    },
+    // The size of a package header and of an image chunk, which the update
+    // payloads own.
+    Rule {
+        patterns: &[": usize = 288", "[0u8; 288]", "[0; 288]"],
+        allowed: &["twinleaf-proto/"],
+    },
+    // The envelope of an image chunk, which the update payloads own.
+    Rule {
+        patterns: &["_ENVELOPE: usize = 32"],
+        allowed: &["twinleaf-proto/"],
+    },
 ];
 
 #[test]
@@ -135,15 +159,20 @@ fn violations(rules: &[Rule], sources: &[(String, String)]) -> Vec<String> {
             if rule.allowed.iter().any(|prefix| path.starts_with(prefix)) {
                 continue;
             }
+            let home = if rule.allowed.is_empty() {
+                "nowhere".to_string()
+            } else {
+                format!("under {}", rule.allowed.join(", "))
+            };
             for (index, line) in text.lines().enumerate() {
                 for pattern in rule.patterns {
-                    if line.contains(pattern) {
+                    if holds(line, pattern) {
                         findings.push(format!(
-                            "{}:{}: `{}` belongs under {}",
+                            "{}:{}: `{}` belongs {}",
                             path,
                             index + 1,
                             pattern,
-                            rule.allowed.join(", ")
+                            home
                         ));
                     }
                 }
@@ -151,6 +180,35 @@ fn violations(rules: &[Rule], sources: &[(String, String)]) -> Vec<String> {
         }
     }
     findings
+}
+
+/// Returns whether `line` holds `pattern`. A pattern that opens with a letter
+/// counts only where no letter, digit or underscore comes before it.
+fn holds(line: &str, pattern: &str) -> bool {
+    let opens_a_name = pattern.starts_with(|c: char| c.is_ascii_alphabetic());
+    line.match_indices(pattern).any(|(at, _)| {
+        !opens_a_name
+            || !line[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+#[test]
+fn a_pattern_that_opens_with_a_letter_matches_where_a_name_starts() {
+    assert!(holds("let h = Header::parse(bytes);", "Header::parse("));
+    assert!(holds("packet::Header::parse(bytes)", "Header::parse("));
+    assert!(!holds("PackageHeader::parse(bytes)", "Header::parse("));
+    assert!(holds(
+        "PackageHeader::parse(a); Header::parse(b)",
+        "Header::parse("
+    ));
+    assert!(holds(
+        "const CAPTURE_TRIGGER_INDEX: i16 = -1;",
+        "_INDEX: i16 = -"
+    ));
+    assert!(holds("let x = vec![0u8; 288];", "[0u8; 288]"));
 }
 
 #[test]

@@ -62,7 +62,8 @@ ids they use.
 |-------------------------------------------------------|---------------------------------------------------------------------|
 | `rpc.info`, `rpc.listinfo`                            | [`rpc::RpcMeta`]                                                    |
 | `dev.metadata`                                        | [`data::MetadataSelector`] request, [`data::MetadataReply`] reply   |
-| Capture metadata                                      | [`capture::CaptureMetadata`]                                        |
+| Capture                                               | [`capture::Selector`] request, [`capture::Status`] and [`capture::CaptureMetadata`] replies |
+| `dev.firmware.upload`                                 | [`update::PackageHeader`] and the chunks [`update`] sizes           |
 | `dev.session`, `dev.revision`, `dev.serial`, `dev.firmware.serial` | [`SessionId`], [`HwRev`], [`DeviceSerial`], [`FirmwareSerial`] |
 
 ## Serial Framing

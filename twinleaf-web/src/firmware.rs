@@ -928,10 +928,20 @@ pub(crate) mod tests {
     /// A signed package around an image of `len` bytes, in the layout
     /// `flash` tells from an image.
     fn package(len: usize) -> Vec<u8> {
-        let mut data = vec![0u8; 288];
-        data[8..10].copy_from_slice(&1u16.to_le_bytes());
-        data[10..12].copy_from_slice(&288u16.to_le_bytes());
-        data[24..28].copy_from_slice(&(len as u32).to_le_bytes());
+        use twinleaf::proto::update::{PackageHeader, FORMAT_VERSION, HEADER_SIZE};
+        let mut header = [0; HEADER_SIZE];
+        PackageHeader {
+            magic: &[0; 8],
+            format: FORMAT_VERSION,
+            header_size: HEADER_SIZE as u16,
+            board_id: &[0; 8],
+            hw_rev: 0,
+            flags: 0,
+            image_len: len as u32,
+            signature: &[0; 64],
+        }
+        .write(&mut header);
+        let mut data = header.to_vec();
         data.extend(std::iter::repeat_n(0xa5, len));
         data
     }

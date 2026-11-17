@@ -305,12 +305,11 @@ const CAPTURED: [u8; 5] = [1, 2, 3, 4, 5];
 /// not list, with the selector `args` encode. Its capture is always done.
 /// It refuses block 7 as busy, and any other block past the last as invalid.
 fn fake_capture(args: &[u8]) -> Result<Vec<u8>, RpcError> {
-    use crate::proto::capture::{CaptureMetadata, METADATA_VERSION};
-    let selector = args.try_into().map_err(|_| RpcError::ArgsSize)?;
-    Ok(match i16::from_le_bytes(selector) {
-        -1 => Vec::new(),
-        -2 => vec![2],
-        -3 => {
+    use crate::proto::capture::{CaptureMetadata, Selector, Status, METADATA_VERSION};
+    Ok(match Selector::parse(args)? {
+        Selector::Trigger => Vec::new(),
+        Selector::Status => vec![Status::Done.code()],
+        Selector::Metadata => {
             let metadata = CaptureMetadata {
                 version: METADATA_VERSION,
                 data_type: crate::proto::data::DataType::U8,
@@ -330,13 +329,13 @@ fn fake_capture(args: &[u8]) -> Result<Vec<u8>, RpcError> {
             reply.truncate(written);
             reply
         }
-        block @ 0..=1 => {
-            let mut bytes = CAPTURED.chunks(4).nth(block as usize).unwrap().to_vec();
+        Selector::Block(block @ 0..=1) => {
+            let mut bytes = CAPTURED.chunks(4).nth(usize::from(block)).unwrap().to_vec();
             bytes.resize(4, 0);
             bytes
         }
-        7 => return Err(RpcError::Busy),
-        _ => return Err(RpcError::Invalid),
+        Selector::Block(7) => return Err(RpcError::Busy),
+        Selector::Block(_) => return Err(RpcError::Invalid),
     })
 }
 

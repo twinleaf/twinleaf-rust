@@ -8,6 +8,7 @@ pub mod proxy;
 pub mod rpc;
 pub mod settings;
 pub mod sync;
+pub mod update;
 
 /// Returns the `N` bytes of `bytes` from offset `at`, or `None` if they run
 /// past the end.

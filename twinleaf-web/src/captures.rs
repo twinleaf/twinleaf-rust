@@ -539,6 +539,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::broadcast;
     use twinleaf::device::rpc::RpcMeta;
+    use twinleaf::proto::capture::Selector;
     use twinleaf::proxy::{HostOptions, Layout, Mount, Proxy};
     use twinleaf::Connection;
 
@@ -949,7 +950,10 @@ mod tests {
         let mut found_busy = false;
         for _ in 0..5 {
             // Refused while the other host's last capture is in progress.
-            let _ = device.submit("test.capture", &(-1i16).to_le_bytes()).await;
+            let trigger = Selector::Trigger
+                .arg()
+                .expect("the trigger has an argument");
+            let _ = device.submit("test.capture", &trigger).await;
             page.capture("/", "test.capture", Want::Once);
             let once = bench.until(settled).await;
             let once = &once[once.len() - 1];

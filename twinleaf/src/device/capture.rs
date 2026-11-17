@@ -10,6 +10,7 @@
 use super::connection::Device;
 use crate::data::ColumnData;
 use crate::proto::capture as wire;
+use crate::proto::capture::{Selector, Status};
 use crate::proto::data::DataType;
 use crate::proto::rpc::RpcError;
 use crate::session::rpc::{CallError, PendingReply, ReplyFuture};
@@ -19,9 +20,6 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CAPTURE_TRIGGER_INDEX: i16 = -1;
-const CAPTURE_STATUS_INDEX: i16 = -2;
-const CAPTURE_METADATA_INDEX: i16 = -3;
 
 /// Where a capture stands, as its status selector reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,12 +38,12 @@ pub enum CaptureStatus {
 
 impl CaptureStatus {
     fn from_raw(raw: u8) -> Self {
-        match raw {
-            0 => Self::Idle,
-            1 => Self::Capturing,
-            2 => Self::Done,
-            4 => Self::Error,
-            value => Self::Unknown(value),
+        match Status::from_code(raw) {
+            Some(Status::Idle) => Self::Idle,
+            Some(Status::Capturing) => Self::Capturing,
+            Some(Status::Done) => Self::Done,
+            Some(Status::Error) => Self::Error,
+            None => Self::Unknown(raw),
         }
     }
 }
@@ -117,7 +115,7 @@ impl CaptureMetadata {
             return Err(CaptureError::ZeroBlocksize);
         }
         let blocks = (self.size as usize).div_ceil(usize::from(self.blocksize));
-        match blocks <= i16::MAX as usize + 1 {
+        match blocks <= usize::from(Selector::MAX_BLOCK) + 1 {
             true => Ok(blocks as u16),
             false => Err(CaptureError::TooManyBlocks { blocks }),
         }
@@ -299,7 +297,7 @@ impl Capture {
     /// Resolves to [`CaptureError::Rpc`] if the call fails. A device that is
     /// capturing already refuses, which [`CaptureError::is_busy`] tells.
     pub fn trigger(&self) -> PendingCapture<()> {
-        self.select(CAPTURE_TRIGGER_INDEX, |_| Ok(()))
+        self.select(Selector::Trigger, |_| Ok(()))
     }
 
     /// Asks where the capture stands.
@@ -309,7 +307,7 @@ impl Capture {
     /// Resolves to [`CaptureError::Rpc`] if the call fails, and to
     /// [`CaptureError::InvalidStatusLength`] if the reply is not one byte.
     pub fn status(&self) -> PendingCapture<CaptureStatus> {
-        self.select(CAPTURE_STATUS_INDEX, |reply| match reply[..] {
+        self.select(Selector::Status, |reply| match reply[..] {
             [status] => Ok(CaptureStatus::from_raw(status)),
             _ => Err(CaptureError::InvalidStatusLength {
                 actual: reply.len(),
@@ -326,9 +324,7 @@ impl Capture {
     /// [`CaptureError::UnsupportedMetadataVersion`] if the reply is not
     /// metadata this build reads.
     pub fn metadata(&self) -> PendingCapture<CaptureMetadata> {
-        self.select(CAPTURE_METADATA_INDEX, |reply| {
-            parse_capture_metadata(&reply)
-        })
+        self.select(Selector::Metadata, |reply| parse_capture_metadata(&reply))
     }
 
     /// Reads block `index` of the data, counted from zero.
@@ -340,27 +336,25 @@ impl Capture {
     /// block past the 32768 an `i16` selector reaches resolves to
     /// [`CaptureError::TooManyBlocks`], and nothing is sent for it.
     pub fn block(&self, index: u16) -> PendingCapture<Vec<u8>> {
-        match i16::try_from(index) {
-            Ok(selector) => self.select(selector, Ok),
-            Err(_) => PendingCapture {
-                reply: Err(CaptureError::TooManyBlocks {
-                    blocks: usize::from(index) + 1,
-                }),
-                parse: Ok,
-            },
-        }
+        self.select(Selector::Block(index), Ok)
     }
 
-    /// Submits the call with `selector`, whose reply `parse` reads.
+    /// Submits the call with `selector`, whose reply `parse` reads. A
+    /// selector with no argument is refused as
+    /// [`CaptureError::TooManyBlocks`], and nothing is sent for it.
     fn select<T>(
         &self,
-        selector: i16,
+        selector: Selector,
         parse: fn(Vec<u8>) -> Result<T, CaptureError>,
     ) -> PendingCapture<T> {
-        PendingCapture {
-            reply: Ok(self.device.submit(&self.rpc_name, &selector.to_le_bytes())),
-            parse,
-        }
+        let reply = match (selector.arg(), selector) {
+            (Some(arg), _) => Ok(self.device.submit(&self.rpc_name, &arg)),
+            (None, Selector::Block(index)) => Err(CaptureError::TooManyBlocks {
+                blocks: usize::from(index) + 1,
+            }),
+            (None, _) => unreachable!("only a block lacks an argument"),
+        };
+        PendingCapture { reply, parse }
     }
 }
 

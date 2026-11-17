@@ -16,6 +16,7 @@ use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
 use twinleaf::proto::data::DataType;
 use twinleaf::proto::log::LogLevel;
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
+use twinleaf::proto::update::IMAGE_CHUNK_ENVELOPE;
 use twinleaf::proto::{BoardId, DeviceRoute, FirmwareMagic, HwRev, SessionId, StreamId};
 use twinleaf_device::data::{filter, ColumnDef, DataStream, Params, StreamDef};
 use twinleaf_device::device::{Action, Announcer, Entry, Group, Identity};
@@ -69,8 +70,6 @@ pub(super) const FID_DELAY_NS: u64 = (1e9 / FID_REPETITION_RATE) as u64;
 const FID_WANDER: f64 = 1e-3;
 /// How long the wander takes to forget where it was, in seconds.
 const FID_WANDER_SECONDS: f64 = 1.0;
-/// The bytes of an image's upload chunk that are envelope rather than image.
-const CHUNK_ENVELOPE: usize = 32;
 /// Packets each lane of the host's port holds, more than one tick sends.
 const PORT_CAPACITY: usize = 1 << 16;
 
@@ -489,7 +488,7 @@ impl SimDevice {
         sim.offset = unix_duration().as_secs() as i64 - (now_ns / 1_000_000_000) as i64;
         sim.slot = Some(match cli.upload {
             UploadKind::Image => Slot::Image {
-                envelope: CHUNK_ENVELOPE,
+                envelope: IMAGE_CHUNK_ENVELOPE,
                 uploaded: 0,
             },
             UploadKind::Signed => Slot::Signed(PACKAGE, Upload::new()),
@@ -1017,40 +1016,49 @@ mod tests {
         }
 
         /// Calls capture `rpc` with `selector`.
-        fn select(&mut self, rpc: &str, selector: i16) -> Result<Vec<u8>, RpcError> {
-            self.call(rpc, &selector.to_le_bytes())
+        fn select(&mut self, rpc: &str, selector: Selector) -> Result<Vec<u8>, RpcError> {
+            let arg = selector.arg().expect("the selector has an argument");
+            self.call(rpc, &arg)
         }
 
         /// Triggers capture `rpc` now, and reads it once its delay has
         /// passed on the device's clock.
         fn capture(&mut self, rpc: &str) -> Read {
-            self.select(rpc, -1).unwrap();
+            self.select(rpc, Selector::Trigger).unwrap();
             self.read(rpc)
         }
 
         /// Reads the capture `rpc` was triggered for, which is busy until
         /// one repetition has passed.
         fn read(&mut self, rpc: &str) -> Read {
-            assert_eq!(self.select(rpc, -2), Ok(vec![1]), "{rpc} is capturing");
-            assert_eq!(self.select(rpc, 0), Err(RpcError::Busy));
-            assert_eq!(self.select(rpc, -1), Err(RpcError::Busy));
+            assert_eq!(
+                self.select(rpc, Selector::Status),
+                Ok(vec![Status::Capturing.code()]),
+                "{rpc} is capturing"
+            );
+            assert_eq!(self.select(rpc, Selector::Block(0)), Err(RpcError::Busy));
+            assert_eq!(self.select(rpc, Selector::Trigger), Err(RpcError::Busy));
             self.now_ns += FID_DELAY_NS;
             self.collect(rpc)
         }
 
         /// Reads the capture `rpc` has done.
         fn collect(&mut self, rpc: &str) -> Read {
-            assert_eq!(self.select(rpc, -2), Ok(vec![2]), "{rpc} is done");
-            let reply = self.select(rpc, -3).unwrap();
+            assert_eq!(
+                self.select(rpc, Selector::Status),
+                Ok(vec![Status::Done.code()]),
+                "{rpc} is done"
+            );
+            let reply = self.select(rpc, Selector::Metadata).unwrap();
             let meta = CaptureMetadata::parse(&reply).unwrap();
             let mut raw = Vec::new();
             let blocks = (meta.data_size as usize).div_ceil(usize::from(meta.block_size));
             for block in 0..blocks {
-                raw.extend(self.select(rpc, block as i16).unwrap());
+                raw.extend(self.select(rpc, Selector::Block(block as u16)).unwrap());
             }
             assert_eq!(raw.len(), meta.data_size as usize);
             assert_eq!(
-                self.select(rpc, blocks as i16),
+                self.select(rpc, Selector::Block(blocks as u16)),
                 Err(RpcError::Invalid),
                 "no block past the last"
             );
@@ -1108,7 +1116,11 @@ mod tests {
     #[test]
     fn an_fid_capture_is_one_shot_as_its_adc_reads_it_out() {
         let mut driven = Driven::new();
-        assert_eq!(driven.select("fid.capture", -2), Ok(vec![0]), "idle");
+        assert_eq!(
+            driven.select("fid.capture", Selector::Status),
+            Ok(vec![Status::Idle.code()]),
+            "idle"
+        );
         let fid = driven.capture("fid.capture");
 
         assert_eq!((fid.name.as_str(), fid.units.as_str()), ("FID", "V"));
@@ -1133,8 +1145,8 @@ mod tests {
         let mut driven = Driven::with(&["--fid-noise", "0"]);
         let mut frequencies = Vec::new();
         for shot in 0..3 {
-            driven.select("fid.capture", -1).unwrap();
-            driven.select("phase.capture", -1).unwrap();
+            driven.select("fid.capture", Selector::Trigger).unwrap();
+            driven.select("phase.capture", Selector::Trigger).unwrap();
             let fid = driven.read("fid.capture");
             let phase = driven.collect("phase.capture");
             let frequency = frequency_of(&phase);
@@ -1239,12 +1251,18 @@ mod tests {
     fn each_capture_has_a_buffer_of_its_own() {
         let mut driven = Driven::new();
         driven.capture("fid.capture");
-        assert_eq!(driven.select("phase.capture", -2), Ok(vec![0]));
-        assert_eq!(driven.select("test.capture", -2), Ok(vec![0]));
-        driven.select("test.capture", -1).unwrap();
-        assert_eq!(driven.select("fid.capture", -2), Ok(vec![2]));
+        let idle = Ok(vec![Status::Idle.code()]);
+        assert_eq!(driven.select("phase.capture", Selector::Status), idle);
+        assert_eq!(driven.select("test.capture", Selector::Status), idle);
+        driven.select("test.capture", Selector::Trigger).unwrap();
         assert_eq!(
-            driven.select("fid.capture", 0).map(|block| block.len()),
+            driven.select("fid.capture", Selector::Status),
+            Ok(vec![Status::Done.code()])
+        );
+        assert_eq!(
+            driven
+                .select("fid.capture", Selector::Block(0))
+                .map(|block| block.len()),
             Ok(256)
         );
     }

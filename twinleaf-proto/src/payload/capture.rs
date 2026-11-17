@@ -1,4 +1,9 @@
-//! Capture metadata, an RPC reply format.
+//! The capture RPC's selector, its status and its metadata reply.
+//!
+//! A capture RPC takes an `i16` selector as its argument, little endian.
+//! `-1` triggers a capture, `-2` reports its [`Status`], `-3` reports its
+//! [`CaptureMetadata`], and `0` and up read that block of its data. An empty
+//! argument reports the status. [`Selector`] parses and writes the argument.
 //!
 //! A capture RPC called with the metadata selector replies with a fixed head
 //! whose first byte is its own length, then four strings whose lengths the
@@ -9,6 +14,92 @@ use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::data::{DataType, RecordReader, RecordWriter};
+use crate::rpc::RpcError;
+
+/// Where a capture stands, as the status selector reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(u8)]
+pub enum Status {
+    /// Nothing captured yet.
+    Idle = 0,
+    /// A capture is in progress.
+    Capturing = 1,
+    /// Data is ready to read.
+    Done = 2,
+    /// The last capture failed.
+    Error = 4,
+}
+
+impl Status {
+    /// The byte the status selector replies with.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The status a reply byte names, or `None` for a byte no status has.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Idle),
+            1 => Some(Self::Capturing),
+            2 => Some(Self::Done),
+            4 => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+/// What a capture RPC argument asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Selector {
+    /// Start a capture.
+    Trigger,
+    /// The [`Status`] byte.
+    Status,
+    /// The [`CaptureMetadata`].
+    Metadata,
+    /// One block of the data.
+    Block(u16),
+}
+
+impl Selector {
+    /// The largest block index a selector holds.
+    pub const MAX_BLOCK: u16 = i16::MAX as u16;
+
+    /// The selector an argument encodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError::ArgsSize`] for an argument that is neither empty
+    /// nor two bytes, and [`RpcError::Invalid`] for a value below `-3`.
+    pub fn parse(arg: &[u8]) -> Result<Self, RpcError> {
+        let selector = match arg {
+            [] => return Ok(Self::Status),
+            [low, high] => i16::from_le_bytes([*low, *high]),
+            _ => return Err(RpcError::ArgsSize),
+        };
+        match selector {
+            -1 => Ok(Self::Trigger),
+            -2 => Ok(Self::Status),
+            -3 => Ok(Self::Metadata),
+            index if index >= 0 => Ok(Self::Block(index as u16)),
+            _ => Err(RpcError::Invalid),
+        }
+    }
+
+    /// The argument that encodes the selector. `None` for a block above
+    /// [`Self::MAX_BLOCK`].
+    pub fn arg(self) -> Option<[u8; 2]> {
+        let selector: i16 = match self {
+            Self::Trigger => -1,
+            Self::Status => -2,
+            Self::Metadata => -3,
+            Self::Block(index) => i16::try_from(index).ok()?,
+        };
+        Some(selector.to_le_bytes())
+    }
+}
 
 /// Version of the layout described here (`TL_CAPTURE_METADATA_VERSION`).
 pub const METADATA_VERSION: u8 = 1;
@@ -482,6 +573,61 @@ mod tests {
             b'v', b'b', b'u', b's', b'm', b'V',
             b't', b'_', b'r', b'e', b'l', b's', b'e', b'c', b'o', b'n', b'd',
         ]);
+    }
+
+    #[test]
+    fn selectors_parse_from_the_argument() {
+        assert_eq!(Selector::parse(&[]), Ok(Selector::Status));
+        assert_eq!(
+            Selector::parse(&(-1i16).to_le_bytes()),
+            Ok(Selector::Trigger)
+        );
+        assert_eq!(
+            Selector::parse(&(-2i16).to_le_bytes()),
+            Ok(Selector::Status)
+        );
+        assert_eq!(
+            Selector::parse(&(-3i16).to_le_bytes()),
+            Ok(Selector::Metadata)
+        );
+        assert_eq!(Selector::parse(&5i16.to_le_bytes()), Ok(Selector::Block(5)));
+        assert_eq!(
+            Selector::parse(&(-4i16).to_le_bytes()),
+            Err(RpcError::Invalid)
+        );
+        assert_eq!(Selector::parse(&[1, 2, 3]), Err(RpcError::ArgsSize));
+    }
+
+    /// Every selector with an argument parses back to itself from it, and
+    /// only a block above [`Selector::MAX_BLOCK`] has no argument.
+    #[test]
+    fn a_selector_parses_back_from_its_argument() {
+        let named = [Selector::Trigger, Selector::Status, Selector::Metadata];
+        let blocks = (0..=Selector::MAX_BLOCK).map(Selector::Block);
+        for selector in named.into_iter().chain(blocks) {
+            let arg = selector
+                .arg()
+                .expect("a selector up to MAX_BLOCK has an argument");
+            assert_eq!(Selector::parse(&arg), Ok(selector));
+        }
+        for index in Selector::MAX_BLOCK + 1..=u16::MAX {
+            assert_eq!(Selector::Block(index).arg(), None);
+        }
+    }
+
+    /// Each status reads back from its code, and every other byte names no
+    /// status.
+    #[test]
+    fn a_status_reads_back_from_its_code() {
+        let statuses = [Status::Idle, Status::Capturing, Status::Done, Status::Error];
+        for status in statuses {
+            assert_eq!(Status::from_code(status.code()), Some(status));
+        }
+        for code in 0..=u8::MAX {
+            if !statuses.iter().any(|status| status.code() == code) {
+                assert_eq!(Status::from_code(code), None);
+            }
+        }
     }
 
     #[test]
