@@ -6,9 +6,9 @@ use super::{FirmwareCatalog, FirmwareDate, FirmwareError, FirmwareRelease};
 /// The user agent of every request.
 const HTTP_USER_AGENT: &str = concat!("twinleaf/", env!("CARGO_PKG_VERSION"));
 
-/// The HTTP agent for catalog requests. On Apple platforms TLS is the operating
-/// system's (see the `ureq` target dependencies in Cargo.toml), verified against
-/// the system trust store; elsewhere it is ureq's default, rustls.
+/// The HTTP agent for catalog requests. On Apple platforms it uses the
+/// operating system's TLS and verifies against the system trust store.
+/// Everywhere else it uses rustls.
 fn agent() -> ureq::Agent {
     #[cfg(target_vendor = "apple")]
     {
