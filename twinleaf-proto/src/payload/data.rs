@@ -772,6 +772,22 @@ impl<'a> SegmentView<'a> {
             .get()
     }
 
+    /// Rows per second, `sampling_rate / decimation`, or `None` if either is
+    /// zero.
+    pub fn rate_hz(&self) -> Option<f64> {
+        let (sampling_rate, decimation) = (self.sampling_rate(), self.decimation());
+        (sampling_rate != 0 && decimation != 0)
+            .then(|| f64::from(sampling_rate) / f64::from(decimation))
+    }
+
+    /// Seconds from one row to the next, `decimation / sampling_rate`, or
+    /// `None` if either is zero.
+    pub fn period(&self) -> Option<f64> {
+        let (sampling_rate, decimation) = (self.sampling_rate(), self.decimation());
+        (sampling_rate != 0 && decimation != 0)
+            .then(|| f64::from(decimation) / f64::from(sampling_rate))
+    }
+
     /// Filter cutoff in hertz.
     pub fn filter_cutoff(&self) -> f32 {
         self.field::<F32>(core::mem::offset_of!(SegmentHead, filter_cutoff))
@@ -1825,6 +1841,29 @@ mod tests {
                 "Total field"
             )
         );
+    }
+
+    /// A segment's rate is its sampling rate over its decimation and its
+    /// period is the decimation over the sampling rate. A zero in either
+    /// field gives neither.
+    #[test]
+    fn a_segment_rate_and_period_come_from_its_sampling_rate_and_decimation() {
+        let record_of = |sampling_rate, decimation| {
+            written(Metadata::Segment(Segment {
+                sampling_rate,
+                decimation,
+                ..segment()
+            }))
+        };
+        let record = record_of(1000, 3);
+        let view = SegmentView::new_checked(&record).unwrap();
+        assert_eq!(view.rate_hz(), Some(1000.0 / 3.0));
+        assert_eq!(view.period(), Some(3.0 / 1000.0));
+        for (sampling_rate, decimation) in [(1000, 0), (0, 3), (0, 0)] {
+            let record = record_of(sampling_rate, decimation);
+            let view = SegmentView::new_checked(&record).unwrap();
+            assert_eq!((view.rate_hz(), view.period()), (None, None));
+        }
     }
 
     /// An older device's shorter head leaves out its last fields, which read

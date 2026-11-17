@@ -151,14 +151,6 @@ metadata_record!(StreamRecord, Stream, StreamView);
 metadata_record!(SegmentRecord, Segment, SegmentView);
 metadata_record!(ColumnRecord, Column, ColumnView);
 
-/// Returns the sample rate in hertz after decimation,
-/// `sampling_rate / decimation`, or `None` if either is zero.
-pub(crate) fn rate_hz(segment: &wire::SegmentView<'_>) -> Option<f64> {
-    let (sampling_rate, decimation) = (segment.sampling_rate(), segment.decimation());
-    (sampling_rate != 0 && decimation != 0)
-        .then(|| f64::from(sampling_rate) / f64::from(decimation))
-}
-
 /// A request for metadata one route still lacks, as selectors for a
 /// `dev.metadata` call that the caller makes.
 #[derive(Debug, Clone)]
@@ -338,7 +330,7 @@ impl StreamMetadataSnapshot {
     /// for a segment whose rate or decimation is zero. The parser emits no
     /// rows from such a segment.
     pub fn rate_hz(&self) -> f64 {
-        rate_hz(&self.segment.get()).unwrap_or(0.0)
+        self.segment.get().rate_hz().unwrap_or(0.0)
     }
 
     pub(crate) fn segment_record(&self) -> &SegmentRecord {
@@ -468,7 +460,7 @@ mod tests {
                 ..fixtures::segment(1)
             })
             .unwrap();
-            rate_hz(&segment.get())
+            segment.get().rate_hz()
         };
         assert_eq!(rate(1000, 4), Some(250.0));
         assert_eq!(rate(1000, 0), None);

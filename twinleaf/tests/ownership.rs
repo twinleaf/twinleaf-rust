@@ -107,6 +107,30 @@ const RULES: &[Rule] = &[
         patterns: &["feature = \"host\""],
         allowed: &[],
     },
+    // A segment's row rate and row period, which `SegmentView::rate_hz` and
+    // `SegmentView::period` own.
+    Rule {
+        patterns: &[
+            "f64::from(sampling_rate) / f64::from(decimation)",
+            "f64::from(decimation) / f64::from(sampling_rate)",
+            ".sampling_rate()) / f64::from(",
+            ".decimation()) / f64::from(",
+        ],
+        allowed: &["twinleaf-proto/"],
+    },
+    // The heartbeat period, which `heartbeat::PERIOD` owns.
+    Rule {
+        patterns: &[
+            "HEARTBEAT_INTERVAL: u64 = 2",
+            "LIVENESS_TIMEOUT: Duration = Duration::",
+        ],
+        allowed: &[],
+    },
+    // The data types that decode into a column, which `decodes` owns.
+    Rule {
+        patterns: &[": [DataType; "],
+        allowed: &["twinleaf-data/"],
+    },
 ];
 
 #[test]

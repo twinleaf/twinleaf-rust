@@ -9,6 +9,9 @@
 use crate::packet::{Header, Packet, PacketType};
 use crate::SessionId;
 
+/// How often a device sends a heartbeat.
+pub const PERIOD: core::time::Duration = core::time::Duration::from_millis(200);
+
 /// Payload length of a heartbeat carrying only a session, `sizeof(tl_session_id)`.
 pub const SESSION_PAYLOAD_SIZE: usize = 4;
 /// Payload length of a heartbeat carrying a session and a settings sequence.

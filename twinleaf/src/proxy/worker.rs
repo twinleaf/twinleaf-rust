@@ -47,7 +47,7 @@
 use super::engine::Mount;
 use super::DumpFlags;
 use crate::chan::StreamMap;
-use crate::proto::heartbeat::Heartbeat;
+use crate::proto::heartbeat::{self, Heartbeat};
 use crate::proto::log::LogLevel;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, PacketType};
@@ -725,8 +725,9 @@ struct Worker {
 }
 
 /// How long a device on a serial or UDP port that has already sent a packet
-/// may stay silent before its port is torn down and reopened.
-const LIVENESS_TIMEOUT: Duration = Duration::from_millis(1000);
+/// may stay silent before its port is torn down and reopened. It may miss
+/// five heartbeats.
+const LIVENESS_TIMEOUT: Duration = heartbeat::PERIOD.saturating_mul(5);
 
 /// How long a device on a TCP connection may stay silent. It allows one RTO
 /// plus slack. The silence counts from the start of the attempt to open the

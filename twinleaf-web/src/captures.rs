@@ -39,7 +39,6 @@ use twinleaf::device::capture::{
 };
 use twinleaf::device::rpc::{CallError, RpcDescriptor, RpcMetaFlags};
 use twinleaf::device::{Presence, Receiver};
-use twinleaf::proto::data::DataType;
 use twinleaf::{DeviceRoute, DeviceTree};
 
 /// The delays between two captures a page may ask for, in seconds.
@@ -59,21 +58,6 @@ const POLL_FIRST: Duration = Duration::from_millis(2);
 const POLL_MAX: Duration = Duration::from_millis(100);
 /// How often a capture being read says how far it is.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
-
-/// The element types a capture frame carries, those a page reads as an
-/// array of numbers.
-const ELEMENTS: [DataType; 10] = [
-    DataType::U8,
-    DataType::I8,
-    DataType::U16,
-    DataType::I16,
-    DataType::U32,
-    DataType::I32,
-    DataType::U64,
-    DataType::I64,
-    DataType::F32,
-    DataType::F64,
-];
 
 /// The amplitude spectral density of the capture `readout` holds, as the
 /// hub estimates a signal's, by [`Welch`] over all its values, along the
@@ -220,7 +204,7 @@ fn done(status: CaptureStatus, waited: Duration) -> Result<bool, Failure> {
 /// or why a page cannot read it.
 fn checked(mut readout: CaptureReadout) -> Result<CaptureReadout, Failure> {
     let meta = &readout.metadata;
-    if !ELEMENTS.contains(&meta.data_type) {
+    if !twinleaf::data::decodes(meta.data_type) {
         return Err(Failure::error(format!(
             "its elements are of type 0x{:02x}, which this proxy does not send",
             meta.data_type.value()
@@ -540,6 +524,7 @@ mod tests {
     use tokio::sync::broadcast;
     use twinleaf::device::rpc::RpcMeta;
     use twinleaf::proto::capture::Selector;
+    use twinleaf::proto::data::DataType;
     use twinleaf::proxy::{HostOptions, Layout, Mount, Proxy};
     use twinleaf::Connection;
 

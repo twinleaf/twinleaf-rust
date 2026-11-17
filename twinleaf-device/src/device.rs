@@ -15,7 +15,7 @@
 
 use heapless::String;
 use twinleaf_proto::data::{self, Metadata, MetadataFlags};
-use twinleaf_proto::heartbeat::Heartbeat;
+use twinleaf_proto::heartbeat::{self, Heartbeat};
 use twinleaf_proto::log::{LogLevel, LogMessage, MAX_MESSAGE_SIZE};
 use twinleaf_proto::packet::{Packet, PacketType, PacketView};
 use twinleaf_proto::route;
@@ -30,7 +30,7 @@ use crate::storage::conf::{self, Image};
 use crate::Sink;
 
 /// Nanoseconds between heartbeats.
-pub const HEARTBEAT_INTERVAL: u64 = 200_000_000;
+pub const HEARTBEAT_INTERVAL: u64 = heartbeat::PERIOD.as_nanos() as u64;
 
 /// Nanoseconds a changed configuration waits before it saves itself.
 pub const AUTOSAVE_INTERVAL: u64 = 60_000_000_000;

@@ -8,8 +8,8 @@ use crate::decode::body::{decode_samples, decodes};
 use crate::model::continuity::{Boundary, Change, Generations, Loss, LossSite};
 use crate::model::sample::{sample_time, BatchContext, RowSource, SampleBatchBuilder};
 use crate::model::schema::{
-    rate_hz, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery, SegmentRecord,
-    StreamKey, StreamMetadataSnapshot, StreamRecord, StreamSchema,
+    ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery, SegmentRecord, StreamKey,
+    StreamMetadataSnapshot, StreamRecord, StreamSchema,
 };
 use crate::proto::data as wire;
 use crate::proto::data::MAX_SAMPLE_NUMBER;
@@ -500,7 +500,7 @@ impl StreamTracker {
         };
         let segment = segment_record.get();
 
-        let Some(new_rate) = rate_hz(&segment) else {
+        let Some(new_rate) = segment.rate_hz() else {
             return Err(StreamDataError::InvalidRate {
                 sampling_rate: segment.sampling_rate(),
                 decimation: segment.decimation(),

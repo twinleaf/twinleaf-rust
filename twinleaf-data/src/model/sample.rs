@@ -19,10 +19,14 @@ pub(crate) struct SampleClock {
 }
 
 impl SampleClock {
+    /// Returns the clock of `segment`, which starts at its start time and
+    /// steps by its period. A segment whose sampling rate or decimation is
+    /// zero has no period, and its clock steps by zero. The parser emits no
+    /// rows from such a segment.
     pub(crate) fn of(segment: wire::SegmentView<'_>) -> Self {
         Self {
             start_time: f64::from(segment.start_time()),
-            period: f64::from(segment.decimation()) / f64::from(segment.sampling_rate()),
+            period: segment.period().unwrap_or(0.0),
         }
     }
 

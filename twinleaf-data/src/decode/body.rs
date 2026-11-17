@@ -11,8 +11,10 @@ use crate::proto::data as wire;
 
 macro_rules! define_decoders {
     ($($variant:ident $native:ty),* $(,)?) => {
-        /// Returns `true` if this build decodes columns of `data_type`.
-        pub(crate) fn decodes(data_type: wire::DataType) -> bool {
+        /// Returns `true` if this build decodes columns of `data_type` into
+        /// values of their own type. A column of any other type decodes to
+        /// [`ColumnData::Unknown`].
+        pub fn decodes(data_type: wire::DataType) -> bool {
             matches!(data_type, $(wire::DataType::$variant)|*)
         }
 

@@ -57,9 +57,10 @@ fn parse_config(url: &str) -> io::Result<(&str, u32, u32)> {
 /// The default data rate of a serial port.
 static DEFAULT_RATE: u32 = 115200;
 
-/// The rules of a serial port's task. A heartbeat goes out every 100 ms.
-/// Everything received in the first 50 ms is discarded. Bytes that wait over
-/// 200 ms for the rest of their frame are discarded as stale.
+/// The rules of a serial port's task. The port sends a heartbeat when it has
+/// sent nothing for 100 ms. Everything received in the first 50 ms is
+/// discarded. Bytes that wait over 200 ms for the rest of their frame are
+/// discarded as stale.
 pub(super) const RULES: Rules = Rules {
     heartbeat: Some(Duration::from_millis(100)),
     quiet: None,

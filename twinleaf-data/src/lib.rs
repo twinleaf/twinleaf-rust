@@ -137,6 +137,7 @@ pub mod fixtures;
 
 #[doc(no_inline)]
 pub use crate::proto::data::DataType;
+pub use decode::body::decodes;
 pub use decode::parser::{PacketOutcome, PacketParser};
 pub use decode::state::{DataError, StreamDataError};
 #[cfg(feature = "processing")]
