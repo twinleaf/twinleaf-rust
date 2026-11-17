@@ -790,6 +790,14 @@ impl<'a> SegmentView<'a> {
             .get()
     }
 
+    /// Whether `other` names the same segment. That is the same id, start
+    /// time and time reference.
+    pub fn is_same_segment(&self, other: &SegmentView<'_>) -> bool {
+        self.segment_id() == other.segment_id()
+            && self.start_time() == other.start_time()
+            && self.time_reference() == other.time_reference()
+    }
+
     /// Samples per second before decimation.
     pub fn sampling_rate(&self) -> u32 {
         self.field::<U32>(core::mem::offset_of!(SegmentHead, sampling_rate))

@@ -138,8 +138,11 @@ struct StreamTracker {
     /// its last rows, as after its link was lost. Rows of another segment
     /// then may be of a restart whose stop went unseen.
     relearned: bool,
-    /// Whether the device sent the record of the last rows' slot again since
-    /// them, so that the slot holds the record the device sent last.
+    /// Whether the device sent a record of the last rows' slot since them
+    /// that may open a new acquisition. Such a record is of another segment
+    /// than the last rows', or came after the stream's records were dropped
+    /// to be learned again. The last rows' own record sent again leaves the
+    /// flag as it is.
     renewed: bool,
     rate_hz: f64,
     /// Whether the device sent a closing record, or the record a start opened of a segment other
@@ -181,26 +184,31 @@ impl StreamTracker {
 
     /// Whether `segment` is the segment of the last accepted rows.
     fn is_last(&self, segment: wire::SegmentView<'_>) -> bool {
-        self.last_segment.as_ref().is_some_and(|last| {
-            (last.get().segment_id(), last.get().start_time())
-                == (segment.segment_id(), segment.start_time())
-        })
+        self.last_segment
+            .as_ref()
+            .is_some_and(|last| last.get().is_same_segment(&segment))
     }
 
     fn segment(&self, segment_id: SegmentId) -> Option<&SegmentRecord> {
         self.segments.get(usize::from(segment_id.value()))?.as_ref()
     }
 
-    fn set_segment(&mut self, segment_id: SegmentId, segment: SegmentRecord) {
+    /// Holds `segment` in its slot. A record of the last rows' slot renews
+    /// it when it is of another segment than the last rows', or when the
+    /// stream's records were dropped to be learned again.
+    fn set_segment(&mut self, segment: SegmentRecord) {
+        let view = segment.get();
+        let segment_id = view.segment_id();
+        let in_last_slot = self
+            .last_segment
+            .as_ref()
+            .is_some_and(|last| last.get().segment_id() == segment_id);
+        self.renewed |= in_last_slot && (!self.is_last(view) || self.relearned);
         let index = usize::from(segment_id.value());
         if self.segments.len() <= index {
             self.segments.resize(index + 1, None);
         }
         self.segments[index] = Some(segment);
-        self.renewed |= self
-            .last_segment
-            .as_ref()
-            .is_some_and(|last| last.get().segment_id() == segment_id);
     }
 
     /// Learns the stream record of a stream that had none.
@@ -307,9 +315,9 @@ impl StreamTracker {
         let lost = |samples: u64| Loss::at(self.blamed, samples, Some(expected));
 
         // Rows in the last rows' slot are of a later lap of the ring when
-        // that slot's segment starts at another time. A device never moves a
-        // segment's start, and never starts two acquisitions of one slot in
-        // the same second.
+        // that slot's segment starts at another time. On one time reference a
+        // device never moves a segment's start, and never starts two
+        // acquisitions of one slot in the same second.
         // Rows are of the current segment. A device that declares a revision marks the segment a
         // start opens and closes the one a stop ends, so the time between holds no sample to
         // lose. Rows in another segment after the records were dropped may be of a restart that
@@ -404,9 +412,9 @@ impl StreamTracker {
         // the device broadcast its record since them.
         // A segment's sample numbers only go up, so rows numbered at or
         // below the last rows, in their segment, while the device has sent
-        // no record of that slot since them, are of a new acquisition in the
-        // slot whose record has not come. A child behind a hub sends such
-        // rows after a reboot it has not yet announced.
+        // no record of that slot since them that renews it, are of a new
+        // acquisition in the slot whose record has not come. A child behind
+        // a hub sends such rows after a reboot it has not yet announced.
         let behind = !self.renewed
             && self
                 .last_segment
@@ -786,7 +794,7 @@ impl DeviceState {
                 stream.restarted |= closes
                     || segment.flags().contains(wire::SegmentFlags::START)
                         && !stream.is_last(segment);
-                stream.set_segment(segment_id, incoming);
+                stream.set_segment(incoming);
                 let switched = stream.current_segment_id != segment_id
                     && match source {
                         MetadataSource::Broadcast => true,

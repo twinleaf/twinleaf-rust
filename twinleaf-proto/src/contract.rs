@@ -301,6 +301,7 @@ fn m1(n_streams: Option<u8>, stream: StreamId) -> bool {
 }
 
 /// A segment as a row names it, its id with the start and time reference of its latest record.
+/// Its fields are the ones [`data::SegmentView::is_same_segment`] compares.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Segment {
     id: SegmentId,
@@ -311,6 +312,17 @@ struct Segment {
 }
 
 impl Segment {
+    /// The segment `record` names.
+    fn of(record: data::Segment<'_>) -> Self {
+        Self {
+            id: record.segment_id,
+            start_time: record.start_time,
+            epoch: record.epoch,
+            timeref_session: record.timeref_session,
+            timeref_serial: record.timeref_serial.into(),
+        }
+    }
+
     fn time_reference(&self) -> data::TimeReference<'_> {
         data::TimeReference {
             epoch: self.epoch,
@@ -392,13 +404,7 @@ impl Stream {
             record.start_time
         );
         let record = Record {
-            segment: Segment {
-                id: record.segment_id,
-                start_time: record.start_time,
-                epoch: record.epoch,
-                timeref_session: record.timeref_session,
-                timeref_serial: record.timeref_serial.into(),
-            },
+            segment: Segment::of(record),
             flags: record.flags,
             sampling_rate: record.sampling_rate,
             decimation: record.decimation,
@@ -697,7 +703,20 @@ mod tests {
         reference: u32,
         flags: SegmentFlags,
     ) -> Step {
-        let record = Metadata::Segment(data::Segment {
+        let record =
+            Metadata::Segment(segment_record(epoch, segment, start_time, reference, flags));
+        device(written(|buf| record.write(MetadataFlags::UPDATE, buf)))
+    }
+
+    /// The record [`segment_in`] writes.
+    fn segment_record(
+        epoch: Epoch,
+        segment: u8,
+        start_time: u32,
+        reference: u32,
+        flags: SegmentFlags,
+    ) -> data::Segment<'static> {
+        data::Segment {
             stream_id: StreamId::new(1),
             segment_id: SegmentId::new(segment),
             flags,
@@ -709,8 +728,7 @@ mod tests {
             decimation: 1,
             filter_cutoff: 0.0,
             filter_type: FilterType::NONE,
-        });
-        device(written(|buf| record.write(MetadataFlags::UPDATE, buf)))
+        }
     }
 
     /// The record of a segment a switch opened.
@@ -1217,5 +1235,61 @@ mod tests {
             close(0, 103),
         ];
         assert_eq!(broken(&steps), []);
+    }
+
+    /// The contract's segment and the view's test of the same segment agree.
+    /// Records that differ in one of id, start time, epoch and the time
+    /// reference's session and serial name other segments to both.
+    #[test]
+    fn a_segment_is_the_one_the_view_names_the_same() {
+        let base = segment_record(
+            Epoch::UNIX,
+            0,
+            100,
+            3,
+            SegmentFlags::VALID | SegmentFlags::ACTIVE,
+        );
+        let bytes = |record: data::Segment<'_>| {
+            let metadata = Metadata::Segment(record);
+            let mut buf = alloc::vec![0; metadata.record_len()];
+            let (_, len) = metadata.write_record(&mut buf).unwrap();
+            buf.truncate(len);
+            buf
+        };
+        let others = [
+            data::Segment {
+                segment_id: SegmentId::new(1),
+                ..base
+            },
+            data::Segment {
+                start_time: 101,
+                ..base
+            },
+            data::Segment {
+                epoch: Epoch::SYSTIME,
+                ..base
+            },
+            data::Segment {
+                timeref_session: SessionId::new(4),
+                ..base
+            },
+            data::Segment {
+                timeref_serial: "S2",
+                ..base
+            },
+        ];
+        let base_bytes = bytes(base);
+        let base_view = data::SegmentView::new_checked(&base_bytes).unwrap();
+        for (index, other) in others.into_iter().chain([base]).enumerate() {
+            let other_bytes = bytes(other);
+            let other_view = data::SegmentView::new_checked(&other_bytes).unwrap();
+            let same = index == others.len();
+            assert_eq!(
+                Segment::of(base) == Segment::of(other),
+                same,
+                "pair {index}"
+            );
+            assert_eq!(base_view.is_same_segment(&other_view), same, "pair {index}");
+        }
     }
 }

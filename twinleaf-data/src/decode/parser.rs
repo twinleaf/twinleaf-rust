@@ -983,6 +983,160 @@ mod tests {
         );
     }
 
+    /// A parser holding 30 rows of slot 0 of a device that declares a
+    /// revision, where a start opened the slot's segment at 10 s, after the
+    /// device sent that segment's record again unchanged.
+    fn parser_after_a_resent_record() -> PacketParser {
+        let mut parser = PacketParser::new(false);
+        let device = wire::Device {
+            protocol: 1,
+            ..fixtures::device()
+        };
+        announce_schema_for(&mut parser, device, &[DataType::F32], 4, 2, 1, 1);
+        let opened = wire::Metadata::Segment(wire::Segment {
+            start_time: 10,
+            flags: wire::SegmentFlags::VALID
+                | wire::SegmentFlags::ACTIVE
+                | wire::SegmentFlags::START,
+            ..fixtures::segment(STREAM_ID)
+        });
+        announce(&mut parser, opened);
+        parser
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4 * 30])))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+        announce(&mut parser, opened);
+        parser
+    }
+
+    /// The record a device sends again of the segment it is in does not
+    /// renew the slot. Rows of a new acquisition in the slot, in a new
+    /// session, wait for the record that opens it, and decode with it.
+    #[test]
+    fn rows_of_a_new_acquisition_wait_for_its_record_after_the_last_one_came_again() {
+        let mut parser = parser_in_a_new_session();
+        assert_eq!(
+            parser
+                .push_packet(checked(&stream_data_packet(17, vec![0; 4 * 3])))
+                .expect("valid rows"),
+            PacketOutcome::WaitingForMetadata
+        );
+        assert!(
+            parser.pop_batch().is_none(),
+            "the rows wait for their record"
+        );
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::segment(STREAM_ID, 0)]
+        );
+
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                start_time: 50,
+                flags: wire::SegmentFlags::VALID
+                    | wire::SegmentFlags::ACTIVE
+                    | wire::SegmentFlags::START,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(checked(&stream_data_packet(20, vec![0; 4])))
+            .expect("valid rows");
+        let after = parser.pop_batch().expect("the new acquisition's rows");
+        assert_eq!(after.timestamps(), [71.0], "the end of sample 20 from 50 s");
+        assert!(after.boundary().is_some());
+    }
+
+    /// The parser of [`parser_after_a_resent_record`] after the device's
+    /// heartbeat and record of a new session.
+    fn parser_in_a_new_session() -> PacketParser {
+        let mut parser = parser_after_a_resent_record();
+        parser
+            .push_packet(checked(&packet::heartbeat_session(43, DeviceRoute::root())))
+            .unwrap();
+        announce(
+            &mut parser,
+            wire::Metadata::Device(wire::Device {
+                session: crate::proto::SessionId::new(43),
+                protocol: 1,
+                ..fixtures::device()
+            }),
+        );
+        parser
+    }
+
+    /// The last rows' record sent again after the device's new session, as
+    /// a proxy that still holds it sends it, does not renew the slot. Rows
+    /// numbered back in the slot wait for the record that opens their
+    /// acquisition.
+    #[test]
+    fn the_last_record_sent_again_in_a_new_session_does_not_renew_its_slot() {
+        let mut parser = parser_in_a_new_session();
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                start_time: 10,
+                flags: wire::SegmentFlags::VALID
+                    | wire::SegmentFlags::ACTIVE
+                    | wire::SegmentFlags::START,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        assert_eq!(
+            parser
+                .push_packet(checked(&stream_data_packet(5, vec![0; 4])))
+                .expect("valid rows"),
+            PacketOutcome::WaitingForMetadata
+        );
+        assert!(
+            parser.pop_batch().is_none(),
+            "the rows wait for their record"
+        );
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::segment(STREAM_ID, 0)]
+        );
+    }
+
+    /// A record of the last rows' slot with their start second, on the time
+    /// reference of the device's new session, opens a new acquisition. Its
+    /// rows decode with a boundary.
+    #[test]
+    fn a_restart_on_the_devices_own_clock_opens_a_new_acquisition() {
+        let mut parser = parser_in_a_new_session();
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                start_time: 10,
+                timeref_session: crate::proto::SessionId::new(43),
+                flags: wire::SegmentFlags::VALID
+                    | wire::SegmentFlags::ACTIVE
+                    | wire::SegmentFlags::START,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4 * 3])))
+            .expect("valid rows");
+        let after = parser.pop_batch().expect("the new acquisition's rows");
+        assert!(after.boundary().is_some());
+    }
+
+    /// Rows numbered back in their segment wait for its record, also after
+    /// the device sent the last rows' record again.
+    #[test]
+    fn rows_numbered_back_after_their_record_came_again_wait() {
+        let mut parser = parser_after_a_resent_record();
+        assert_eq!(
+            parser
+                .push_packet(checked(&stream_data_packet(5, vec![0; 4])))
+                .expect("valid rows"),
+            PacketOutcome::WaitingForMetadata
+        );
+        assert!(parser.pop_batch().is_none());
+    }
+
     /// A stream's first rows in a segment the device did not announce wait
     /// for that segment's record, as the record the parser holds is left
     /// from an earlier lap of the ring.
