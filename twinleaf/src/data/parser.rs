@@ -1318,6 +1318,34 @@ mod tests {
         );
     }
 
+    /// Rows or a record of a stream above the device's stream count are
+    /// refused alone. The streams the device counts keep decoding, and the
+    /// route asks for nothing.
+    #[test]
+    fn a_stream_above_the_stream_count_is_refused_alone() {
+        let route = DeviceRoute::root();
+        let above = [
+            stream_data_packet_for(3, 0, 1),
+            fixtures::broadcast(wire::Metadata::Segment(fixtures::segment(3)), route),
+        ];
+        for packet in above {
+            let mut parser = parser_with_streams(2);
+            assert!(parser.metadata(route).is_some());
+            parser.push_packet(&packet).expect("a refusal is no error");
+            assert!(parser.metadata(route).is_some(), "the metadata is kept");
+            for stream_id in [1, 2] {
+                assert!(matches!(
+                    parser.push_packet(&stream_data_packet_for(stream_id, 0, 1)),
+                    Ok(PacketOutcome::Rows(1))
+                ));
+            }
+            assert!(
+                parser.take_metadata_queries_for(route).is_empty(),
+                "no bootstrap query"
+            );
+        }
+    }
+
     #[test]
     fn pending_batches_never_straddle_a_shared_generation_bump() {
         let mut parser = parser_with_streams(2).with_batch_rows(4);

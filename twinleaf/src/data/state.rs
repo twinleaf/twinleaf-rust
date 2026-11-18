@@ -683,19 +683,13 @@ impl DeviceState {
         self.query_in_flight = false;
     }
 
-    fn accepts_stream(&mut self, stream_id: StreamId, global_generation: &mut u32) -> bool {
-        if self
+    /// Whether the device record counts `stream_id`. A record or rows of a
+    /// stream above the count are refused, and the rest is kept.
+    fn accepts_stream(&self, stream_id: StreamId) -> bool {
+        !self
             .metadata
             .as_ref()
             .is_some_and(|device| stream_id.value() > device.get().n_streams())
-        {
-            // An impossible stream id means our device description is stale or
-            // corrupt. Bootstrap the route again instead of retaining it.
-            self.forget_all_metadata(global_generation);
-            false
-        } else {
-            true
-        }
     }
 
     /// Merges one metadata record into this route's decoding state. A record
@@ -744,7 +738,7 @@ impl DeviceState {
                     return;
                 };
                 let stream_id = incoming.get().stream_id();
-                if !self.accepts_stream(stream_id, global_generation) {
+                if !self.accepts_stream(stream_id) {
                     return;
                 }
                 let stream = self.stream_mut(stream_id);
@@ -768,7 +762,7 @@ impl DeviceState {
                 };
                 let segment = incoming.get();
                 let (stream_id, segment_id) = (segment.stream_id(), segment.segment_id());
-                if !self.accepts_stream(stream_id, global_generation) {
+                if !self.accepts_stream(stream_id) {
                     return;
                 }
                 let closes = source == MetadataSource::Broadcast
@@ -800,7 +794,7 @@ impl DeviceState {
                 };
                 let column = incoming.get();
                 let (stream_id, index) = (column.stream_id(), column.index().index());
-                if !self.accepts_stream(stream_id, global_generation) {
+                if !self.accepts_stream(stream_id) {
                     return;
                 }
                 let stream = self.stream_mut(stream_id);
@@ -866,7 +860,7 @@ impl DeviceState {
         let Some(device_metadata) = self.metadata.clone() else {
             return Ok(PacketEvent::WaitingForMetadata);
         };
-        if !self.accepts_stream(data.stream_id, global_generation) {
+        if !self.accepts_stream(data.stream_id) {
             return Ok(PacketEvent::WaitingForMetadata);
         }
 
