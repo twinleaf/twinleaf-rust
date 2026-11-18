@@ -29,7 +29,7 @@ pub const METADATA_HEADER_SIZE: usize = 2;
 pub const SAMPLE_HEADER_SIZE: usize = 4;
 /// Shortest sample payload, the sample header and one sample byte. A sample
 /// packet always carries at least one sample byte.
-pub const MIN_SAMPLE_PAYLOAD: usize = SAMPLE_HEADER_SIZE + 1;
+pub(crate) const MIN_SAMPLE_PAYLOAD: usize = SAMPLE_HEADER_SIZE + 1;
 /// Largest sample number on the wire. Sample numbers wrap at 24 bits.
 pub const MAX_SAMPLE_NUMBER: u32 = crate::SampleNumber::MAX;
 
@@ -483,15 +483,6 @@ impl<'a> Segment<'a> {
             filter_type: FilterType::new(head.filter_type),
             timeref_serial: strings.take(head.timeref_serial_len)?,
         })
-    }
-
-    /// The time reference the segment's times count from.
-    pub fn time_reference(&self) -> TimeReference<'a> {
-        TimeReference {
-            epoch: self.epoch,
-            session: self.timeref_session,
-            serial: self.timeref_serial,
-        }
     }
 }
 
@@ -1349,8 +1340,8 @@ impl<'a> Samples<'a> {
     }
 
     /// Parses a sample packet from its header and payload. Returns `None` if it
-    /// is not a sample packet of streams 1 to 127, or if the payload is shorter
-    /// than [`MIN_SAMPLE_PAYLOAD`] and so carries no sample byte.
+    /// is not a sample packet of streams 1 to 127, or if the payload is too
+    /// short to carry the sample header and one sample byte.
     pub fn parse(header: Header, payload: &'a [u8]) -> Option<Self> {
         let stream_id = header.ptype.sample_stream()?;
         let (head, data) = payload.split_at_checked(SAMPLE_HEADER_SIZE)?;
@@ -1984,7 +1975,12 @@ mod tests {
     fn a_time_reference_is_its_epoch_session_and_serial() {
         let record = written(Metadata::Segment(segment()));
         let view = SegmentView::new_checked(&record).unwrap();
-        let reference = segment().time_reference();
+        let record_segment = segment();
+        let reference = TimeReference {
+            epoch: record_segment.epoch,
+            session: record_segment.timeref_session,
+            serial: record_segment.timeref_serial,
+        };
         assert_eq!(view.time_reference(), reference);
         assert_eq!(
             reference,

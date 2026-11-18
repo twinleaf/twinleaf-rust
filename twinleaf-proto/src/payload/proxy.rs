@@ -79,7 +79,7 @@ impl LinkStatus {
     /// Reads a `PROXY_STATUS` payload. Code 4 reads as
     /// [`Unknown`](Self::Unknown), since the old form has no stop. Returns
     /// `None` if the payload is empty.
-    pub fn parse_status(payload: &[u8]) -> Option<Self> {
+    pub(crate) fn parse_status(payload: &[u8]) -> Option<Self> {
         let code = *payload.first()?;
         Some(match Self::from(code) {
             Self::Stopped => Self::Unknown(code),
@@ -94,7 +94,7 @@ impl LinkStatus {
     /// # Errors
     ///
     /// Returns [`WriteError::BufferTooSmall`] if `out` is empty.
-    pub fn write_status(self, out: &mut [u8]) -> Result<usize, WriteError> {
+    fn write_status(self, out: &mut [u8]) -> Result<usize, WriteError> {
         let status = match self {
             Self::Stopped => Self::FailedToReconnect,
             status => status,
@@ -104,8 +104,9 @@ impl LinkStatus {
     }
 
     /// Writes this status as a full `PROXY_STATUS` packet with no routing
-    /// into `buf`, its payload as [`write_status`](Self::write_status) writes
-    /// it. Returns the packet length.
+    /// into `buf`. [`Stopped`](Self::Stopped) goes out as
+    /// [`FailedToReconnect`](Self::FailedToReconnect). Returns the packet
+    /// length.
     ///
     /// # Errors
     ///
@@ -167,8 +168,8 @@ impl<'a> ProxyRx<'a> {
         })
     }
 
-    /// Returns the length of the payload [`write_payload`](Self::write_payload)
-    /// writes.
+    /// Returns the length of the `PROXY_RX` payload, the packet without its
+    /// header.
     pub fn payload_len(&self) -> usize {
         1 + match self {
             Self::Reply(reply) => 2 + reply.value.len(),
@@ -186,7 +187,7 @@ impl<'a> ProxyRx<'a> {
     /// # Errors
     ///
     /// Returns [`WriteError::BufferTooSmall`] if the payload does not fit.
-    pub fn write_payload(&self, out: &mut [u8]) -> Result<usize, WriteError> {
+    fn write_payload(&self, out: &mut [u8]) -> Result<usize, WriteError> {
         let (kind, body) = out.split_first_mut().ok_or(WriteError::BufferTooSmall)?;
         let written = match *self {
             Self::Reply(reply) => {

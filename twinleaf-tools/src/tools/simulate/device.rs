@@ -12,7 +12,7 @@
 
 use std::num::NonZeroU32;
 
-use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
+use twinleaf::proto::capture::{CaptureMetadata, Selector, Status, METADATA_VERSION};
 use twinleaf::proto::data::DataType;
 use twinleaf::proto::log::LogLevel;
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
@@ -20,7 +20,7 @@ use twinleaf::proto::update::IMAGE_CHUNK_ENVELOPE;
 use twinleaf::proto::{BoardId, DeviceRoute, FirmwareMagic, HwRev, SessionId, StreamId};
 use twinleaf_device::data::{filter, ColumnDef, DataStream, Params, StreamDef};
 use twinleaf_device::device::{Action, Announcer, Entry, Group, Identity};
-use twinleaf_device::rpc::{Access, Capture, Reply, RpcSpec, Selector, Setting, Status, STANDARD};
+use twinleaf_device::rpc::{Access, Capture, Reply, RpcSpec, Setting, STANDARD};
 use twinleaf_device::sim::{self, Port, Sim, Slot};
 use twinleaf_device::storage::update::{Package, Upload};
 use twinleaf_device::Sink;
