@@ -459,7 +459,8 @@ mod tests {
     use crate::model::sample::ColumnData;
     use crate::proto::data as wire;
     use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};
-    use crate::proto::SampleNumber;
+    use crate::proto::sync::Epoch;
+    use crate::proto::{SampleNumber, SessionId};
     use crate::store::buffer::Buffer;
 
     const STREAM_ID: u8 = 1;
@@ -1059,32 +1060,22 @@ mod tests {
         );
     }
 
-    /// The boundary of `outputs` rows of segment 0, at `sampling_rate`
-    /// decimated by `decimation`, then row `first` of segment `next`, which
-    /// starts `seconds` after segment 0.
+    /// The boundary of `outputs` rows of slot 0 in `parser`, then row `first`
+    /// of the segment `next`.
     fn boundary_across(
-        (sampling_rate, decimation): (u32, u32),
+        mut parser: PacketParser,
         outputs: usize,
-        (next, seconds, first): (u8, u32, u32),
+        next: wire::Segment<'_>,
+        first: u32,
     ) -> Option<Boundary> {
-        let mut parser = parser_with_clock(&[DataType::F32], 4, 4, sampling_rate, decimation);
         parser
             .push_packet(checked(&stream_data_packet(0, vec![0; 4 * outputs])))
             .expect("valid rows");
         parser.pop_batch().expect("the first batch");
-        announce(
-            &mut parser,
-            wire::Metadata::Segment(wire::Segment {
-                segment_id: crate::proto::SegmentId::new(next),
-                start_time: seconds,
-                sampling_rate,
-                decimation,
-                ..fixtures::segment(STREAM_ID)
-            }),
-        );
+        announce(&mut parser, wire::Metadata::Segment(next));
         parser
             .push_packet(checked(&stream_data_packet_in_segment(
-                next,
+                next.segment_id.value(),
                 first,
                 vec![0; 4],
             )))
@@ -1108,8 +1099,15 @@ mod tests {
     #[test]
     fn a_ring_that_came_round_rolls_over_onto_the_same_slot() {
         // 4 segments of one row at 1 Hz, all after the first lost.
+        let next = wire::Segment {
+            segment_id: crate::proto::SegmentId::new(0),
+            start_time: 4,
+            sampling_rate: 1,
+            decimation: 1,
+            ..fixtures::segment(STREAM_ID)
+        };
         assert_eq!(
-            boundary_across((1, 1), 1, (0, 4, 0)),
+            boundary_across(parser_with_clock(&[DataType::F32], 4, 4, 1, 1), 1, next, 0),
             Some(Boundary {
                 change: rollover(0, 0),
                 loss: Some(Loss {
@@ -1183,6 +1181,100 @@ mod tests {
                 "revision {protocol} with {flags:?}"
             );
         }
+    }
+
+    /// The boundary of five rows of slot 0 under `before`, then row 0 of slot 1 under `after`.
+    /// Both are records a switch opens, at 10 rows a second.
+    fn boundary_between(before: wire::Segment<'_>, after: wire::Segment<'_>) -> Option<Boundary> {
+        let open = wire::SegmentFlags::VALID | wire::SegmentFlags::ACTIVE;
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 10, 1);
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(0),
+                flags: open,
+                ..before
+            }),
+        );
+        let after = wire::Segment {
+            segment_id: crate::proto::SegmentId::new(1),
+            flags: open,
+            ..after
+        };
+        boundary_across(parser, 5, after, 0)
+    }
+
+    /// A segment on the time reference of session 7 of `clock`, in `epoch`, from `start_time`.
+    fn on_reference(epoch: Epoch, start_time: u32) -> wire::Segment<'static> {
+        wire::Segment {
+            epoch,
+            start_time,
+            sampling_rate: 10,
+            decimation: 1,
+            ..fixtures::segment(STREAM_ID)
+        }
+    }
+
+    fn reference_changed(old: u32, new: u32) -> Option<Boundary> {
+        Some(Boundary::of(Change::TimeRefSessionChanged {
+            old: SessionId::new(old),
+            new: SessionId::new(new),
+        }))
+    }
+
+    /// A next segment whose epoch alone differs, forward, is on another time reference.
+    #[test]
+    fn an_epoch_change_forward_is_a_time_reference_change() {
+        assert_eq!(
+            boundary_between(
+                on_reference(Epoch::SYSTIME, 5000),
+                on_reference(Epoch::UNIX, 1_700_000_000)
+            ),
+            reference_changed(7, 7)
+        );
+    }
+
+    /// A next segment whose epoch alone differs, backward, is on another time reference.
+    #[test]
+    fn an_epoch_change_backward_is_a_time_reference_change() {
+        assert_eq!(
+            boundary_between(
+                on_reference(Epoch::UNIX, 1_700_000_000),
+                on_reference(Epoch::SYSTIME, 5000)
+            ),
+            reference_changed(7, 7)
+        );
+    }
+
+    /// A next segment whose serial alone differs is on another time reference.
+    #[test]
+    fn a_serial_change_is_a_time_reference_change() {
+        assert_eq!(
+            boundary_between(
+                on_reference(Epoch::SYSTIME, 5000),
+                wire::Segment {
+                    timeref_serial: "other",
+                    ..on_reference(Epoch::SYSTIME, 5003)
+                }
+            ),
+            reference_changed(7, 7)
+        );
+    }
+
+    /// A next segment whose session alone differs is on another time reference, with both
+    /// sessions named.
+    #[test]
+    fn a_session_change_is_a_time_reference_change() {
+        assert_eq!(
+            boundary_between(
+                on_reference(Epoch::SYSTIME, 5000),
+                wire::Segment {
+                    timeref_session: SessionId::new(8),
+                    ..on_reference(Epoch::SYSTIME, 5003)
+                }
+            ),
+            reference_changed(7, 8)
+        );
     }
 
     /// Rows a device that declares no revision sends after its link came back go on from the last

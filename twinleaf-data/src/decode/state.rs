@@ -128,7 +128,6 @@ struct StreamTracker {
     last_sample_number: SampleNumber,
     last_timestamp: f64,
     last_session_id: SessionId,
-    last_time_ref_session_id: SessionId,
     /// The record of the segment the last accepted rows were in, whose start
     /// and clock place the rows a rollover lost.
     last_segment: Option<SegmentRecord>,
@@ -164,7 +163,6 @@ impl StreamTracker {
             last_sample_number: SampleNumber::new(0),
             last_timestamp: 0.0,
             last_session_id: SessionId::new(0),
-            last_time_ref_session_id: SessionId::new(0),
             last_segment: None,
             last_schema: None,
             relearned: false,
@@ -282,9 +280,9 @@ impl StreamTracker {
             return Some(Boundary::of(Change::Initial));
         }
 
-        if segment.timeref_session() != self.last_time_ref_session_id {
+        if segment.time_reference() != last.time_reference() {
             return Some(Boundary::of(Change::TimeRefSessionChanged {
-                old: self.last_time_ref_session_id,
+                old: last.timeref_session(),
                 new: segment.timeref_session(),
             }));
         }
@@ -360,7 +358,8 @@ impl StreamTracker {
     /// gap of a whole period. The count is below 1 when no row was missed.
     ///
     /// The count rests on law `S6` of the contract in `twinleaf_proto::contract`, which says
-    /// how far a segment's rows number before the next segment.
+    /// how far a segment's rows number before the next segment on the same time reference. The
+    /// parser reaches this count only for a segment on the last rows' time reference.
     fn missing_before(&self, segment: wire::SegmentView<'_>, first: SampleNumber) -> i128 {
         let Some(last) = self.last_segment.as_ref().map(SegmentRecord::get) else {
             return 0;
@@ -532,7 +531,6 @@ impl StreamTracker {
         self.last_sample_number = last_sample_n;
         self.last_timestamp = sample_time(segment, last_sample_n.value() + 1);
         self.last_session_id = device.session();
-        self.last_time_ref_session_id = segment.timeref_session();
         self.last_segment = Some(segment_record.clone());
         self.last_schema = self.schema.clone();
         self.relearned = false;

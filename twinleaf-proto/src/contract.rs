@@ -277,10 +277,11 @@ fn s6(stream: &Stream, record: &Record) -> bool {
     let Some(before) = stream.last_row.as_ref() else {
         return true;
     };
-    let same_reference = before.epoch == next.epoch
-        && before.timeref_session == next.timeref_session
-        && before.timeref_serial == next.timeref_serial;
-    if !record.active() || record.starts() || stream.runs.contains_key(next) || !same_reference {
+    if !record.active()
+        || record.starts()
+        || stream.runs.contains_key(next)
+        || before.time_reference() != next.time_reference()
+    {
         return true;
     }
     let Some(seconds) = next.start_time.checked_sub(before.start_time) else {
@@ -307,6 +308,16 @@ struct Segment {
     epoch: Epoch,
     timeref_session: SessionId,
     timeref_serial: String,
+}
+
+impl Segment {
+    fn time_reference(&self) -> data::TimeReference<'_> {
+        data::TimeReference {
+            epoch: self.epoch,
+            session: self.timeref_session,
+            serial: &self.timeref_serial,
+        }
+    }
 }
 
 /// A segment record, the segment it names with everything else it says.
@@ -675,11 +686,22 @@ mod tests {
 
     /// A segment's record with `flags`, on the time reference of session `reference`.
     fn segment(segment: u8, start_time: u32, reference: u32, flags: SegmentFlags) -> Step {
+        segment_in(Epoch::UNIX, segment, start_time, reference, flags)
+    }
+
+    /// A segment's record with `flags`, on the time reference of session `reference` in `epoch`.
+    fn segment_in(
+        epoch: Epoch,
+        segment: u8,
+        start_time: u32,
+        reference: u32,
+        flags: SegmentFlags,
+    ) -> Step {
         let record = Metadata::Segment(data::Segment {
             stream_id: StreamId::new(1),
             segment_id: SegmentId::new(segment),
             flags,
-            epoch: Epoch::UNIX,
+            epoch,
             timeref_serial: "S1",
             timeref_session: SessionId::new(reference),
             start_time,
@@ -1066,6 +1088,18 @@ mod tests {
             (Law::S6, held(record(1, 103)), held(record(1, 102)), 5),
             (Law::S6, held(start(1, 102)), held(record(1, 102)), 5),
             (Law::S6, held(record_on(1, 102, 4)), held(record(1, 102)), 5),
+            (
+                Law::S6,
+                held(segment_in(
+                    Epoch::SYSTIME,
+                    1,
+                    99,
+                    3,
+                    SegmentFlags::VALID | SegmentFlags::ACTIVE,
+                )),
+                held(record(1, 99)),
+                5,
+            ),
             (
                 Law::M1,
                 vec![

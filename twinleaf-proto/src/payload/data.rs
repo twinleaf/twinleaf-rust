@@ -468,6 +468,27 @@ impl<'a> Segment<'a> {
             timeref_serial: strings.take(head.timeref_serial_len)?,
         })
     }
+
+    /// The time reference the segment's times count from.
+    pub fn time_reference(&self) -> TimeReference<'a> {
+        TimeReference {
+            epoch: self.epoch,
+            session: self.timeref_session,
+            serial: self.timeref_serial,
+        }
+    }
+}
+
+/// The time reference a segment's times count from. Two segments are on the
+/// same time reference only if all three fields are equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TimeReference<'a> {
+    /// Timescale the times count in.
+    pub epoch: Epoch,
+    /// Session id of the timebase source.
+    pub session: SessionId,
+    /// Serial of the device that owns the timebase.
+    pub serial: &'a str,
 }
 
 /// One column of a stream's sample (`TL_METADATA_COLUMN`).
@@ -752,6 +773,15 @@ impl<'a> SegmentView<'a> {
             self.field::<U32>(core::mem::offset_of!(SegmentHead, timeref_session))
                 .get(),
         )
+    }
+
+    /// The time reference the segment's times count from.
+    pub fn time_reference(&self) -> TimeReference<'a> {
+        TimeReference {
+            epoch: self.epoch(),
+            session: self.timeref_session(),
+            serial: self.timeref_serial(),
+        }
     }
 
     /// Time of sample zero, in seconds after `epoch`.
@@ -1863,6 +1893,40 @@ mod tests {
             let record = record_of(sampling_rate, decimation);
             let view = SegmentView::new_checked(&record).unwrap();
             assert_eq!((view.rate_hz(), view.period()), (None, None));
+        }
+    }
+
+    /// A segment's view and its record give the same time reference, and two
+    /// references that differ in any one field are unequal.
+    #[test]
+    fn a_time_reference_is_its_epoch_session_and_serial() {
+        let record = written(Metadata::Segment(segment()));
+        let view = SegmentView::new_checked(&record).unwrap();
+        let reference = segment().time_reference();
+        assert_eq!(view.time_reference(), reference);
+        assert_eq!(
+            reference,
+            TimeReference {
+                epoch: Epoch::UNIX,
+                session: SESSION,
+                serial: "twinleaf-37383731",
+            }
+        );
+        for other in [
+            TimeReference {
+                epoch: Epoch::SYSTIME,
+                ..reference
+            },
+            TimeReference {
+                session: SessionId::new(SESSION.value() + 1),
+                ..reference
+            },
+            TimeReference {
+                serial: "other",
+                ..reference
+            },
+        ] {
+            assert_ne!(other, reference);
         }
     }
 

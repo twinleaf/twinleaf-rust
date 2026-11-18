@@ -176,7 +176,9 @@ pub enum Change {
         /// Session the device reports now.
         new: SessionId,
     },
-    /// The time reference epoch changed.
+    /// The time reference changed, in its epoch, its session or its serial.
+    /// The two fields are the sessions of the two time references, which are
+    /// equal when only the epoch or the serial changed.
     TimeRefSessionChanged {
         /// Time reference session the preceding rows carried.
         old: SessionId,
