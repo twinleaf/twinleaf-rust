@@ -287,6 +287,12 @@ impl PacketParser {
         self.state.metadata(route)
     }
 
+    /// Returns the route's metadata generation. It moves on when a query
+    /// completes or fails and when the route relearns or resets.
+    pub(crate) fn metadata_generation(&self, route: DeviceRoute) -> Option<u32> {
+        self.state.metadata_generation(route)
+    }
+
     /// Returns the route's current metadata revision without building a
     /// snapshot.
     pub(crate) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
@@ -1309,6 +1315,83 @@ mod tests {
                 device: 0,
                 global: 0
             }
+        );
+    }
+
+    /// Rows or a record of a stream above the device's stream count are
+    /// refused alone. The streams the device counts keep decoding, and the
+    /// route asks for nothing.
+    #[test]
+    fn a_stream_above_the_stream_count_is_refused_alone() {
+        let route = DeviceRoute::root();
+        let above = [
+            stream_data_packet_for(3, 0, 1),
+            fixtures::broadcast(wire::Metadata::Segment(fixtures::segment(3)), route),
+        ];
+        for packet in above {
+            let mut parser = parser_with_streams(2);
+            assert!(parser.metadata(route).is_some());
+            parser.push_packet(&packet).expect("a refusal is no error");
+            assert!(parser.metadata(route).is_some(), "the metadata is kept");
+            for stream_id in [1, 2] {
+                assert!(matches!(
+                    parser.push_packet(&stream_data_packet_for(stream_id, 0, 1)),
+                    Ok(PacketOutcome::Rows(1))
+                ));
+            }
+            assert!(
+                parser.take_metadata_queries_for(route).is_empty(),
+                "no bootstrap query"
+            );
+        }
+    }
+
+    /// A record the parser drops is logged with its route, its kind and why.
+    /// The same drop again, as a device that broadcasts the record each
+    /// second makes it, is a warning only the first time. A column ahead of
+    /// its turn is no fault and gives no warning.
+    #[test]
+    fn a_dropped_metadata_record_is_logged() {
+        let route = DeviceRoute::from_hops(&[3]).expect("a route");
+        let mut parser = PacketParser::new(true);
+        let query = parser
+            .take_metadata_queries_for(route)
+            .pop()
+            .expect("a bootstrap query");
+        let mut reply = metadata_reply(&[
+            wire::Metadata::Device(wire::Device {
+                n_streams: 2,
+                ..fixtures::device()
+            }),
+            wire::Metadata::Segment(fixtures::segment(3)),
+        ]);
+        // A column record whose stream id is 0, which does not parse.
+        reply.extend_from_slice(&[wire::MetadataType::Column.into(), 7, 7, 0, 0, 0x42, 0, 0, 0]);
+        let warnings = crate::data::tests::warnings_during(|| {
+            parser.apply_metadata_reply(query, &reply);
+            for _ in 0..2 {
+                for record in [
+                    wire::Metadata::Segment(fixtures::segment(3)),
+                    wire::Metadata::Column(fixtures::column(1, 2, DataType::F32)),
+                ] {
+                    parser
+                        .push_packet(&fixtures::broadcast(record, route))
+                        .expect("a drop is no error");
+                }
+            }
+        });
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|warning| warning.contains("/3")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("Segment") && warnings[0].contains("stream 3"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("Column") && warnings[1].contains("does not parse"),
+            "{warnings:?}"
         );
     }
 
