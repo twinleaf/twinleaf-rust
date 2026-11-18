@@ -66,7 +66,7 @@ use std::collections::VecDeque;
 /// # for record in [
 /// #     wire::Metadata::Device(wire::Device { session: SessionId::new(1), n_streams: 1, name: "sensor", serial: "S1", firmware: "1", protocol: 0 }),
 /// #     wire::Metadata::Stream(wire::Stream { stream_id: id, n_columns: 1, n_segments: 1, sample_size: 4, buf_samples: 128, name: "field" }),
-/// #     wire::Metadata::Segment(wire::Segment { stream_id: id, segment_id: SegmentId::new(0), flags: wire::SegmentFlags::default(), epoch: Epoch::UNIX, timeref_serial: "", timeref_session: SessionId::new(1), start_time: 0, sampling_rate: 10, decimation: 1, filter_cutoff: 0.0, filter_type: wire::FilterType::NONE }),
+/// #     wire::Metadata::Segment(wire::Segment { stream_id: id, segment_id: SegmentId::new(0), flags: wire::SegmentFlags::VALID, epoch: Epoch::UNIX, timeref_serial: "", timeref_session: SessionId::new(1), start_time: 0, sampling_rate: 10, decimation: 1, filter_cutoff: 0.0, filter_type: wire::FilterType::NONE }),
 /// #     wire::Metadata::Column(wire::Column { stream_id: id, index: ColumnId::new(0), data_type: DataType::F32, name: "x", units: "nT", description: "" }),
 /// # ] {
 /// #     let len = record.write(wire::MetadataFlags::UPDATE, &mut buf)?;
@@ -664,26 +664,10 @@ mod tests {
     /// announces them, and rows in a segment other than 0 decode at once.
     #[test]
     fn a_bootstrap_reply_announces_the_current_segment() {
-        let mut parser = PacketParser::new(true);
-        let query = take_query(&mut parser);
-        assert!(query.selectors.is_empty(), "a bootstrap query");
-        let segment = wire::Segment {
+        let mut parser = parser_bootstrapped_with(wire::Segment {
             segment_id: crate::proto::SegmentId::new(2),
             ..fixtures::segment(STREAM_ID)
-        };
-        parser.apply_metadata_reply(
-            query,
-            &fixtures::metadata_reply(&[
-                wire::Metadata::Device(fixtures::device()),
-                wire::Metadata::Stream(wire::Stream {
-                    n_segments: 4,
-                    sample_size: 4,
-                    ..fixtures::stream(STREAM_ID)
-                }),
-                wire::Metadata::Segment(segment),
-                wire::Metadata::Column(fixtures::column(STREAM_ID, 0, DataType::F32)),
-            ]),
-        );
+        });
 
         let batches: Vec<SampleBatch> = [5, 6]
             .map(|first| {
@@ -702,6 +686,188 @@ mod tests {
         assert!(parser
             .take_metadata_queries_for(DeviceRoute::root())
             .is_empty());
+    }
+
+    /// A record of slot 0 of the stream that holds nothing, with a start
+    /// time and time reference no populated record of the slot has.
+    fn placeholder() -> wire::Segment<'static> {
+        wire::Segment {
+            flags: wire::SegmentFlags::default(),
+            start_time: 100,
+            timeref_session: SessionId::new(9),
+            ..fixtures::segment(STREAM_ID)
+        }
+    }
+
+    /// The populated record of slot 0 of the stream, from 0 s.
+    fn populated() -> wire::Segment<'static> {
+        wire::Segment {
+            flags: wire::SegmentFlags::VALID | wire::SegmentFlags::ACTIVE,
+            ..fixtures::segment(STREAM_ID)
+        }
+    }
+
+    /// A parser that took a bootstrap reply in which the stream, of four
+    /// slots, has `segment` in its current slot.
+    fn parser_bootstrapped_with(segment: wire::Segment<'_>) -> PacketParser {
+        let mut parser = PacketParser::new(true);
+        let query = take_query(&mut parser);
+        assert!(query.selectors.is_empty(), "a bootstrap query");
+        parser.apply_metadata_reply(
+            query,
+            &fixtures::metadata_reply(&[
+                wire::Metadata::Device(fixtures::device()),
+                wire::Metadata::Stream(wire::Stream {
+                    n_segments: 4,
+                    ..fixtures::stream(STREAM_ID)
+                }),
+                wire::Metadata::Segment(segment),
+                wire::Metadata::Column(fixtures::column(STREAM_ID, 0, DataType::F32)),
+            ]),
+        );
+        parser
+    }
+
+    /// Rows of a slot that holds a placeholder wait for the slot's record,
+    /// and the parser asks for it. Rows after it decode with its times.
+    #[test]
+    fn rows_do_not_decode_against_a_placeholder() {
+        let mut parser = parser_bootstrapped_with(placeholder());
+        assert!(parser.metadata(DeviceRoute::root()).is_some());
+
+        assert_eq!(
+            parser
+                .push_packet(checked(&stream_data_packet(0, vec![0; 4])))
+                .expect("valid rows"),
+            PacketOutcome::WaitingForMetadata
+        );
+        assert!(parser.pop_batch().is_none());
+        let query = take_query(&mut parser);
+        assert_eq!(
+            query.selectors,
+            [wire::MetadataSelector::segment(STREAM_ID, 0)]
+        );
+
+        parser.apply_metadata_reply(
+            query,
+            &fixtures::metadata_reply(&[wire::Metadata::Segment(populated())]),
+        );
+        parser
+            .push_packet(checked(&stream_data_packet(1, vec![0; 4])))
+            .expect("valid rows");
+        let batch = parser.pop_batch().expect("rows under the populated record");
+        assert_eq!(batch.timestamps(), [2.0], "the end of sample 1 from 0 s");
+    }
+
+    /// A placeholder a reply brings for a slot that holds a populated record
+    /// leaves the record in place, and the rows after it go on under it.
+    #[test]
+    fn a_placeholder_does_not_replace_a_populated_record() {
+        let mut parser = PacketParser::new(true);
+        announce(
+            &mut parser,
+            wire::Metadata::Device(wire::Device {
+                n_streams: 2,
+                ..fixtures::device()
+            }),
+        );
+        announce(&mut parser, wire::Metadata::Stream(fixtures::stream(1)));
+        announce(&mut parser, wire::Metadata::Segment(populated()));
+        announce(
+            &mut parser,
+            wire::Metadata::Column(fixtures::column(1, 0, DataType::F32)),
+        );
+        announce(&mut parser, wire::Metadata::Stream(fixtures::stream(2)));
+        parser
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4 * 5])))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+
+        let query = take_query(&mut parser);
+        assert!(!query.selectors.is_empty(), "a query that names records");
+        parser.apply_metadata_reply(
+            query,
+            &fixtures::metadata_reply(&[wire::Metadata::Segment(placeholder())]),
+        );
+        parser
+            .push_packet(checked(&stream_data_packet(5, vec![0; 4])))
+            .expect("valid rows");
+        let after = parser.pop_batch().expect("the rows after");
+        assert_eq!(after.timestamps(), [6.0], "the end of sample 5 from 0 s");
+        assert_eq!(after.boundary(), None);
+    }
+
+    /// A placeholder a device broadcasts for the slot of its last rows does
+    /// not close the segment, so the rows after it are no restart.
+    #[test]
+    fn a_broadcast_placeholder_is_not_a_closing_record() {
+        let mut parser = PacketParser::new(true);
+        let device = wire::Device {
+            protocol: 1,
+            ..fixtures::device()
+        };
+        announce_schema_for(&mut parser, device, &[DataType::F32], 4, 1, 1, 1);
+        announce(&mut parser, wire::Metadata::Segment(populated()));
+        parser
+            .push_packet(checked(&stream_data_packet(0, vec![0; 4 * 5])))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                timeref_session: SessionId::new(7),
+                ..placeholder()
+            }),
+        );
+        parser
+            .push_packet(checked(&stream_data_packet(5, vec![0; 4])))
+            .expect("valid rows");
+        let after = parser.pop_batch().expect("the rows after");
+        assert_eq!(after.boundary(), None);
+    }
+
+    /// A stream that has not started answers only a placeholder for its
+    /// current slot, and that completes the device's metadata.
+    #[test]
+    fn a_stream_that_has_not_started_completes_the_metadata() {
+        let mut parser = parser_bootstrapped_with(placeholder());
+        assert!(parser.metadata(DeviceRoute::root()).is_some());
+        assert!(parser
+            .take_metadata_queries_for(DeviceRoute::root())
+            .is_empty());
+    }
+
+    /// A placeholder for any slot names that slot current while the current
+    /// slot is empty, as a proxy's snapshot of a stream that has not
+    /// started does, and that completes the device's metadata.
+    #[test]
+    fn a_broadcast_placeholder_names_an_empty_current_slot() {
+        let mut parser = PacketParser::new(true);
+        announce(&mut parser, wire::Metadata::Device(fixtures::device()));
+        announce(
+            &mut parser,
+            wire::Metadata::Stream(wire::Stream {
+                n_segments: 4,
+                ..fixtures::stream(STREAM_ID)
+            }),
+        );
+        announce(
+            &mut parser,
+            wire::Metadata::Column(fixtures::column(STREAM_ID, 0, DataType::F32)),
+        );
+
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(2),
+                ..placeholder()
+            }),
+        );
+        let queries = parser.take_metadata_queries_for(DeviceRoute::root());
+        let asked: Vec<_> = queries.into_iter().map(|query| query.selectors).collect();
+        assert_eq!(asked, Vec::<Vec<wire::MetadataSelector>>::new());
+        assert!(parser.metadata(DeviceRoute::root()).is_some());
     }
 
     #[test]

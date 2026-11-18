@@ -394,7 +394,7 @@ impl Stream {
     }
 
     fn recorded(&mut self, record: data::Segment<'_>) -> Option<(Law, String)> {
-        if !record.flags.contains(SegmentFlags::VALID) {
+        if !record.is_populated() {
             return None;
         }
         let what = format!(

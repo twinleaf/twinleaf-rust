@@ -44,7 +44,7 @@ use std::ops::Range;
 /// # for record in [
 /// #     wire::Metadata::Device(wire::Device { session: SessionId::new(1), n_streams: 1, name: "sensor", serial: "S1", firmware: "1", protocol: 0 }),
 /// #     wire::Metadata::Stream(wire::Stream { stream_id: id, n_columns: 1, n_segments: 1, sample_size: 4, buf_samples: 128, name: "field" }),
-/// #     wire::Metadata::Segment(wire::Segment { stream_id: id, segment_id: SegmentId::new(0), flags: wire::SegmentFlags::default(), epoch: Epoch::UNIX, timeref_serial: "", timeref_session: SessionId::new(1), start_time: 0, sampling_rate: 10, decimation: 1, filter_cutoff: 0.0, filter_type: wire::FilterType::NONE }),
+/// #     wire::Metadata::Segment(wire::Segment { stream_id: id, segment_id: SegmentId::new(0), flags: wire::SegmentFlags::VALID, epoch: Epoch::UNIX, timeref_serial: "", timeref_session: SessionId::new(1), start_time: 0, sampling_rate: 10, decimation: 1, filter_cutoff: 0.0, filter_type: wire::FilterType::NONE }),
 /// #     wire::Metadata::Column(wire::Column { stream_id: id, index: ColumnId::new(0), data_type: DataType::F32, name: "x", units: "nT", description: "" }),
 /// # ] {
 /// #     let len = record.write(wire::MetadataFlags::UPDATE, &mut buf)?;
@@ -714,7 +714,7 @@ mod tests {
         wire::Metadata::Segment(wire::Segment {
             stream_id: StreamId::new(1),
             segment_id: SegmentId::new((k % 2) as u8),
-            flags: wire::SegmentFlags::default(),
+            flags: wire::SegmentFlags::VALID,
             epoch: Epoch::UNIX,
             timeref_serial: "",
             timeref_session: SessionId::new(1),

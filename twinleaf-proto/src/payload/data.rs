@@ -160,7 +160,8 @@ impl core::ops::BitOr for MetadataFlags {
 pub struct SegmentFlags(u8);
 
 impl SegmentFlags {
-    /// The rest of the segment record is populated. Without this, ignore it.
+    /// The rest of the segment record is populated. Without this the record
+    /// describes no segment and says only that its slot holds nothing.
     pub const VALID: Self = Self(1);
     /// New samples are still being generated for this segment.
     pub const ACTIVE: Self = Self(2);
@@ -431,6 +432,12 @@ struct SegmentHead {
 impl<'a> Segment<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
     pub const HEAD_SIZE: usize = size_of::<SegmentHead>();
+
+    /// Whether the record describes a segment, which its
+    /// [`VALID`](SegmentFlags::VALID) flag says.
+    pub fn is_populated(&self) -> bool {
+        self.flags.contains(SegmentFlags::VALID)
+    }
 
     /// Writes the bare record, without a `[type][flags]` header, into `buf`,
     /// and returns its length. Strings are truncated to the room left.
@@ -766,6 +773,12 @@ impl<'a> SegmentView<'a> {
     /// Segment state.
     pub fn flags(&self) -> SegmentFlags {
         SegmentFlags::from_bits(self.field::<u8>(core::mem::offset_of!(SegmentHead, flags)))
+    }
+
+    /// Whether the record describes a segment, which its
+    /// [`VALID`](SegmentFlags::VALID) flag says.
+    pub fn is_populated(&self) -> bool {
+        self.flags().contains(SegmentFlags::VALID)
     }
 
     /// Timescale of `start_time`.

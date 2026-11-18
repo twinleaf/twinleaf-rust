@@ -116,7 +116,7 @@ pub fn segment(stream_id: u8) -> wire::Segment<'static> {
     wire::Segment {
         stream_id: StreamId::new(stream_id),
         segment_id: SegmentId::new(0),
-        flags: wire::SegmentFlags::default(),
+        flags: wire::SegmentFlags::VALID,
         epoch: Epoch::UNIX,
         timeref_serial: "clock",
         timeref_session: SessionId::new(7),
@@ -177,7 +177,7 @@ pub fn segment_record(segment_id: u8) -> wire::Segment<'static> {
     wire::Segment {
         stream_id: StreamId::new(1),
         segment_id: SegmentId::new(segment_id),
-        flags: wire::SegmentFlags::default(),
+        flags: wire::SegmentFlags::VALID,
         epoch: Epoch::UNIX,
         timeref_serial: "clock",
         timeref_session: SessionId::new(7),

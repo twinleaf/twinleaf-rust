@@ -109,11 +109,50 @@ pub enum StreamDataError {
     },
 }
 
+/// What a stream's parser knows of one slot of its segment ring.
+#[derive(Debug, Clone)]
+enum Slot {
+    /// The parser holds no record of the slot.
+    Empty,
+    /// The device said it holds nothing in the slot. The record is kept for
+    /// the snapshot while the slot is current.
+    Unpopulated(SegmentRecord),
+    /// A populated record of the segment in the slot.
+    Held(SegmentRecord),
+}
+
+impl Slot {
+    /// The slot `record` fills, by whether it is populated.
+    fn of(record: SegmentRecord) -> Self {
+        if record.get().is_populated() {
+            Slot::Held(record)
+        } else {
+            Slot::Unpopulated(record)
+        }
+    }
+
+    /// Returns the populated record the slot holds.
+    fn populated(&self) -> Option<&SegmentRecord> {
+        match self {
+            Slot::Held(record) => Some(record),
+            Slot::Empty | Slot::Unpopulated(_) => None,
+        }
+    }
+
+    /// Returns the record the device sent for the slot, populated or not.
+    fn record(&self) -> Option<&SegmentRecord> {
+        match self {
+            Slot::Held(record) | Slot::Unpopulated(record) => Some(record),
+            Slot::Empty => None,
+        }
+    }
+}
+
 /// Metadata and continuity state for one stream on one device.
 #[derive(Debug, Clone)]
 struct StreamTracker {
     metadata: Option<StreamRecord>,
-    segments: Vec<Option<SegmentRecord>>,
+    segments: Vec<Slot>,
     columns: Vec<ColumnRecord>,
     /// Built from the stream record and the columns once every column has
     /// arrived, and dropped whenever either changes.
@@ -189,13 +228,24 @@ impl StreamTracker {
             .is_some_and(|last| last.get().is_same_segment(&segment))
     }
 
-    fn segment(&self, segment_id: SegmentId) -> Option<&SegmentRecord> {
-        self.segments.get(usize::from(segment_id.value()))?.as_ref()
+    fn slot(&self, segment_id: SegmentId) -> Option<&Slot> {
+        self.segments.get(usize::from(segment_id.value()))
     }
 
-    /// Holds `segment` in its slot. A record of the last rows' slot renews
-    /// it when it is of another segment than the last rows', or when the
-    /// stream's records were dropped to be learned again.
+    /// Returns the populated record of slot `segment_id`.
+    fn segment(&self, segment_id: SegmentId) -> Option<&SegmentRecord> {
+        self.slot(segment_id)?.populated()
+    }
+
+    /// Whether slot `segment_id` holds no record, populated or unpopulated.
+    fn is_empty(&self, segment_id: SegmentId) -> bool {
+        self.slot(segment_id)
+            .is_none_or(|slot| slot.record().is_none())
+    }
+
+    /// Holds the populated `segment` in its slot. A record of the last rows'
+    /// slot renews it when it is of another segment than the last rows', or
+    /// when the stream's records were dropped to be learned again.
     fn set_segment(&mut self, segment: SegmentRecord) {
         let view = segment.get();
         let segment_id = view.segment_id();
@@ -204,11 +254,16 @@ impl StreamTracker {
             .as_ref()
             .is_some_and(|last| last.get().segment_id() == segment_id);
         self.renewed |= in_last_slot && (!self.is_last(view) || self.relearned);
+        self.fill(segment_id, Slot::Held(segment));
+    }
+
+    /// Puts `slot` in slot `segment_id` and changes nothing else.
+    fn fill(&mut self, segment_id: SegmentId, slot: Slot) {
         let index = usize::from(segment_id.value());
         if self.segments.len() <= index {
-            self.segments.resize(index + 1, None);
+            self.segments.resize(index + 1, Slot::Empty);
         }
-        self.segments[index] = Some(segment);
+        self.segments[index] = slot;
     }
 
     /// Learns the stream record of a stream that had none.
@@ -238,8 +293,9 @@ impl StreamTracker {
         };
     }
 
-    /// Returns selectors for the metadata this stream still needs before it
-    /// can be decoded.
+    /// Returns selectors for the records this stream lacks for a complete
+    /// snapshot. A current slot the device said holds nothing lacks no
+    /// record, though no rows decode in it.
     fn missing_metadata(&self) -> Vec<wire::MetadataSelector> {
         let stream_id = self.key.stream_id.value();
         let mut missing = Vec::new();
@@ -253,7 +309,7 @@ impl StreamTracker {
                 missing.push(wire::MetadataSelector::stream(stream_id));
             }
         }
-        if self.segment(self.current_segment_id).is_none() {
+        if self.is_empty(self.current_segment_id) {
             missing.push(wire::MetadataSelector::segment(
                 stream_id,
                 self.current_segment_id.value(),
@@ -407,9 +463,11 @@ impl StreamTracker {
                 segment_count: n_segments,
             });
         }
-        // The current segment is the one the last broadcast record or rows
-        // named, so a segment other than the last rows' is announced when
-        // the device broadcast its record since them.
+        // The current slot is the one rows or a broadcast populated record
+        // named last, or one a bootstrap reply or an unpopulated record
+        // named while the current slot was empty. So a segment other than
+        // the last rows' is announced when the device broadcast its record
+        // since them.
         // A segment's sample numbers only go up, so rows numbered at or
         // below the last rows, in their segment, while the device has sent
         // no record of that slot since them that renews it, are of a new
@@ -421,7 +479,11 @@ impl StreamTracker {
                 .as_ref()
                 .is_some_and(|last| last.get().segment_id() == data.segment_id)
             && data.first.value() <= self.last_sample_number.value();
-        let announced = self.current_segment_id == data.segment_id && !behind;
+        // Rows in a slot the device said holds nothing are of a segment whose
+        // record has not come, as rows of a slot the device did not announce
+        // are.
+        let unpopulated = matches!(self.slot(data.segment_id), Some(Slot::Unpopulated(_)));
+        let announced = self.current_segment_id == data.segment_id && !behind && !unpopulated;
         // A device sends a segment's record before the segment's first
         // sample, so the record of the segment rows arrive in is announced.
         // Rows in a segment the device did not announce find a ring record
@@ -430,7 +492,7 @@ impl StreamTracker {
         // record a metadata reply brings for it stands.
         if !announced {
             if let Some(stale) = self.segments.get_mut(usize::from(data.segment_id.value())) {
-                *stale = None;
+                *stale = Slot::Empty;
             }
         }
         if !announced {
@@ -592,7 +654,7 @@ impl StreamTracker {
         Some(StreamMetadataSnapshot::new(
             self.schema.clone()?,
             device,
-            self.segment(self.current_segment_id)?.clone(),
+            self.slot(self.current_segment_id)?.record()?.clone(),
         ))
     }
 }
@@ -600,7 +662,9 @@ impl StreamTracker {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataSource {
     /// A reply to a query that names its records may describe an older ring
-    /// segment.
+    /// segment. A populated record it holds never names its slot current.
+    /// An unpopulated record names its slot current while the current slot
+    /// is empty, as one from any source does.
     Reply,
     /// Broadcasts describe the current output segment.
     Broadcast,
@@ -787,22 +851,37 @@ impl DeviceState {
                 if !self.accepts_stream(stream_id, global_generation) {
                     return;
                 }
-                let closes = source == MetadataSource::Broadcast
-                    && !segment.flags().contains(wire::SegmentFlags::ACTIVE);
                 let stream = self.stream_mut(stream_id);
-                let learned = stream.segment(segment_id) != Some(&incoming);
-                stream.restarted |= closes
-                    || segment.flags().contains(wire::SegmentFlags::START)
-                        && !stream.is_last(segment);
-                stream.set_segment(incoming);
-                let switched = stream.current_segment_id != segment_id
-                    && match source {
-                        MetadataSource::Broadcast => true,
-                        MetadataSource::Bootstrap => {
-                            stream.segment(stream.current_segment_id).is_none()
+                let current_empty = stream.is_empty(stream.current_segment_id);
+                // An unpopulated record only fills an empty slot. It neither
+                // closes nor renews a segment, and it names its slot current
+                // from any source while the current slot is empty.
+                let (learned, names_current) = match Slot::of(incoming) {
+                    Slot::Held(incoming) => {
+                        let segment = incoming.get();
+                        let closes = source == MetadataSource::Broadcast
+                            && !segment.flags().contains(wire::SegmentFlags::ACTIVE);
+                        let learned = stream.segment(segment_id) != Some(&incoming);
+                        stream.restarted |= closes
+                            || segment.flags().contains(wire::SegmentFlags::START)
+                                && !stream.is_last(segment);
+                        stream.set_segment(incoming);
+                        let names_current = match source {
+                            MetadataSource::Broadcast => true,
+                            MetadataSource::Bootstrap => current_empty,
+                            MetadataSource::Reply => false,
+                        };
+                        (learned, names_current)
+                    }
+                    unpopulated => {
+                        let empty = stream.is_empty(segment_id);
+                        if empty {
+                            stream.fill(segment_id, unpopulated);
                         }
-                        MetadataSource::Reply => false,
-                    };
+                        (empty, current_empty)
+                    }
+                };
+                let switched = stream.current_segment_id != segment_id && names_current;
                 if switched {
                     stream.current_segment_id = segment_id;
                 }

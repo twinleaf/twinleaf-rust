@@ -323,14 +323,17 @@ impl StreamMetadataSnapshot {
     }
 
     /// Returns the current segment's descriptor, borrowed from its retained
-    /// record.
+    /// record. The record may be unpopulated, which
+    /// [`is_populated`](wire::SegmentView::is_populated) tells. Then its
+    /// times and time reference describe nothing.
     pub fn segment(&self) -> wire::SegmentView<'_> {
         self.segment.get()
     }
 
     /// Returns the segment's sample rate in hertz after decimation, or zero
     /// for a segment whose rate or decimation is zero. The parser emits no
-    /// rows from such a segment.
+    /// rows from such a segment. The rate of an unpopulated record describes
+    /// no rows.
     pub fn rate_hz(&self) -> f64 {
         self.segment.get().rate_hz().unwrap_or(0.0)
     }
@@ -376,7 +379,8 @@ impl StreamMetadataSnapshot {
 /// Point-in-time metadata for one device and all advertised streams.
 ///
 /// The parser learns these records incrementally. A snapshot is available only
-/// after every advertised stream has a stream, current segment, and columns.
+/// after every advertised stream has a stream record, columns, and a record of
+/// its current segment slot. That record may be unpopulated.
 #[derive(Debug, Clone)]
 pub struct DeviceMetadataSnapshot(Arc<DeviceMetadataInner>);
 

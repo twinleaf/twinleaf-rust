@@ -1363,7 +1363,7 @@ mod tests {
         data::Metadata::Segment(data::Segment {
             stream_id: StreamId::new(1),
             segment_id: SegmentId::new((k % 2) as u8),
-            flags: data::SegmentFlags::default(),
+            flags: data::SegmentFlags::VALID,
             epoch: Epoch::UNIX,
             timeref_serial: "",
             timeref_session: SessionId::new(1),

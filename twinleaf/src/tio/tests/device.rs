@@ -362,7 +362,7 @@ pub(crate) fn description() -> [wire::Metadata<'static>; 4] {
         wire::Metadata::Segment(wire::Segment {
             stream_id,
             segment_id: SegmentId::new(0),
-            flags: wire::SegmentFlags::default(),
+            flags: wire::SegmentFlags::VALID,
             epoch: Epoch::UNIX,
             timeref_serial: "",
             timeref_session: SessionId::new(7),
