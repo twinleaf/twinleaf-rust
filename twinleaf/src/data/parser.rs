@@ -1346,6 +1346,55 @@ mod tests {
         }
     }
 
+    /// A record the parser drops is logged with its route, its kind and why.
+    /// The same drop again, as a device that broadcasts the record each
+    /// second makes it, is a warning only the first time. A column ahead of
+    /// its turn is no fault and gives no warning.
+    #[test]
+    fn a_dropped_metadata_record_is_logged() {
+        let route = DeviceRoute::from_hops(&[3]).expect("a route");
+        let mut parser = PacketParser::new(true);
+        let query = parser
+            .take_metadata_queries_for(route)
+            .pop()
+            .expect("a bootstrap query");
+        let mut reply = metadata_reply(&[
+            wire::Metadata::Device(wire::Device {
+                n_streams: 2,
+                ..fixtures::device()
+            }),
+            wire::Metadata::Segment(fixtures::segment(3)),
+        ]);
+        // A column record whose stream id is 0, which does not parse.
+        reply.extend_from_slice(&[wire::MetadataType::Column.into(), 7, 7, 0, 0, 0x42, 0, 0, 0]);
+        let warnings = crate::data::tests::warnings_during(|| {
+            parser.apply_metadata_reply(query, &reply);
+            for _ in 0..2 {
+                for record in [
+                    wire::Metadata::Segment(fixtures::segment(3)),
+                    wire::Metadata::Column(fixtures::column(1, 2, DataType::F32)),
+                ] {
+                    parser
+                        .push_packet(&fixtures::broadcast(record, route))
+                        .expect("a drop is no error");
+                }
+            }
+        });
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|warning| warning.contains("/3")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("Segment") && warnings[0].contains("stream 3"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("Column") && warnings[1].contains("does not parse"),
+            "{warnings:?}"
+        );
+    }
+
     #[test]
     fn pending_batches_never_straddle_a_shared_generation_bump() {
         let mut parser = parser_with_streams(2).with_batch_rows(4);
