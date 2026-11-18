@@ -24,6 +24,8 @@ pub(crate) mod strategy {
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
 
+    use crate::packet::WriteError;
+
     /// A length from 0 to `max`. Four in five are 0, 1, `max - 1` or `max`.
     pub(crate) fn len_to(max: usize) -> impl Strategy<Value = usize> {
         prop_oneof![
@@ -192,13 +194,13 @@ pub(crate) mod strategy {
     /// write is not checked. Returns the length and the zeroed buffer.
     pub(crate) fn write_over_any(
         len: usize,
-        write: impl Fn(&mut [u8]) -> Option<usize>,
-    ) -> Result<(Option<usize>, Vec<u8>), TestCaseError> {
+        write: impl Fn(&mut [u8]) -> Result<usize, WriteError>,
+    ) -> Result<(Result<usize, WriteError>, Vec<u8>), TestCaseError> {
         let mut zeroes = vec![0; len];
         let mut ones = vec![u8::MAX; len];
         let written = write(&mut zeroes);
         prop_assert_eq!(write(&mut ones), written);
-        let Some(end) = written else {
+        let Ok(end) = written else {
             return Ok((written, zeroes));
         };
         prop_assert_eq!(

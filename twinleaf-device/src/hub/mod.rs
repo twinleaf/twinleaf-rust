@@ -15,7 +15,7 @@
 mod calls;
 
 use twinleaf_proto::heartbeat::Heartbeat;
-use twinleaf_proto::packet::{Packet, PacketType, PacketView};
+use twinleaf_proto::packet::{Header, Packet, PacketType, PacketView};
 use twinleaf_proto::route::{pop_hop, push_hop};
 use twinleaf_proto::rpc::{self, Answer, Method, Request, RpcError};
 use twinleaf_proto::{DeviceRoute, RpcRequestId, SessionId};
@@ -181,16 +181,16 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
         if !self.present(port) {
             return Err(CallError::Absent);
         }
+        // The request is written before the call takes a slot, and the slot's
+        // id is stamped on it after, so a request too long takes no slot.
         let method = Method::ByName(method.as_bytes());
-        if rpc::request_payload_len(method, args).is_none_or(|len| len > Packet::MAX_PAYLOAD) {
-            return Err(CallError::TooLong);
-        }
+        let len = rpc::write_request(buf, RpcRequestId::new(0), method, args)
+            .map_err(|_| CallError::TooLong)?;
         let id = self
             .calls
             .call(port, purpose, now_ns)
             .map_err(|Full| CallError::Full)?;
-        let len = rpc::write_request(buf, id, method, args)
-            .expect("a request that fits a payload fits a packet");
+        rpc::set_req_id(&mut buf[Header::SIZE..len], id);
         Ok((id, len))
     }
 

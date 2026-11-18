@@ -33,7 +33,10 @@ impl Capture<'_> {
             Selector::Status => put(out, &[self.status.code()]),
             Selector::Metadata => {
                 let mut buf = [0u8; crate::rpc::REPLY_MAX];
-                let len = self.metadata.write(&mut buf).ok_or(RpcError::NoBufs)?;
+                let len = self
+                    .metadata
+                    .write(&mut buf)
+                    .map_err(|_| RpcError::NoBufs)?;
                 put(out, &buf[..len])
             }
             Selector::Block(index) => put(out, self.block(index).ok_or(RpcError::Invalid)?),

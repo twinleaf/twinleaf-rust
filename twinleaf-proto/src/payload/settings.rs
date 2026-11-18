@@ -6,7 +6,7 @@
 //! bytes the RPC of that name would return. The other `flags` bits are
 //! reserved and sent as zero. [`Setting`] parses and writes the packet.
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, Packet, PacketType, WriteError};
 
 /// Size of the `{ name_len, flags }` head before the name and value.
 pub const SETTING_HEADER_SIZE: usize = 2;
@@ -52,36 +52,53 @@ impl<'a> Setting<'a> {
         core::str::from_utf8(self.name).ok()
     }
 
-    /// Returns the payload length. Returns `None` if the name is longer than
-    /// 255 bytes or the payload exceeds [`Packet::MAX_PAYLOAD`].
-    pub fn payload_len(&self) -> Option<usize> {
+    /// Returns the payload length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::NameTooLong`] if the name is longer than 255
+    /// bytes, and [`WriteError::PayloadTooLarge`] if the payload exceeds
+    /// [`Packet::MAX_PAYLOAD`].
+    pub fn payload_len(&self) -> Result<usize, WriteError> {
         if self.name.len() > u8::MAX as usize {
-            return None;
+            return Err(WriteError::NameTooLong);
         }
         let len = self.head_len() + self.name.len() + self.reply.len();
-        (len <= Packet::MAX_PAYLOAD).then_some(len)
+        if len > Packet::MAX_PAYLOAD {
+            return Err(WriteError::PayloadTooLarge);
+        }
+        Ok(len)
     }
 
-    /// Writes a full `SETTING` packet into `buf`. Returns its length, or `None`
-    /// if it does not fit or the name exceeds 255 bytes.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full `SETTING` packet into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`payload_len`](Self::payload_len), and
+    /// [`WriteError::BufferTooSmall`] if the packet does not fit `buf`.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let payload_len = self.payload_len()?;
         let total = Header::SIZE + payload_len;
         if buf.len() < total {
-            return None;
+            return Err(WriteError::BufferTooSmall);
         }
         let hdr = Header::new(PacketType::SETTING, payload_len as u16);
-        hdr.write(buf.first_chunk_mut()?);
+        hdr.write(buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?);
         self.write_payload(&mut buf[Header::SIZE..total])?;
-        Some(total)
+        Ok(total)
     }
 
-    /// Writes the payload alone, without a packet header, into `out`. Returns
-    /// its length, or `None` if it does not fit or the name exceeds 255 bytes.
-    pub fn write_payload(&self, out: &mut [u8]) -> Option<usize> {
+    /// Writes the payload alone, without a packet header, into `out`, and
+    /// returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`payload_len`](Self::payload_len), and
+    /// [`WriteError::BufferTooSmall`] if the payload does not fit `out`.
+    pub fn write_payload(&self, out: &mut [u8]) -> Result<usize, WriteError> {
         let len = self.payload_len()?;
         if out.len() < len {
-            return None;
+            return Err(WriteError::BufferTooSmall);
         }
         out[0] = self.name.len() as u8;
         out[1] = match self.seq {
@@ -95,7 +112,7 @@ impl<'a> Setting<'a> {
         let value_start = name_start + self.name.len();
         out[name_start..value_start].copy_from_slice(self.name);
         out[value_start..len].copy_from_slice(self.reply);
-        Some(len)
+        Ok(len)
     }
 
     fn head_len(&self) -> usize {
@@ -202,14 +219,14 @@ mod tests {
             let setting = Setting { name: &name, seq, reply: &reply };
             let head = SETTING_HEADER_SIZE + seq.map_or(0, |_| SEQUENCE_SIZE);
             let payload_len = head + name.len() + reply.len();
-            prop_assert_eq!(setting.payload_len(), Some(payload_len));
+            prop_assert_eq!(setting.payload_len(), Ok(payload_len));
             let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| setting.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             prop_assert_eq!(header, Header::new(PacketType::SETTING, payload_len as u16));
             prop_assert_eq!(Setting::parse(&buf[Header::SIZE..]), Some(setting));
             let (len, payload) = write_over_any(payload_len, |out| setting.write_payload(out))?;
-            prop_assert_eq!(len, Some(payload_len));
+            prop_assert_eq!(len, Ok(payload_len));
             prop_assert_eq!(&payload[..], &buf[Header::SIZE..]);
             if let Some(text) = text {
                 prop_assert_eq!(setting.name_str(), text.as_deref());
@@ -236,7 +253,7 @@ mod tests {
             prop_assert_eq!(setting.name.len(), name_len as usize);
             prop_assert_eq!(setting.seq.is_some(), seq);
             let (len, written) = write_over_any(payload.len(), |out| setting.write_payload(out))?;
-            prop_assert_eq!(len, Some(payload.len()));
+            prop_assert_eq!(len, Ok(payload.len()));
             let mut canonical = payload.clone();
             canonical[1] = flags & VERSION;
             prop_assert_eq!(written, canonical);
@@ -254,14 +271,14 @@ mod tests {
             let head = SETTING_HEADER_SIZE + seq.map_or(0, |_| SEQUENCE_SIZE);
             let payload_len = head + name.len() + reply.len();
             let valid = name.len() <= MAX_NAME && payload_len <= Packet::MAX_PAYLOAD;
-            prop_assert_eq!(setting.payload_len(), valid.then_some(payload_len));
+            prop_assert_eq!(setting.payload_len().ok(), valid.then_some(payload_len));
 
             let mut buf = buffer(Header::SIZE + payload_len, slack);
             let fits = valid && buf.len() >= Header::SIZE + payload_len;
-            prop_assert_eq!(setting.write(&mut buf), fits.then_some(Header::SIZE + payload_len));
+            prop_assert_eq!(setting.write(&mut buf).ok(), fits.then_some(Header::SIZE + payload_len));
             let mut out = buffer(payload_len, slack);
             let fits = valid && out.len() >= payload_len;
-            prop_assert_eq!(setting.write_payload(&mut out), fits.then_some(payload_len));
+            prop_assert_eq!(setting.write_payload(&mut out).ok(), fits.then_some(payload_len));
         }
     }
 

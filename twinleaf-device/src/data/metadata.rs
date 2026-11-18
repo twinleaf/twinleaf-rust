@@ -266,7 +266,7 @@ fn append(out: &mut Reply, record: Metadata<'_>) -> Result<bool, RpcError> {
     {
         return Ok(false);
     }
-    record.write_reply_frame(&mut out[start..]);
+    let _ = record.write_reply_frame(&mut out[start..]);
     Ok(true)
 }
 

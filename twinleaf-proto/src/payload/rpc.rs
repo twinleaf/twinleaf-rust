@@ -12,7 +12,7 @@
 //! [`Request`], [`Reply`], and [`ErrorReply`] parse the payloads, and the
 //! `write_*` functions build them. [`RpcMeta`] decodes the `rpc.info` word.
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, Packet, PacketType, WriteError};
 use crate::{RpcMethodId, RpcRequestId};
 
 /// Method word bit marking a request by name, 0x8000.
@@ -195,26 +195,37 @@ impl<'a> Request<'a> {
     }
 }
 
-/// Writes a full `RPC_REQ` packet with no routing into `buf`. Returns its
-/// length, or `None` if it does not fit.
+/// Writes a full `RPC_REQ` packet with no routing into `buf` and returns its
+/// length.
+///
+/// # Errors
+///
+/// Returns [`WriteError::NameTooLong`] if the method name is longer than
+/// [`NAMELEN_MASK`] bytes, [`WriteError::BufferTooSmall`] if the packet does
+/// not fit `buf`, and [`WriteError::PayloadTooLarge`] if the payload exceeds
+/// [`Packet::MAX_PAYLOAD`], in that order.
 pub fn write_request(
     buf: &mut [u8],
     id: RpcRequestId,
     method: Method<'_>,
     args: &[u8],
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     write_request_packet(buf, PacketType::RPC_REQ, id, method, args)
 }
 
 /// Writes a full `PROXY_TX` packet with no routing into `buf`, a control
-/// request to a proxy whose payload is a request payload. Returns its
-/// length, or `None` if it does not fit.
+/// request to a proxy whose payload is a request payload, and returns its
+/// length.
+///
+/// # Errors
+///
+/// Returns the errors of [`write_request`].
 pub fn write_proxy_request(
     buf: &mut [u8],
     id: RpcRequestId,
     method: Method<'_>,
     args: &[u8],
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     write_request_packet(buf, PacketType::PROXY_TX, id, method, args)
 }
 
@@ -225,42 +236,55 @@ fn write_request_packet(
     id: RpcRequestId,
     method: Method<'_>,
     args: &[u8],
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     let payload_len = request_payload_len(method, args)?;
     let total = Header::SIZE + payload_len;
-    if buf.len() < total || payload_len > Packet::MAX_PAYLOAD {
-        return None;
+    if buf.len() < total {
+        return Err(WriteError::BufferTooSmall);
+    }
+    if payload_len > Packet::MAX_PAYLOAD {
+        return Err(WriteError::PayloadTooLarge);
     }
     let hdr = Header::new(ptype, payload_len as u16);
-    hdr.write(buf.first_chunk_mut()?);
+    hdr.write(buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?);
     write_request_payload(&mut buf[Header::SIZE..total], id, method, args)?;
-    Some(total)
+    Ok(total)
 }
 
-/// Returns the payload length of a request, or `None` if the method name is
-/// longer than [`NAMELEN_MASK`] bytes.
-pub fn request_payload_len(method: Method<'_>, args: &[u8]) -> Option<usize> {
+/// Returns the payload length of a request.
+///
+/// # Errors
+///
+/// Returns [`WriteError::NameTooLong`] if the method name is longer than
+/// [`NAMELEN_MASK`] bytes.
+pub fn request_payload_len(method: Method<'_>, args: &[u8]) -> Result<usize, WriteError> {
     let name_len = match method {
         Method::ById(_) => 0,
         Method::ByName(name) => name.len(),
     };
     if name_len > NAMELEN_MASK as usize {
-        return None;
+        return Err(WriteError::NameTooLong);
     }
-    Some(4 + name_len + args.len())
+    Ok(4 + name_len + args.len())
 }
 
-/// Writes the request payload alone, without a packet header, into `out`.
-/// Returns its length, or `None` if it does not fit.
+/// Writes the request payload alone, without a packet header, into `out`,
+/// and returns its length.
+///
+/// # Errors
+///
+/// Returns [`WriteError::NameTooLong`] if the method name is longer than
+/// [`NAMELEN_MASK`] bytes, and [`WriteError::BufferTooSmall`] if the payload
+/// does not fit `out`.
 pub fn write_request_payload(
     out: &mut [u8],
     id: RpcRequestId,
     method: Method<'_>,
     args: &[u8],
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     let len = request_payload_len(method, args)?;
     if out.len() < len {
-        return None;
+        return Err(WriteError::BufferTooSmall);
     }
     let (method_id, name) = match method {
         Method::ById(id) => (id.value(), &[][..]),
@@ -270,7 +294,7 @@ pub fn write_request_payload(
     out[2..4].copy_from_slice(&method_id.to_le_bytes());
     out[4..4 + name.len()].copy_from_slice(name);
     out[4 + name.len()..len].copy_from_slice(args);
-    Some(len)
+    Ok(len)
 }
 
 /// Overwrites the request id at the start of a request, reply, or error
@@ -304,31 +328,51 @@ impl<'a> Reply<'a> {
     }
 }
 
-/// Writes a full `RPC_REP` packet with no routing into `buf`. Returns its
-/// length, or `None` if `buf` is too small or the value is longer than a
-/// packet carries.
-pub fn write_reply(buf: &mut [u8], req_id: RpcRequestId, value: &[u8]) -> Option<usize> {
+/// Writes a full `RPC_REP` packet with no routing into `buf` and returns its
+/// length.
+///
+/// # Errors
+///
+/// Returns [`WriteError::BufferTooSmall`] if `buf` is too small, and
+/// [`WriteError::PayloadTooLarge`] if the value is longer than a packet
+/// carries, in that order.
+pub fn write_reply(
+    buf: &mut [u8],
+    req_id: RpcRequestId,
+    value: &[u8],
+) -> Result<usize, WriteError> {
     let payload_len = 2 + value.len();
     let total = Header::SIZE + payload_len;
-    if buf.len() < total || payload_len > Packet::MAX_PAYLOAD {
-        return None;
+    if buf.len() < total {
+        return Err(WriteError::BufferTooSmall);
+    }
+    if payload_len > Packet::MAX_PAYLOAD {
+        return Err(WriteError::PayloadTooLarge);
     }
     let hdr = Header::new(PacketType::RPC_REP, payload_len as u16);
-    hdr.write(buf.first_chunk_mut()?);
+    hdr.write(buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?);
     write_reply_payload(&mut buf[Header::SIZE..total], req_id, value)?;
-    Some(total)
+    Ok(total)
 }
 
-/// Writes the reply payload alone, without a packet header, into `out`.
-/// Returns its length, or `None` if it does not fit.
-pub fn write_reply_payload(out: &mut [u8], req_id: RpcRequestId, value: &[u8]) -> Option<usize> {
+/// Writes the reply payload alone, without a packet header, into `out`, and
+/// returns its length.
+///
+/// # Errors
+///
+/// Returns [`WriteError::BufferTooSmall`] if the payload does not fit `out`.
+pub fn write_reply_payload(
+    out: &mut [u8],
+    req_id: RpcRequestId,
+    value: &[u8],
+) -> Result<usize, WriteError> {
     let len = 2 + value.len();
     if out.len() < len {
-        return None;
+        return Err(WriteError::BufferTooSmall);
     }
     out[0..2].copy_from_slice(&req_id.to_le_bytes());
     out[2..len].copy_from_slice(value);
-    Some(len)
+    Ok(len)
 }
 
 /// A refused request, with its raw error code and any message that followed
@@ -362,48 +406,68 @@ impl<'a> ErrorReply<'a> {
 }
 
 /// Writes a full `RPC_ERROR` packet with no routing and no message into
-/// `buf`. Returns its length, or `None` if `buf` is too small.
-pub fn write_error(buf: &mut [u8], req_id: RpcRequestId, code: RpcError) -> Option<usize> {
+/// `buf` and returns its length.
+///
+/// # Errors
+///
+/// Returns [`WriteError::BufferTooSmall`] if `buf` is too small.
+pub fn write_error(
+    buf: &mut [u8],
+    req_id: RpcRequestId,
+    code: RpcError,
+) -> Result<usize, WriteError> {
     write_error_with(buf, req_id, code, &[])
 }
 
 /// Writes a full `RPC_ERROR` packet with no routing into `buf`, with
-/// `message` after its code. Returns its length, or `None` if `buf` is too
-/// small or the message is longer than a packet carries.
+/// `message` after its code, and returns its length.
+///
+/// # Errors
+///
+/// Returns [`WriteError::BufferTooSmall`] if `buf` is too small, and
+/// [`WriteError::PayloadTooLarge`] if the message is longer than a packet
+/// carries, in that order.
 pub fn write_error_with(
     buf: &mut [u8],
     req_id: RpcRequestId,
     code: RpcError,
     message: &[u8],
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     let payload_len = 4 + message.len();
     let total = Header::SIZE + payload_len;
-    if buf.len() < total || payload_len > Packet::MAX_PAYLOAD {
-        return None;
+    if buf.len() < total {
+        return Err(WriteError::BufferTooSmall);
+    }
+    if payload_len > Packet::MAX_PAYLOAD {
+        return Err(WriteError::PayloadTooLarge);
     }
     let hdr = Header::new(PacketType::RPC_ERROR, payload_len as u16);
-    hdr.write(buf.first_chunk_mut()?);
+    hdr.write(buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?);
     write_error_payload(&mut buf[Header::SIZE..total], req_id, code.value(), message)?;
-    Some(total)
+    Ok(total)
 }
 
-/// Writes the error payload alone, without a packet header, into `out`.
-/// Returns its length, or `None` if it does not fit. `code` is raw and may be
-/// a code with no [`RpcError`] name.
+/// Writes the error payload alone, without a packet header, into `out`, and
+/// returns its length. `code` is raw and may be a code with no [`RpcError`]
+/// name.
+///
+/// # Errors
+///
+/// Returns [`WriteError::BufferTooSmall`] if the payload does not fit `out`.
 pub fn write_error_payload(
     out: &mut [u8],
     req_id: RpcRequestId,
     code: u16,
     message: &[u8],
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     let len = 4 + message.len();
     if out.len() < len {
-        return None;
+        return Err(WriteError::BufferTooSmall);
     }
     out[0..2].copy_from_slice(&req_id.to_le_bytes());
     out[2..4].copy_from_slice(&code.to_le_bytes());
     out[4..len].copy_from_slice(message);
-    Some(len)
+    Ok(len)
 }
 
 /// A reply or an error, told apart by the packet type.
@@ -932,10 +996,10 @@ mod tests {
         ) {
             let method = named.method();
             let payload_len = REQUEST_HEAD + named.name_len() + args.len();
-            prop_assert_eq!(request_payload_len(method, &args), Some(payload_len));
+            prop_assert_eq!(request_payload_len(method, &args), Ok(payload_len));
             let (len, buf) =
                 write_over_any(Header::SIZE + payload_len, |buf| write_request(buf, id, method, &args))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             prop_assert_eq!(header, Header::new(PacketType::RPC_REQ, payload_len as u16));
             let request = Request::parse(&buf[Header::SIZE..]).unwrap();
@@ -944,7 +1008,7 @@ mod tests {
             prop_assert_eq!(request.args, &args[..]);
             let (len, payload) =
                 write_over_any(payload_len, |out| write_request_payload(out, id, method, &args))?;
-            prop_assert_eq!(len, Some(payload_len));
+            prop_assert_eq!(len, Ok(payload_len));
             prop_assert_eq!(&payload[..], &buf[Header::SIZE..]);
         }
 
@@ -966,7 +1030,7 @@ mod tests {
             let (len, written) = write_over_any(payload.len(), |out| {
                 write_request_payload(out, request.id, request.method, request.args)
             })?;
-            prop_assert_eq!(len, Some(payload.len()));
+            prop_assert_eq!(len, Ok(payload.len()));
             prop_assert_eq!(written, payload);
         }
 
@@ -997,19 +1061,22 @@ mod tests {
             let id = RpcRequestId::new(1);
             let payload_len = REQUEST_HEAD + name_len + args_len;
             let named = name_len <= NAMELEN_MASK as usize;
-            prop_assert_eq!(request_payload_len(method, &args), named.then_some(payload_len));
+            prop_assert_eq!(
+                request_payload_len(method, &args),
+                named.then_some(payload_len).ok_or(WriteError::NameTooLong)
+            );
 
             let mut buf = buffer(Header::SIZE + payload_len, slack);
             let fits = named && payload_len <= Packet::MAX_PAYLOAD
                 && buf.len() >= Header::SIZE + payload_len;
             prop_assert_eq!(
-                write_request(&mut buf, id, method, &args),
+                write_request(&mut buf, id, method, &args).ok(),
                 fits.then_some(Header::SIZE + payload_len)
             );
             let mut out = buffer(payload_len, slack);
             let fits = named && out.len() >= payload_len;
             prop_assert_eq!(
-                write_request_payload(&mut out, id, method, &args),
+                write_request_payload(&mut out, id, method, &args).ok(),
                 fits.then_some(payload_len)
             );
         }
@@ -1027,7 +1094,7 @@ mod tests {
             let payload_len = REPLY_HEADER_SIZE + value.len();
             let (len, buf) =
                 write_over_any(Header::SIZE + payload_len, |buf| write_reply(buf, req_id, &value))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             prop_assert_eq!(header, Header::new(PacketType::RPC_REP, payload_len as u16));
             let reply = Reply { req_id, value: &value };
@@ -1037,7 +1104,7 @@ mod tests {
             prop_assert_eq!(answer.unwrap().req_id(), req_id);
             let (len, payload) =
                 write_over_any(payload_len, |out| write_reply_payload(out, req_id, &value))?;
-            prop_assert_eq!(len, Some(payload_len));
+            prop_assert_eq!(len, Ok(payload_len));
             prop_assert_eq!(&payload[..], &buf[Header::SIZE..]);
         }
 
@@ -1060,7 +1127,7 @@ mod tests {
             let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| {
                 write_error_with(buf, req_id, error, &message)
             })?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             prop_assert_eq!(header, Header::new(PacketType::RPC_ERROR, payload_len as u16));
             let parsed = ErrorReply { req_id, code, message: &message };
@@ -1070,12 +1137,12 @@ mod tests {
             prop_assert_eq!(answer.unwrap().req_id(), req_id);
             let (len, payload) =
                 write_over_any(payload_len, |out| write_error_payload(out, req_id, code, &message))?;
-            prop_assert_eq!(len, Some(payload_len));
+            prop_assert_eq!(len, Ok(payload_len));
             prop_assert_eq!(&payload[..], &buf[Header::SIZE..]);
 
             let (len, bare) =
                 write_over_any(Header::SIZE + ERROR_HEAD, |buf| write_error(buf, req_id, error))?;
-            prop_assert_eq!(len, Some(bare.len()));
+            prop_assert_eq!(len, Ok(bare.len()));
             let mut with_none = [0u8; Header::SIZE + ERROR_HEAD];
             write_error_with(&mut with_none, req_id, error, &[]).unwrap();
             prop_assert_eq!(&bare[..], &with_none[..]);
@@ -1114,14 +1181,19 @@ mod tests {
                 let payload_len = head + len;
                 let room = slack >= 0;
                 prop_assert_eq!(
-                    packet,
+                    packet.ok(),
                     (room && payload_len <= Packet::MAX_PAYLOAD).then_some(Header::SIZE + payload_len)
                 );
-                prop_assert_eq!(payload, room.then_some(payload_len));
+                prop_assert_eq!(
+                    payload,
+                    room.then_some(payload_len).ok_or(WriteError::BufferTooSmall)
+                );
             }
             prop_assert_eq!(
                 write_error(&mut buffer(Header::SIZE + ERROR_HEAD, slack), id, RpcError::Range),
-                (slack >= 0).then_some(Header::SIZE + ERROR_HEAD)
+                (slack >= 0)
+                    .then_some(Header::SIZE + ERROR_HEAD)
+                    .ok_or(WriteError::BufferTooSmall)
             );
         }
 
@@ -1153,14 +1225,14 @@ mod tests {
                 let (len, written) = write_over_any(payload.len(), |out| {
                     write_reply_payload(out, reply.req_id, reply.value)
                 })?;
-                prop_assert_eq!(len, Some(payload.len()));
+                prop_assert_eq!(len, Ok(payload.len()));
                 prop_assert_eq!(&written, &payload);
             }
             if let Some(error) = error {
                 let (len, written) = write_over_any(payload.len(), |out| {
                     write_error_payload(out, error.req_id, error.code, error.message)
                 })?;
-                prop_assert_eq!(len, Some(payload.len()));
+                prop_assert_eq!(len, Ok(payload.len()));
                 prop_assert_eq!(&written, &payload);
             }
             let answer = Answer::parse(ptype, &payload);

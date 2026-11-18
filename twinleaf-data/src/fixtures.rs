@@ -221,14 +221,17 @@ pub fn checked(packet: &[u8]) -> Checked<'_> {
 pub mod packet {
     use crate::proto::data as wire;
     use crate::proto::heartbeat::Heartbeat;
-    use crate::proto::packet::{write_routing, Packet};
+    use crate::proto::packet::{write_routing, Packet, WriteError};
     use crate::proto::proxy::{LinkStatus, ProxyRx};
     use crate::proto::rpc;
     use crate::proto::{DeviceRoute, RpcRequestId, SampleNumber, SegmentId, SessionId, StreamId};
 
     /// The packet `write` puts at the start of a buffer, addressed to
     /// `route`.
-    fn routed(route: DeviceRoute, write: impl FnOnce(&mut [u8]) -> Option<usize>) -> Vec<u8> {
+    fn routed(
+        route: DeviceRoute,
+        write: impl FnOnce(&mut [u8]) -> Result<usize, WriteError>,
+    ) -> Vec<u8> {
         let mut buf = [0u8; Packet::MAX_SIZE];
         let len = write(&mut buf).expect("the packet fits");
         let len = write_routing(&mut buf, len, route).expect("the route fits");

@@ -1184,19 +1184,23 @@ impl<'c> World<'c> {
                     ..setting
                 }
                 .write(&mut buf)
+                .ok()
             }),
             PacketType::HEARTBEAT => match Heartbeat::parse(view.payload) {
                 Some(Heartbeat::Session { session, settings }) => Heartbeat::Session {
                     session,
                     settings: settings.filter(|_| firmware.beat_settings).map(offset),
                 }
-                .write(&mut buf),
+                .write(&mut buf)
+                .ok(),
                 Some(Heartbeat::Any(_)) | None => None,
             },
             PacketType::RPC_REP => wire::Reply::parse(view.payload)
                 .filter(|reply| Some(reply.req_id) == version)
                 .and_then(|reply| Some((reply.req_id, u32::decode_reply(reply.value).ok()?)))
-                .and_then(|(id, seq)| wire::write_reply(&mut buf, id, &offset(seq).to_le_bytes())),
+                .and_then(|(id, seq)| {
+                    wire::write_reply(&mut buf, id, &offset(seq).to_le_bytes()).ok()
+                }),
             _ => None,
         };
         written.map_or_else(|| packet.to_vec(), |len| buf[..len].to_vec())

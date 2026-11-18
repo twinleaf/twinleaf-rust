@@ -14,6 +14,7 @@ use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::data::{DataType, RecordReader, RecordWriter};
+use crate::packet::WriteError;
 use crate::rpc::RpcError;
 
 /// Where a capture stands, as the status selector reports it.
@@ -157,15 +158,18 @@ pub struct CaptureMetadata<'a> {
 
 impl<'a> CaptureMetadata<'a> {
     /// Writes the RPC reply payload into `buf` and returns its length. Strings
-    /// are truncated to the room left after the head. Returns `None` if `buf`
-    /// cannot hold the head.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// are truncated to the room left after the head.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, METADATA_FIXED_LEN)?;
         let name_len = record.push(self.name);
         let units_len = record.push(self.units);
         let x_name_len = record.push(self.x_name);
         let x_units_len = record.push(self.x_units);
-        Some(record.finish(MetadataHead {
+        Ok(record.finish(MetadataHead {
             head_len: METADATA_FIXED_LEN as u8,
             version: self.version,
             data_type: self.data_type.value(),
@@ -406,7 +410,7 @@ mod tests {
             let wire = fields.wire();
             let metadata = fields.metadata();
             let (len, reply) = write_over_any(wire.len(), |buf| metadata.write(buf))?;
-            prop_assert_eq!(len, Some(wire.len()));
+            prop_assert_eq!(len, Ok(wire.len()));
             prop_assert_eq!(&reply, &wire);
             prop_assert_eq!(CaptureMetadata::parse(&wire).map(by_bits), Some(by_bits(metadata)));
         }
@@ -428,14 +432,14 @@ mod tests {
             let metadata = fields.metadata();
             let (len, reply) =
                 write_over_any(METADATA_FIXED_LEN + room, |buf| metadata.write(buf))?;
-            prop_assert_eq!(len, Some(wire.len()));
+            prop_assert_eq!(len, Ok(wire.len()));
             prop_assert_eq!(&reply[..wire.len()], &wire[..]);
             prop_assert_eq!(
                 CaptureMetadata::parse(&wire).map(by_bits),
                 Some(by_bits(expected.metadata()))
             );
             let (len, _) = write_over_any(METADATA_FIXED_LEN - 1, |buf| metadata.write(buf))?;
-            prop_assert_eq!(len, None);
+            prop_assert_eq!(len, Err(WriteError::BufferTooSmall));
         }
 
         /// C4. A longer head than this build's is read as far as this build
@@ -670,10 +674,13 @@ mod tests {
 
     #[test]
     fn write_rejects_a_buffer_too_small_for_the_head() {
-        assert_eq!(metadata().write(&mut [0u8; METADATA_FIXED_LEN - 1]), None);
+        assert_eq!(
+            metadata().write(&mut [0u8; METADATA_FIXED_LEN - 1]),
+            Err(WriteError::BufferTooSmall)
+        );
         // With room for the head alone the strings truncate away.
         let mut buf = [0u8; METADATA_FIXED_LEN];
-        assert_eq!(metadata().write(&mut buf), Some(METADATA_FIXED_LEN));
+        assert_eq!(metadata().write(&mut buf), Ok(METADATA_FIXED_LEN));
         let parsed = CaptureMetadata::parse(&buf).unwrap();
         assert_eq!((parsed.name, parsed.units), ("", ""));
         assert_eq!(parsed.length, 3);

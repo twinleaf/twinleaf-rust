@@ -648,14 +648,14 @@ impl Route {
 mod tests {
     use super::*;
     use crate::data::MetadataFlags;
-    use crate::packet::Packet;
+    use crate::packet::{Packet, WriteError};
     use crate::rpc::{self, Method};
     use crate::SampleNumber;
 
     /// A packet the device at `/` sent or was sent.
     type Step = (DeviceRoute, Sender, Vec<u8>);
 
-    fn written(write: impl FnOnce(&mut [u8]) -> Option<usize>) -> Vec<u8> {
+    fn written(write: impl FnOnce(&mut [u8]) -> Result<usize, WriteError>) -> Vec<u8> {
         let mut buf = [0; Packet::MAX_SIZE];
         let len = write(&mut buf).unwrap();
         buf[..len].to_vec()

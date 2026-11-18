@@ -6,7 +6,7 @@
 //! `data` is chosen by the sender. Twinleaf devices send their uptime in
 //! milliseconds. [`LogMessage`] parses and writes the packet.
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, Packet, PacketType, WriteError};
 
 /// Size of the `{ data, level }` head before the message.
 pub const LOG_HEADER_SIZE: usize = 5;
@@ -66,23 +66,28 @@ impl<'a> LogMessage<'a> {
         })
     }
 
-    /// Writes a full `LOG` packet into `buf`. Returns its length, or `None` if
-    /// it does not fit or the message exceeds [`MAX_MESSAGE_SIZE`].
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full `LOG` packet into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::MessageTooLong`] if the message exceeds
+    /// [`MAX_MESSAGE_SIZE`], and [`WriteError::BufferTooSmall`] if `buf`
+    /// cannot hold the packet.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         if self.message.len() > MAX_MESSAGE_SIZE {
-            return None;
+            return Err(WriteError::MessageTooLong);
         }
         let payload_len = LOG_HEADER_SIZE + self.message.len();
         let total = Header::SIZE + payload_len;
         if buf.len() < total {
-            return None;
+            return Err(WriteError::BufferTooSmall);
         }
         let hdr = Header::new(PacketType::LOG, payload_len as u16);
-        hdr.write(buf.first_chunk_mut()?);
+        hdr.write(buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?);
         buf[Header::SIZE..Header::SIZE + 4].copy_from_slice(&self.data.to_le_bytes());
         buf[Header::SIZE + 4] = self.level.value();
         buf[Header::SIZE + LOG_HEADER_SIZE..total].copy_from_slice(self.message);
-        Some(total)
+        Ok(total)
     }
 }
 
@@ -119,7 +124,7 @@ mod tests {
             let log = LogMessage { level, data, message: &message };
             let payload_len = LOG_HEADER_SIZE + message.len();
             let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| log.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             prop_assert_eq!(header, Header::new(PacketType::LOG, payload_len as u16));
             prop_assert_eq!(LogMessage::parse(&buf[Header::SIZE..]), Some(log));
@@ -139,7 +144,7 @@ mod tests {
             };
             prop_assert!(payload.len() >= LOG_HEADER_SIZE);
             let (len, buf) = write_over_any(Header::SIZE + payload.len(), |buf| log.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             prop_assert_eq!(&buf[Header::SIZE..], &payload[..]);
         }
 
@@ -151,7 +156,7 @@ mod tests {
             let needed = Header::SIZE + LOG_HEADER_SIZE + message.len();
             let mut buf = buffer(needed, slack);
             let fits = message.len() <= MAX_MESSAGE_SIZE && buf.len() >= needed;
-            prop_assert_eq!(log.write(&mut buf), fits.then_some(needed));
+            prop_assert_eq!(log.write(&mut buf).ok(), fits.then_some(needed));
         }
     }
 

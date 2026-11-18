@@ -17,7 +17,7 @@ use heapless::String;
 use twinleaf_proto::data::{self, Metadata, MetadataFlags};
 use twinleaf_proto::heartbeat::{self, Heartbeat};
 use twinleaf_proto::log::{LogLevel, LogMessage, MAX_MESSAGE_SIZE};
-use twinleaf_proto::packet::{Packet, PacketType, PacketView};
+use twinleaf_proto::packet::{Packet, PacketType, PacketView, WriteError};
 use twinleaf_proto::route;
 use twinleaf_proto::rpc::{self, Method, Request, RpcError};
 use twinleaf_proto::settings::Setting as Announcement;
@@ -1070,7 +1070,11 @@ fn announce(version: &mut u32, out: &mut impl Sink, name: &str, reply: &[u8]) {
 
 /// Send one packet back along `routing`. Every writer is bounded by the
 /// packet, so a packet that does not fit is a bug.
-fn send(out: &mut impl Sink, routing: &[u8], write: impl FnOnce(&mut [u8]) -> Option<usize>) {
+fn send(
+    out: &mut impl Sink,
+    routing: &[u8],
+    write: impl FnOnce(&mut [u8]) -> Result<usize, WriteError>,
+) {
     let mut buf = [0u8; Packet::MAX_SIZE];
     let mut len = write(&mut buf).expect("a device packet fits a packet");
     for &hop in routing {

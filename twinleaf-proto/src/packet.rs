@@ -191,6 +191,40 @@ pub enum PacketError {
     TrailingBytes,
 }
 
+/// Why a writer refuses to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum WriteError {
+    /// The output buffer cannot hold what is written.
+    #[error("buffer too small")]
+    BufferTooSmall,
+    /// The payload is over [`Packet::MAX_PAYLOAD`] bytes.
+    #[error("payload too large")]
+    PayloadTooLarge,
+    /// A sample packet with no sample bytes.
+    #[error("no samples")]
+    NoSamples,
+    /// The first sample number does not fit its 24 bit field.
+    #[error("sample number too large")]
+    SampleNumberTooLarge,
+    /// A name is longer than its length field holds.
+    #[error("name too long")]
+    NameTooLong,
+    /// A time reference serial is over its limit.
+    #[error("serial too long")]
+    SerialTooLong,
+    /// A log message is over its limit.
+    #[error("message too long")]
+    MessageTooLong,
+    /// A metadata record is too long for its one byte length.
+    #[error("record too long")]
+    RecordTooLong,
+    /// The buffer does not start with a packet header, or the header would
+    /// name no packet type.
+    #[error("not a packet")]
+    NotAPacket,
+}
+
 /// The four byte packet header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -442,15 +476,32 @@ impl<'a> Checked<'a> {
 /// Addresses the packet at the start of `buf` to `routing`. The packet's
 /// header and payload are its first `len` bytes. Writes the route after them
 /// and its length into the header, and returns the packet's new length.
-/// Returns `None` if `buf` does not start with a header or has no room for
-/// the route.
-pub fn write_routing(buf: &mut [u8], len: usize, routing: DeviceRoute) -> Option<usize> {
-    let total = len.checked_add(routing.len())?;
-    let mut header = Header::parse(buf.get(..Header::SIZE)?.try_into().ok()?)?;
+///
+/// # Errors
+///
+/// Returns [`WriteError::NotAPacket`] if `buf` does not start with a header,
+/// and [`WriteError::BufferTooSmall`] if it has no room for the route.
+pub fn write_routing(
+    buf: &mut [u8],
+    len: usize,
+    routing: DeviceRoute,
+) -> Result<usize, WriteError> {
+    let total = len
+        .checked_add(routing.len())
+        .ok_or(WriteError::BufferTooSmall)?;
+    let head = buf.get(..Header::SIZE).ok_or(WriteError::NotAPacket)?;
+    let head = head.try_into().map_err(|_| WriteError::NotAPacket)?;
+    let mut header = Header::parse(head).ok_or(WriteError::NotAPacket)?;
     header.routing_size = routing.len() as u8;
-    routing.write_wire(buf.get_mut(len..total)?).ok()?;
-    header.write((&mut buf[..Header::SIZE]).try_into().ok()?);
-    Some(total)
+    let route = buf.get_mut(len..total).ok_or(WriteError::BufferTooSmall)?;
+    routing
+        .write_wire(route)
+        .map_err(|_| WriteError::BufferTooSmall)?;
+    let head = (&mut buf[..Header::SIZE])
+        .try_into()
+        .map_err(|_| WriteError::NotAPacket)?;
+    header.write(head);
+    Ok(total)
 }
 
 /// Borrowed view of a packet's payload, read as the type its header names.
@@ -733,7 +784,9 @@ mod tests {
     }
 
     /// The packet a writer puts at the start of a fresh buffer.
-    fn written(write: impl FnOnce(&mut [u8]) -> Option<usize>) -> ([u8; Packet::MAX_SIZE], usize) {
+    fn written(
+        write: impl FnOnce(&mut [u8]) -> Result<usize, WriteError>,
+    ) -> ([u8; Packet::MAX_SIZE], usize) {
         let mut buf = [0u8; Packet::MAX_SIZE];
         let len = write(&mut buf).unwrap();
         (buf, len)
@@ -859,8 +912,14 @@ mod tests {
         assert_eq!(view.route(), Ok(route));
         assert_eq!(view.header.ttl, 3);
 
-        assert_eq!(write_routing(&mut buf[..7], 6, route), None);
-        assert_eq!(write_routing(&mut [0u8; 8], 4, route), None);
+        assert_eq!(
+            write_routing(&mut buf[..7], 6, route),
+            Err(WriteError::BufferTooSmall)
+        );
+        assert_eq!(
+            write_routing(&mut [0u8; 8], 4, route),
+            Err(WriteError::NotAPacket)
+        );
     }
 
     #[test]
@@ -944,7 +1003,7 @@ mod tests {
     /// Every whole-packet writer writes bytes the check accepts as one packet.
     #[test]
     fn every_whole_packet_writer_passes_the_check() {
-        fn check(write: impl FnOnce(&mut [u8]) -> Option<usize>) -> PacketType {
+        fn check(write: impl FnOnce(&mut [u8]) -> Result<usize, WriteError>) -> PacketType {
             let (buf, len) = written(write);
             match Checked::exact(&buf[..len]) {
                 Ok(checked) => checked.header().ptype,
@@ -1044,7 +1103,10 @@ mod tests {
             first: crate::SampleNumber::new(5),
             data: &[],
         };
-        assert_eq!(samples.write(&mut [0; Packet::MAX_SIZE]), None);
+        assert_eq!(
+            samples.write(&mut [0; Packet::MAX_SIZE]),
+            Err(WriteError::NoSamples)
+        );
         assert_eq!(
             Checked::exact(&[129, 0, 4, 0, 5, 0, 0, 0]).unwrap_err(),
             PacketError::PayloadTooShort
@@ -1061,12 +1123,18 @@ mod tests {
         let (buf, len) =
             written(|buf| rpc::write_proxy_request(buf, id, rpc::Method::ByName(b"x"), &[5]));
         assert_eq!(buf[..len], [66, 0, 6, 0, 1, 0, 1, 0x80, b'x', 5]);
-        assert_eq!(LinkStatus::Stopped.write(&mut [0; 4]), None);
-        assert_eq!(ProxyRx::Alive.write(&mut [0; 4]), None);
+        assert_eq!(
+            LinkStatus::Stopped.write(&mut [0; 4]),
+            Err(WriteError::BufferTooSmall)
+        );
+        assert_eq!(
+            ProxyRx::Alive.write(&mut [0; 4]),
+            Err(WriteError::BufferTooSmall)
+        );
         let big = [0; Packet::MAX_PAYLOAD];
         assert_eq!(
             ProxyRx::Unknown(9, &big).write(&mut [0; 2 * Packet::MAX_SIZE]),
-            None
+            Err(WriteError::PayloadTooLarge)
         );
     }
 
@@ -1130,5 +1198,261 @@ mod tests {
         ]
         .into_iter()
         .all(|ptype| lane(ptype, &[]).is_none()));
+    }
+
+    /// A buffer longer than any packet, so that only a value is refused.
+    const ROOMY: usize = 2 * Packet::MAX_SIZE;
+
+    /// Each reason a writer refuses for, from a writer that refuses for it.
+    #[test]
+    fn each_write_error_names_its_reason() {
+        let id = crate::RpcRequestId::new(1);
+        assert_eq!(
+            rpc::write_reply(&mut [0; 5], id, &[]),
+            Err(WriteError::BufferTooSmall)
+        );
+        assert_eq!(
+            rpc::write_reply(&mut [0; ROOMY], id, &[0; Packet::MAX_PAYLOAD]),
+            Err(WriteError::PayloadTooLarge)
+        );
+        let samples = |first: u32, data: &'static [u8]| data::Samples {
+            stream_id: crate::StreamId::new(1),
+            segment_id: crate::SegmentId::new(0),
+            first: crate::SampleNumber::new(first),
+            data,
+        };
+        assert_eq!(
+            samples(0, &[]).write(&mut [0; ROOMY]),
+            Err(WriteError::NoSamples)
+        );
+        assert_eq!(
+            samples(1 << 24, &[1]).write(&mut [0; ROOMY]),
+            Err(WriteError::SampleNumberTooLarge)
+        );
+        let long_name = [b'n'; rpc::NAMELEN_MASK as usize + 1];
+        assert_eq!(
+            rpc::write_request(&mut [0; ROOMY], id, rpc::Method::ByName(&long_name), &[]),
+            Err(WriteError::NameTooLong)
+        );
+        let timeref = crate::sync::Timeref {
+            epoch: crate::sync::Epoch::UNIX,
+            time: 0,
+            session: crate::SessionId::new(1),
+            serial: &[b's'; crate::sync::MAX_SERIAL_SIZE + 1],
+            clock: None,
+        };
+        assert_eq!(
+            timeref.write(&mut [0; ROOMY]),
+            Err(WriteError::SerialTooLong)
+        );
+        let log = LogMessage {
+            level: crate::log::LogLevel::INFO,
+            data: 0,
+            message: &[0; crate::log::MAX_MESSAGE_SIZE + 1],
+        };
+        assert_eq!(log.write(&mut [0; ROOMY]), Err(WriteError::MessageTooLong));
+        let long = "n".repeat(120);
+        let device = data::Metadata::Device(data::Device {
+            session: crate::SessionId::new(1),
+            n_streams: 1,
+            name: &long,
+            serial: &long,
+            firmware: &long,
+            protocol: 0,
+        });
+        assert_eq!(
+            device.write_reply_frame(&mut [0; ROOMY]),
+            Err(WriteError::RecordTooLong)
+        );
+        assert_eq!(
+            write_routing(&mut [0; ROOMY], 4, DeviceRoute::root()),
+            Err(WriteError::NotAPacket)
+        );
+    }
+
+    /// A writer that refuses both a buffer too small and a value reports the
+    /// one it checks first. Each case gives the value alone, the buffer
+    /// alone, and both.
+    #[test]
+    fn a_writer_names_the_buffer_or_the_value_in_its_order() {
+        use WriteError::*;
+        let id = crate::RpcRequestId::new(1);
+        let big = [0; Packet::MAX_PAYLOAD];
+        let over = [0; Packet::MAX_PAYLOAD + 1];
+
+        let long_name = [b'n'; rpc::NAMELEN_MASK as usize + 1];
+        let request = |buf: &mut [u8], name: &[u8], args: &[u8]| {
+            rpc::write_request(buf, id, rpc::Method::ByName(name), args)
+        };
+        assert_eq!(request(&mut [0; ROOMY], &long_name, &[]), Err(NameTooLong));
+        assert_eq!(request(&mut [0; 4], b"x", &[]), Err(BufferTooSmall));
+        assert_eq!(request(&mut [0; 4], &long_name, &[]), Err(NameTooLong));
+        assert_eq!(request(&mut [0; ROOMY], b"x", &big), Err(PayloadTooLarge));
+        assert_eq!(request(&mut [0; 4], b"x", &big), Err(BufferTooSmall));
+        let payload = |out: &mut [u8], name: &[u8]| {
+            rpc::write_request_payload(out, id, rpc::Method::ByName(name), &[])
+        };
+        assert_eq!(payload(&mut [0; ROOMY], &long_name), Err(NameTooLong));
+        assert_eq!(payload(&mut [0; 4], b"x"), Err(BufferTooSmall));
+        assert_eq!(payload(&mut [0; 4], &long_name), Err(NameTooLong));
+
+        let reply = |buf: &mut [u8], value: &[u8]| rpc::write_reply(buf, id, value);
+        assert_eq!(reply(&mut [0; ROOMY], &big), Err(PayloadTooLarge));
+        assert_eq!(reply(&mut [0; 4], &[]), Err(BufferTooSmall));
+        assert_eq!(reply(&mut [0; 4], &big), Err(BufferTooSmall));
+        let error = |buf: &mut [u8], message: &[u8]| {
+            rpc::write_error_with(buf, id, rpc::RpcError::Range, message)
+        };
+        assert_eq!(error(&mut [0; ROOMY], &big), Err(PayloadTooLarge));
+        assert_eq!(error(&mut [0; 4], &[]), Err(BufferTooSmall));
+        assert_eq!(error(&mut [0; 4], &big), Err(BufferTooSmall));
+
+        let beat = |buf: &mut [u8], payload: &[u8]| Heartbeat::Any(payload).write(buf);
+        assert_eq!(beat(&mut [0; ROOMY], &over), Err(PayloadTooLarge));
+        assert_eq!(beat(&mut [0; 2], &[]), Err(BufferTooSmall));
+        assert_eq!(beat(&mut [0; 2], &over), Err(PayloadTooLarge));
+
+        let log = |buf: &mut [u8], message: &[u8]| {
+            let log = LogMessage {
+                level: crate::log::LogLevel::INFO,
+                data: 0,
+                message,
+            };
+            log.write(buf)
+        };
+        let message = [0; crate::log::MAX_MESSAGE_SIZE + 1];
+        assert_eq!(log(&mut [0; ROOMY], &message), Err(MessageTooLong));
+        assert_eq!(log(&mut [0; 2], &[]), Err(BufferTooSmall));
+        assert_eq!(log(&mut [0; 2], &message), Err(MessageTooLong));
+
+        let rx = |buf: &mut [u8], body: &[u8]| ProxyRx::Unknown(9, body).write(buf);
+        assert_eq!(rx(&mut [0; ROOMY], &big), Err(PayloadTooLarge));
+        assert_eq!(rx(&mut [0; 2], &[]), Err(BufferTooSmall));
+        assert_eq!(rx(&mut [0; 2], &big), Err(PayloadTooLarge));
+
+        let long = "n".repeat(255);
+        let record = |name: &str| {
+            let record = data::Device {
+                session: crate::SessionId::new(1),
+                n_streams: 1,
+                name,
+                serial: name,
+                firmware: name,
+                protocol: 0,
+            };
+            let mut stored = [0; ROOMY];
+            let len = record.write(&mut stored).unwrap();
+            (stored, len)
+        };
+        let flags = data::MetadataFlags::UPDATE;
+        let device = |name| {
+            data::Metadata::Device(data::Device {
+                session: crate::SessionId::new(1),
+                n_streams: 1,
+                name,
+                serial: name,
+                firmware: name,
+                protocol: 0,
+            })
+        };
+        assert_eq!(
+            device(&long).write(flags, &mut [0; ROOMY]),
+            Err(PayloadTooLarge)
+        );
+        assert_eq!(device("d").write(flags, &mut [0; 8]), Err(BufferTooSmall));
+        assert_eq!(device(&long).write(flags, &mut [0; 8]), Err(BufferTooSmall));
+        assert_eq!(
+            device(&long).write_reply_frame(&mut [0; ROOMY]),
+            Err(RecordTooLong)
+        );
+        assert_eq!(
+            device("d").write_reply_frame(&mut [0; 4]),
+            Err(BufferTooSmall)
+        );
+        assert_eq!(
+            device(&long).write_reply_frame(&mut [0; 4]),
+            Err(BufferTooSmall)
+        );
+        let (long_record, long_len) = record(&long);
+        let (short_record, short_len) = record("d");
+        let relay =
+            |buf: &mut [u8], bytes: &[u8]| data::write_metadata_record(buf, 1, flags, bytes);
+        assert_eq!(
+            relay(&mut [0; ROOMY], &long_record[..long_len]),
+            Err(PayloadTooLarge)
+        );
+        assert_eq!(
+            relay(&mut [0; 8], &short_record[..short_len]),
+            Err(BufferTooSmall)
+        );
+        assert_eq!(
+            relay(&mut [0; 8], &long_record[..long_len]),
+            Err(BufferTooSmall)
+        );
+
+        let samples = |buf: &mut [u8], first: u32, data: &[u8]| {
+            let samples = data::Samples {
+                stream_id: crate::StreamId::new(1),
+                segment_id: crate::SegmentId::new(0),
+                first: crate::SampleNumber::new(first),
+                data,
+            };
+            samples.write(buf)
+        };
+        let too_far = 1 << 24;
+        assert_eq!(
+            samples(&mut [0; ROOMY], too_far, &[1]),
+            Err(SampleNumberTooLarge)
+        );
+        assert_eq!(samples(&mut [0; ROOMY], 0, &[]), Err(NoSamples));
+        assert_eq!(samples(&mut [0; ROOMY], 0, &big), Err(PayloadTooLarge));
+        assert_eq!(samples(&mut [0; 4], 0, &[1]), Err(BufferTooSmall));
+        assert_eq!(
+            samples(&mut [0; 4], too_far, &[]),
+            Err(SampleNumberTooLarge)
+        );
+        assert_eq!(samples(&mut [0; 4], 0, &[]), Err(NoSamples));
+        assert_eq!(samples(&mut [0; 4], 0, &big), Err(PayloadTooLarge));
+
+        let setting = |buf: &mut [u8], name: &[u8], reply: &[u8]| {
+            Setting {
+                name,
+                seq: None,
+                reply,
+            }
+            .write(buf)
+        };
+        let name = [b'n'; 256];
+        assert_eq!(setting(&mut [0; ROOMY], &name, &[]), Err(NameTooLong));
+        assert_eq!(setting(&mut [0; ROOMY], b"x", &big), Err(PayloadTooLarge));
+        assert_eq!(setting(&mut [0; 4], b"x", &[]), Err(BufferTooSmall));
+        assert_eq!(setting(&mut [0; 4], &name, &[]), Err(NameTooLong));
+        assert_eq!(setting(&mut [0; 4], b"x", &big), Err(PayloadTooLarge));
+
+        let timeref = |buf: &mut [u8], serial: &[u8]| {
+            let timeref = crate::sync::Timeref {
+                epoch: crate::sync::Epoch::UNIX,
+                time: 0,
+                session: crate::SessionId::new(1),
+                serial,
+                clock: None,
+            };
+            timeref.write(buf)
+        };
+        let serial = [b's'; crate::sync::MAX_SERIAL_SIZE + 1];
+        assert_eq!(timeref(&mut [0; ROOMY], &serial), Err(SerialTooLong));
+        assert_eq!(timeref(&mut [0; 4], b"s"), Err(BufferTooSmall));
+        assert_eq!(timeref(&mut [0; 4], &serial), Err(SerialTooLong));
+
+        let route = DeviceRoute::from_hops(&[1, 2]).unwrap();
+        let mut packet = [0; 8];
+        packet[..5].copy_from_slice(&[PacketType::RPC_REP.value(), 0, 1, 0, 9]);
+        assert_eq!(write_routing(&mut [0; ROOMY], 5, route), Err(NotAPacket));
+        assert_eq!(
+            write_routing(&mut packet[..6], 5, route),
+            Err(BufferTooSmall)
+        );
+        assert_eq!(write_routing(&mut [0; 6], 5, route), Err(NotAPacket));
+        assert_eq!(write_routing(&mut packet, 5, route), Ok(7));
     }
 }

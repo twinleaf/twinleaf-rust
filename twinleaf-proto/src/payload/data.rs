@@ -18,7 +18,7 @@
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, Packet, PacketType, WriteError};
 use crate::sync::Epoch;
 use crate::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 
@@ -275,15 +275,18 @@ impl<'a> Device<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
     pub const HEAD_SIZE: usize = size_of::<DeviceHead>();
 
-    /// Writes the bare record, without a `[type][flags]` header, into `buf`.
-    /// Returns its length, or `None` if `buf` cannot hold the head. Strings
-    /// are truncated to the room left.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes the bare record, without a `[type][flags]` header, into `buf`,
+    /// and returns its length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let name_len = record.push(self.name);
         let serial_len = record.push(self.serial);
         let firmware_len = record.push(self.firmware);
-        Some(record.finish(DeviceHead {
+        Ok(record.finish(DeviceHead {
             head_len: Self::HEAD_SIZE as u8,
             name_len,
             session: self.session.value().into(),
@@ -343,13 +346,16 @@ impl<'a> Stream<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
     pub const HEAD_SIZE: usize = size_of::<StreamHead>();
 
-    /// Writes the bare record, without a `[type][flags]` header, into `buf`.
-    /// Returns its length, or `None` if `buf` cannot hold the head. Strings
-    /// are truncated to the room left.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes the bare record, without a `[type][flags]` header, into `buf`,
+    /// and returns its length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let name_len = record.push(self.name);
-        Some(record.finish(StreamHead {
+        Ok(record.finish(StreamHead {
             head_len: Self::HEAD_SIZE as u8,
             stream_id: self.stream_id.value(),
             n_columns: self.n_columns,
@@ -426,13 +432,16 @@ impl<'a> Segment<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
     pub const HEAD_SIZE: usize = size_of::<SegmentHead>();
 
-    /// Writes the bare record, without a `[type][flags]` header, into `buf`.
-    /// Returns its length, or `None` if `buf` cannot hold the head. Strings
-    /// are truncated to the room left.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes the bare record, without a `[type][flags]` header, into `buf`,
+    /// and returns its length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let timeref_serial_len = record.push(self.timeref_serial);
-        Some(record.finish(SegmentHead {
+        Ok(record.finish(SegmentHead {
             head_len: Self::HEAD_SIZE as u8,
             stream_id: self.stream_id.value(),
             segment_id: self.segment_id.value(),
@@ -524,15 +533,18 @@ impl<'a> Column<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
     pub const HEAD_SIZE: usize = size_of::<ColumnHead>();
 
-    /// Writes the bare record, without a `[type][flags]` header, into `buf`.
-    /// Returns its length, or `None` if `buf` cannot hold the head. Strings
-    /// are truncated to the room left.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes the bare record, without a `[type][flags]` header, into `buf`,
+    /// and returns its length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let name_len = record.push(self.name);
         let units_len = record.push(self.units);
         let description_len = record.push(self.description);
-        Some(record.finish(ColumnHead {
+        Ok(record.finish(ColumnHead {
             head_len: Self::HEAD_SIZE as u8,
             stream_id: self.stream_id.value(),
             index: self.index.value(),
@@ -943,26 +955,37 @@ impl<'a> Metadata<'a> {
         matches!(kind, 1..=4)
     }
 
-    /// Writes the bare record into `buf`. Returns its type byte and length, or
-    /// `None` if `buf` cannot hold the head.
-    pub fn write_record(&self, buf: &mut [u8]) -> Option<(u8, usize)> {
+    /// Writes the bare record into `buf` and returns its type byte and length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write_record(&self, buf: &mut [u8]) -> Result<(u8, usize), WriteError> {
         let (kind, len) = match self {
             Self::Device(record) => (MetadataType::Device, record.write(buf)?),
             Self::Stream(record) => (MetadataType::Stream, record.write(buf)?),
             Self::Segment(record) => (MetadataType::Segment, record.write(buf)?),
             Self::Column(record) => (MetadataType::Column, record.write(buf)?),
         };
-        Some((kind.into(), len))
+        Ok((kind.into(), len))
     }
 
     /// Writes one `dev.metadata` reply frame, `[type][record length u8][record]`,
-    /// into `buf`. Returns its length, or `None` if the record does not fit
-    /// `buf` or a `u8` length.
-    pub fn write_reply_frame(&self, buf: &mut [u8]) -> Option<usize> {
-        let (kind, len) = self.write_record(buf.get_mut(METADATA_REPLY_FRAME_HEADER..)?)?;
+    /// into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the frame
+    /// header and the record head, and [`WriteError::RecordTooLong`] if the
+    /// record is longer than a `u8` length holds.
+    pub fn write_reply_frame(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
+        let record = buf
+            .get_mut(METADATA_REPLY_FRAME_HEADER..)
+            .ok_or(WriteError::BufferTooSmall)?;
+        let (kind, len) = self.write_record(record)?;
         buf[0] = kind;
-        buf[1] = u8::try_from(len).ok()?;
-        Some(METADATA_REPLY_FRAME_HEADER + len)
+        buf[1] = u8::try_from(len).map_err(|_| WriteError::RecordTooLong)?;
+        Ok(METADATA_REPLY_FRAME_HEADER + len)
     }
 
     /// Returns the length of the bare record, with each string capped at 255
@@ -983,11 +1006,19 @@ impl<'a> Metadata<'a> {
         }
     }
 
-    /// Writes a full `METADATA` packet with `flags` into `buf`. Returns its
-    /// length, or `None` if the head does not fit or the payload exceeds
-    /// [`Packet::MAX_PAYLOAD`]. Strings are truncated to the room left.
-    pub fn write(&self, flags: MetadataFlags, buf: &mut [u8]) -> Option<usize> {
-        let (kind, len) = self.write_record(buf.get_mut(Header::SIZE + METADATA_HEADER_SIZE..)?)?;
+    /// Writes a full `METADATA` packet with `flags` into `buf` and returns its
+    /// length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if the head does not fit, and
+    /// [`WriteError::PayloadTooLarge`] if the payload exceeds
+    /// [`Packet::MAX_PAYLOAD`].
+    pub fn write(&self, flags: MetadataFlags, buf: &mut [u8]) -> Result<usize, WriteError> {
+        let record = buf
+            .get_mut(Header::SIZE + METADATA_HEADER_SIZE..)
+            .ok_or(WriteError::BufferTooSmall)?;
+        let (kind, len) = self.write_record(record)?;
         write_metadata_headers(buf, kind, flags, len)
     }
 
@@ -1008,34 +1039,41 @@ impl<'a> Metadata<'a> {
 }
 
 /// Writes the packet and metadata headers around a record already in place.
-/// Returns the packet length, or `None` if the payload is too big.
+/// Returns the packet length, or [`WriteError::PayloadTooLarge`] if the
+/// payload is too big.
 fn write_metadata_headers(
     buf: &mut [u8],
     kind: u8,
     flags: MetadataFlags,
     record_len: usize,
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     let payload_len = METADATA_HEADER_SIZE + record_len;
     if payload_len > Packet::MAX_PAYLOAD {
-        return None;
+        return Err(WriteError::PayloadTooLarge);
     }
     Header::new(PacketType::METADATA, payload_len as u16)
         .write((&mut buf[..Header::SIZE]).try_into().unwrap());
     buf[Header::SIZE] = kind;
     buf[Header::SIZE + 1] = flags.bits();
-    Some(Header::SIZE + payload_len)
+    Ok(Header::SIZE + payload_len)
 }
 
-/// Writes a full `METADATA` packet that carries the bare `record` unchanged.
-/// Returns its length, or `None` if it does not fit `buf` or a packet.
+/// Writes a full `METADATA` packet that carries the bare `record` unchanged,
+/// and returns its length.
+///
+/// # Errors
+///
+/// Returns [`WriteError::BufferTooSmall`] if it does not fit `buf`, and
+/// [`WriteError::PayloadTooLarge`] if it does not fit a packet.
 pub fn write_metadata_record(
     buf: &mut [u8],
     kind: u8,
     flags: MetadataFlags,
     record: &[u8],
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     let start = Header::SIZE + METADATA_HEADER_SIZE;
-    buf.get_mut(start..start + record.len())?
+    buf.get_mut(start..start + record.len())
+        .ok_or(WriteError::BufferTooSmall)?
         .copy_from_slice(record);
     write_metadata_headers(buf, kind, flags, record.len())
 }
@@ -1240,9 +1278,12 @@ impl<'a> Samples<'a> {
     /// Byte offset of the first sample in a data packet.
     pub const DATA_OFFSET: usize = Header::SIZE + SAMPLE_HEADER_SIZE;
 
-    /// Writes a full sample packet into `buf`. Returns its length, or `None` if
-    /// `data` is empty or the sample number or samples do not fit.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full sample packet into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`write_header`](Self::write_header).
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let total = Self::write_header(
             buf,
             self.stream_id,
@@ -1251,32 +1292,47 @@ impl<'a> Samples<'a> {
             self.data.len(),
         )?;
         buf[Self::DATA_OFFSET..total].copy_from_slice(self.data);
-        Some(total)
+        Ok(total)
     }
 
     /// Writes the headers of a packet carrying `data_len` bytes of samples
-    /// already in place at [`Self::DATA_OFFSET`]. Returns the packet length, or
-    /// `None` if `data_len` is 0 or the sample number or samples do not fit.
+    /// already in place at [`Self::DATA_OFFSET`], and returns the packet
+    /// length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::SampleNumberTooLarge`] if `first` does not fit
+    /// its field, [`WriteError::NoSamples`] if `data_len` is 0,
+    /// [`WriteError::PayloadTooLarge`] if the payload exceeds
+    /// [`Packet::MAX_PAYLOAD`], and [`WriteError::BufferTooSmall`] if `buf`
+    /// cannot hold the packet, in that order.
     pub fn write_header(
         buf: &mut [u8],
         stream_id: StreamId,
         segment_id: SegmentId,
         first: SampleNumber,
         data_len: usize,
-    ) -> Option<usize> {
-        if !first.fits_stream_packet() || data_len == 0 {
-            return None;
+    ) -> Result<usize, WriteError> {
+        if !first.fits_stream_packet() {
+            return Err(WriteError::SampleNumberTooLarge);
+        }
+        if data_len == 0 {
+            return Err(WriteError::NoSamples);
         }
         let payload_len = SAMPLE_HEADER_SIZE + data_len;
         let total = Header::SIZE + payload_len;
-        if payload_len > Packet::MAX_PAYLOAD || buf.len() < total {
-            return None;
+        if payload_len > Packet::MAX_PAYLOAD {
+            return Err(WriteError::PayloadTooLarge);
         }
-        Header::new(PacketType::stream(stream_id.value())?, payload_len as u16)
-            .write(buf.first_chunk_mut()?);
+        if buf.len() < total {
+            return Err(WriteError::BufferTooSmall);
+        }
+        let ptype = PacketType::stream(stream_id.value()).ok_or(WriteError::NotAPacket)?;
+        let head = buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?;
+        Header::new(ptype, payload_len as u16).write(head);
         buf[Header::SIZE..Header::SIZE + 3].copy_from_slice(&first.to_le_bytes()[..3]);
         buf[Header::SIZE + 3] = segment_id.value();
-        Some(total)
+        Ok(total)
     }
 
     /// Parses a sample packet from its header and payload. Returns `None` if it
@@ -1306,8 +1362,13 @@ pub(crate) struct RecordWriter<'a> {
 }
 
 impl<'a> RecordWriter<'a> {
-    pub(crate) fn new(buf: &'a mut [u8], head: usize) -> Option<Self> {
-        (buf.len() >= head).then_some(Self { buf, len: head })
+    /// Returns a writer of a record whose head is `head` bytes, or
+    /// [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub(crate) fn new(buf: &'a mut [u8], head: usize) -> Result<Self, WriteError> {
+        if buf.len() < head {
+            return Err(WriteError::BufferTooSmall);
+        }
+        Ok(Self { buf, len: head })
     }
 
     /// Appends `value` and returns how many of its bytes fit.
@@ -2032,7 +2093,7 @@ mod tests {
         let mut buf = [0u8; Header::SIZE + METADATA_HEADER_SIZE + 6];
         assert_eq!(
             Metadata::Device(device()).write(MetadataFlags::PERIODIC, &mut buf),
-            None
+            Err(WriteError::BufferTooSmall)
         );
     }
 
@@ -2164,7 +2225,10 @@ mod tests {
         });
         let mut buf = [0u8; 512];
         assert!(record.record_len() > usize::from(u8::MAX));
-        assert_eq!(record.write_reply_frame(&mut buf), None);
+        assert_eq!(
+            record.write_reply_frame(&mut buf),
+            Err(WriteError::RecordTooLong)
+        );
     }
 
     #[test]
@@ -2236,14 +2300,14 @@ mod tests {
             let payload_len = SAMPLE_HEADER_SIZE + data.len();
             let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| samples.write(buf))?;
             if data.is_empty() {
-                prop_assert_eq!(len, None);
+                prop_assert_eq!(len, Err(WriteError::NoSamples));
                 let (len, _) = write_over_any(buf.len(), |in_place| {
                     Samples::write_header(in_place, stream_id, segment_id, samples.first, 0)
                 })?;
-                prop_assert_eq!(len, None);
+                prop_assert_eq!(len, Err(WriteError::NoSamples));
                 return Ok(());
             }
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             let ptype = PacketType::new(128 + stream_id.value());
             prop_assert_eq!(header, Header::new(ptype, payload_len as u16));
@@ -2253,7 +2317,7 @@ mod tests {
                 in_place[Samples::DATA_OFFSET..].copy_from_slice(&data);
                 Samples::write_header(in_place, stream_id, segment_id, samples.first, data.len())
             })?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             prop_assert_eq!(in_place, buf);
         }
 
@@ -2285,9 +2349,9 @@ mod tests {
                 && data_len > 0
                 && data_len <= MAX_SAMPLE_DATA
                 && buf.len() >= needed;
-            prop_assert_eq!(samples.write(&mut buf), fits.then_some(needed));
+            prop_assert_eq!(samples.write(&mut buf).ok(), fits.then_some(needed));
             prop_assert_eq!(
-                Samples::write_header(&mut buf, samples.stream_id, samples.segment_id, samples.first, data_len),
+                Samples::write_header(&mut buf, samples.stream_id, samples.segment_id, samples.first, data_len).ok(),
                 fits.then_some(needed)
             );
         }
@@ -2318,7 +2382,7 @@ mod tests {
             };
             prop_assert!(parses);
             let (len, buf) = write_over_any(Header::SIZE + payload.len(), |buf| samples.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let mut head = [0u8; Header::SIZE];
             header.write(&mut head);
             prop_assert_eq!(&buf[..Header::SIZE], &head[..]);
@@ -2797,11 +2861,12 @@ mod tests {
     fn write_record_over_any(
         fields: &Fields,
         len: usize,
-    ) -> Result<(Option<usize>, Vec<u8>), TestCaseError> {
+    ) -> Result<(Result<usize, WriteError>, Vec<u8>), TestCaseError> {
         let metadata = fields.metadata();
         write_over_any(len, |buf| {
             let (kind, len) = metadata.write_record(buf)?;
-            (kind == fields.kind()).then_some(len)
+            assert_eq!(kind, fields.kind(), "the type byte is not the record's");
+            Ok(len)
         })
     }
 
@@ -3104,7 +3169,7 @@ mod tests {
         fn a_record_is_laid_out_as_its_struct(fields in fields(MAX_STRING)) {
             let wire = fields.wire();
             let (len, record) = write_record_over_any(&fields, wire.len())?;
-            prop_assert_eq!(len, Some(wire.len()));
+            prop_assert_eq!(len, Ok(wire.len()));
             prop_assert_eq!(&record, &wire);
             prop_assert_eq!(fields.metadata().record_len(), wire.len());
         }
@@ -3141,9 +3206,9 @@ mod tests {
                     &wire,
                 ]
                 .concat();
-                prop_assert_eq!(written, Some(packet_len));
+                prop_assert_eq!(written, Ok(packet_len));
                 prop_assert_eq!(&packet, &expected);
-                prop_assert_eq!(relayed, Some(packet_len));
+                prop_assert_eq!(relayed, Ok(packet_len));
                 prop_assert_eq!(&relay, &expected);
                 let parsed = Metadata::parse(&packet[Header::SIZE..]);
                 prop_assert_eq!(
@@ -3151,19 +3216,19 @@ mod tests {
                     Some((by_bits(metadata), flags))
                 );
             } else {
-                prop_assert_eq!(written, None);
-                prop_assert_eq!(relayed, None);
+                prop_assert_eq!(written, Err(WriteError::PayloadTooLarge));
+                prop_assert_eq!(relayed, Err(WriteError::PayloadTooLarge));
             }
 
             let frame_len = METADATA_REPLY_FRAME_HEADER + wire.len();
             let (framed, frame) = write_over_any(frame_len, |buf| metadata.write_reply_frame(buf))?;
             if wire.len() <= MAX_STRING {
-                prop_assert_eq!(framed, Some(frame_len));
+                prop_assert_eq!(framed, Ok(frame_len));
                 prop_assert_eq!(&frame, &[&[fields.kind(), wire.len() as u8][..], &wire].concat());
                 let frames: Option<Vec<_>> = MetadataReply::parse(&frame).map(Iterator::collect);
                 prop_assert_eq!(frames, Some(vec![(fields.mtype(), &wire[..])]));
             } else {
-                prop_assert_eq!(framed, None);
+                prop_assert_eq!(framed, Err(WriteError::RecordTooLong));
             }
         }
 
@@ -3180,7 +3245,7 @@ mod tests {
             let mut buf = [0u8; Packet::MAX_SIZE];
             let frames = vec![0u8; len];
             let fits = crate::rpc::write_reply(&mut buf, crate::RpcRequestId::new(1), &frames);
-            prop_assert_eq!(fits.is_some(), len <= MAX_METADATA_REPLY_SIZE);
+            prop_assert_eq!(fits.is_ok(), len <= MAX_METADATA_REPLY_SIZE);
         }
 
         /// M4. Into a buffer that holds the head and some room more, each
@@ -3202,10 +3267,13 @@ mod tests {
             let head = fields.head_size();
 
             let (len, record) = write_record_over_any(&fields, head + room)?;
-            prop_assert_eq!(len, Some(wire.len()));
+            prop_assert_eq!(len, Ok(wire.len()));
             prop_assert_eq!(&record[..wire.len()], &wire[..]);
             reads_as(&wire, &expected)?;
-            prop_assert_eq!(write_record_over_any(&fields, head - 1)?.0, None);
+            prop_assert_eq!(
+                write_record_over_any(&fields, head - 1)?.0,
+                Err(WriteError::BufferTooSmall)
+            );
             let whole: usize = cut_in_turn(&strings, usize::MAX).iter().map(|text| text.len()).sum();
             prop_assert!(fields.metadata().record_len() >= head + whole);
 
@@ -3214,13 +3282,13 @@ mod tests {
             let start = Header::SIZE + METADATA_HEADER_SIZE;
             let (len, packet) = write_over_any(start + head + room, |buf| metadata.write(flags, buf))?;
             if METADATA_HEADER_SIZE + wire.len() <= Packet::MAX_PAYLOAD {
-                prop_assert_eq!(len, Some(start + wire.len()));
+                prop_assert_eq!(len, Ok(start + wire.len()));
                 prop_assert_eq!(&packet[start..start + wire.len()], &wire[..]);
             } else {
-                prop_assert_eq!(len, None);
+                prop_assert_eq!(len, Err(WriteError::PayloadTooLarge));
             }
             let (len, _) = write_over_any(start + head - 1, |buf| metadata.write(flags, buf))?;
-            prop_assert_eq!(len, None);
+            prop_assert_eq!(len, Err(WriteError::BufferTooSmall));
         }
 
         /// M5. A longer head than this build's is read as far as this build

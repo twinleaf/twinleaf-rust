@@ -131,6 +131,19 @@ const RULES: &[Rule] = &[
         patterns: &[": [DataType; "],
         allowed: &["twinleaf-data/"],
     },
+    // Why a writer refuses a packet, which the protocol crate's writers own
+    // and report as a `WriteError`.
+    Rule {
+        patterns: &[
+            "expect(\"payload sized above\")",
+            "> WirePacket::MAX_PAYLOAD",
+            "return Err(EncodeError::NoSamples)",
+            "return Err(EncodeError::SampleNumberTooLarge(",
+            ".ok_or(EncodeError::ValueTooLarge",
+            ".is_none_or(|len| len > Packet::MAX_PAYLOAD)",
+        ],
+        allowed: &[],
+    },
 ];
 
 #[test]

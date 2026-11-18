@@ -17,7 +17,7 @@
 //! status. It has no stop, so a stop goes out as a failure to reconnect, and
 //! code 4 there reads as [`LinkStatus::Unknown`].
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, Packet, PacketType, WriteError};
 use crate::rpc::{write_error_payload, write_reply_payload, ErrorReply, Reply};
 
 /// Kind byte of a reply.
@@ -89,25 +89,34 @@ impl LinkStatus {
 
     /// Writes this status as a `PROXY_STATUS` payload into `out`.
     /// [`Stopped`](Self::Stopped) goes out as
-    /// [`FailedToReconnect`](Self::FailedToReconnect). Returns the length,
-    /// or `None` if `out` is empty.
-    pub fn write_status(self, out: &mut [u8]) -> Option<usize> {
+    /// [`FailedToReconnect`](Self::FailedToReconnect). Returns the length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `out` is empty.
+    pub fn write_status(self, out: &mut [u8]) -> Result<usize, WriteError> {
         let status = match self {
             Self::Stopped => Self::FailedToReconnect,
             status => status,
         };
-        *out.first_mut()? = u8::from(status);
-        Some(1)
+        *out.first_mut().ok_or(WriteError::BufferTooSmall)? = u8::from(status);
+        Ok(1)
     }
 
     /// Writes this status as a full `PROXY_STATUS` packet with no routing
     /// into `buf`, its payload as [`write_status`](Self::write_status) writes
-    /// it. Returns the packet length, or `None` if it does not fit.
-    pub fn write(self, buf: &mut [u8]) -> Option<usize> {
-        let (head, body) = buf.split_first_chunk_mut::<{ Header::SIZE }>()?;
+    /// it. Returns the packet length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if the packet does not fit.
+    pub fn write(self, buf: &mut [u8]) -> Result<usize, WriteError> {
+        let (head, body) = buf
+            .split_first_chunk_mut::<{ Header::SIZE }>()
+            .ok_or(WriteError::BufferTooSmall)?;
         let len = self.write_status(body)?;
         Header::new(PacketType::PROXY_STATUS, len as u16).write(head);
-        Some(Header::SIZE + len)
+        Ok(Header::SIZE + len)
     }
 }
 
@@ -172,9 +181,13 @@ impl<'a> ProxyRx<'a> {
     }
 
     /// Writes the `PROXY_RX` payload alone, without a packet header, into
-    /// `out`. Returns its length, or `None` if it does not fit.
-    pub fn write_payload(&self, out: &mut [u8]) -> Option<usize> {
-        let (kind, body) = out.split_first_mut()?;
+    /// `out`, and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if the payload does not fit.
+    pub fn write_payload(&self, out: &mut [u8]) -> Result<usize, WriteError> {
+        let (kind, body) = out.split_first_mut().ok_or(WriteError::BufferTooSmall)?;
         let written = match *self {
             Self::Reply(reply) => {
                 *kind = REPLY;
@@ -186,7 +199,7 @@ impl<'a> ProxyRx<'a> {
             }
             Self::Link(status) => {
                 *kind = LINK;
-                *body.first_mut()? = u8::from(status);
+                *body.first_mut().ok_or(WriteError::BufferTooSmall)? = u8::from(status);
                 1
             }
             Self::Alive => {
@@ -195,30 +208,40 @@ impl<'a> ProxyRx<'a> {
             }
             Self::Dropped { stream_id, packets } => {
                 *kind = DROPPED;
-                let (stream, count) = body.split_first_mut()?;
+                let (stream, count) = body.split_first_mut().ok_or(WriteError::BufferTooSmall)?;
                 *stream = stream_id;
-                *count.first_chunk_mut()? = packets.to_le_bytes();
+                *count.first_chunk_mut().ok_or(WriteError::BufferTooSmall)? = packets.to_le_bytes();
                 5
             }
             Self::Unknown(code, payload) => {
                 *kind = code;
-                body.get_mut(..payload.len())?.copy_from_slice(payload);
+                body.get_mut(..payload.len())
+                    .ok_or(WriteError::BufferTooSmall)?
+                    .copy_from_slice(payload);
                 payload.len()
             }
         };
-        Some(1 + written)
+        Ok(1 + written)
     }
 
-    /// Writes a full `PROXY_RX` packet with no routing into `buf`. Returns
-    /// its length, or `None` if it does not fit.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full `PROXY_RX` packet with no routing into `buf`, and
+    /// returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::PayloadTooLarge`] if the payload exceeds
+    /// [`Packet::MAX_PAYLOAD`], and [`WriteError::BufferTooSmall`] if the
+    /// packet does not fit `buf`.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         if self.payload_len() > Packet::MAX_PAYLOAD {
-            return None;
+            return Err(WriteError::PayloadTooLarge);
         }
-        let (head, body) = buf.split_first_chunk_mut::<{ Header::SIZE }>()?;
+        let (head, body) = buf
+            .split_first_chunk_mut::<{ Header::SIZE }>()
+            .ok_or(WriteError::BufferTooSmall)?;
         let len = self.write_payload(body)?;
         Header::new(PacketType::PROXY_RX, len as u16).write(head);
-        Some(Header::SIZE + len)
+        Ok(Header::SIZE + len)
     }
 }
 
@@ -235,7 +258,7 @@ mod tests {
     fn written(rx: ProxyRx<'_>) -> Vec<u8> {
         let len = rx.payload_len();
         let mut out = vec![0; len];
-        assert_eq!(rx.write_payload(&mut out), Some(len));
+        assert_eq!(rx.write_payload(&mut out), Ok(len));
         out
     }
 
@@ -299,7 +322,7 @@ mod tests {
         fn a_proxy_rx_decodes_as_it_was_encoded(drawn in any_rx()) {
             let rx = drawn.rx();
             let (len, buf) = write_over_any(rx.payload_len(), |out| rx.write_payload(out))?;
-            prop_assert_eq!(len, Some(rx.payload_len()));
+            prop_assert_eq!(len, Ok(rx.payload_len()));
             prop_assert_eq!(ProxyRx::parse(&buf), Some(rx));
         }
 
@@ -310,7 +333,10 @@ mod tests {
             let rx = drawn.rx();
             let needed = rx.payload_len();
             let mut buf = buffer(needed, slack);
-            prop_assert_eq!(rx.write_payload(&mut buf), (buf.len() >= needed).then_some(needed));
+            prop_assert_eq!(
+                rx.write_payload(&mut buf),
+                (buf.len() >= needed).then_some(needed).ok_or(WriteError::BufferTooSmall)
+            );
         }
 
         /// Every payload either parses or is too short for its kind, and what
@@ -338,7 +364,7 @@ mod tests {
         #[test]
         fn a_status_decodes_as_it_was_encoded(status in status(), payload in bytes(2)) {
             let mut out = payload.clone();
-            prop_assert_eq!(status.write_status(&mut out), Some(1));
+            prop_assert_eq!(status.write_status(&mut out), Ok(1));
             prop_assert_eq!(out[1], payload[1]);
             let expected = match status {
                 LinkStatus::Stopped => LinkStatus::FailedToReconnect,

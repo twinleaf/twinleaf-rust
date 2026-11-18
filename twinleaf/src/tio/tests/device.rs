@@ -325,7 +325,7 @@ fn fake_capture(args: &[u8]) -> Result<Vec<u8>, RpcError> {
                 x_units: "s",
             };
             let mut reply = vec![0u8; 64];
-            let written = metadata.write(&mut reply).ok_or(RpcError::NoBufs)?;
+            let written = metadata.write(&mut reply).map_err(|_| RpcError::NoBufs)?;
             reply.truncate(written);
             reply
         }

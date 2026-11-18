@@ -110,7 +110,9 @@ macro_rules! metadata_record {
             pub(crate) fn encode(fields: wire::$kind<'_>) -> Option<Self> {
                 let record = wire::Metadata::$kind(fields);
                 let mut buf = [0u8; WirePacket::MAX_PAYLOAD];
-                let (_, len) = record.write_record(buf.get_mut(..record.record_len())?)?;
+                let (_, len) = record
+                    .write_record(buf.get_mut(..record.record_len())?)
+                    .ok()?;
                 Self::new(&buf[..len])
             }
 
@@ -131,7 +133,7 @@ macro_rules! metadata_record {
                     wire::MetadataFlags::UPDATE,
                     &self.0,
                 )
-                .ok_or(PacketError::PayloadTooBig)?;
+                .map_err(|_| PacketError::PayloadTooBig)?;
                 let len = write_routing(&mut buf, len, routing)
                     .expect("any payload and the longest route fit a packet");
                 Ok(buf[..len].to_vec())

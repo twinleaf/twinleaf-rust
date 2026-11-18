@@ -6,7 +6,7 @@
 //! heartbeats to keep a child port awake, and a host sends one when it opens a
 //! serial port.
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, Packet, PacketType, WriteError};
 use crate::SessionId;
 
 /// How often a device sends a heartbeat.
@@ -66,9 +66,14 @@ impl<'a> Heartbeat<'a> {
         }
     }
 
-    /// Writes a full `HEARTBEAT` packet into `buf`. Returns its length, or
-    /// `None` if it does not fit.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full `HEARTBEAT` packet into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::PayloadTooLarge`] if the payload exceeds
+    /// [`Packet::MAX_PAYLOAD`], and [`WriteError::BufferTooSmall`] if `buf`
+    /// cannot hold the packet.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         match self {
             Self::Session {
                 session,
@@ -88,18 +93,18 @@ impl<'a> Heartbeat<'a> {
     }
 }
 
-fn write_packet(buf: &mut [u8], payload: &[u8]) -> Option<usize> {
+fn write_packet(buf: &mut [u8], payload: &[u8]) -> Result<usize, WriteError> {
     if payload.len() > Packet::MAX_PAYLOAD {
-        return None;
+        return Err(WriteError::PayloadTooLarge);
     }
     let total = Header::SIZE + payload.len();
     if buf.len() < total {
-        return None;
+        return Err(WriteError::BufferTooSmall);
     }
     let hdr = Header::new(PacketType::HEARTBEAT, payload.len() as u16);
     hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
     buf[Header::SIZE..total].copy_from_slice(payload);
-    Some(total)
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -184,7 +189,7 @@ mod tests {
                 prop_assert_eq!(beat.settings(), None);
             }
             let (len, buf) = write_over_any(Header::SIZE + payload.len(), |buf| beat.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             prop_assert_eq!(&buf[Header::SIZE..], &payload[..]);
         }
 
@@ -197,7 +202,7 @@ mod tests {
             let needed = Header::SIZE + payload.len();
             let mut buf = buffer(needed, slack);
             let fits = payload.len() <= Packet::MAX_PAYLOAD && buf.len() >= needed;
-            prop_assert_eq!(beat.write(&mut buf), fits.then_some(needed));
+            prop_assert_eq!(beat.write(&mut buf).ok(), fits.then_some(needed));
         }
     }
 

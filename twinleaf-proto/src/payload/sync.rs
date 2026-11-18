@@ -15,7 +15,7 @@
 //! [`Timeref`] parses and writes the packet.
 
 use super::array_at;
-use crate::packet::{Header, PacketType};
+use crate::packet::{Header, PacketType, WriteError};
 use crate::SessionId;
 
 /// Size of the timeref header before the serial string.
@@ -319,26 +319,34 @@ impl<'a> Timeref<'a> {
         payload.get(3).copied().unwrap_or(0)
     }
 
-    /// Writes a full `SYNC` packet into `buf`. Returns its length, or `None` if
-    /// it does not fit or the serial exceeds [`MAX_SERIAL_SIZE`].
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full `SYNC` packet into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`write_with_pad`](Self::write_with_pad).
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         self.write_with_pad(buf, 0)
     }
 
     /// Writes a full `SYNC` packet whose pad byte carries `pad`, and a clock
-    /// TLV after the serial when there is a clock. Returns its length, or
-    /// `None` if it does not fit or the serial exceeds [`MAX_SERIAL_SIZE`].
-    pub fn write_with_pad(&self, buf: &mut [u8], pad: u8) -> Option<usize> {
+    /// TLV after the serial when there is a clock, and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::SerialTooLong`] if the serial exceeds
+    /// [`MAX_SERIAL_SIZE`], and [`WriteError::BufferTooSmall`] if the packet
+    /// does not fit `buf`.
+    pub fn write_with_pad(&self, buf: &mut [u8], pad: u8) -> Result<usize, WriteError> {
         if self.serial.len() > MAX_SERIAL_SIZE {
-            return None;
+            return Err(WriteError::SerialTooLong);
         }
         let serial_end = Header::SIZE + TIMEREF_HEADER_SIZE + self.serial.len();
         let total = serial_end + self.clock.map_or(0, |_| CLOCK_TLV_SIZE);
         if buf.len() < total {
-            return None;
+            return Err(WriteError::BufferTooSmall);
         }
         let hdr = Header::new(PacketType::SYNC, (total - Header::SIZE) as u16);
-        hdr.write(buf.first_chunk_mut()?);
+        hdr.write(buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?);
         buf[4] = 0; // timeref type
         buf[5] = self.epoch.value();
         buf[6] = self.serial.len() as u8;
@@ -356,7 +364,7 @@ impl<'a> Timeref<'a> {
                 clock.flags.bits(),
             ]);
         }
-        Some(total)
+        Ok(total)
     }
 }
 
@@ -545,7 +553,7 @@ mod tests {
             let timeref = fields.timeref();
             let (len, buf) =
                 write_over_any(fields.packet_len(), |buf| timeref.write_with_pad(buf, pad))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             let payload = &buf[Header::SIZE..];
             prop_assert_eq!(header, Header::new(PacketType::SYNC, payload.len() as u16));
@@ -553,7 +561,7 @@ mod tests {
             prop_assert_eq!(Timeref::parse(payload), Some(timeref));
 
             let (len, mut plain) = write_over_any(buf.len(), |buf| timeref.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             prop_assert_eq!(Timeref::pad(&plain[Header::SIZE..]), 0);
             plain[Header::SIZE + 3] = pad;
             prop_assert_eq!(&plain, &buf);
@@ -563,7 +571,7 @@ mod tests {
                 Header::SIZE + TIMEREF_HEADER_SIZE + fields.serial.len(),
                 |buf| old.write_with_pad(buf, pad),
             )?;
-            prop_assert_eq!(len, Some(old_buf.len()));
+            prop_assert_eq!(len, Ok(old_buf.len()));
             prop_assert_eq!(&old_buf[Header::SIZE..], &buf[Header::SIZE..old_buf.len()]);
         }
 
@@ -623,9 +631,9 @@ mod tests {
                 timeref.write_with_pad(buf, Timeref::pad(&payload))
             })?;
             if timeref.serial.len() > MAX_SERIAL_SIZE {
-                prop_assert_eq!(written, None);
+                prop_assert_eq!(written, Err(WriteError::SerialTooLong));
             } else {
-                prop_assert!(written.is_some());
+                prop_assert!(written.is_ok());
                 prop_assert_eq!(&buf[Header::SIZE..][..serial_end], &payload[..serial_end]);
             }
         }
@@ -641,7 +649,7 @@ mod tests {
             let needed = fields.packet_len();
             let mut buf = buffer(needed, slack);
             let fits = fields.serial.len() <= MAX_SERIAL_SIZE && buf.len() >= needed;
-            prop_assert_eq!(fields.timeref().write(&mut buf), fits.then_some(needed));
+            prop_assert_eq!(fields.timeref().write(&mut buf).ok(), fits.then_some(needed));
         }
 
         /// Each named clock flag is the bit IEEE 1588 gives it in the first
@@ -732,7 +740,7 @@ mod tests {
         let mut buf = [0u8; crate::packet::Packet::MAX_SIZE];
         assert_eq!(
             longest.write(&mut buf),
-            Some(Header::SIZE + TIMEREF_HEADER_SIZE + MAX_SERIAL_SIZE + CLOCK_TLV_SIZE)
+            Ok(Header::SIZE + TIMEREF_HEADER_SIZE + MAX_SERIAL_SIZE + CLOCK_TLV_SIZE)
         );
     }
 

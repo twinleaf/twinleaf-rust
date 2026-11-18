@@ -9,6 +9,8 @@
 
 use crc::{Crc, CRC_32_ISO_HDLC};
 
+use crate::packet::WriteError;
+
 /// Frame delimiter, 0xC0.
 pub const SLIP_END: u8 = 0xC0;
 /// Escape, 0xDB.
@@ -29,10 +31,13 @@ pub const fn max_serialized_size(packet_size: usize) -> usize {
     2 * (packet_size + CRC_SIZE) + 1
 }
 
-/// Encodes `packet` and its CRC32 into `out` as one SLIP frame. Returns the
-/// frame length, or `None` if `out` is too small. A buffer sized by
-/// [`max_serialized_size`] always fits.
-pub fn serialize(packet: &[u8], out: &mut [u8]) -> Option<usize> {
+/// Encodes `packet` and its CRC32 into `out` as one SLIP frame and returns
+/// the frame length. A buffer sized by [`max_serialized_size`] always fits.
+///
+/// # Errors
+///
+/// Returns [`WriteError::BufferTooSmall`] if `out` is too small.
+pub fn serialize(packet: &[u8], out: &mut [u8]) -> Result<usize, WriteError> {
     let crc = CRC32.checksum(packet).to_le_bytes();
     let mut len = 0;
     for mut part in [packet, &crc[..]] {
@@ -42,7 +47,9 @@ pub fn serialize(packet: &[u8], out: &mut [u8]) -> Option<usize> {
                 .iter()
                 .position(|&byte| byte == SLIP_END || byte == SLIP_ESC)
                 .unwrap_or(part.len());
-            out.get_mut(len..len + run)?.copy_from_slice(&part[..run]);
+            out.get_mut(len..len + run)
+                .ok_or(WriteError::BufferTooSmall)?
+                .copy_from_slice(&part[..run]);
             len += run;
             let Some((&special, rest)) = part[run..].split_first() else {
                 break;
@@ -51,14 +58,15 @@ pub fn serialize(packet: &[u8], out: &mut [u8]) -> Option<usize> {
                 SLIP_END => SLIP_ESC_END,
                 _ => SLIP_ESC_ESC,
             };
-            out.get_mut(len..len + 2)?
+            out.get_mut(len..len + 2)
+                .ok_or(WriteError::BufferTooSmall)?
                 .copy_from_slice(&[SLIP_ESC, code]);
             len += 2;
             part = rest;
         }
     }
-    *out.get_mut(len)? = SLIP_END;
-    Some(len + 1)
+    *out.get_mut(len).ok_or(WriteError::BufferTooSmall)? = SLIP_END;
+    Ok(len + 1)
 }
 
 /// Frame-level error bits, matching `TL_SERIAL_ERROR_*`.
@@ -362,7 +370,10 @@ mod tests {
     #[test]
     fn serialize_rejects_short_buffer() {
         let mut small = [0u8; 4];
-        assert!(serialize(b"hello", &mut small).is_none());
+        assert_eq!(
+            serialize(b"hello", &mut small),
+            Err(WriteError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -502,11 +513,11 @@ mod bytewise {
     use super::*;
     use proptest::prelude::*;
 
-    fn serialize_bytewise(packet: &[u8], out: &mut [u8]) -> Option<usize> {
-        fn put(out: &mut [u8], len: &mut usize, value: u8) -> Option<()> {
-            *out.get_mut(*len)? = value;
+    fn serialize_bytewise(packet: &[u8], out: &mut [u8]) -> Result<usize, WriteError> {
+        fn put(out: &mut [u8], len: &mut usize, value: u8) -> Result<(), WriteError> {
+            *out.get_mut(*len).ok_or(WriteError::BufferTooSmall)? = value;
             *len += 1;
-            Some(())
+            Ok(())
         }
 
         let crc = CRC32.checksum(packet).to_le_bytes();
@@ -525,7 +536,7 @@ mod bytewise {
             }
         }
         put(out, &mut len, SLIP_END)?;
-        Some(len)
+        Ok(len)
     }
 
     impl<const CAPACITY: usize> Deserializer<CAPACITY> {
@@ -684,7 +695,7 @@ mod bytewise {
             let (mut runs, mut bytes) = (vec![0; room], vec![0; room]);
             let (ran, bytewise) = (serialize(&packet, &mut runs), serialize_bytewise(&packet, &mut bytes));
             prop_assert_eq!(ran, bytewise);
-            if let Some(len) = ran {
+            if let Ok(len) = ran {
                 prop_assert_eq!(&runs[..len], &bytes[..len]);
             }
         }

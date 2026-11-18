@@ -4,14 +4,13 @@
 use crate::proto::data as wire;
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::packet::Packet as WirePacket;
-use crate::proto::packet::{write_routing, Checked, Header, PacketError, PacketView};
+use crate::proto::packet::{write_routing, Checked, Header, PacketError, PacketView, WriteError};
 use crate::proto::rpc as wire_rpc;
 use crate::proto::RpcRequestId;
 use crate::proto::SessionId as WireSessionId;
 use bytes::Bytes;
 use std::fmt;
 
-use crate::proto::data::MAX_SAMPLE_NUMBER;
 use crate::proto::packet::PacketType;
 use crate::proto::DeviceRoute;
 
@@ -157,8 +156,8 @@ impl Packet {
         routing: DeviceRoute,
     ) -> Result<Packet, EncodeError> {
         let method = wire_rpc::Method::ByName(name.as_bytes());
-        let payload_len = request_payload_len(name, arg)?;
-        build(payload_len, routing, |buf| {
+        let asked = Asked::Request { name, arg };
+        build(routing, asked, |buf| {
             wire_rpc::write_request(buf, RpcRequestId::new(id), method, arg)
         })
     }
@@ -171,8 +170,7 @@ impl Packet {
     /// Returns [`EncodeError::PayloadTooLarge`] if `value` does not fit a
     /// packet.
     pub fn rpc_reply(id: u16, value: &[u8], routing: DeviceRoute) -> Result<Packet, EncodeError> {
-        let payload_len = wire_rpc::REPLY_HEADER_SIZE + value.len();
-        build(payload_len, routing, |buf| {
+        build(routing, Asked::Reply { value }, |buf| {
             wire_rpc::write_reply(buf, RpcRequestId::new(id), value)
         })
     }
@@ -215,7 +213,9 @@ impl Packet {
     // A one byte payload always fits a packet.
     #[allow(clippy::missing_panics_doc)]
     pub fn legacy_status(status: LinkStatus) -> Packet {
-        build(1, DeviceRoute::root(), |buf| status.write(buf)).expect("a legacy status always fits")
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
+        let len = status.write(&mut buf).expect("a legacy status always fits");
+        finish(&mut buf, len, DeviceRoute::root())
     }
 
     /// Creates a link status as a `PROXY_RX` packet. The status concerns the
@@ -253,8 +253,8 @@ impl Packet {
     /// Returns an [`EncodeError`] if the name or the payload is too long.
     pub fn proxy_request(name: &str, arg: &[u8], id: u16) -> Result<Packet, EncodeError> {
         let method = wire_rpc::Method::ByName(name.as_bytes());
-        let payload_len = request_payload_len(name, arg)?;
-        build(payload_len, DeviceRoute::root(), |buf| {
+        let asked = Asked::Request { name, arg };
+        build(DeviceRoute::root(), asked, |buf| {
             wire_rpc::write_proxy_request(buf, RpcRequestId::new(id), method, arg)
         })
     }
@@ -304,8 +304,9 @@ impl Packet {
         flags: wire::MetadataFlags,
         routing: DeviceRoute,
     ) -> Result<Packet, EncodeError> {
-        let payload_len = wire::METADATA_HEADER_SIZE + record.record_len();
-        build(payload_len, routing, |buf| record.write(flags, buf))
+        build(routing, Asked::Metadata(record), |buf| {
+            record.write(flags, buf)
+        })
     }
 
     /// Creates a packet of packed sample `data` for stream `stream_id`,
@@ -323,12 +324,6 @@ impl Packet {
         data: &[u8],
         routing: DeviceRoute,
     ) -> Result<Packet, EncodeError> {
-        if first_sample_n > MAX_SAMPLE_NUMBER {
-            return Err(EncodeError::SampleNumberTooLarge(first_sample_n));
-        }
-        if data.is_empty() {
-            return Err(EncodeError::NoSamples);
-        }
         let samples = wire::Samples {
             stream_id: crate::proto::StreamId::try_new(stream_id)
                 .ok_or(EncodeError::InvalidStreamId(stream_id))?,
@@ -336,8 +331,11 @@ impl Packet {
             first: crate::proto::SampleNumber::new(first_sample_n),
             data,
         };
-        let payload_len = wire::SAMPLE_HEADER_SIZE + data.len();
-        build(payload_len, routing, |buf| samples.write(buf))
+        let asked = Asked::Samples {
+            first: first_sample_n,
+            data,
+        };
+        build(routing, asked, |buf| samples.write(buf))
     }
 
     /// Returns the packet's checked bytes.
@@ -458,39 +456,70 @@ impl From<Checked<'_>> for Packet {
     }
 }
 
-/// Returns the payload length of a request calling `name` with `arg`.
-/// Returns [`EncodeError::ValueTooLarge`] if the name is too long to encode.
-fn request_payload_len(name: &str, arg: &[u8]) -> Result<usize, EncodeError> {
-    let method = wire_rpc::Method::ByName(name.as_bytes());
-    wire_rpc::request_payload_len(method, arg).ok_or(EncodeError::ValueTooLarge {
-        value: name.len(),
-        maximum: wire_rpc::NAMELEN_MASK as usize,
-    })
+/// What a constructor asked a writer to write, for the numbers of the
+/// [`EncodeError`] a refusal becomes.
+#[derive(Clone, Copy)]
+enum Asked<'a> {
+    /// A request calling `name` with `arg`.
+    Request { name: &'a str, arg: &'a [u8] },
+    /// A reply carrying `value`.
+    Reply { value: &'a [u8] },
+    /// A `PROXY_RX` payload.
+    ProxyRx(ProxyRx<'a>),
+    /// A metadata record.
+    Metadata(wire::Metadata<'a>),
+    /// Samples from sample number `first`.
+    Samples { first: u32, data: &'a [u8] },
 }
 
 /// Builds a packet addressed to `routing`. `write` fills the header and the
-/// `payload_len` byte payload from the start of the buffer and returns their
-/// length. Returns [`EncodeError::PayloadTooLarge`] before `write` runs if
-/// `payload_len` exceeds the maximum.
+/// payload from the start of a buffer of [`WirePacket::MAX_SIZE`] bytes and
+/// returns their length.
 fn build(
-    payload_len: usize,
     routing: DeviceRoute,
-    write: impl FnOnce(&mut [u8]) -> Option<usize>,
+    asked: Asked<'_>,
+    write: impl FnOnce(&mut [u8]) -> Result<usize, WriteError>,
 ) -> Result<Packet, EncodeError> {
-    if payload_len > WirePacket::MAX_PAYLOAD {
-        return Err(EncodeError::PayloadTooLarge {
-            actual: payload_len,
-            maximum: WirePacket::MAX_PAYLOAD,
-        });
-    }
     let mut buf = [0u8; WirePacket::MAX_SIZE];
-    let len = write(&mut buf).expect("payload sized above");
+    let len = write(&mut buf).map_err(|error| refused(error, asked))?;
     Ok(finish(&mut buf, len, routing))
+}
+
+/// The [`EncodeError`] a writer's refusal of `asked` becomes. The buffer
+/// holds any packet, so a buffer too small means a payload too large. The
+/// numbers are worked out here, from the protocol crate's lengths.
+fn refused(error: WriteError, asked: Asked<'_>) -> EncodeError {
+    let actual = match (error, asked) {
+        (WriteError::NoSamples, _) => return EncodeError::NoSamples,
+        (WriteError::SampleNumberTooLarge, Asked::Samples { first, .. }) => {
+            return EncodeError::SampleNumberTooLarge(first)
+        }
+        (_, Asked::Request { name, arg }) => {
+            let method = wire_rpc::Method::ByName(name.as_bytes());
+            match (error, wire_rpc::request_payload_len(method, arg)) {
+                (WriteError::NameTooLong, _) | (_, Err(_)) => {
+                    return EncodeError::ValueTooLarge {
+                        value: name.len(),
+                        maximum: wire_rpc::NAMELEN_MASK as usize,
+                    }
+                }
+                (_, Ok(len)) => len,
+            }
+        }
+        (_, Asked::Reply { value }) => wire_rpc::REPLY_HEADER_SIZE + value.len(),
+        (_, Asked::ProxyRx(rx)) => rx.payload_len(),
+        (_, Asked::Metadata(record)) => wire::METADATA_HEADER_SIZE + record.record_len(),
+        (_, Asked::Samples { data, .. }) => wire::SAMPLE_HEADER_SIZE + data.len(),
+    };
+    EncodeError::PayloadTooLarge {
+        actual,
+        maximum: WirePacket::MAX_PAYLOAD,
+    }
 }
 
 /// Builds a `PROXY_RX` packet carrying `rx` with no route.
 fn proxy_rx(rx: ProxyRx<'_>) -> Result<Packet, EncodeError> {
-    build(rx.payload_len(), DeviceRoute::root(), |buf| rx.write(buf))
+    build(DeviceRoute::root(), Asked::ProxyRx(rx), |buf| rx.write(buf))
 }
 
 /// Writes `routing` after the first `len` bytes of `buf`, a header and
@@ -851,6 +880,83 @@ mod tests {
                 actual: 5 + WirePacket::MAX_PAYLOAD,
                 maximum: WirePacket::MAX_PAYLOAD,
             }
+        );
+    }
+
+    /// Each reason a writer refuses for becomes the encode error that names
+    /// it, with the numbers of what was asked. A payload too large for the
+    /// buffer is a payload too large.
+    #[test]
+    fn a_writer_refusal_becomes_the_encode_error_with_its_numbers() {
+        let root = DeviceRoute::root();
+        let too_large = |actual| EncodeError::PayloadTooLarge {
+            actual,
+            maximum: WirePacket::MAX_PAYLOAD,
+        };
+        let over = vec![0; WirePacket::MAX_PAYLOAD + 1];
+        let past_the_buffer = vec![0; WirePacket::MAX_SIZE];
+
+        assert_eq!(
+            Packet::rpc_request("x", &over, 0, root).unwrap_err(),
+            too_large(5 + over.len())
+        );
+        assert_eq!(
+            Packet::rpc_request("x", &past_the_buffer, 0, root).unwrap_err(),
+            too_large(5 + past_the_buffer.len())
+        );
+        assert_eq!(
+            Packet::rpc_reply(0, &over, root).unwrap_err(),
+            too_large(2 + over.len())
+        );
+        assert_eq!(
+            Packet::rpc_reply(0, &past_the_buffer, root).unwrap_err(),
+            too_large(2 + past_the_buffer.len())
+        );
+        assert_eq!(
+            Packet::proxy_error(0, wire_rpc::RpcError::Range, &"e".repeat(500)).unwrap_err(),
+            too_large(505)
+        );
+        let long = "n".repeat(255);
+        let record = wire::Metadata::Device(wire::Device {
+            session: WireSessionId::new(1),
+            n_streams: 1,
+            name: &long,
+            serial: &long,
+            firmware: &long,
+            protocol: 0,
+        });
+        assert_eq!(
+            Packet::metadata(record, wire::MetadataFlags::UPDATE, root).unwrap_err(),
+            too_large(wire::METADATA_HEADER_SIZE + record.record_len())
+        );
+        assert_eq!(
+            Packet::samples(1, 0, 0, &over, root).unwrap_err(),
+            too_large(4 + over.len())
+        );
+        assert_eq!(
+            Packet::samples(1, 0, 0, &past_the_buffer, root).unwrap_err(),
+            too_large(4 + past_the_buffer.len())
+        );
+        assert_eq!(
+            Packet::samples(1, 0, 0, &[], root).unwrap_err(),
+            EncodeError::NoSamples
+        );
+        assert_eq!(
+            Packet::samples(1, 0, 1 << 24, &[0], root).unwrap_err(),
+            EncodeError::SampleNumberTooLarge(1 << 24)
+        );
+        let name = "n".repeat(usize::from(wire_rpc::NAMELEN_MASK) + 1);
+        let named_too_long = EncodeError::ValueTooLarge {
+            value: name.len(),
+            maximum: usize::from(wire_rpc::NAMELEN_MASK),
+        };
+        assert_eq!(
+            Packet::rpc_request(&name, &[], 0, root).unwrap_err(),
+            named_too_long
+        );
+        assert_eq!(
+            Packet::proxy_request(&name, &[], 0).unwrap_err(),
+            named_too_long
         );
     }
 
