@@ -1390,6 +1390,83 @@ async fn a_failed_metadata_query_is_asked_again_when_its_backoff_ends() {
     assert_eq!(refused.elapsed(), super::metadata::RETRY_FIRST);
 }
 
+/// After a bootstrap reply that describes the whole device, a new session
+/// makes the route bootstrap again, and that query goes out at once.
+#[tokio::test(start_paused = true)]
+async fn a_relearns_bootstrap_query_is_sent_at_once() {
+    let tasks = Supervisor::current();
+    let (store, proxy) = engine_on(&tasks);
+    let root = DeviceRoute::root();
+    let followed = metadata(&store, root);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    proxy.send(samples(0, root));
+
+    let asked = proxy.sent.recv_async().await.unwrap();
+    let packet::Payload::RpcRequest(request) = asked.payload() else {
+        panic!("expected a metadata query, got {:?}", asked.payload());
+    };
+    assert!(request.args.is_empty(), "a bootstrap query");
+    let (route, id) = (asked.route(), request.id.value());
+    let mut whole = vec![0u8; wire::MAX_METADATA_REPLY_SIZE];
+    let mut len = 0;
+    for record in crate::data::tests::fixtures::metadata_records(1) {
+        len += record.write_reply_frame(&mut whole[len..]).unwrap();
+    }
+    proxy.reply(id, &whole[..len], route);
+    while !followed
+        .recv_async()
+        .await
+        .as_ref()
+        .is_ok_and(|state| snapshot(state).is_some())
+    {}
+
+    proxy.send(Packet::heartbeat_session(2, root));
+    let relearned = Instant::now();
+    let asked = tokio::time::timeout(super::metadata::RETRY_FIRST / 2, proxy.sent.recv_async())
+        .await
+        .expect("the bootstrap query goes out at once")
+        .unwrap();
+    let packet::Payload::RpcRequest(request) = asked.payload() else {
+        panic!("expected a metadata query, got {:?}", asked.payload());
+    };
+    assert!(request.args.is_empty(), "a bootstrap query");
+    assert_eq!(relearned.elapsed(), Duration::ZERO);
+}
+
+/// A device that answers every metadata query with a reply that fills
+/// nothing is asked again on the delay a failed query waits, which
+/// doubles, and not at once.
+#[tokio::test(start_paused = true)]
+async fn a_reply_that_fills_nothing_is_asked_again_on_a_backoff() {
+    let tasks = Supervisor::current();
+    let (store, proxy) = engine_on(&tasks);
+    let root = DeviceRoute::root();
+    let _followed = metadata(&store, root);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    proxy.send(samples(0, root));
+
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut beat = tokio::time::interval(Duration::from_secs(1));
+    let mut calls = 0;
+    while calls < 1000 {
+        tokio::select! {
+            () = crate::chan::sleep_until(until) => break,
+            _ = beat.tick() => proxy.send(Packet::heartbeat(root)),
+            asked = proxy.sent.recv_async() => {
+                let asked = asked.unwrap();
+                if let packet::Payload::RpcRequest(request) = asked.payload() {
+                    calls += 1;
+                    proxy.reply(request.id.value(), &[], asked.route());
+                }
+            }
+        }
+    }
+    assert!(
+        (3..=8).contains(&calls),
+        "{calls} dev.metadata calls in 10 s"
+    );
+}
+
 /// A route whose metadata query is backing off and that the engine
 /// stops asking, as its device is lost or no receiver follows it, sets
 /// no wake for the retry, so the engine sleeps past the moment it was

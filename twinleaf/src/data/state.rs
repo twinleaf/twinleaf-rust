@@ -1108,6 +1108,10 @@ impl ParseState {
         self.device(route)?.metadata_snapshot()
     }
 
+    pub(super) fn metadata_generation(&self, route: DeviceRoute) -> Option<u32> {
+        self.device(route).map(|device| device.metadata_generation)
+    }
+
     pub(super) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
         self.device(route).map(|device| device.metadata_revision)
     }

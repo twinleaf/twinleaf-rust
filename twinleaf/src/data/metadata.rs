@@ -165,7 +165,8 @@ pub struct MetadataQuery {
     /// Empty when only the device record is missing. An empty argument
     /// selects the device-chosen bootstrap prefix.
     pub selectors: Vec<wire::MetadataSelector>,
-    pub(super) generation: u32,
+    /// The route's metadata generation when the query was formed.
+    pub(crate) generation: u32,
 }
 
 impl MetadataQuery {

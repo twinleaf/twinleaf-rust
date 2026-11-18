@@ -287,6 +287,12 @@ impl PacketParser {
         self.state.metadata(route)
     }
 
+    /// Returns the route's metadata generation. It moves on when a query
+    /// completes or fails and when the route relearns or resets.
+    pub(crate) fn metadata_generation(&self, route: DeviceRoute) -> Option<u32> {
+        self.state.metadata_generation(route)
+    }
+
     /// Returns the route's current metadata revision without building a
     /// snapshot.
     pub(crate) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
