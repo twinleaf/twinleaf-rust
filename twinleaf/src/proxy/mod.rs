@@ -39,8 +39,10 @@
 //! - The client hung up, or a write to it stalled for longer than the
 //!   transport's drain timeout of 3 s, `DRAIN_TIMEOUT`, as when the client
 //!   stops reading. It is logged as `HungUp`.
-//! - The client sent nothing for longer than the 5 s quiet time of the
-//!   proxy's keepalive, `PROXY_KEEPALIVE`. It is logged as `HungUp`.
+//! - A control client sent nothing for longer than the 5 s quiet time of
+//!   the proxy's keepalive, `PROXY_KEEPALIVE`. It is logged as `HungUp`. A
+//!   tio 1.x client is kept however quiet it is.
+//! - `auto` opened nothing for a tio 1.x client. It is logged as `Refused`.
 //! - The packets other than samples queued for the client passed 8 MiB,
 //!   `HARD_LIMIT`, as a flood of them outran a client that still reads. It
 //!   is logged as `TooSlow`.
@@ -162,9 +164,12 @@
 //!   serial device attached. If none of these is single, the refusal lists
 //!   the candidates.
 //!
-//! A client reaches no device until a control request opens a target, and
-//! it hears each link status as a `PROXY_RX` link packet. A client that
-//! sends no control request opens nothing.
+//! A control client reaches no device until a control request opens a
+//! target, and it hears each link status as a `PROXY_RX` link packet. A
+//! client whose first packet within 2 s of connecting is not a control
+//! request is a tio 1.x client. It is opened to `auto` at once, hears link
+//! statuses in the legacy form, type 64, and is kept however quiet it is.
+//! It is disconnected if `auto` opens nothing.
 //!
 //! # Choosing a proxy
 //!

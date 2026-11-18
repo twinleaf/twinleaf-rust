@@ -588,29 +588,20 @@ fn a_packet_that_does_not_decode_is_skipped_and_the_client_stays() {
     assert_eq!(proxy.clients().len(), 2);
 }
 
-/// A client whose first packet is not a control request opens nothing,
-/// so what it sends reaches no device, though `auto` would resolve.
+/// A tio 1.x client, whose first packet is not a control request, opens
+/// `auto` and is answered by the device a control client opened, over the
+/// same link.
 #[test]
-fn a_client_that_opens_nothing_reaches_no_device() {
+fn a_legacy_client_reaches_the_device_auto_opens() {
     let device = FakeDevice::start();
     let proxy = Proxy::host(options()).unwrap();
     let opener = TestClient::connect(&proxy.endpoint());
     opener.hello(4242, "opener");
     opener.open(&device.url).unwrap();
 
-    let talker = TestClient::connect(&proxy.endpoint());
-    let request = Packet::rpc_request("dev.name", &[], 7, DeviceRoute::root());
-    talker.send(request.unwrap());
+    let legacy = TestClient::connect(&proxy.endpoint());
 
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while let Ok(heard) = talker.rx.recv_deadline(deadline) {
-        if let Ok(transport::TransportEvent::Packet(pkt)) = heard {
-            assert!(
-                !matches!(pkt.payload(), Payload::RpcReply(_)),
-                "a device answered"
-            );
-        }
-    }
+    assert_eq!(legacy.dev_name(7), "FAKE");
     assert_eq!(device.accepted(), 1);
 }
 
