@@ -25,7 +25,7 @@ use ratatui::{
 };
 use tui_prompts::{State, TextState};
 use twinleaf::device::rpc::{
-    RpcDescriptor, RpcMetaExt, RpcRegistry, RpcValueType, RpcValueTypeExt,
+    RpcAccess, RpcDescriptor, RpcMetaExt, RpcRegistry, RpcValueType, RpcValueTypeExt,
 };
 use twinleaf::device::Settings;
 use twinleaf::DeviceRoute;
@@ -33,6 +33,10 @@ const RPCLIST_MAX_LEN: usize = 12;
 /// The close hint in the title of the input block. Clicking it closes the
 /// palette.
 const CLOSE_HINT: &str = " <Esc/Ctrl+C> ";
+/// The button on an action RPC's row. Clicking it calls the RPC.
+const RUN_BUTTON: &str = "[run]";
+/// The gap between a suggestion's name and what trails it.
+const NAME_GAP: &str = "  ";
 
 #[derive(Debug, Clone)]
 pub struct RpcReq {
@@ -553,10 +557,14 @@ impl RpcPalette {
         }
         self.selected = Some(idx);
 
+        let on_run_button = registry
+            .and_then(|r| r.find(&self.suggestions[idx].name))
+            .is_some_and(is_action)
+            && self.run_button_columns(idx).contains(&mouse.column);
         let now = Instant::now();
         let is_double = matches!(self.last_click.take(),
             Some((t, prev)) if prev == idx && now.duration_since(t) < Duration::from_millis(400));
-        if is_double {
+        if on_run_button || is_double {
             let name = self.suggestions[idx].name.clone();
             let req = RpcReq {
                 route: *route,
@@ -570,6 +578,17 @@ impl RpcPalette {
         }
         self.last_click = Some((now, idx));
         PaletteEvent::Consumed
+    }
+
+    /// Returns the columns the run button takes on suggestion row `idx`, if
+    /// that row has one.
+    fn run_button_columns(&self, idx: usize) -> std::ops::Range<u16> {
+        let name = self.suggestions[idx].name.chars().count() + NAME_GAP.len();
+        let start = self.zones.list.x.saturating_add(name as u16);
+        let end = start
+            .saturating_add(RUN_BUTTON.len() as u16)
+            .min(self.zones.list.right());
+        start..end
     }
 
     /// Selects and commits the clicked route picker row, as Enter does.
@@ -1082,7 +1101,7 @@ impl RpcPalette {
 
     /// Renders one suggestion row with fuzzy-match highlights and, when
     /// known, the registry's permission and type signature and the setting's
-    /// value trailing in dim.
+    /// value trailing in dim. An action's row carries a run button instead.
     fn render_suggestion_line<'a>(
         &self,
         sugg: &'a Suggestion,
@@ -1119,8 +1138,17 @@ impl RpcPalette {
                     .add_modifier(Modifier::DIM)
             };
             let sig = rpc_signature(desc);
-            if !sig.is_empty() {
-                spans.push(Span::raw("  "));
+            if is_action(desc) {
+                // An action has no value to show, so its row offers the call.
+                let run_style = if is_selected || is_hovered {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+                };
+                spans.push(Span::raw(NAME_GAP));
+                spans.push(Span::styled(RUN_BUTTON, run_style));
+            } else if !sig.is_empty() {
+                spans.push(Span::raw(NAME_GAP));
                 spans.push(Span::styled(sig, sig_style));
             }
             let value = settings
@@ -1408,6 +1436,15 @@ fn spinner_frame(blink: bool) -> &'static str {
     }
 }
 
+/// Returns `true` for an RPC called with no argument for its effect, like
+/// `dev.reboot`. A device reports one as a typed void with neither the
+/// readable nor the writable flag, metadata `0x8000`.
+fn is_action(desc: &RpcDescriptor) -> bool {
+    !desc.meta.is_unknown()
+        && desc.meta.access() == RpcAccess::Action
+        && desc.meta.kind() == RpcValueType::Unit
+}
+
 fn rpc_signature(desc: &RpcDescriptor) -> String {
     if desc.meta.is_unknown() {
         return String::new();
@@ -1418,5 +1455,26 @@ fn rpc_signature(desc: &RpcDescriptor) -> String {
         format!("[{}]", perm)
     } else {
         format!("[{} {}]", perm, t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use twinleaf::device::rpc::{RpcMeta, RpcMetaFlags};
+
+    #[test]
+    fn only_a_flagless_typed_void_is_an_action() {
+        let desc = |bits| RpcDescriptor::from_meta(bits, "x".to_string());
+        assert!(is_action(&desc(RpcMeta::ACTION.bits())));
+        assert!(is_action(&desc(0x8000)));
+        // Untyped metadata says nothing about the RPC.
+        assert!(!is_action(&desc(0)));
+        assert!(!is_action(&desc(
+            RpcMeta::fixed_uint(1, RpcMetaFlags::WRITABLE).bits()
+        )));
+        assert!(!is_action(&desc(
+            RpcMeta::ACTION.bits() | RpcMetaFlags::CAPTURE.bits()
+        )));
     }
 }
