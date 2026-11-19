@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5ca3a3c0c632029212b7410cf21b7e8510352e18691a0ff525d2c0fbb4ebb512 # shrinks to Case { seed: 690084552327, ports: 1, clients: [0], faults: Faults { drop: 50, duplicate: 0, reorder: false, delay_ms: 0, jitter_ms: 0, late: 0, free_events: false }, firmware: Firmware { counter: true, beat_settings: true, numbered: true, wrap: false }, steps: [Step { gap_ms: 1, seed: 0, op: Call { client: 0, target: Loglevel, pick: 0 } }] }

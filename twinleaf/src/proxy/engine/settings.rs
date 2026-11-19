@@ -2,7 +2,7 @@
 
 use crate::proto::rpc::RpcMetaFlags;
 use crate::proto::SessionId;
-use crate::session::rpc::{CallError, PendingReply, Pipeline, RpcRegistry, READ_WINDOW};
+use crate::session::rpc::{CallError, PendingReply, ReadPipeline, RpcRegistry, READ_WINDOW};
 use crate::session::SettingChange;
 use crate::tio::rpc::RpcReply;
 use std::collections::{BTreeMap, BTreeSet};
@@ -172,7 +172,9 @@ impl SettingsCache {
     /// again through `submit`, until both reads agree. If they never do, the
     /// last read is kept at the first version, and the announcements between
     /// the two, still to be observed, bring it up to date. A value the device
-    /// refuses to read is not held.
+    /// refuses to read is not held. A read that times out is asked again as
+    /// [`ReadPipeline`] does. The third timeout of one read, or any other
+    /// error, ends the snapshot.
     pub(crate) async fn snapshot_with(
         &mut self,
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
@@ -185,8 +187,11 @@ impl SettingsCache {
             let before = version(submit(SETTINGS_VERSION, &[]).await)?;
             let mut values = BTreeMap::new();
             {
-                let calls = self.cached.iter().map(|name| submit(name, &[]));
-                let mut replies = Pipeline::new(calls, READ_WINDOW);
+                let mut replies = ReadPipeline::new(
+                    &self.cached,
+                    |name: &&String| submit(name, &[]),
+                    READ_WINDOW,
+                );
                 for name in &self.cached {
                     let Some(reply) = replies.next().await else {
                         break;
@@ -239,7 +244,7 @@ fn ahead(seq: u32, applied: u32) -> bool {
 mod tests {
     use super::*;
     use crate::proto::rpc::RpcError;
-    use crate::session::rpc::{poll_once, resolved, RpcDescriptor, RpcErrorPayload};
+    use crate::session::rpc::{poll_once, resolved, timed_out, RpcDescriptor, RpcErrorPayload};
     use std::task::Poll;
 
     /// The metadata words of an announced read-write byte, an announced
@@ -355,6 +360,31 @@ mod tests {
         assert!(matches!(taken, Poll::Ready(Ok(()))));
         assert_eq!(cache.get("test.amplitude"), Some(&[7][..]));
         assert_eq!(cache.get("test.status"), None);
+        assert_eq!(cache.version(), Some(4));
+    }
+
+    /// A read that times out once is asked again, and the snapshot holds
+    /// every value.
+    #[test]
+    fn a_snapshot_in_which_one_read_times_out_once_holds_every_value() {
+        let mut cache = SettingsCache::new(&registry(true));
+        let mut first_ask = true;
+        let taken = poll_once(std::pin::pin!(cache.snapshot_with(|name, _| {
+            match name {
+                SETTINGS_VERSION => resolved(Some(vec![4, 0, 0, 0])),
+                "test.amplitude" if first_ask => {
+                    first_ask = false;
+                    timed_out()
+                }
+                "test.amplitude" => resolved(Some(vec![7])),
+                "test.status" => resolved(Some(vec![2])),
+                _ => resolved(None),
+            }
+        })));
+
+        assert!(matches!(taken, Poll::Ready(Ok(()))), "{taken:?}");
+        assert_eq!(cache.get("test.amplitude"), Some(&[7][..]));
+        assert_eq!(cache.get("test.status"), Some(&[2][..]));
         assert_eq!(cache.version(), Some(4));
     }
 

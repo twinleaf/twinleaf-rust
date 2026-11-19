@@ -48,8 +48,8 @@ pub use error::{CallError, RpcErrorPayload};
 pub use registry::{RpcDescriptor, RpcRegistry, RpcRegistryError};
 pub use reply::{pipelined, PendingReply, ReplyFuture};
 #[cfg(test)]
-pub(crate) use reply::{poll_once, resolved};
-pub(crate) use reply::{Pipeline, READ_WINDOW};
+pub(crate) use reply::{poll_once, resolved, timed_out};
+pub(crate) use reply::{ReadPipeline, READ_WINDOW};
 #[doc(no_inline)]
 pub use twinleaf_device::rpc::{Channel, Std, STANDARD};
 pub use value::{RpcMetaExt, RpcValue, RpcValueDecodeError, RpcValueEncodeError, RpcValueTypeExt};
