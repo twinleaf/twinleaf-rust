@@ -64,15 +64,20 @@
 //!    Rules out holding every announced name, such as the privileged
 //!    `test.secret`.
 //! 2. Snapshot reads, postcondition. A snapshot that succeeds reads the
-//!    counter, every cacheable entry once and the counter again, and reads
-//!    them all again while the two counts differ, giving up only after more
-//!    than one try. It claims the first count of its last pair. A cache that
-//!    caches nothing reads nothing. Source, the doc of
-//!    [`SettingsCache::snapshot_with`], "until both reads agree. If they
-//!    never do, the last read is kept at the first version", and the doc of
+//!    counter, then every cacheable entry, then the counter again. Between
+//!    the two reads of the counter it reads every cacheable entry, each
+//!    once, and again only when its read timed out, with at most three
+//!    reads of one entry. It reads them all again while the two counts
+//!    differ, giving up only after more than one try. It claims the first
+//!    count of its last pair. A cache that caches nothing reads nothing.
+//!    Source, the doc of [`SettingsCache::snapshot_with`], "until both reads
+//!    agree. If they never do, the last read is kept at the first version"
+//!    and "A read that times out is asked again", the doc of `ReadPipeline`,
+//!    "A read is asked at most three times", and the doc of
 //!    `SNAPSHOT_ATTEMPTS`. Rules out a snapshot that skips the second read,
-//!    claims the second count, reads a privileged entry, or reads again once
-//!    the counts agree.
+//!    claims the second count, reads a privileged entry, reads again once
+//!    the counts agree, reads again an entry whose read was answered, or
+//!    reads an entry a fourth time.
 //! 3. The claim, model based. After every event and snapshot, a cache whose
 //!    claim the model knows claims exactly the count at the model's position,
 //!    or claims no count and holds nothing. Each [`SettingsCache::observe`]
@@ -562,6 +567,8 @@ enum Class {
     Failed,
     /// A snapshot that ended at a timeout.
     TimedOut,
+    /// A read of a snapshot asked again after it timed out.
+    Reasked,
     /// A host that read the registry again and built a new cache.
     Reload,
     /// A cache that applied an announcement across the wrap of the count.
@@ -596,7 +603,7 @@ enum Class {
 }
 
 impl Class {
-    const ALL: [Class; 24] = [
+    const ALL: [Class; 25] = [
         Class::Dropped,
         Class::Late,
         Class::LateReply,
@@ -606,6 +613,7 @@ impl Class {
         Class::GaveUp,
         Class::Failed,
         Class::TimedOut,
+        Class::Reasked,
         Class::Reload,
         Class::Wrap,
         Class::Gap,
@@ -635,12 +643,13 @@ impl Class {
             Class::Snapshot => 3_300,
             Class::Retried => 110,
             Class::GaveUp => 2,
-            Class::Failed => 2_000,
-            Class::TimedOut => 2_000,
+            Class::Failed => 480,
+            Class::TimedOut => 480,
+            Class::Reasked => 2_300,
             Class::Reload => 3_000,
             Class::Wrap => 140,
             Class::Gap => 270,
-            Class::Behind => 140,
+            Class::Behind => 80,
             Class::Foreign => 90,
             Class::Unknown => 0,
             Class::Skipped => 0,
@@ -853,12 +862,47 @@ enum Then {
     Registry,
 }
 
-/// One read a snapshot made, the count it read if it read the counter, and
-/// the session that answered.
+/// One read a snapshot made, the count it read if it read the counter, the
+/// session that answered, and whether its reply was a timeout.
 struct Read {
     name: String,
     count: Option<u32>,
     session: Option<SessionId>,
+    timed_out: bool,
+}
+
+/// The two counts of each try of a snapshot that read `reads`, in the order
+/// submitted, or `None` where the reads break law 2. Each try reads the
+/// counter, then every cacheable entry, then the counter. Between the two
+/// counter reads each cacheable entry is answered exactly once, after at most
+/// two reads of it that timed out, and nothing else is read.
+fn snapshot_tries(reads: &[Read]) -> Option<Vec<(u32, u32)>> {
+    let mut pairs = Vec::new();
+    let mut rest = reads;
+    while let Some((first, tail)) = rest.split_first() {
+        let end = tail.iter().position(|read| read.name == COUNTER)?;
+        let (between, last) = (&tail[..end], &tail[end]);
+        rest = &tail[end + 1..];
+        let mut asks: BTreeMap<&str, Vec<bool>> = BTreeMap::new();
+        for read in between {
+            asks.entry(read.name.as_str())
+                .or_default()
+                .push(read.timed_out);
+        }
+        let whole = first.name == COUNTER
+            && !first.timed_out
+            && !last.timed_out
+            && asks.keys().copied().eq(cacheable().iter().copied())
+            && asks.values().all(|timed_out| {
+                let (answered, before) = timed_out.split_last().expect("a read at least");
+                !answered && before.len() <= 2 && before.iter().all(|timed_out| *timed_out)
+            });
+        if !whole {
+            return None;
+        }
+        pairs.push((first.count?, last.count?));
+    }
+    (!pairs.is_empty()).then_some(pairs)
 }
 
 /// A read a snapshot has in flight, its place in the order submitted, and
@@ -1949,6 +1993,7 @@ impl<'c> World<'c> {
             name: flight.name,
             count,
             session: answer.stamp.map(|stamp| stamp.session),
+            timed_out: matches!(answer.reply, Err(CallError::Timeout)),
         };
         snapshotting.reads.push((flight.index, read));
         let _ = flight.resolve.send(answer.reply);
@@ -1973,6 +2018,19 @@ impl<'c> World<'c> {
         }
         let submitted: Vec<Submitted> = snapshotting.submitted.borrow_mut().drain(..).collect();
         for (name, arg, resolve) in submitted {
+            let try_start = snapshotting
+                .reads
+                .iter()
+                .filter(|(_, read)| read.name == COUNTER)
+                .map(|(index, _)| *index)
+                .max();
+            let reasked = name != COUNTER
+                && snapshotting.reads.iter().any(|(index, read)| {
+                    read.name == name && read.timed_out && Some(*index) > try_start
+                });
+            if reasked {
+                self.stats.bump(Class::Reasked);
+            }
             let id = self.send_call(c, &name, &arg);
             self.schedule(self.now + TIMEOUT, Wake::ReadTimeout(c, id));
             snapshotting.flights.push(Flight {
@@ -2037,25 +2095,17 @@ impl<'c> World<'c> {
             }
             return Claim::Nothing;
         }
-        let span = cacheable().len() + 2;
-        let pairs: Vec<(u32, u32)> = reads
-            .chunks(span)
-            .filter_map(|attempt| {
-                let (first, rest) = attempt.split_first()?;
-                let (last, between) = rest.split_last()?;
-                let mut names: Vec<&str> = between.iter().map(|read| read.name.as_str()).collect();
-                names.sort_unstable();
-                let whole = first.name == COUNTER
-                    && last.name == COUNTER
-                    && names.iter().copied().eq(cacheable().iter().copied());
-                whole.then_some((first.count?, last.count?))
-            })
-            .collect();
-        if pairs.is_empty() || pairs.len() * span != reads.len() {
-            let names: Vec<&str> = reads.iter().map(|read| read.name.as_str()).collect();
+        let Some(pairs) = snapshot_tries(reads) else {
+            let names: Vec<String> = reads
+                .iter()
+                .map(|read| match read.timed_out {
+                    true => format!("{} (timed out)", read.name),
+                    false => read.name.clone(),
+                })
+                .collect();
             self.fail(format!("law 2, host {c}'s snapshot read {names:?}"));
             return Claim::Unknown;
-        }
+        };
         let (&(before, after), earlier) = pairs.split_last().expect("a pair at least");
         if earlier.iter().any(|(before, after)| before == after) {
             self.fail(format!(

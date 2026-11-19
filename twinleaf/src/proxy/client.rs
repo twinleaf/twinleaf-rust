@@ -20,13 +20,13 @@ use crate::chan::oneshot::{self, error::TryRecvError};
 use crate::chan::{lock, StreamMap};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType, SessionId, TCP_DEFAULT_PORT};
-use crate::rt::{finish, BoxFuture};
-use crate::session::{answer, encode, Introduction, AUTO, PROXY_KEEPALIVE};
+use crate::rt::{finish, sleep_until_some, BoxFuture};
+use crate::session::{answer, encode, Introduction, AUTO, HELLO_TIMEOUT, PROXY_KEEPALIVE};
 use crate::session::{Layout, Scope};
 use crate::session::{Purpose, Refusal, Request, Update, Watch};
 use crate::session::{Receiver, RecvError, SettingChange};
 use crate::session::{Store, CHANGES, PRESENCE, REGISTRY, SETTINGS};
-use crate::tio::packet::{Packet, Payload};
+use crate::tio::packet::{Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, is_local_tcp, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
 use futures_util::future;
 use futures_util::stream::{self, BoxStream};
@@ -44,6 +44,20 @@ use tokio_stream::StreamNotifyClose;
 /// for the client, and this queue only keeps the socket's task busy while
 /// the next batch is taken.
 pub(super) const SOCKET_QUEUE: usize = 64;
+
+/// What a client speaks, as its first packet tells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Speaks {
+    /// It has sent nothing yet, and is taken for a legacy client at this
+    /// instant.
+    Unknown(Instant),
+    /// Its first packet was a control request.
+    Control,
+    /// A tio 1.x client, whose first packet was anything else, or that sent
+    /// nothing within [`HELLO_TIMEOUT`], by when a 2.0 client has given up.
+    /// It is opened to `auto` and hears link statuses as type 64.
+    Legacy,
+}
 
 /// Returns `true` if `pkt` is an RPC request, reply or error.
 fn is_rpc(pkt: &Packet) -> bool {
@@ -74,8 +88,9 @@ impl Drop for Held {
 }
 
 /// An open in flight. It resolves to the id of the control request it
-/// answers and the outcome of the binding.
-type Opening = BoxFuture<'static, (u16, Result<Binding, Refusal>)>;
+/// answers, or `None` for a legacy client's open of `auto`, and the outcome
+/// of the binding.
+type Opening = BoxFuture<'static, (Option<u16>, Result<Binding, Refusal>)>;
 
 /// A client's connection and what it opened.
 pub(super) struct Client {
@@ -87,7 +102,9 @@ pub(super) struct Client {
     incoming: crate::chan::RecvStream<'static, ReceiveResult>,
     /// Closes once the server drops its lifeline, as the proxy stops.
     alive: oneshot::Receiver<Infallible>,
-    /// Packets the client sent that wait their turn while an open waits.
+    speaks: Speaks,
+    /// Packets the client sent that wait their turn while it is classified
+    /// and while an open waits.
     backlog: VecDeque<Packet>,
     /// What goes to the client.
     outbox: Arc<Outbox>,
@@ -120,6 +137,7 @@ impl Client {
             client,
             incoming: incoming.into_stream(),
             alive,
+            speaks: Speaks::Unknown(Instant::now() + HELLO_TIMEOUT),
             backlog: VecDeque::new(),
             outbox: Arc::default(),
             watches: StreamMap::new(),
@@ -178,18 +196,21 @@ impl Client {
         self.client.close(left).await;
     }
 
-    /// Forwards what the client sends to its mounts, follows its watches,
-    /// and writes its outbox, until the connection ends, keeping the client's
-    /// link alive. Returns why it ended.
+    /// Classifies the client, then forwards what it sends to its mounts,
+    /// follows its watches, and writes its outbox, until the connection
+    /// ends. Returns why it ended.
     async fn serve(&mut self) -> Result<(), ClientError> {
-        self.client.keep_alive(PROXY_KEEPALIVE).await;
         loop {
             if self.stopping() {
                 return Err(self.stopped());
             }
-            // What the client sent while an open waited goes first, in
-            // order.
-            while self.opening.is_none() {
+            let classify_until = match self.speaks {
+                Speaks::Unknown(until) => Some(until),
+                Speaks::Control | Speaks::Legacy => None,
+            };
+            // What the client sent while it was classified or an open waited
+            // goes first, in order.
+            while classify_until.is_none() && self.opening.is_none() {
                 let Some(pkt) = self.backlog.pop_front() else {
                     break;
                 };
@@ -206,6 +227,9 @@ impl Client {
                 received = self.incoming.next() => {
                     let Some(received) = received else { return Err(ClientError::HungUp); };
                     if let Some(pkt) = self.delivered(received)? {
+                        if classify_until.is_some() {
+                            self.classify(Some(&pkt)).await;
+                        }
                         self.backlog.push_back(pkt);
                     }
                 }
@@ -217,6 +241,32 @@ impl Client {
                 (request, outcome) = finish(&mut self.opening) => {
                     self.opened(request, outcome).await?;
                 }
+                () = sleep_until_some(classify_until) => self.classify(None).await,
+            }
+        }
+    }
+
+    /// Classifies the client by its first packet `first`, or by `None` if it
+    /// sent none in time. A control client's link is kept alive from then
+    /// on. A legacy client opens `auto` at once, and its packets wait until
+    /// the open is done.
+    async fn classify(&mut self, first: Option<&Packet>) {
+        match first.map(Packet::ptype) {
+            Some(PacketType::PROXY_TX) => {
+                self.speaks = Speaks::Control;
+                self.client.keep_alive(PROXY_KEEPALIVE).await;
+            }
+            Some(_) | None => {
+                self.speaks = Speaks::Legacy;
+                let (shared, addr) = (self.shared.clone(), self.addr.clone());
+                let binding = bind(
+                    shared,
+                    addr,
+                    AUTO.to_string(),
+                    Purpose::Use,
+                    Arc::clone(&self.outbox),
+                );
+                self.opening = Some(Box::pin(async move { (None, binding.await) }));
             }
         }
     }
@@ -248,8 +298,15 @@ impl Client {
                 log::info!("{}->{} -- {:?}", pkt.route(), self.addr, pkt.payload());
             }
         }
+        let legacy = self.speaks == Speaks::Legacy;
         let sends: Vec<_> = queued
             .into_iter()
+            .map(|pkt| match pkt.payload() {
+                Payload::ProxyRx(ProxyRx::Link(status)) if legacy => {
+                    Packet::legacy_status(status).with_route(pkt.route())
+                }
+                _ => pkt,
+            })
             .map(|pkt| self.client.send_async(pkt))
             .collect();
         self.writing = Some(Box::pin(async {
@@ -320,7 +377,9 @@ impl Client {
                 self.control(&pkt).await;
                 return Ok(());
             }
-            PacketType::HEARTBEAT if pkt.route().is_empty() => return Ok(()),
+            PacketType::HEARTBEAT if self.speaks == Speaks::Control && pkt.route().is_empty() => {
+                return Ok(())
+            }
             PacketType::PROXY_RX => {
                 log::debug!("Dropping a control reply from client {}", self.addr);
                 return Ok(());
@@ -523,17 +582,19 @@ impl Client {
             let message = format!("this connection already opened {}", binding.target);
             return self.answer(id, Err(Refusal::new(RpcError::State, message)));
         }
-        self.opening = Some(Box::pin(async move { (id, binding.await) }));
+        self.opening = Some(Box::pin(async move { (Some(id), binding.await) }));
     }
 
     /// Answers the open that ended with `outcome`. Once the table shows what
-    /// the client opened, answers control request `request`.
+    /// the client opened, answers control request `request`. A legacy client
+    /// hears no answer.
     ///
-    /// Returns [`ClientError::Stopped`] for an open refused while the proxy
+    /// Returns [`ClientError::Refused`] if a legacy client's open is refused,
+    /// and [`ClientError::Stopped`] for an open refused while the proxy
     /// stops, which the client hears as the stop.
     async fn opened(
         &mut self,
-        request: u16,
+        request: Option<u16>,
         outcome: Result<Binding, Refusal>,
     ) -> Result<(), ClientError> {
         let outcome = match outcome {
@@ -546,8 +607,15 @@ impl Client {
             Err(_) if self.stopping() => return Err(self.stopped()),
             Err(refusal) => Err(refusal),
         };
-        self.answer(request, outcome);
-        Ok(())
+        match request {
+            Some(id) => {
+                self.answer(id, outcome);
+                Ok(())
+            }
+            None => outcome
+                .map(drop)
+                .map_err(|refusal| ClientError::Refused(refusal.message)),
+        }
     }
 }
 
@@ -1419,20 +1487,63 @@ mod tests {
         }
     }
 
-    /// A client that sends nothing opens nothing, though the proxy has a
-    /// default, and is given up once it has been quiet for longer than the
-    /// keepalive allows.
+    /// A client that sends nothing is a legacy client once [`HELLO_TIMEOUT`]
+    /// has passed, and opens `auto` then.
     #[tokio::test(start_paused = true)]
-    async fn a_client_that_sends_nothing_opens_nothing_and_is_given_up() {
-        let mut client = connect(Some(Layout::single(DEVICE)), None);
+    async fn a_client_that_sends_nothing_opens_auto_once_it_is_classified() {
         let connected = Instant::now();
+        let mut client = connect(Some(Layout::single(DEVICE)), None);
 
-        while let Some(pkt) = timeout(PAUSED_WAIT, client.end.recv()).await.unwrap() {
-            assert!(matches!(pkt.payload(), Payload::ProxyRx(ProxyRx::Alive)));
+        let device = opened(&mut client.devices).await;
+
+        assert_eq!(device.url, DEVICE);
+        assert_took(connected.elapsed(), HELLO_TIMEOUT, "classifying");
+    }
+
+    /// A legacy client's first packet, a heartbeat at the root, reaches the
+    /// device `auto` opens. It hears no sign of life however long it is
+    /// quiet, and hears the stop in the legacy form.
+    #[tokio::test(start_paused = true)]
+    async fn a_legacy_client_reaches_auto_and_hears_only_the_legacy_form() {
+        let Client {
+            mut end,
+            mut devices,
+            served,
+            _lifeline,
+            links: _links,
+            _registry,
+        } = connect(Some(Layout::single(DEVICE)), None);
+        let beat = Packet::heartbeat(DeviceRoute::root());
+        end.send(&beat).await;
+        let mut device = opened(&mut devices).await;
+        device.end.send(&beat).await;
+
+        let forwarded = timeout(PAUSED_WAIT, device.end.recv()).await.unwrap();
+        assert_eq!(
+            forwarded.map(|pkt| pkt.ptype()),
+            Some(PacketType::HEARTBEAT)
+        );
+        let deadline = Instant::now() + PROXY_KEEPALIVE.quiet * 4;
+        while let Ok(heard) = timeout_at(deadline, end.recv()).await {
+            let pkt = heard.expect("the legacy client was kept");
+            assert_ne!(pkt.ptype(), PacketType::PROXY_RX, "{:?}", pkt.payload());
         }
+        drop(_lifeline);
+        let stop = timeout(PAUSED_WAIT, end.recv()).await.unwrap().unwrap();
 
-        assert_eq!(connected.elapsed(), PROXY_KEEPALIVE.quiet);
-        assert!(client.devices.try_recv().is_err(), "a device was opened");
+        assert!(
+            matches!(
+                stop.payload(),
+                Payload::LegacyStatus(LinkStatus::FailedToReconnect)
+            ),
+            "{:?}",
+            stop.payload()
+        );
+        let served = timeout(PAUSED_WAIT, served).await.unwrap().unwrap();
+        assert!(
+            matches!(served, Some(Err(ClientError::Stopped))),
+            "{served:?}"
+        );
     }
 
     /// A control client that sends nothing for longer than the keepalive

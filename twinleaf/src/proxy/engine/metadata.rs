@@ -23,6 +23,17 @@ enum Schedule {
     /// A backed-off route that has come due. It may be asked again, and
     /// `delay` is what the next failure doubles.
     Due { delay: Duration },
+    /// The last query had an OK reply. When the next query names the same
+    /// selectors in the same metadata generation, the reply filled nothing,
+    /// and the route is backed off as a failed query is. `generation` is the
+    /// parser's metadata generation after the reply, which a relearn or a
+    /// reset moves on. `delay` is the delay the route held when it was asked,
+    /// if any, which that backoff doubles.
+    Answered {
+        selectors: Vec<wire::MetadataSelector>,
+        generation: u32,
+        delay: Option<Duration>,
+    },
     /// The device answered `NotFound`. Its firmware has no `dev.metadata`.
     Unsupported,
 }
@@ -72,7 +83,7 @@ impl MetadataSchedule {
         now: Instant,
     ) -> Vec<DeviceRoute> {
         let due = |state: Option<&mut Schedule>| match state {
-            None | Some(Schedule::Due { .. }) => true,
+            None | Some(Schedule::Due { .. } | Schedule::Answered { .. }) => true,
             Some(state @ Schedule::Backoff { .. }) => match *state {
                 Schedule::Backoff { until, delay } if until <= now => {
                     *state = Schedule::Due { delay };
@@ -88,9 +99,23 @@ impl MetadataSchedule {
             .collect()
     }
 
-    /// Asks `route` for whatever metadata `parser` still wants.
+    /// Asks `route` for whatever metadata `parser` still wants. A query that
+    /// names the selectors an OK reply just answered, in the generation that
+    /// reply left, backs the route off in place of being sent.
     pub(super) fn submit(&mut self, parser: &mut PacketParser, route: DeviceRoute) {
         for query in parser.take_metadata_queries_for(route) {
+            if let Some(Schedule::Answered {
+                selectors,
+                generation,
+                ..
+            }) = self.schedule.get(&route)
+            {
+                if *generation == query.generation && same_selectors(selectors, &query.selectors) {
+                    self.back_off(parser, query);
+                    continue;
+                }
+                self.schedule.remove(&route);
+            }
             let resolve = self.resolve.clone();
             let args = query.args();
             self.handle.submit_with(
@@ -114,8 +139,23 @@ impl MetadataSchedule {
         let route = query.route;
         match result {
             Ok(reply) => {
+                let delay = match self.schedule.get(&route) {
+                    Some(Schedule::Due { delay }) => Some(*delay),
+                    _ => None,
+                };
+                let current = parser.metadata_generation(route) == Some(query.generation);
+                let selectors = query.selectors.clone();
                 parser.apply_metadata_reply(query, &reply);
-                self.schedule.remove(&route);
+                // A reply to a query a relearn or a reset overtook applies
+                // nothing and says nothing of the next query.
+                if let Some(generation) = parser.metadata_generation(route).filter(|_| current) {
+                    let answered = Schedule::Answered {
+                        selectors,
+                        generation,
+                        delay,
+                    };
+                    self.schedule.insert(route, answered);
+                }
                 Completed::Applied
             }
             Err(CallError::DeviceError(RpcErrorPayload {
@@ -136,7 +176,8 @@ impl MetadataSchedule {
     ) -> Option<Instant> {
         let until = |route| match self.schedule.get(&route) {
             Some(Schedule::Backoff { until, .. }) => Some(*until),
-            Some(Schedule::Due { .. } | Schedule::Unsupported) | None => None,
+            Some(Schedule::Due { .. } | Schedule::Answered { .. } | Schedule::Unsupported)
+            | None => None,
         };
         routes.into_iter().filter_map(until).min()
     }
@@ -156,10 +197,12 @@ impl MetadataSchedule {
             return Completed::BackedOff;
         }
         let delay = match self.schedule.get(&route) {
-            None => RETRY_FIRST,
-            Some(Schedule::Backoff { delay, .. }) | Some(Schedule::Due { delay }) => {
-                (*delay * 2).min(RETRY_MAX)
-            }
+            None | Some(Schedule::Answered { delay: None, .. }) => RETRY_FIRST,
+            Some(Schedule::Backoff { delay, .. })
+            | Some(Schedule::Due { delay })
+            | Some(Schedule::Answered {
+                delay: Some(delay), ..
+            }) => (*delay * 2).min(RETRY_MAX),
             Some(Schedule::Unsupported) => return Completed::BackedOff,
         };
         self.schedule.insert(
@@ -187,6 +230,11 @@ impl MetadataSchedule {
         log::warn!("{route} has no dev.metadata; its streams cannot be decoded");
         Completed::Unsupported
     }
+}
+
+/// Whether two queries name the same selectors, in any order.
+fn same_selectors(a: &[wire::MetadataSelector], b: &[wire::MetadataSelector]) -> bool {
+    a.len() == b.len() && a.iter().all(|selector| b.contains(selector))
 }
 
 #[cfg(test)]

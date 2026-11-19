@@ -98,6 +98,9 @@ pub(super) enum ClientError {
     /// A packet it sent could not be queued for its device.
     #[error("a packet it sent could not reach its device")]
     ForwardFailed,
+    /// The open of `auto` for a legacy client was refused, for this reason.
+    #[error("auto opened nothing for it: {0}")]
+    Refused(String),
 }
 
 /// The bytes of samples the stream holds before it drops the oldest. It is

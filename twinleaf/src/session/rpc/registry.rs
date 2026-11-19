@@ -2,14 +2,11 @@
 
 use super::cache;
 use super::error::CallError;
-use super::reply::{PendingReply, Pipeline};
+use super::reply::{PendingReply, ReadPipeline, READ_WINDOW};
 use crate::proto::rpc::{RpcError, RpcMeta};
 use crate::proto::SessionId;
 use crate::tio::rpc::RpcReply;
 use std::collections::BTreeMap;
-
-/// The most `rpc.listinfo` calls in flight at once during a walk.
-const WALK_WINDOW: usize = 16;
 
 /// The most walks one load makes of a table that keeps changing.
 const WALK_ATTEMPTS: usize = 3;
@@ -79,10 +76,13 @@ impl RpcRegistry {
     /// Loads one device's RPC table through `submit`.
     ///
     /// Reads `dev.name`, `rpc.hash`, and `dev.session` first. On a cache
-    /// miss it walks `rpc.listinfo` with [`WALK_WINDOW`] calls in flight. A
-    /// walk counts only when `rpc.hash` reads the same after it, and only
-    /// then is it cached. Otherwise the table is walked again under the new
-    /// hash, up to [`WALK_ATTEMPTS`] times.
+    /// miss it walks `rpc.listinfo` with [`READ_WINDOW`] calls in flight. A
+    /// descriptor whose read times out is asked again as [`ReadPipeline`]
+    /// does, and the walk keeps every descriptor read so far. The third
+    /// timeout of one descriptor fails the load. A walk counts only when
+    /// `rpc.hash` reads the same after it, and only then is it cached.
+    /// Otherwise the table is walked again under the new hash, up to
+    /// [`WALK_ATTEMPTS`] times.
     pub(crate) async fn load_with(
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
     ) -> Result<Self, RpcRegistryError> {
@@ -100,9 +100,11 @@ impl RpcRegistry {
             let total: u16 = decode(submit("rpc.listinfo", &[]).await?)?;
             let mut entries = cache::Entries::with_capacity(total.into());
             {
-                let descriptors =
-                    (0..total).map(|index| submit("rpc.listinfo", &index.to_le_bytes()));
-                let mut replies = Pipeline::new(descriptors, WALK_WINDOW);
+                let mut replies = ReadPipeline::new(
+                    0..total,
+                    |index: &u16| submit("rpc.listinfo", &index.to_le_bytes()),
+                    READ_WINDOW,
+                );
                 while let Some(reply) = replies.next().await {
                     let (meta, name) = decode::<(u16, String)>(reply?)?;
                     entries.push((name, meta));
@@ -171,7 +173,7 @@ fn decode<T: RpcReply>(reply: Vec<u8>) -> Result<T, RpcRegistryError> {
 #[cfg(test)]
 mod tests {
     use super::super::error::RpcErrorPayload;
-    use super::super::reply::{poll_once, resolved};
+    use super::super::reply::{poll_once, resolved, timed_out};
     use super::*;
     use std::task::Poll;
 
@@ -323,6 +325,40 @@ mod tests {
         ));
         let stale = cache::path("test-device", before).expect("the scratch directory");
         assert!(!stale.exists(), "the mixed walk was cached");
+    }
+
+    /// An entry whose read times out once is asked again, and the walk
+    /// loads every entry.
+    #[test]
+    fn a_walk_in_which_one_entry_times_out_once_loads_every_entry() {
+        let hash = 0x0bad_f00du32;
+        let mut first_ask = true;
+        let loaded = poll_once(std::pin::pin!(RpcRegistry::load_with(|name, arg| {
+            match (name, arg) {
+                ("dev.name", _) => resolved(Some(b"test-device".to_vec())),
+                ("rpc.hash", _) => resolved(Some(hash.to_le_bytes().to_vec())),
+                (SESSION, _) => resolved(Some(7u32.to_le_bytes().to_vec())),
+                ("rpc.listinfo", []) => resolved(Some(3u16.to_le_bytes().to_vec())),
+                ("rpc.listinfo", [1, 0]) if first_ask => {
+                    first_ask = false;
+                    timed_out()
+                }
+                ("rpc.listinfo", [index, 0]) => {
+                    let names = ["dev.name", "dev.uptime", "test.amplitude"];
+                    resolved(Some(descriptor(names[usize::from(*index)])))
+                }
+                _ => resolved(None),
+            }
+        })));
+        let Poll::Ready(loaded) = loaded else {
+            panic!("the load waits on a reply it was given");
+        };
+
+        let registry = loaded.expect("the walk loads every entry");
+        assert_eq!(
+            registry.names(),
+            ["dev.name", "dev.uptime", "test.amplitude"]
+        );
     }
 
     #[test]

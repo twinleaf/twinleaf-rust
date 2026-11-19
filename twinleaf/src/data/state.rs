@@ -595,6 +595,31 @@ enum MetadataSource {
     Bootstrap,
 }
 
+/// Why a route logs a metadata record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Logged {
+    /// The record does not parse as the type it claims, and is dropped.
+    Unparsed,
+    /// The record names a stream the device record does not count, and is
+    /// dropped.
+    AboveCount,
+    /// The record is kept, and a field's text holds U+FFFD.
+    Replacement,
+}
+
+/// The names of the `fields` whose text holds U+FFFD.
+fn replacements(fields: &[(&'static str, &str)]) -> Vec<&'static str> {
+    fields
+        .iter()
+        .filter(|(_, text)| text.contains(char::REPLACEMENT_CHARACTER))
+        .map(|&(field, _)| field)
+        .collect()
+}
+
+/// A metadata record a route logs, by its type, the stream and segment or
+/// column it names, and why.
+type LoggedKey = (wire::MetadataType, Option<StreamId>, Option<u8>, Logged);
+
 /// Metadata and stream state for one absolute device route.
 #[derive(Clone)]
 struct DeviceState {
@@ -611,6 +636,9 @@ struct DeviceState {
     /// this route would contain.
     metadata_revision: u32,
     generation: u32,
+    /// Each record logged as a warning since the metadata was last reset. A
+    /// record logged again for the same reason logs at debug level.
+    logged: Vec<LoggedKey>,
 }
 
 impl DeviceState {
@@ -625,6 +653,7 @@ impl DeviceState {
             metadata_generation: 0,
             metadata_revision: 0,
             generation: 0,
+            logged: Vec::new(),
         }
     }
 
@@ -654,6 +683,7 @@ impl DeviceState {
     fn reset(&mut self) {
         self.metadata = None;
         self.previous = None;
+        self.logged.clear();
         self.rediscover_metadata();
         self.generation += 1;
         for stream in self.streams.iter_mut().flatten() {
@@ -683,23 +713,99 @@ impl DeviceState {
         self.query_in_flight = false;
     }
 
-    fn accepts_stream(&mut self, stream_id: StreamId, global_generation: &mut u32) -> bool {
-        if self
+    /// Whether the device record counts `stream_id`. A record or rows of a
+    /// stream above the count are refused, and the rest is kept.
+    fn accepts_stream(&self, stream_id: StreamId) -> bool {
+        !self
             .metadata
             .as_ref()
             .is_some_and(|device| stream_id.value() > device.get().n_streams())
-        {
-            // An impossible stream id means our device description is stale or
-            // corrupt. Bootstrap the route again instead of retaining it.
-            self.forget_all_metadata(global_generation);
-            false
-        } else {
-            true
+    }
+
+    /// Logs `message` about the metadata record `key` names, after the
+    /// route. The first time since the last reset is a warning, and the same
+    /// key again is logged at debug level.
+    fn log_once(&mut self, key: LoggedKey, message: std::fmt::Arguments<'_>) {
+        let level = match self.logged.contains(&key) {
+            true => log::Level::Debug,
+            false => {
+                self.logged.push(key);
+                log::Level::Warn
+            }
+        };
+        log::log!(level, "{} {message}", self.route);
+    }
+
+    /// Logs a metadata record this route drops, and why, once per kind,
+    /// stream and reason.
+    fn log_dropped(
+        &mut self,
+        kind: wire::MetadataType,
+        stream_id: Option<StreamId>,
+        reason: Logged,
+        why: std::fmt::Arguments<'_>,
+    ) {
+        self.log_once(
+            (kind, stream_id, None, reason),
+            format_args!("dropped a {kind:?} metadata record {why}"),
+        );
+    }
+
+    /// Logs a record that does not parse.
+    fn log_unparsed(&mut self, kind: wire::MetadataType) {
+        self.log_dropped(
+            kind,
+            None,
+            Logged::Unparsed,
+            format_args!("as it does not parse"),
+        );
+    }
+
+    /// Logs a kept record whose `marked` fields hold U+FFFD, naming them,
+    /// once per record. `stream_id` and `index` name the record, with
+    /// `index` its segment or column. Nothing is logged when no field is
+    /// marked.
+    fn log_replacement(
+        &mut self,
+        kind: wire::MetadataType,
+        stream_id: Option<StreamId>,
+        index: Option<(&str, u8)>,
+        marked: &[&str],
+    ) {
+        if marked.is_empty() {
+            return;
         }
+        let stream = stream_id.map_or_else(String::new, |id| format!(" of stream {id}"));
+        let index_name = index.map_or_else(String::new, |(name, value)| format!(" {name} {value}"));
+        self.log_once(
+            (kind, stream_id, index.map(|(_, value)| value), Logged::Replacement),
+            format_args!(
+                "kept a {kind:?} metadata record{stream}{index_name} with U+FFFD in its {}, the mark of text that could not be read as UTF-8",
+                marked.join(" and ")
+            ),
+        );
+    }
+
+    /// Logs a record of a stream the device record does not count.
+    fn log_dropped_above(&mut self, kind: wire::MetadataType, stream_id: StreamId) {
+        let counted = self
+            .metadata
+            .as_ref()
+            .map_or(0, |device| device.get().n_streams());
+        self.log_dropped(
+            kind,
+            Some(stream_id),
+            Logged::AboveCount,
+            format_args!("of stream {stream_id}, above the {counted} streams its device counts"),
+        );
     }
 
     /// Merges one metadata record into this route's decoding state. A record
-    /// that does not parse as the type it claims is ignored.
+    /// that does not parse as the type it claims, of a stream the device
+    /// record does not count, or a column past the next one its stream can
+    /// append, is dropped and logged. Only the column waits at debug level,
+    /// as it is asked for again in its turn. A record that is kept with a
+    /// field whose text holds U+FFFD is logged once.
     fn apply_metadata(
         &mut self,
         kind: wire::MetadataType,
@@ -710,8 +816,15 @@ impl DeviceState {
         match kind {
             wire::MetadataType::Device => {
                 let Some(incoming) = DeviceRecord::new(record) else {
+                    self.log_unparsed(kind);
                     return;
                 };
+                let device = incoming.get();
+                let marked = replacements(&[
+                    ("name", device.name()),
+                    ("serial", device.serial()),
+                    ("firmware", device.firmware()),
+                ]);
                 if self.metadata.as_ref() != Some(&incoming) {
                     self.revise_metadata();
                 }
@@ -738,13 +851,17 @@ impl DeviceState {
                     }
                 }
                 self.metadata = Some(incoming);
+                self.log_replacement(kind, None, None, &marked);
             }
             wire::MetadataType::Stream => {
                 let Some(incoming) = StreamRecord::new(record) else {
+                    self.log_unparsed(kind);
                     return;
                 };
                 let stream_id = incoming.get().stream_id();
-                if !self.accepts_stream(stream_id, global_generation) {
+                let marked = replacements(&[("name", incoming.get().name())]);
+                if !self.accepts_stream(stream_id) {
+                    self.log_dropped_above(kind, stream_id);
                     return;
                 }
                 let stream = self.stream_mut(stream_id);
@@ -758,17 +875,22 @@ impl DeviceState {
                 if contradicted {
                     // This should never happen: stream metadata is constant.
                     self.forget_all_metadata(global_generation);
+                    return;
                 } else if learned {
                     self.revise_metadata();
                 }
+                self.log_replacement(kind, Some(stream_id), None, &marked);
             }
             wire::MetadataType::Segment => {
                 let Some(incoming) = SegmentRecord::new(record) else {
+                    self.log_unparsed(kind);
                     return;
                 };
                 let segment = incoming.get();
                 let (stream_id, segment_id) = (segment.stream_id(), segment.segment_id());
-                if !self.accepts_stream(stream_id, global_generation) {
+                let marked = replacements(&[("timeref serial", segment.timeref_serial())]);
+                if !self.accepts_stream(stream_id) {
+                    self.log_dropped_above(kind, stream_id);
                     return;
                 }
                 let closes = source == MetadataSource::Broadcast
@@ -793,21 +915,32 @@ impl DeviceState {
                 if learned || switched {
                     self.revise_metadata();
                 }
+                let index = Some(("segment", segment_id.value()));
+                self.log_replacement(kind, Some(stream_id), index, &marked);
             }
             wire::MetadataType::Column => {
                 let Some(incoming) = ColumnRecord::new(record) else {
+                    self.log_unparsed(kind);
                     return;
                 };
                 let column = incoming.get();
                 let (stream_id, index) = (column.stream_id(), column.index().index());
-                if !self.accepts_stream(stream_id, global_generation) {
+                let marked = replacements(&[
+                    ("name", column.name()),
+                    ("units", column.units()),
+                    ("description", column.description()),
+                ]);
+                let column_id = column.index().value();
+                if !self.accepts_stream(stream_id) {
+                    self.log_dropped_above(kind, stream_id);
                     return;
                 }
                 let stream = self.stream_mut(stream_id);
+                let held = stream.columns.len();
                 let (contradicted, learned) = match stream.columns.get(index) {
                     Some(current) => (*current != incoming, false),
                     None => {
-                        let appended = index == stream.columns.len();
+                        let appended = index == held;
                         if appended {
                             if !decodes(column.data_type()) {
                                 log::warn!(
@@ -820,11 +953,23 @@ impl DeviceState {
                         (false, appended)
                     }
                 };
+                if index > held {
+                    // A parser that learns from broadcasts meets later
+                    // columns first, so this drop is no fault.
+                    log::debug!(
+                        "{} dropped a {kind:?} metadata record of stream {stream_id} column {index}, as column {held} comes first",
+                        self.route
+                    );
+                }
                 if contradicted {
                     // This should never happen: columns are constant.
                     self.forget_all_metadata(global_generation);
                 } else if learned {
                     self.revise_metadata();
+                }
+                if !contradicted && index <= held {
+                    let index = Some(("column", column_id));
+                    self.log_replacement(kind, Some(stream_id), index, &marked);
                 }
             }
             wire::MetadataType::Unknown(_) => {}
@@ -866,7 +1011,7 @@ impl DeviceState {
         let Some(device_metadata) = self.metadata.clone() else {
             return Ok(PacketEvent::WaitingForMetadata);
         };
-        if !self.accepts_stream(data.stream_id, global_generation) {
+        if !self.accepts_stream(data.stream_id) {
             return Ok(PacketEvent::WaitingForMetadata);
         }
 
@@ -936,7 +1081,10 @@ impl DeviceState {
                     self.apply_metadata(kind, record, source, global_generation);
                 }
             }
-            None => log::warn!("dropping a dev.metadata reply with broken framing"),
+            None => log::warn!(
+                "{} dropped a dev.metadata reply with broken framing",
+                self.route
+            ),
         }
     }
 
@@ -1106,6 +1254,10 @@ impl ParseState {
 
     pub(super) fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
         self.device(route)?.metadata_snapshot()
+    }
+
+    pub(super) fn metadata_generation(&self, route: DeviceRoute) -> Option<u32> {
+        self.device(route).map(|device| device.metadata_generation)
     }
 
     pub(super) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {

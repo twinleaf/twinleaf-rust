@@ -287,6 +287,12 @@ impl PacketParser {
         self.state.metadata(route)
     }
 
+    /// Returns the route's metadata generation. It moves on when a query
+    /// completes or fails and when the route relearns or resets.
+    pub(crate) fn metadata_generation(&self, route: DeviceRoute) -> Option<u32> {
+        self.state.metadata_generation(route)
+    }
+
     /// Returns the route's current metadata revision without building a
     /// snapshot.
     pub(crate) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
@@ -1310,6 +1316,219 @@ mod tests {
                 global: 0
             }
         );
+    }
+
+    /// Rows or a record of a stream above the device's stream count are
+    /// refused alone. The streams the device counts keep decoding, and the
+    /// route asks for nothing.
+    #[test]
+    fn a_stream_above_the_stream_count_is_refused_alone() {
+        let route = DeviceRoute::root();
+        let above = [
+            stream_data_packet_for(3, 0, 1),
+            fixtures::broadcast(wire::Metadata::Segment(fixtures::segment(3)), route),
+        ];
+        for packet in above {
+            let mut parser = parser_with_streams(2);
+            assert!(parser.metadata(route).is_some());
+            parser.push_packet(&packet).expect("a refusal is no error");
+            assert!(parser.metadata(route).is_some(), "the metadata is kept");
+            for stream_id in [1, 2] {
+                assert!(matches!(
+                    parser.push_packet(&stream_data_packet_for(stream_id, 0, 1)),
+                    Ok(PacketOutcome::Rows(1))
+                ));
+            }
+            assert!(
+                parser.take_metadata_queries_for(route).is_empty(),
+                "no bootstrap query"
+            );
+        }
+    }
+
+    /// A record the parser drops is logged with its route, its kind and why.
+    /// The same drop again, as a device that broadcasts the record each
+    /// second makes it, is a warning only the first time. A column ahead of
+    /// its turn is no fault and gives no warning.
+    #[test]
+    fn a_dropped_metadata_record_is_logged() {
+        let route = DeviceRoute::from_hops(&[3]).expect("a route");
+        let mut parser = PacketParser::new(true);
+        let query = parser
+            .take_metadata_queries_for(route)
+            .pop()
+            .expect("a bootstrap query");
+        let mut reply = metadata_reply(&[
+            wire::Metadata::Device(wire::Device {
+                n_streams: 2,
+                ..fixtures::device()
+            }),
+            wire::Metadata::Segment(fixtures::segment(3)),
+        ]);
+        // A column record whose stream id is 0, which does not parse.
+        reply.extend_from_slice(&[wire::MetadataType::Column.into(), 7, 7, 0, 0, 0x42, 0, 0, 0]);
+        let warnings = crate::data::tests::warnings_during(|| {
+            parser.apply_metadata_reply(query, &reply);
+            for _ in 0..2 {
+                for record in [
+                    wire::Metadata::Segment(fixtures::segment(3)),
+                    wire::Metadata::Column(fixtures::column(1, 2, DataType::F32)),
+                ] {
+                    parser
+                        .push_packet(&fixtures::broadcast(record, route))
+                        .expect("a drop is no error");
+                }
+            }
+        });
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|warning| warning.contains("/3")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("Segment") && warnings[0].contains("stream 3"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("Column") && warnings[1].contains("does not parse"),
+            "{warnings:?}"
+        );
+    }
+
+    /// The bare column record of stream 1, index 0 and type f32 whose units
+    /// are `B0 43`, a degree sign without its lead byte, then `C`.
+    fn column_with_bad_units() -> Vec<u8> {
+        let head = [7, 1, 0, DataType::F32.value(), 4, 2, 0];
+        [&head[..], b"temp", &[0xB0, b'C']].concat()
+    }
+
+    /// The units of column 0 of stream 1 in the metadata the parser holds
+    /// for `route`.
+    fn units(parser: &PacketParser, route: DeviceRoute) -> String {
+        let metadata = parser.metadata(route).expect("complete metadata");
+        let stream = metadata
+            .stream(crate::proto::StreamId::new(STREAM_ID))
+            .expect("stream 1");
+        let column = stream.schema().column(crate::proto::ColumnId::new(0));
+        column.expect("column 0").units().to_owned()
+    }
+
+    /// A `dev.metadata` reply whose column has units that are not UTF-8
+    /// completes the stream, and the parser asks for nothing more.
+    #[test]
+    fn a_reply_column_whose_units_are_not_utf8_completes_the_stream() {
+        let route = DeviceRoute::root();
+        let mut parser = PacketParser::new(true);
+        let query = take_query(&mut parser);
+        let mut reply = metadata_reply(&[
+            wire::Metadata::Device(fixtures::device()),
+            wire::Metadata::Stream(fixtures::stream(STREAM_ID)),
+            wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+        ]);
+        let column = column_with_bad_units();
+        reply.extend_from_slice(&[wire::MetadataType::Column.into(), column.len() as u8]);
+        reply.extend_from_slice(&column);
+        parser.apply_metadata_reply(query, &reply);
+
+        assert_eq!(units(&parser, route), "\u{FFFD}C");
+        assert!(parser.take_metadata_queries_for(route).is_empty());
+    }
+
+    /// A broadcast column whose units are not UTF-8 is applied.
+    #[test]
+    fn a_broadcast_column_whose_units_are_not_utf8_is_applied() {
+        let route = DeviceRoute::root();
+        let mut parser = PacketParser::new(true);
+        for record in [
+            wire::Metadata::Device(fixtures::device()),
+            wire::Metadata::Stream(fixtures::stream(STREAM_ID)),
+            wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+        ] {
+            announce(&mut parser, record);
+        }
+        let mut raw = [0u8; 64];
+        let len = wire::write_metadata_record(
+            &mut raw,
+            wire::MetadataType::Column.into(),
+            wire::MetadataFlags::UPDATE,
+            &column_with_bad_units(),
+        )
+        .expect("the record fits");
+        let (packet, _) = tio::Packet::from_slice_prefix(&raw[..len]).expect("a repaired packet");
+        parser.push_packet(&packet).expect("a metadata record");
+
+        assert_eq!(units(&parser, route), "\u{FFFD}C");
+    }
+
+    /// A record kept with text that is not UTF-8 is a warning that names
+    /// the route, the record and the field, the first time only.
+    #[test]
+    fn a_record_whose_text_is_not_utf8_is_logged_once() {
+        let route = DeviceRoute::from_hops(&[3]).expect("a route");
+        let mut parser = PacketParser::new(true);
+        let column = column_with_bad_units();
+        let warnings = crate::data::tests::warnings_during(|| {
+            for _ in 0..2 {
+                let query = parser
+                    .take_metadata_queries_for(route)
+                    .pop()
+                    .expect("a query");
+                let mut reply = metadata_reply(&[wire::Metadata::Device(fixtures::device())]);
+                reply.extend_from_slice(&[wire::MetadataType::Column.into(), column.len() as u8]);
+                reply.extend_from_slice(&column);
+                parser.apply_metadata_reply(query, &reply);
+            }
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            ["/3", "Column", "stream 1 column 0", "U+FFFD in its units"]
+                .iter()
+                .all(|part| warnings[0].contains(part)),
+            "{warnings:?}"
+        );
+    }
+
+    /// The warnings a parser at `/3` logs for a bootstrap reply that holds
+    /// the device record and then `column`, a bare column record.
+    fn warnings_for_reply_column(column: &[u8]) -> Vec<String> {
+        let route = DeviceRoute::from_hops(&[3]).expect("a route");
+        let mut parser = PacketParser::new(true);
+        crate::data::tests::warnings_during(|| {
+            let query = parser
+                .take_metadata_queries_for(route)
+                .pop()
+                .expect("a query");
+            let mut reply = metadata_reply(&[wire::Metadata::Device(fixtures::device())]);
+            reply.extend_from_slice(&[wire::MetadataType::Column.into(), column.len() as u8]);
+            reply.extend_from_slice(column);
+            parser.apply_metadata_reply(query, &reply);
+        })
+    }
+
+    /// A device may send U+FFFD as valid UTF-8, so the warning says what
+    /// the text holds and not that its bytes were not UTF-8.
+    #[test]
+    fn a_record_that_sends_a_replacement_character_is_not_said_to_be_invalid() {
+        let units = "\u{FFFD}".as_bytes();
+        let head = [7, 1, 0, DataType::F32.value(), 4, units.len() as u8, 0];
+        let warnings = warnings_for_reply_column(&[&head[..], b"temp", units].concat());
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("not UTF-8")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A record whose text holds U+FFFD and that is then dropped logs the
+    /// drop and nothing else.
+    #[test]
+    fn a_dropped_record_whose_text_holds_a_replacement_character_logs_only_the_drop() {
+        let mut column = column_with_bad_units();
+        column[1] = 99; // a stream above the device's count of 1
+        let warnings = warnings_for_reply_column(&column);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("dropped"), "{warnings:?}");
     }
 
     #[test]
