@@ -939,14 +939,7 @@ impl<'a> Metadata<'a> {
     /// malformed record.
     pub fn parse(payload: &'a [u8]) -> Option<(Self, MetadataFlags)> {
         let (kind, flags, record) = split_metadata(payload)?;
-        let metadata = match MetadataType::from(kind) {
-            MetadataType::Device => Self::Device(Device::parse(record)?),
-            MetadataType::Stream => Self::Stream(Stream::parse(record)?),
-            MetadataType::Segment => Self::Segment(Segment::parse(record)?),
-            MetadataType::Column => Self::Column(Column::parse(record)?),
-            MetadataType::Unknown(_) => return None,
-        };
-        Some((metadata, flags))
+        Some((parse_record(kind, record)?, flags))
     }
 }
 
@@ -1002,6 +995,120 @@ pub fn split_record(record: &[u8]) -> Option<(&[u8], &[u8])> {
         return None;
     }
     Some(record.split_at(declared))
+}
+
+impl DeviceHead {
+    /// Where the head holds the length of each string, in string order.
+    const STRINGS: [usize; 3] = [
+        core::mem::offset_of!(DeviceHead, name_len),
+        core::mem::offset_of!(DeviceHead, serial_len),
+        core::mem::offset_of!(DeviceHead, firmware_len),
+    ];
+}
+
+impl StreamHead {
+    /// Where the head holds the length of each string, in string order.
+    const STRINGS: [usize; 1] = [core::mem::offset_of!(StreamHead, name_len)];
+}
+
+impl SegmentHead {
+    /// Where the head holds the length of each string, in string order.
+    const STRINGS: [usize; 1] = [core::mem::offset_of!(SegmentHead, timeref_serial_len)];
+}
+
+impl ColumnHead {
+    /// Where the head holds the length of each string, in string order.
+    const STRINGS: [usize; 3] = [
+        core::mem::offset_of!(ColumnHead, name_len),
+        core::mem::offset_of!(ColumnHead, units_len),
+        core::mem::offset_of!(ColumnHead, description_len),
+    ];
+}
+
+/// Parses the bare `record` as record type `kind`. Returns `None` for a type
+/// with no defined layout or a record that does not parse.
+fn parse_record(kind: u8, record: &[u8]) -> Option<Metadata<'_>> {
+    Some(match MetadataType::from(kind) {
+        MetadataType::Device => Metadata::Device(Device::parse(record)?),
+        MetadataType::Stream => Metadata::Stream(Stream::parse(record)?),
+        MetadataType::Segment => Metadata::Segment(Segment::parse(record)?),
+        MetadataType::Column => Metadata::Column(Column::parse(record)?),
+        MetadataType::Unknown(_) => return None,
+    })
+}
+
+/// Writes the bare `record` of type `kind` into `out` with the text of each
+/// string repaired, and returns the length written.
+///
+/// Each string that is not UTF-8 becomes what [`String::from_utf8_lossy`]
+/// gives for it, with U+FFFD in place of each invalid sequence. Text that is
+/// UTF-8 is unchanged. The output is the head as the record declares it,
+/// with only the string lengths rewritten, then each string cut on a
+/// character boundary to the room left in `out` and to 255 bytes in turn,
+/// then the bytes the record holds after its last string as far as `out`
+/// has room. A record that parses comes back unchanged when `out` holds it.
+///
+/// Returns `None` if `kind` has no defined layout, if the record would be
+/// refused for a reason other than its text, or if `out` cannot hold the
+/// head. Whenever it returns a length, the output parses as `kind`.
+///
+/// [`String::from_utf8_lossy`]: https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8_lossy
+pub fn repair_record_text(kind: u8, record: &[u8], out: &mut [u8]) -> Option<usize> {
+    let lengths: &[usize] = match MetadataType::from(kind) {
+        MetadataType::Device => &DeviceHead::STRINGS,
+        MetadataType::Stream => &StreamHead::STRINGS,
+        MetadataType::Segment => &SegmentHead::STRINGS,
+        MetadataType::Column => &ColumnHead::STRINGS,
+        MetadataType::Unknown(_) => return None,
+    };
+    let (head, mut rest) = split_record(record)?;
+    out.get_mut(..head.len())?.copy_from_slice(head);
+    let mut len = head.len();
+    for &offset in lengths {
+        // A length the declared head does not reach is zero.
+        let Some(&declared) = head.get(offset) else {
+            continue;
+        };
+        let (text, after) = rest.split_at_checked(usize::from(declared))?;
+        rest = after;
+        let written = write_lossy(text, &mut out[len..]);
+        out[offset] = written as u8;
+        len += written;
+    }
+    let tail = rest.len().min(out.len() - len);
+    out[len..len + tail].copy_from_slice(&rest[..tail]);
+    len += tail;
+    parse_record(kind, &out[..len])?;
+    Some(len)
+}
+
+/// Writes the longest prefix of the lossy UTF-8 reading of `text` that ends
+/// on a character boundary and fits both `out` and 255 bytes. Returns its
+/// length.
+fn write_lossy(text: &[u8], out: &mut [u8]) -> usize {
+    const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
+    let limit = out.len().min(u8::MAX as usize);
+    let mut len = 0;
+    for chunk in text.utf8_chunks() {
+        let valid = chunk.valid();
+        let mut keep = valid.len().min(limit - len);
+        while !valid.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        out[len..len + keep].copy_from_slice(&valid.as_bytes()[..keep]);
+        len += keep;
+        if keep < valid.len() {
+            return len;
+        }
+        if !chunk.invalid().is_empty() {
+            if limit - len < REPLACEMENT.len() {
+                return len;
+            }
+            out[len..len + REPLACEMENT.len()].copy_from_slice(REPLACEMENT);
+            len += REPLACEMENT.len();
+        }
+    }
+    len
 }
 
 /// Name of the RPC that reads metadata records on demand.
@@ -1429,6 +1536,31 @@ mod tests {
     //! - M8, postcondition. Metadata and segment flags are sets of bits.
     //!   `contains`, `union`, `|` and `is_empty` give what the bits give.
     //!   Source, the docs of those methods.
+    //! - M9, identity. [`repair_record_text`] gives a record that parses
+    //!   back byte for byte when the buffer holds it. Source, its doc. It
+    //!   rules out a repair that rewrites a head byte or drops the bytes
+    //!   after the last string.
+    //! - M10, postcondition. Whenever [`repair_record_text`] returns a
+    //!   length, the bytes it wrote parse as the record type. Source, its
+    //!   doc. It rules out a length byte that does not match the string
+    //!   written.
+    //! - M11, completeness. Given room for the declared head,
+    //!   [`repair_record_text`] refuses a record exactly when the record
+    //!   with every string's bytes replaced by ASCII of the same length does
+    //!   not parse. A buffer short of the head is refused. Source, its doc,
+    //!   a record refused for a reason other than its text. It rules out a
+    //!   repair that keeps a record with a bad stream id or a string past the
+    //!   end, or refuses one whose only fault is its text.
+    //! - M12, model based. The output is the declared head with each string
+    //!   length rewritten, then each string as `from_utf8_lossy` reads it,
+    //!   cut in turn as [`cut_in_turn`] cuts, then the bytes after the last
+    //!   string as far as the buffer has room. [`record_ranges`] finds the
+    //!   strings from the bytes alone. Source, its doc. It rules out a
+    //!   replacement per byte rather than per invalid sequence, a cut inside
+    //!   a character, and a head byte other than a length that changes.
+    //! - M13, idempotence. Repairing a repaired record changes nothing.
+    //!   Source, M9 and M10 together. It rules out a repair that is not
+    //!   stable under a second pass.
     //!
     //! # Generator obligations
     //!
@@ -1446,6 +1578,11 @@ mod tests {
     //!   types 0 to 5 and 255. About a quarter of the payloads parse, and
     //!   each reason [`record_strings`] gives for a refusal is reached. In M4
     //!   about a third of the cases cut a string inside a character.
+    //! - M9 to M13 on written records and on the M7 payloads, and on written
+    //!   records with bytes of their strings set to 0x80, 0xB0, 0xC2, 0xE2,
+    //!   0xF0, 0xFF or any value, so strings grow past 255 bytes, a quarter
+    //!   of them with a stream id of 0, 128, 255 or any value. The buffer is
+    //!   any length up to three times the record and two bytes more.
     //!
     //! `class_counts` prints the share of each class with
     //! `TWINLEAF_PAYLOAD_CLASSES` set.
@@ -3189,6 +3326,271 @@ mod tests {
             prop_assert_eq!(segment.contains(other), a & b == b);
             prop_assert_eq!(segment.union(other).bits(), a | b);
             prop_assert_eq!((segment | other).bits(), a | b);
+        }
+    }
+
+    /// Repairs `record` of type `kind` into a buffer of `len` bytes, as
+    /// [`write_over_any`] does. Returns the length and the zeroed buffer.
+    fn repair_over_any(
+        kind: u8,
+        record: &[u8],
+        len: usize,
+    ) -> Result<(Option<usize>, Vec<u8>), TestCaseError> {
+        write_over_any(len, |out| repair_record_text(kind, record, out))
+    }
+
+    /// The declared head length and the byte range of each string of the
+    /// bare `record` of type `kind`, read from its bytes alone at the
+    /// offsets in [`length_offsets`], or `None` if the head length is under
+    /// two or past the record, or a string runs past the record. A length
+    /// the head does not reach is zero.
+    fn record_ranges(kind: u8, record: &[u8]) -> Option<(usize, Vec<core::ops::Range<usize>>)> {
+        let head = usize::from(*record.first()?);
+        if head < 2 || head > record.len() {
+            return None;
+        }
+        let mut at = head;
+        let mut ranges = Vec::new();
+        for &offset in length_offsets(kind) {
+            let len = if offset < head {
+                usize::from(record[offset])
+            } else {
+                0
+            };
+            if at + len > record.len() {
+                return None;
+            }
+            ranges.push(at..at + len);
+            at += len;
+        }
+        Some((head, ranges))
+    }
+
+    /// `record` with the bytes of each string, as far as the record holds
+    /// them, set to `a`.
+    fn with_ascii_strings(kind: u8, record: &[u8]) -> Vec<u8> {
+        let mut ascii = record.to_vec();
+        let Some(&head) = record.first() else {
+            return ascii;
+        };
+        let head = usize::from(head);
+        let mut at = head;
+        for &offset in length_offsets(kind) {
+            let len = match record.get(offset) {
+                Some(&len) if offset < head => usize::from(len),
+                _ => 0,
+            };
+            for byte in ascii.iter_mut().take(at + len).skip(at) {
+                *byte = b'a';
+            }
+            at += len;
+        }
+        ascii
+    }
+
+    /// The record the repair of `record` into `room` bytes gives, built from
+    /// [`record_ranges`], `from_utf8_lossy` and [`cut_in_turn`], or `None`
+    /// when [`record_ranges`] refuses the record or `room` is short of its
+    /// head. The stream id is not checked here.
+    fn repaired_model(kind: u8, record: &[u8], room: usize) -> Option<Vec<u8>> {
+        let (head, ranges) = record_ranges(kind, record)?;
+        if room < head {
+            return None;
+        }
+        let lossy: Vec<String> = ranges
+            .iter()
+            .map(|range| String::from_utf8_lossy(&record[range.clone()]).into_owned())
+            .collect();
+        let lossy: Vec<&str> = lossy.iter().map(String::as_str).collect();
+        let kept = cut_in_turn(&lossy, room - head);
+        let mut out = record[..head].to_vec();
+        for (&offset, text) in length_offsets(kind).iter().zip(&kept) {
+            if offset < head {
+                out[offset] = text.len() as u8;
+            }
+        }
+        for text in &kept {
+            out.extend_from_slice(text.as_bytes());
+        }
+        let end = ranges.last().map_or(head, |range| range.end);
+        let tail = &record[end..];
+        out.extend_from_slice(&tail[..tail.len().min(room - out.len())]);
+        Some(out)
+    }
+
+    /// A bare record and its type byte. Half are written records with up to
+    /// eight bytes of their strings set to 0x80, 0xB0, 0xC2, 0xE2, 0xF0,
+    /// 0xFF or any value, and a quarter of those with the byte after the
+    /// head length set to 0, 128, 255 or any value. The rest are the M7
+    /// payloads without their `[type][flags]` header.
+    fn damaged() -> impl Strategy<Value = (u8, Vec<u8>)> {
+        let byte = prop_oneof![
+            Just(0x80u8),
+            Just(0xB0),
+            Just(0xC2),
+            Just(0xE2),
+            Just(0xF0),
+            Just(0xFF),
+            any::<u8>(),
+        ];
+        let stream_id = prop_oneof![
+            3 => Just(None),
+            1 => prop_oneof![Just(0u8), Just(128), Just(u8::MAX), any::<u8>()].prop_map(Some),
+        ];
+        prop_oneof![
+            (
+                fields(MAX_STRING),
+                prop::collection::vec((any::<Index>(), byte), 0..=8),
+                stream_id,
+            )
+                .prop_map(|(fields, changes, stream_id)| {
+                    let mut record = fields.wire();
+                    if let Some(stream_id) = stream_id {
+                        record[1] = stream_id;
+                    }
+                    let head = fields.head_size();
+                    let strings = record.len() - head;
+                    if strings > 0 {
+                        for (at, byte) in changes {
+                            record[head + at.index(strings)] = byte;
+                        }
+                    }
+                    (fields.kind(), record)
+                }),
+            any_metadata().prop_filter_map("a type byte", |payload| {
+                let (&kind, rest) = payload.split_first()?;
+                Some((kind, rest.get(1..)?.to_vec()))
+            }),
+        ]
+    }
+
+    /// A bare column record of stream 1, index 2 and type f32 whose strings
+    /// hold these bytes.
+    fn column_with(name: &[u8], units: &[u8], description: &[u8]) -> Vec<u8> {
+        let head = [
+            7,
+            1,
+            2,
+            DataType::F32.value(),
+            name.len() as u8,
+            units.len() as u8,
+            description.len() as u8,
+        ];
+        [&head[..], name, units, description].concat()
+    }
+
+    /// Repairs the column `record` with room for all of it three times over.
+    fn repaired_column(record: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; 3 * record.len()];
+        let len = repair_record_text(4, record, &mut out).expect("a repairable record");
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn a_lone_continuation_byte_becomes_one_replacement_character() {
+        let out = repaired_column(&column_with(b"field", &[0xB0, 0x43], b"Total"));
+        let column = Column::parse(&out).unwrap();
+        assert_eq!(column.units, "\u{FFFD}C");
+        assert_eq!((column.name, column.description), ("field", "Total"));
+        assert_eq!(
+            (column.stream_id, column.index, column.data_type),
+            (StreamId::new(1), ColumnId::new(2), DataType::F32)
+        );
+    }
+
+    #[test]
+    fn a_character_cut_short_at_the_end_becomes_one_replacement_character() {
+        let out = repaired_column(&column_with(b"x", &[0x6D, 0xB5], b""));
+        assert_eq!(Column::parse(&out).unwrap().units, "m\u{FFFD}");
+    }
+
+    #[test]
+    fn text_that_is_utf8_is_unchanged() {
+        let record = column_with(b"x", &[0xC2, 0xB0, 0x43], b"");
+        let out = repaired_column(&record);
+        assert_eq!(Column::parse(&out).unwrap().units, "°C");
+        assert_eq!(out, record);
+    }
+
+    #[test]
+    fn a_string_that_grows_past_255_bytes_is_cut_on_a_character_boundary() {
+        // One ASCII byte then 100 bytes that each become a 3-byte character.
+        let name = [&b"a"[..], &[0xFF; 100]].concat();
+        let out = repaired_column(&column_with(&name, b"V", b""));
+        let column = Column::parse(&out).unwrap();
+        assert_eq!(column.name, format!("a{}", "\u{FFFD}".repeat(84)));
+        assert_eq!(column.name.len(), 253);
+        assert_eq!(column.units, "V");
+    }
+
+    #[test]
+    fn a_buffer_too_short_for_all_the_text_cuts_the_last_strings_first() {
+        let record = column_with(b"ab", &[0xB0, b'C'], b"xyz");
+        // Room for the head, the name, the repaired units and one byte more.
+        let mut out = vec![0; Column::HEAD_SIZE + 2 + 4 + 1];
+        let len = repair_record_text(4, &record, &mut out).unwrap();
+        let column = Column::parse(&out[..len]).unwrap();
+        assert_eq!(
+            (column.name, column.units, column.description),
+            ("ab", "\u{FFFD}C", "x")
+        );
+        assert_eq!(repair_record_text(4, &record, &mut out[..6]), None);
+    }
+
+    proptest! {
+        /// M9. A record that parses is repaired byte for byte when the
+        /// buffer holds it, whatever the buffer held before.
+        #[test]
+        fn a_record_that_parses_comes_back_unchanged(
+            (kind, record) in prop_oneof![
+                fields(MAX_STRING).prop_map(|fields| (fields.kind(), fields.wire())),
+                damaged(),
+            ],
+            slack in 0..=8usize,
+        ) {
+            if parse_record(kind, &record).is_none() {
+                return Ok(());
+            }
+            let (len, out) = repair_over_any(kind, &record, record.len() + slack)?;
+            prop_assert_eq!(len, Some(record.len()));
+            prop_assert_eq!(&out[..record.len()], &record[..]);
+        }
+
+        /// M10, M11 and M12. A repair gives the record the model builds,
+        /// which parses, and refuses exactly the records whose fault is not
+        /// their text, whatever the buffer held before.
+        #[test]
+        fn a_repair_reads_each_string_lossily_and_cuts_it_in_turn(
+            (kind, record) in damaged(),
+            room in any::<Index>(),
+        ) {
+            let room = room.index(3 * record.len() + 3);
+            let (len, out) = repair_over_any(kind, &record, room)?;
+            let head = record.first().map_or(0, |&head| usize::from(head));
+            let ascii_parses = parse_record(kind, &with_ascii_strings(kind, &record)).is_some();
+            prop_assert_eq!(len.is_some(), ascii_parses && room >= head, "{:?}", record);
+            let Some(len) = len else {
+                return Ok(());
+            };
+            prop_assert!(parse_record(kind, &out[..len]).is_some(), "the output does not parse");
+            let expected = repaired_model(kind, &record, room);
+            prop_assert_eq!(Some(&out[..len]), expected.as_deref());
+        }
+
+        /// M13. Repairing a repaired record changes nothing.
+        #[test]
+        fn repairing_twice_changes_nothing(
+            (kind, record) in damaged(),
+            room in any::<Index>(),
+        ) {
+            let room = room.index(3 * record.len() + 3);
+            let (Some(len), once) = repair_over_any(kind, &record, room)? else {
+                return Ok(());
+            };
+            let (again, twice) = repair_over_any(kind, &once[..len], len)?;
+            prop_assert_eq!(again, Some(len));
+            prop_assert_eq!(&twice[..], &once[..len]);
         }
     }
 
