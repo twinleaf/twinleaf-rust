@@ -2,14 +2,11 @@
 
 use super::cache;
 use super::error::CallError;
-use super::reply::{PendingReply, Pipeline};
+use super::reply::{PendingReply, Pipeline, READ_WINDOW};
 use crate::proto::rpc::{RpcError, RpcMeta};
 use crate::proto::SessionId;
 use crate::tio::rpc::RpcReply;
 use std::collections::BTreeMap;
-
-/// The most `rpc.listinfo` calls in flight at once during a walk.
-const WALK_WINDOW: usize = 16;
 
 /// The most walks one load makes of a table that keeps changing.
 const WALK_ATTEMPTS: usize = 3;
@@ -79,7 +76,7 @@ impl RpcRegistry {
     /// Loads one device's RPC table through `submit`.
     ///
     /// Reads `dev.name`, `rpc.hash`, and `dev.session` first. On a cache
-    /// miss it walks `rpc.listinfo` with [`WALK_WINDOW`] calls in flight. A
+    /// miss it walks `rpc.listinfo` with [`READ_WINDOW`] calls in flight. A
     /// walk counts only when `rpc.hash` reads the same after it, and only
     /// then is it cached. Otherwise the table is walked again under the new
     /// hash, up to [`WALK_ATTEMPTS`] times.
@@ -102,7 +99,7 @@ impl RpcRegistry {
             {
                 let descriptors =
                     (0..total).map(|index| submit("rpc.listinfo", &index.to_le_bytes()));
-                let mut replies = Pipeline::new(descriptors, WALK_WINDOW);
+                let mut replies = Pipeline::new(descriptors, READ_WINDOW);
                 while let Some(reply) = replies.next().await {
                     let (meta, name) = decode::<(u16, String)>(reply?)?;
                     entries.push((name, meta));

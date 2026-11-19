@@ -2,7 +2,7 @@
 
 use crate::proto::rpc::RpcMetaFlags;
 use crate::proto::SessionId;
-use crate::session::rpc::{CallError, PendingReply, Pipeline, RpcRegistry};
+use crate::session::rpc::{CallError, PendingReply, Pipeline, RpcRegistry, READ_WINDOW};
 use crate::session::SettingChange;
 use crate::tio::rpc::RpcReply;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,9 +31,6 @@ pub(crate) enum DeviceEvent {
 
 /// The counter a device raises on every setting announcement, numbering each.
 const SETTINGS_VERSION: &str = "settings.version";
-
-/// The most reads in flight at once during a snapshot.
-const SNAPSHOT_WINDOW: usize = 8;
 
 /// The most snapshots one call takes of values that keep moving.
 const SNAPSHOT_ATTEMPTS: usize = 3;
@@ -189,7 +186,7 @@ impl SettingsCache {
             let mut values = BTreeMap::new();
             {
                 let calls = self.cached.iter().map(|name| submit(name, &[]));
-                let mut replies = Pipeline::new(calls, SNAPSHOT_WINDOW);
+                let mut replies = Pipeline::new(calls, READ_WINDOW);
                 for name in &self.cached {
                     let Some(reply) = replies.next().await else {
                         break;

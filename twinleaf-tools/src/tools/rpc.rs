@@ -16,7 +16,7 @@ use twinleaf::device::Device;
 use twinleaf::Connection;
 
 /// The most reads `tio rpc get` keeps in flight at once.
-const READ_WINDOW: usize = 16;
+const READ_WINDOW: usize = 4;
 
 pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
     match rpc_cli.subcommands {

@@ -71,6 +71,10 @@ pub fn pipelined(
     std::iter::from_fn(move || calls.next_call().map(PendingReply::wait))
 }
 
+/// The most reads in flight at once to one device while the host reads many
+/// entries in a row.
+pub(crate) const READ_WINDOW: usize = 4;
+
 /// A run of calls whose replies are taken in order, with up to a window of
 /// calls in flight. [`pipelined`] blocks on each reply, and
 /// [`next`](Self::next) awaits it.

@@ -640,7 +640,7 @@ impl Class {
             Class::Reload => 3_000,
             Class::Wrap => 140,
             Class::Gap => 270,
-            Class::Behind => 140,
+            Class::Behind => 80,
             Class::Foreign => 90,
             Class::Unknown => 0,
             Class::Skipped => 0,
