@@ -97,13 +97,20 @@ macro_rules! metadata_record {
         pub(crate) struct $record(Arc<[u8]>);
 
         impl $record {
-            /// Copies `record` if it parses as this descriptor, or returns
-            /// `None`.
+            /// Copies `record` if it parses as this descriptor. A record
+            /// whose only fault is text that is not UTF-8 is retained with
+            /// that text repaired, as [`Packet::from_wire`] repairs it.
+            /// Returns `None` for any other record that does not parse.
             pub(crate) fn new(record: &[u8]) -> Option<Self> {
                 #[cfg(test)]
                 RECORD_PARSES.with(|parses| parses.set(parses.get() + 1));
-                wire::$view::new_checked(record)?;
-                Some(Self(Arc::from(record)))
+                if wire::$view::new_checked(record).is_some() {
+                    return Some(Self(Arc::from(record)));
+                }
+                let kind = wire::MetadataType::$kind.into();
+                let repaired = tio::packet::repair_metadata_record(kind, record)?;
+                wire::$view::new_checked(&repaired)?;
+                Some(Self(Arc::from(repaired)))
             }
 
             /// Encodes `fields` as a retained record. Returns `None` if the
@@ -484,6 +491,88 @@ mod tests {
             )
             .unwrap()
             .as_bytes()
+        );
+    }
+
+    /// The bare record `fields` writes, with byte `at` of the strings set to
+    /// 0xFF.
+    fn with_a_bad_byte(fields: wire::Metadata<'_>, at: usize) -> Vec<u8> {
+        let mut buf = vec![0; fields.record_len()];
+        let (_, len) = fields.write_record(&mut buf).unwrap();
+        buf.truncate(len);
+        let head = usize::from(buf[0]);
+        buf[head + at] = 0xFF;
+        buf
+    }
+
+    /// Each kind of record keeps a record with one string that is not
+    /// UTF-8, with that string repaired and the rest as sent.
+    #[test]
+    fn a_record_whose_text_is_not_utf8_is_retained_repaired() {
+        let device = DeviceRecord::new(&with_a_bad_byte(
+            wire::Metadata::Device(fixtures::device()),
+            "test-device".len(),
+        ))
+        .expect("a repaired device record");
+        assert_eq!(
+            (
+                device.get().name(),
+                device.get().serial(),
+                device.get().firmware()
+            ),
+            ("test-device", "\u{FFFD}N123", "fw")
+        );
+
+        let stream = StreamRecord::new(&with_a_bad_byte(
+            wire::Metadata::Stream(fixtures::stream(1)),
+            0,
+        ))
+        .expect("a repaired stream record");
+        assert_eq!(stream.get().name(), "\u{FFFD}est-stream");
+        assert_eq!(stream.get().buf_samples(), 128);
+
+        let segment = SegmentRecord::new(&with_a_bad_byte(
+            wire::Metadata::Segment(fixtures::segment(1)),
+            4,
+        ))
+        .expect("a repaired segment record");
+        assert_eq!(segment.get().timeref_serial(), "cloc\u{FFFD}");
+        assert_eq!(segment.get().timeref_session(), SessionId::new(7));
+
+        let column = ColumnRecord::new(&with_a_bad_byte(
+            wire::Metadata::Column(wire::Column {
+                units: "nT",
+                ..fixtures::column(1, 0, wire::DataType::F32)
+            }),
+            "col_0".len() + 1,
+        ))
+        .expect("a repaired column record");
+        assert_eq!(
+            (
+                column.get().name(),
+                column.get().units(),
+                column.get().index()
+            ),
+            ("col_0", "n\u{FFFD}", ColumnId::new(0))
+        );
+    }
+
+    /// A repaired record goes out as it is retained, and comes back the
+    /// same bytes.
+    #[test]
+    fn a_repaired_record_is_relayed_byte_for_byte() {
+        let record = ColumnRecord::new(&with_a_bad_byte(
+            wire::Metadata::Column(fixtures::column(1, 0, wire::DataType::F32)),
+            0,
+        ))
+        .expect("a repaired column record");
+        let sent = record.update(route("/1")).unwrap();
+        let received = Packet::from_wire(sent.clone().into_bytes()).unwrap();
+
+        assert_eq!(received.as_bytes(), sent.as_bytes());
+        assert_eq!(
+            received.payload_bytes()[wire::METADATA_HEADER_SIZE..],
+            record.0[..]
         );
     }
 

@@ -324,7 +324,8 @@ fn proxy_rx() -> impl Strategy<Value = Vec<u8>> {
 pub(crate) struct Invalid {
     /// The header, the payload and the routing.
     pub(crate) bytes: Vec<u8>,
-    /// The error the payload gives.
+    /// The error the payload gives, unless it is a metadata record that
+    /// [`repaired`](super::repaired) repairs.
     pub(crate) error: DecodeError,
     /// What is wrong with the payload.
     pub(crate) class: &'static str,
@@ -335,7 +336,8 @@ pub(crate) struct Invalid {
 /// shortest payload is drawn shorter, from empty to one byte less. The
 /// RPC request, setting and metadata layouts are also drawn with a name
 /// or a record that runs past the payload, and a metadata record with a
-/// string that is not UTF8.
+/// string that is not UTF8. That record does not parse, but it decodes as
+/// the packet [`repaired`](super::repaired) gives.
 pub(crate) fn invalid_body() -> impl Strategy<Value = Invalid> {
     (bad_body(), 0..=15u8, routing()).prop_map(|((ptype, payload, error, class), ttl, hops)| {
         Invalid {
@@ -376,7 +378,12 @@ fn bad_body() -> impl Strategy<Value = (u8, Vec<u8>, DecodeError, &'static str)>
         proxy_rx_short().prop_map(|p| (67, p, PayloadTooShort, "proxy reply short")),
         payload(0, 1).prop_map(|p| (11, p, PayloadTooShort, "metadata short")),
         unframed().prop_map(|p| (11, p, InvalidPayload, "metadata record unframed")),
-        device_overrun().prop_map(|p| (11, p, InvalidPayload, "metadata strings invalid")),
+        device_overrun().prop_map(|p| (
+            11,
+            p,
+            InvalidPayload,
+            "metadata strings overrun or repaired"
+        )),
         (129..=255u8, payload(0, 4)).prop_map(|(t, p)| (t, p, PayloadTooShort, "samples short")),
     ]
 }
@@ -433,8 +440,8 @@ fn unframed() -> impl Strategy<Value = Vec<u8>> {
         .prop_map(|(kind, flags, record)| [vec![kind, flags], record].concat())
 }
 
-/// A device record payload whose strings run past the record, or whose
-/// name is not UTF8.
+/// A device record payload whose strings run past the record, which is an
+/// invalid payload, or whose name is not UTF8, which decodes repaired.
 fn device_overrun() -> impl Strategy<Value = Vec<u8>> {
     let head =
         |flags: u8, lens: [u8; 3]| vec![1, flags, 9, lens[0], 0, 0, 0, 0, lens[1], lens[2], 0];

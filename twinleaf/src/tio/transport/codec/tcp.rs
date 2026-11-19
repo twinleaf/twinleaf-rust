@@ -181,7 +181,9 @@ mod tests {
     //! parses is left to the metadata record properties of `twinleaf-proto`.
     //! The generator builds valid device records, type 1, and no valid
     //! records of types 2 to 4. For a record of a defined type whose framing
-    //! holds, the model takes the packet or `InvalidPayload`. The bytes
+    //! holds, the model takes the packet, the packet [`repaired`] gives for
+    //! a record that does not parse and can be repaired, or
+    //! `InvalidPayload`. The bytes
     //! [`Codec::encode`] appends are the packet's own, which T2 covers.
     //!
     //! # Examples that stay
@@ -189,7 +191,7 @@ mod tests {
     //! None. The wire bytes of each payload are pinned in the payload suites.
 
     use super::*;
-    use crate::tio::transport::codec::tests::strategy;
+    use crate::tio::transport::codec::tests::{repaired, strategy};
     use proptest::prelude::*;
     use proptest::sample::Index;
 
@@ -436,8 +438,15 @@ mod tests {
                 }
                 Step::Frame(frame, body) => {
                     match (body, &result) {
-                        (Body::Valid | Body::Record, Ok(Some(packet))) => {
+                        (Body::Valid, Ok(Some(packet))) => {
                             prop_assert_eq!(packet.as_bytes(), frame);
+                        }
+                        (Body::Record, Ok(Some(packet))) => {
+                            let expected = repaired(frame);
+                            prop_assert_eq!(
+                                packet.as_bytes(),
+                                expected.as_deref().unwrap_or(frame)
+                            );
                         }
                         (Body::Invalid(error), Err(Error::Invalid(actual))) => {
                             prop_assert_eq!(*actual, error);
@@ -528,9 +537,11 @@ mod tests {
         }
 
         /// T3 and T7. A packet whose header decodes and whose payload is not
-        /// valid for its type gives that payload's error, and the call
-        /// removes exactly the packet. The packets on either side decode
-        /// unchanged, however the stream is cut.
+        /// valid for its type gives that payload's error, unless it is a
+        /// metadata record that can be repaired, which decodes as the packet
+        /// [`repaired`] gives. The call removes exactly the packet. The
+        /// packets on either side decode unchanged, however the stream is
+        /// cut.
         #[test]
         fn a_packet_whose_payload_is_invalid_is_skipped_alone(
             before in prop::collection::vec(strategy::packet(), 0..4),
@@ -541,14 +552,17 @@ mod tests {
             let mut stream = wire(&before);
             stream.extend(&invalid.bytes);
             stream.extend(wire(&after));
+            let outcome = repaired(&invalid.bytes)
+                .ok_or(Error::Invalid(invalid.error));
             let mut expected = decoded(&before);
-            expected.push(Err(Error::Invalid(invalid.error)));
+            expected.push(outcome.clone());
             expected.extend(decoded(&after));
             prop_assert_eq!(decode_pieces(strategy::pieces(&stream, &cuts)), expected);
 
             let mut codec = Codec::default();
             let mut src = BytesMut::from(&[&invalid.bytes[..], &wire(&after)].concat()[..]);
-            prop_assert_eq!(codec.decode(&mut src).err(), Some(Error::Invalid(invalid.error)));
+            let first = codec.decode(&mut src).map(|packet| packet.map(|p| p.as_bytes().to_vec()));
+            prop_assert_eq!(first, outcome.map(Some));
             prop_assert_eq!(&src[..], &wire(&after)[..]);
         }
 

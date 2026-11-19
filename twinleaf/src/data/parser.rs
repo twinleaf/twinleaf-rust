@@ -1395,6 +1395,142 @@ mod tests {
         );
     }
 
+    /// The bare column record of stream 1, index 0 and type f32 whose units
+    /// are `B0 43`, a degree sign without its lead byte, then `C`.
+    fn column_with_bad_units() -> Vec<u8> {
+        let head = [7, 1, 0, DataType::F32.value(), 4, 2, 0];
+        [&head[..], b"temp", &[0xB0, b'C']].concat()
+    }
+
+    /// The units of column 0 of stream 1 in the metadata the parser holds
+    /// for `route`.
+    fn units(parser: &PacketParser, route: DeviceRoute) -> String {
+        let metadata = parser.metadata(route).expect("complete metadata");
+        let stream = metadata
+            .stream(crate::proto::StreamId::new(STREAM_ID))
+            .expect("stream 1");
+        let column = stream.schema().column(crate::proto::ColumnId::new(0));
+        column.expect("column 0").units().to_owned()
+    }
+
+    /// A `dev.metadata` reply whose column has units that are not UTF-8
+    /// completes the stream, and the parser asks for nothing more.
+    #[test]
+    fn a_reply_column_whose_units_are_not_utf8_completes_the_stream() {
+        let route = DeviceRoute::root();
+        let mut parser = PacketParser::new(true);
+        let query = take_query(&mut parser);
+        let mut reply = metadata_reply(&[
+            wire::Metadata::Device(fixtures::device()),
+            wire::Metadata::Stream(fixtures::stream(STREAM_ID)),
+            wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+        ]);
+        let column = column_with_bad_units();
+        reply.extend_from_slice(&[wire::MetadataType::Column.into(), column.len() as u8]);
+        reply.extend_from_slice(&column);
+        parser.apply_metadata_reply(query, &reply);
+
+        assert_eq!(units(&parser, route), "\u{FFFD}C");
+        assert!(parser.take_metadata_queries_for(route).is_empty());
+    }
+
+    /// A broadcast column whose units are not UTF-8 is applied.
+    #[test]
+    fn a_broadcast_column_whose_units_are_not_utf8_is_applied() {
+        let route = DeviceRoute::root();
+        let mut parser = PacketParser::new(true);
+        for record in [
+            wire::Metadata::Device(fixtures::device()),
+            wire::Metadata::Stream(fixtures::stream(STREAM_ID)),
+            wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+        ] {
+            announce(&mut parser, record);
+        }
+        let mut raw = [0u8; 64];
+        let len = wire::write_metadata_record(
+            &mut raw,
+            wire::MetadataType::Column.into(),
+            wire::MetadataFlags::UPDATE,
+            &column_with_bad_units(),
+        )
+        .expect("the record fits");
+        let (packet, _) = tio::Packet::from_slice_prefix(&raw[..len]).expect("a repaired packet");
+        parser.push_packet(&packet).expect("a metadata record");
+
+        assert_eq!(units(&parser, route), "\u{FFFD}C");
+    }
+
+    /// A record kept with text that is not UTF-8 is a warning that names
+    /// the route, the record and the field, the first time only.
+    #[test]
+    fn a_record_whose_text_is_not_utf8_is_logged_once() {
+        let route = DeviceRoute::from_hops(&[3]).expect("a route");
+        let mut parser = PacketParser::new(true);
+        let column = column_with_bad_units();
+        let warnings = crate::data::tests::warnings_during(|| {
+            for _ in 0..2 {
+                let query = parser
+                    .take_metadata_queries_for(route)
+                    .pop()
+                    .expect("a query");
+                let mut reply = metadata_reply(&[wire::Metadata::Device(fixtures::device())]);
+                reply.extend_from_slice(&[wire::MetadataType::Column.into(), column.len() as u8]);
+                reply.extend_from_slice(&column);
+                parser.apply_metadata_reply(query, &reply);
+            }
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            ["/3", "Column", "stream 1 column 0", "U+FFFD in its units"]
+                .iter()
+                .all(|part| warnings[0].contains(part)),
+            "{warnings:?}"
+        );
+    }
+
+    /// The warnings a parser at `/3` logs for a bootstrap reply that holds
+    /// the device record and then `column`, a bare column record.
+    fn warnings_for_reply_column(column: &[u8]) -> Vec<String> {
+        let route = DeviceRoute::from_hops(&[3]).expect("a route");
+        let mut parser = PacketParser::new(true);
+        crate::data::tests::warnings_during(|| {
+            let query = parser
+                .take_metadata_queries_for(route)
+                .pop()
+                .expect("a query");
+            let mut reply = metadata_reply(&[wire::Metadata::Device(fixtures::device())]);
+            reply.extend_from_slice(&[wire::MetadataType::Column.into(), column.len() as u8]);
+            reply.extend_from_slice(column);
+            parser.apply_metadata_reply(query, &reply);
+        })
+    }
+
+    /// A device may send U+FFFD as valid UTF-8, so the warning says what
+    /// the text holds and not that its bytes were not UTF-8.
+    #[test]
+    fn a_record_that_sends_a_replacement_character_is_not_said_to_be_invalid() {
+        let units = "\u{FFFD}".as_bytes();
+        let head = [7, 1, 0, DataType::F32.value(), 4, units.len() as u8, 0];
+        let warnings = warnings_for_reply_column(&[&head[..], b"temp", units].concat());
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("not UTF-8")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A record whose text holds U+FFFD and that is then dropped logs the
+    /// drop and nothing else.
+    #[test]
+    fn a_dropped_record_whose_text_holds_a_replacement_character_logs_only_the_drop() {
+        let mut column = column_with_bad_units();
+        column[1] = 99; // a stream above the device's count of 1
+        let warnings = warnings_for_reply_column(&column);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("dropped"), "{warnings:?}");
+    }
+
     #[test]
     fn pending_batches_never_straddle_a_shared_generation_bump() {
         let mut parser = parser_with_streams(2).with_batch_rows(4);

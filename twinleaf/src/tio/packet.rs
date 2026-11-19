@@ -33,7 +33,9 @@ pub struct Packet {
 /// Borrowed view of a packet's payload.
 ///
 /// Text fields are `&str` only where the wire codec validated them as UTF-8.
-/// Everything else stays bytes, and callers convert at the point of use.
+/// Everything else stays bytes, and callers convert at the point of use. A
+/// metadata record's text that is not UTF-8 reads with U+FFFD in place of
+/// each invalid sequence, as [`Packet::from_wire`] repairs it.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum Payload<'a> {
@@ -263,8 +265,48 @@ fn parse_metadata(ptype: PacketType, payload: &[u8]) -> Result<Payload<'_>, Deco
     }
 }
 
+/// Returns the bare metadata `record` of type `kind` with each string that
+/// is not UTF-8 read lossily, or `None` if the record cannot be repaired.
+/// The repaired record may be as long as `record` or 255 bytes, whichever is
+/// larger, and its strings are cut to fit.
+pub(crate) fn repair_metadata_record(kind: u8, record: &[u8]) -> Option<Vec<u8>> {
+    let mut repaired = vec![0; record.len().max(usize::from(u8::MAX))];
+    let len = wire::repair_record_text(kind, record, &mut repaired)?;
+    repaired.truncate(len);
+    Some(repaired)
+}
+
+/// Returns the metadata packet `view` with the text of its record repaired,
+/// the same type, flags, TTL and route, or `None` if it is no metadata
+/// packet or its record cannot be repaired.
+fn repair_metadata_packet(view: &PacketView<'_>) -> Option<Packet> {
+    if view.header.ptype != PacketType::METADATA {
+        return None;
+    }
+    let (kind, _, record) = wire::split_metadata(view.payload)?;
+    let record = repair_metadata_record(kind, record)?;
+    let payload_len = wire::METADATA_HEADER_SIZE + record.len();
+    let mut header = view.header;
+    header.payload_size = u16::try_from(payload_len).ok()?;
+    let mut raw = vec![0; Header::SIZE];
+    header.write(raw.as_mut_slice().try_into().ok()?);
+    raw.extend_from_slice(&view.payload[..wire::METADATA_HEADER_SIZE]);
+    raw.extend_from_slice(&record);
+    raw.extend_from_slice(view.routing);
+    let packet = Packet { raw: raw.into() };
+    let repaired = PacketView::parse_prefix(&packet.raw).ok()?.0;
+    parse_payload(repaired.header, repaired.payload).ok()?;
+    Some(packet)
+}
+
 impl Packet {
     /// Validates `raw` as exactly one packet and takes ownership of it.
+    ///
+    /// A metadata record of a defined type whose only fault is text that is
+    /// not UTF-8 is kept. Each such string reads with U+FFFD in place of
+    /// each invalid sequence, cut to fit, and the packet carries the
+    /// repaired record with its payload length rewritten. Any other packet
+    /// keeps its bytes as they are, without a copy.
     ///
     /// # Errors
     ///
@@ -275,12 +317,18 @@ impl Packet {
             return Err(DecodeError::PacketTooBig);
         }
         DeviceRoute::from_wire(view.routing).map_err(|_| DecodeError::RoutingTooBig)?;
-        parse_payload(view.header, view.payload)?;
-        Ok(Packet { raw })
+        match parse_payload(view.header, view.payload) {
+            Ok(_) => Ok(Packet { raw }),
+            Err(DecodeError::InvalidPayload) => {
+                repair_metadata_packet(&view).ok_or(DecodeError::InvalidPayload)
+            }
+            Err(error) => Err(error),
+        }
     }
 
-    /// Parses one packet from the start of `raw`, sharing its storage.
-    /// Returns the packet and the number of bytes it used.
+    /// Parses one packet from the start of `raw`, sharing its storage unless
+    /// [`from_wire`](Self::from_wire) repairs its metadata text. Returns the
+    /// packet and the number of bytes it used.
     ///
     /// # Errors
     ///
@@ -767,6 +815,77 @@ mod tests {
             Packet::from_wire(Bytes::from(raw)),
             Err(DecodeError::InvalidPayload)
         ));
+    }
+
+    /// A metadata packet at `/1/2` with a TTL of 5, carrying `record` of
+    /// type `kind` with the update flag.
+    fn metadata_raw(kind: u8, record: &[u8]) -> Vec<u8> {
+        let payload_len = wire::METADATA_HEADER_SIZE + record.len();
+        let mut raw = vec![
+            PacketType::METADATA.value(),
+            (5 << 4) | 2,
+            payload_len as u8,
+            0,
+            kind,
+            wire::MetadataFlags::UPDATE.bits(),
+        ];
+        raw.extend_from_slice(record);
+        raw.extend_from_slice(&[2, 1]);
+        raw
+    }
+
+    /// A column record of stream 3, index 4 and type f32 whose units hold
+    /// `units`.
+    fn column_with_units(units: &[u8]) -> Vec<u8> {
+        let head = [7, 3, 4, 0x42, 4, units.len() as u8, 5];
+        [&head[..], b"temp", units, b"probe"].concat()
+    }
+
+    #[test]
+    fn a_metadata_record_whose_text_is_not_utf8_is_kept_repaired() {
+        let raw = metadata_raw(4, &column_with_units(&[0xB0, b'C']));
+        let packet = Packet::from_wire(Bytes::from(raw)).expect("a repaired packet");
+
+        let Payload::Metadata(wire::Metadata::Column(column), flags) = packet.payload() else {
+            panic!("expected a column record, got {:?}", packet.payload());
+        };
+        assert_eq!(column.units, "\u{FFFD}C");
+        assert_eq!((column.name, column.description), ("temp", "probe"));
+        assert_eq!(
+            (
+                column.stream_id.value(),
+                column.index.value(),
+                column.data_type
+            ),
+            (3, 4, wire::DataType::F32)
+        );
+        assert_eq!(flags, wire::MetadataFlags::UPDATE);
+        assert_eq!((packet.route(), packet.ttl()), (route("/1/2"), 5));
+        assert_eq!(
+            packet.as_bytes(),
+            metadata_raw(4, &column_with_units("\u{FFFD}C".as_bytes()))
+        );
+    }
+
+    #[test]
+    fn a_metadata_packet_that_parses_keeps_its_bytes() {
+        let raw = Bytes::from(metadata_raw(4, &column_with_units(b"degC")));
+        let packet = Packet::from_wire(raw.clone()).unwrap();
+
+        assert_eq!(packet.as_bytes(), &raw[..]);
+        assert_eq!(packet.as_bytes().as_ptr(), raw.as_ptr(), "not copied");
+    }
+
+    #[test]
+    fn a_metadata_record_with_a_string_past_its_end_is_still_rejected() {
+        let mut record = column_with_units(&[0xB0, b'C']);
+        record[6] = 9; // the description runs past the record
+        let raw = metadata_raw(4, &record);
+
+        assert_eq!(
+            Packet::from_wire(Bytes::from(raw)).unwrap_err(),
+            DecodeError::InvalidPayload
+        );
     }
 
     #[test]
