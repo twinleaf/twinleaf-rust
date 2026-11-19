@@ -38,7 +38,7 @@ processing = ["dep:rustfft"]
 
 [dependencies]
 bytes = "1"
-twinleaf-proto = { version = "0.1", path = "../twinleaf-proto" }
+twinleaf-proto = { version = "0.1.1", path = "../twinleaf-proto" }
 twinleaf-device = { version = "0.1", path = "../twinleaf-device" }
 crc = "3.2"
 num_enum = "0.7"
