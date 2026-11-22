@@ -1,0 +1,1 @@
+{"devices":[{"url":"tcp://sensor.local:7855","interface":"net","name":"sensor","routes":[{"route":"/0","name":"subsensor"}]}],"notices":["mDNS could not start"]}

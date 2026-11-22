@@ -1,0 +1,1 @@
+{"type":"upgrade","route":"/","state":"failed","source":"latest","target":"2026-06-08 000002","step":"download","error":"firmware catalog error: the test's catalog failed","cancellable":true}

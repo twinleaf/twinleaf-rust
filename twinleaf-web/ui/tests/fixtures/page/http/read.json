@@ -1,0 +1,1 @@
+{"method":"POST","url":"/api/read","body":{"route":"/","names":["fid.amplitude","dev.name"]}}

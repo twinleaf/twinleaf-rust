@@ -1,0 +1,263 @@
+// Device writes on the whole page (round 2, Device writes #1 to #6): a
+// write from the edit bar shows a notice that offers Revert; Ctrl+Z never
+// writes to a device, and while Revert is offered takes back no edit made
+// before the write, but says to use Revert; Revert puts back the old value where the device
+// still shows the value written and says which device it left; Revert goes
+// when a device reconnects; a Revert answered late gives way to a write
+// started after it; a device that refuses is named, with why, first; an
+// action reports with a notice of its own, with no Revert; and right after
+// an action, or a write with no Revert, Ctrl+Z takes back no edit made
+// before it while its notice shows, and says why. The devices
+// are the stub hub's, which answer as the server does. Every control is
+// pressed with the real mouse, and the field typed into from the keyboard.
+import { describe, expect, it } from 'vitest';
+import { flushSync } from 'svelte';
+import { page as browser } from 'vitest/browser';
+import { centre, clickOn, frames, mountPage, pressKey, typeInto, wait } from './harness/page.js';
+import { NOTICE_MS, REVERT_MS } from '../src/lib/writes.svelte.js';
+import { UNDO_ACTION, UNDO_UNKNOWN, USE_REVERT } from '../src/lib/words.js';
+
+const RPCS = [
+  { name: 'gain', channel: 'setting', value: 5 },
+  { name: 'save', channel: 'action', type: null, access: [] },
+];
+const ROUTES = ['/0', '/1'];
+
+/** Where VITE_TL_SHOTS names a folder, relative to this file, the screenshots go there. */
+const SHOTS = import.meta.env.VITE_TL_SHOTS;
+const shot = async (name) => SHOTS && (await browser.screenshot({ path: `${SHOTS}/${name}.png` }));
+
+const row = (name) => [...document.querySelectorAll('tr[id^=prop-]')].find((tr) => tr.querySelector('.pname')?.firstChild.textContent.trim() === name);
+const notices = () => [...document.querySelectorAll('[data-sonner-toast]')].filter((t) => t.dataset.removed !== 'true');
+const noticeText = () => notices().map((t) => t.textContent.replace(/\s+/g, ' ').trim()).join(' | ');
+const button = (scope, text) => [...scope.querySelectorAll('button')].find((b) => b.textContent.trim() === text);
+async function settle() {
+  flushSync();
+  await wait(20);
+  await frames(3);
+}
+/** Clicks row `name`, types `text` into the edit bar and writes it. */
+async function writeRow(name, text) {
+  const tr = row(name);
+  await clickOn(tr.querySelector('td:last-child'));
+  await settle();
+  await typeInto(document.querySelector(`input[aria-label="New value of ${name}"]`), text);
+  await settle();
+  await clickOn(button(document, 'Write to 2 devices'));
+  await settle();
+}
+
+describe('a write to devices', () => {
+  it('offers Revert, which Ctrl+Z is not: Revert puts back the old value where the device still shows the one written, and says which it left', async () => {
+    const page = await mountPage([['sine.sine']], 'columns', 0, [], RPCS, { routes: ROUTES });
+    try {
+      await writeRow('gain', '10');
+      expect(page.hub.calls).toEqual([{ name: 'gain', value: '10', routes: ROUTES }]);
+      expect(noticeText()).toContain('Set gain to 10 (was 5) · 2 devices');
+      expect(button(notices()[0], 'Revert')).toBeTruthy();
+      document.activeElement?.blur();
+      await pressKey('Control+z');
+      await settle();
+      expect(page.hub.calls.length, 'Ctrl+Z writes nothing').toBe(1);
+      page.hub.announce('/1', { gain: 7 });
+      await settle();
+      await clickOn(button(notices()[0], 'Revert'));
+      await settle();
+      expect(page.hub.calls.slice(1)).toEqual([{ name: 'gain', value: '5', routes: ['/0'] }]);
+      expect(noticeText()).toContain('Put gain back to 5');
+      expect(noticeText()).toContain('test (/1) changed since; left at 7');
+      expect(notices().some((t) => button(t, 'Revert'))).toBe(false);
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('keeps Ctrl+Z from an edit made before it while Revert is offered: Ctrl+Z says to use Revert and marks it, and once Revert has gone, takes the edit back', async () => {
+    const page = await mountPage([['sine.sine'], []], 'columns', 0, [], RPCS, { routes: ROUTES });
+    try {
+      page.history.group('Resize', () => page.ws.setRatio('', 0.3));
+      flushSync();
+      const resized = page.ws.layout;
+      await writeRow('gain', '10');
+      expect(button(notices()[0], 'Revert')).toBeTruthy();
+      document.activeElement?.blur();
+      await pressKey('Control+z');
+      await settle();
+      expect(page.ws.layout, 'nothing undone').toBe(resized);
+      expect(page.history.undoLabel).toBe('Resize');
+      expect(page.hub.calls.length, 'nothing written').toBe(1);
+      // The write's notice says so, and marks its Revert, which nothing covers.
+      const notice = notices().find((t) => button(t, 'Revert'));
+      expect(notice.textContent).toContain(USE_REVERT);
+      expect(button(notice, 'Revert').classList.contains('pointed'), 'Revert marked').toBe(true);
+      const revert = button(notice, 'Revert');
+      expect(revert.contains(document.elementFromPoint(...centre(revert))), 'Revert is what the pointer hits').toBe(true);
+      // Revert goes after REVERT_MS: Ctrl+Z takes the edit back.
+      await wait(REVERT_MS + 100);
+      await settle();
+      expect(notices().some((t) => button(t, 'Revert')), 'Revert gone').toBe(false);
+      await pressKey('Control+z');
+      await settle();
+      expect(page.ws.layout, 'the resize undone').not.toBe(resized);
+      expect(page.history.undoLabel).toBe(null);
+      expect(noticeText()).toContain('Undo: Resize');
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('loses its Revert when a device it wrote reconnects, and says so', async () => {
+    const page = await mountPage([['sine.sine']], 'columns', 0, [], RPCS, { routes: ROUTES });
+    try {
+      await writeRow('gain', '10');
+      expect(button(notices()[0], 'Revert')).toBeTruthy();
+      page.hub.presence('/0', 'lost');
+      page.hub.presence('/0', 'alive');
+      await settle();
+      expect(notices().some((t) => button(t, 'Revert'))).toBe(false);
+      expect(noticeText()).toContain('Revert is off: test (/0) reconnected');
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('gives way to the write started after it when its Revert answers late', async () => {
+    const page = await mountPage([['sine.sine']], 'columns', 0, [], RPCS, { routes: ROUTES });
+    try {
+      await writeRow('gain', '10');
+      page.hub.slow = true;
+      await clickOn(button(notices()[0], 'Revert'));
+      await settle();
+      await writeRow('gain', '7');
+      expect(page.hub.calls.slice(1).map((c) => c.value)).toEqual(['5', '7']);
+      // The Revert answers: its notice does not take the place of the write started after it, and no Revert shows.
+      page.hub.release();
+      await settle();
+      expect(noticeText()).not.toContain('Put gain back');
+      expect(notices().some((t) => button(t, 'Revert'))).toBe(false);
+      page.hub.release();
+      await settle();
+      // The write of 7 started while the Revert was out, so the value before it was not known.
+      expect(noticeText()).toContain('Set gain to 7 · 2 devices');
+      expect(noticeText()).toContain('No Revert: old value unknown');
+      expect(noticeText()).not.toContain('was');
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('names the device that refused, and why, first, and says nothing was sent', async () => {
+    const page = await mountPage([['sine.sine']], 'columns', 0, [], RPCS, { routes: ROUTES });
+    try {
+      page.hub.answer = (name, value, route) => (route === '/1' ? { state: 'refused', error: 'it has no such RPC' } : { state: 'ok', value: +value });
+      await writeRow('gain', '10');
+      expect(noticeText()).toContain('Could not set gain');
+      expect(noticeText()).toContain('test (/1) refused: it has no such RPC');
+      expect(noticeText()).toContain('Nothing was sent to the other device');
+      expect(noticeText()).not.toMatch(/skipped|Not sent/);
+      expect(notices().some((t) => button(t, 'Revert'))).toBe(false);
+      // A device that did not answer may have taken the value: it is named, and has no Revert.
+      page.hub.answer = (name, value, route) => (route === '/1' ? { state: 'unknown', error: 'timed out' } : { state: 'ok', value: +value });
+      await writeRow('gain', '11');
+      expect(noticeText()).toContain('Set gain to 11 · 1 of 2 devices');
+      expect(noticeText()).toContain('test (/1) did not answer: timed out');
+      expect(button(notices()[0], 'Revert')).toBeTruthy();
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
+describe('an action', () => {
+  it('runs at once and reports with a notice, with no Revert', async () => {
+    const page = await mountPage([['sine.sine']], 'columns', 0, [], RPCS, { routes: ROUTES });
+    try {
+      await clickOn(button(document.querySelector('.action-grid'), 'save'));
+      await settle();
+      expect(page.hub.calls).toEqual([{ name: 'save', value: '', routes: ROUTES }]);
+      expect(noticeText()).toContain('Ran save · 2 devices');
+      expect(notices().some((t) => button(t, 'Revert'))).toBe(false);
+    } finally {
+      page.dispose();
+    }
+  });
+});
+
+describe('Ctrl+Z after what cannot be put back', () => {
+  /** Ctrl+Z, pressed on no element, after `act` was done to a page whose last edit is a resize: whether the resize was taken back, held while `act`'s notice shows and taken back once it has gone, and what the notices said. */
+  async function undoAfter(act, rpcs, name) {
+    const page = await mountPage([['sine.sine'], []], 'columns', 0, [], rpcs, { routes: ROUTES });
+    try {
+      page.history.group('Resize', () => page.ws.setRatio('', 0.3));
+      flushSync();
+      const resized = page.ws.layout;
+      await act();
+      const calls = page.hub.calls.length;
+      document.activeElement?.blur();
+      await pressKey('Control+z');
+      await settle();
+      await shot(name);
+      const held = { layout: page.ws.layout === resized, undo: page.history.undoLabel, calls: page.hub.calls.length - calls, said: noticeText() };
+      await wait(NOTICE_MS + 100);
+      await settle();
+      await pressKey('Control+z');
+      await settle();
+      return { held, after: { undone: page.ws.layout !== resized, said: noticeText() } };
+    } finally {
+      page.dispose();
+    }
+  }
+
+  it('takes nothing back after an action, and says an action cannot be undone; once its notice has gone, takes the edit back', async () => {
+    const { held, after } = await undoAfter(async () => {
+      await clickOn(button(document.querySelector('.action-grid'), 'save'));
+      await settle();
+    }, RPCS, 'undo-held-action');
+    expect([held.layout, held.undo, held.calls], 'nothing undone, nothing called').toEqual([true, 'Resize', 0]);
+    expect(held.said).toContain(UNDO_ACTION);
+    expect(after.undone).toBe(true);
+    expect(after.said).toContain('Undo: Resize');
+  });
+
+  it('holds after a write and then an action: says an action cannot be undone, then, once that notice has gone, to use Revert while it is offered', async () => {
+    const page = await mountPage([['sine.sine'], []], 'columns', 0, [], RPCS, { routes: ROUTES });
+    try {
+      page.history.group('Resize', () => page.ws.setRatio('', 0.3));
+      flushSync();
+      const resized = page.ws.layout;
+      await writeRow('gain', '10');
+      await clickOn(button(document.querySelector('.action-grid'), 'save'));
+      await settle();
+      const calls = page.hub.calls.length;
+      document.activeElement?.blur();
+      await pressKey('Control+z');
+      await settle();
+      expect(page.ws.layout, 'nothing undone after the action').toBe(resized);
+      expect(noticeText()).toContain(UNDO_ACTION);
+      await wait(NOTICE_MS + 100);
+      await settle();
+      const notice = notices().find((t) => button(t, 'Revert'));
+      expect(notice, 'Revert still offered').toBeTruthy();
+      await pressKey('Control+z');
+      await settle();
+      expect(page.ws.layout, 'nothing undone while Revert is offered').toBe(resized);
+      expect(page.history.undoLabel).toBe('Resize');
+      expect(notice.textContent).toContain(USE_REVERT);
+      expect(button(notice, 'Revert').classList.contains('pointed'), 'Revert marked').toBe(true);
+      expect(page.hub.calls.length, 'nothing called').toBe(calls);
+    } finally {
+      page.dispose();
+    }
+  });
+
+  it('takes nothing back after a write with no Revert, and says the old value was not known; once its notice has gone, takes the edit back', async () => {
+    const { held, after } = await undoAfter(async () => {
+      await writeRow('mode', '3');
+      expect(noticeText()).toContain('No Revert: old value unknown');
+    }, [...RPCS, { name: 'mode', channel: 'setting', type: 'u8', announced: false }], 'undo-held-unknown');
+    expect([held.layout, held.undo, held.calls], 'nothing undone, nothing called').toEqual([true, 'Resize', 0]);
+    expect(held.said).toContain(UNDO_UNKNOWN);
+    expect(after.undone).toBe(true);
+    expect(after.said).toContain('Undo: Resize');
+  });
+});

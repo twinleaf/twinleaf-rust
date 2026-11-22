@@ -1,0 +1,1 @@
+{"type":"captures","route":"/","captures":[{"rpc":"fid.capture","label":{"name":"FID","units":"V","x_name":"Time","x_units":"s"}},{"rpc":"phase.capture","label":{"name":"Unwrapped phase","units":"rad","x_name":"Time","x_units":"s"}},{"rpc":"test.capture","label":{"name":"Test Signal","units":"V","x_name":"Time","x_units":"s"}},{"rpc":"quiet.capture","label":null}]}

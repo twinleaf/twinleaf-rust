@@ -1,0 +1,1 @@
+{"type":"memory","bytes":5120,"budget":1000000000,"seconds":9.96875,"max_age":600.0,"rate":512.0,"held":null,"oldest":{"0":0.03125},"paused":{"steady":307200.0,"need":614400.0,"keeps":600.0,"memory_binds":false}}

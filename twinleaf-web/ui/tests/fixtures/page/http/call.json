@@ -1,0 +1,1 @@
+{"method":"POST","url":"/api/call","body":{"name":"fid.amplitude","value":"0.5","routes":["/","/0"]}}
