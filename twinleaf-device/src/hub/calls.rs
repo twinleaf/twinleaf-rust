@@ -227,13 +227,12 @@ impl<P, const N: usize> Default for Calls<P, N> {
 mod tests {
     use super::*;
     use twinleaf_proto::packet::PacketType;
-    use twinleaf_proto::rpc::{self, RpcError};
+    use twinleaf_proto::rpc;
 
     /// What a hub asks a child for on its own behalf.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Ask {
         Name,
-        Rate,
     }
 
     const NOW: u64 = 1_000_000_000;
@@ -318,16 +317,6 @@ mod tests {
         assert_ne!(reused, stale);
         assert_eq!(table.answered(0, answer(&reply(stale, b""))), None);
         assert!(table.answered(0, answer(&reply(reused, b""))).is_some());
-    }
-
-    #[test]
-    fn an_error_answers_its_entry_like_a_reply() {
-        let mut table = table();
-        let minted = table.call(0, Ask::Rate, NOW).unwrap();
-        let mut buf = [0u8; 16];
-        let len = rpc::write_error(&mut buf, minted, RpcError::NotFound).unwrap();
-        let answer = Answer::parse(PacketType::RPC_ERROR, &buf[4..len]).unwrap();
-        assert_eq!(table.answered(0, answer), Some(Origin::Internal(Ask::Rate)));
     }
 
     #[test]

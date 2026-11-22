@@ -6,54 +6,10 @@
 //! progress, triggering and reading are refused as busy.
 
 use twinleaf_proto::capture::CaptureMetadata;
+pub use twinleaf_proto::capture::{Selector, Status};
 use twinleaf_proto::rpc::RpcError;
 
 use crate::rpc::{put, Reply};
-
-/// Where a capture stands, as the status selector reports it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Status {
-    /// Nothing captured yet.
-    Idle = 0,
-    /// A capture is in progress.
-    Capturing = 1,
-    /// Data is ready to read.
-    Done = 2,
-    /// The last capture failed.
-    Error = 4,
-}
-
-/// What a capture RPC argument asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Selector {
-    /// Start a capture.
-    Trigger,
-    /// The [`Status`] byte.
-    Status,
-    /// The [`CaptureMetadata`].
-    Metadata,
-    /// One block of the data.
-    Block(u16),
-}
-
-impl Selector {
-    /// The selector an argument encodes.
-    pub fn parse(arg: &[u8]) -> Result<Self, RpcError> {
-        let selector = match arg {
-            [] => return Ok(Self::Status),
-            [low, high] => i16::from_le_bytes([*low, *high]),
-            _ => return Err(RpcError::ArgsSize),
-        };
-        match selector {
-            -1 => Ok(Self::Trigger),
-            -2 => Ok(Self::Status),
-            -3 => Ok(Self::Metadata),
-            index if index >= 0 => Ok(Self::Block(index as u16)),
-            _ => Err(RpcError::Invalid),
-        }
-    }
-}
 
 /// A capture as its RPC serves it.
 #[derive(Clone, Copy, Debug)]
@@ -74,10 +30,13 @@ impl Capture<'_> {
         match selector {
             Selector::Trigger | Selector::Block(_) if busy => Err(RpcError::Busy),
             Selector::Trigger => Ok(()),
-            Selector::Status => put(out, &[self.status as u8]),
+            Selector::Status => put(out, &[self.status.code()]),
             Selector::Metadata => {
                 let mut buf = [0u8; crate::rpc::REPLY_MAX];
-                let len = self.metadata.write(&mut buf).ok_or(RpcError::NoBufs)?;
+                let len = self
+                    .metadata
+                    .write(&mut buf)
+                    .map_err(|_| RpcError::NoBufs)?;
                 put(out, &buf[..len])
             }
             Selector::Block(index) => put(out, self.block(index).ok_or(RpcError::Invalid)?),
@@ -118,29 +77,6 @@ mod tests {
                 x_units: "s",
             },
         }
-    }
-
-    #[test]
-    fn selectors_parse_from_the_argument() {
-        assert_eq!(Selector::parse(&[]), Ok(Selector::Status));
-        assert_eq!(
-            Selector::parse(&(-1i16).to_le_bytes()),
-            Ok(Selector::Trigger)
-        );
-        assert_eq!(
-            Selector::parse(&(-2i16).to_le_bytes()),
-            Ok(Selector::Status)
-        );
-        assert_eq!(
-            Selector::parse(&(-3i16).to_le_bytes()),
-            Ok(Selector::Metadata)
-        );
-        assert_eq!(Selector::parse(&5i16.to_le_bytes()), Ok(Selector::Block(5)));
-        assert_eq!(
-            Selector::parse(&(-4i16).to_le_bytes()),
-            Err(RpcError::Invalid)
-        );
-        assert_eq!(Selector::parse(&[1, 2, 3]), Err(RpcError::ArgsSize));
     }
 
     #[test]

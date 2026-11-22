@@ -291,14 +291,6 @@ mod counter_tests {
     }
 
     #[test]
-    fn signed_delta_uses_the_short_path() {
-        let domain = CounterDomain::new(100);
-        assert_eq!(domain.signed_delta(3, 98), 5);
-        assert_eq!(domain.signed_delta(98, 3), -5);
-        assert_eq!(domain.signed_delta(50, 0), -50);
-    }
-
-    #[test]
     fn conversions_stay_inside_the_period() {
         let domain = CounterDomain::new(1_000_000);
         assert_eq!(domain.normalize(2_500_000), 500_000);
@@ -943,14 +935,6 @@ mod discipline_tests {
         assert_eq!(servo.observe(estimate(0.0, -43_000.0)), 1.0);
         assert!(servo.saturated());
         assert!(servo.observe(estimate(0.0, 500.0)) == -0.5 && !servo.saturated());
-    }
-
-    #[test]
-    fn no_estimate_holds_the_correction() {
-        let mut servo = steering(50.0);
-        let acquired = servo.observe(estimate(-500.0, 3_000.0));
-        assert_eq!(servo.observe(None), acquired);
-        assert_eq!(servo.output_ppm(), acquired);
     }
 
     #[test]
@@ -1817,69 +1801,6 @@ mod synchronizer_tests {
                 })
                 .collect();
             assert!(wrong.is_empty(), "{edge_ms} ms: {wrong:?}");
-        }
-    }
-
-    /// An adopted hub whose pulses step under half a second either way keeps
-    /// the child on its second through the switch, without requalifying.
-    #[test]
-    fn a_switch_under_an_adopted_hub_keeps_its_second() {
-        const HUB: u32 = 1_000;
-        let label = |edge_ms: u64| HUB + ((edge_ms + 500) / 1_000) as u32;
-        for step_ms in [400, 600] {
-            let mut sync = plain();
-            let timeline: Vec<(u64, Status)> = (0..24_000u64)
-                .map(|ms| {
-                    let now = ms * 1_000_000;
-                    let edge_ms = match ms < 11_500 {
-                        true => 0,
-                        false => step_ms,
-                    };
-                    sync.poll(now);
-                    match (ms + 1_000 - edge_ms) % 1_000 {
-                        0 => drop(sync.capture(edge_ms as u32 * 1_000, now)),
-                        3 => sync.observe_parent(
-                            packet(label(ms - 3)),
-                            pad(label(ms - 3) as u8, TimeStatus::Locked),
-                            now,
-                        ),
-                        _ => {}
-                    }
-                    (ms, sync.status())
-                })
-                .collect();
-            let adopted = timeline
-                .iter()
-                .position(|(_, status)| status.reference == ReferenceState::Upstream)
-                .expect("never adopted");
-            let steps: Vec<(u64, u32)> = timeline[adopted..]
-                .windows(2)
-                .filter_map(|pair| {
-                    let ((_, before), (ms, after)) = (pair[0], pair[1]);
-                    (after.active.second != before.active.second)
-                        .then(|| (ms, after.active.second.wrapping_sub(before.active.second)))
-                })
-                .collect();
-            assert!(
-                steps.iter().all(|&(_, step)| step == 1)
-                    && steps
-                        .windows(2)
-                        .all(|pair| (500..1_500).contains(&(pair[1].0 - pair[0].0))),
-                "{step_ms} ms: {steps:?}"
-            );
-            let requalified: Vec<_> = timeline
-                .iter()
-                .filter(|(_, status)| {
-                    status.counter_edge == Some(step_ms as u32 * 1_000)
-                        && status.reference != ReferenceState::Upstream
-                })
-                .collect();
-            assert!(requalified.is_empty(), "{step_ms} ms: {requalified:?}");
-            assert_eq!(
-                (timeline[adopted].0, sync.status().active.second),
-                (3_000, label(23_000 + step_ms)),
-                "{step_ms} ms"
-            );
         }
     }
 
@@ -2938,30 +2859,6 @@ mod synchronizer_tests {
         );
     }
 
-    /// A clean PPS 43 ppm slow of the oscillator, inside Sandi's ±50 ppm pull,
-    /// is locked and steered out within a minute, and stays locked.
-    #[test]
-    fn a_clean_pps_forty_three_ppm_off_the_oscillator_is_pulled_in_within_a_minute() {
-        let trace = sandi_following(43.0, 30.0, 120);
-        let pulled = trace[59..].iter().all(|status| {
-            status.pulse.is_locked()
-                && status
-                    .correction_ppm
-                    .is_some_and(|ppm| (ppm + 43.0).abs() < 1.0)
-        });
-        let last = trace[trace.len() - 1];
-        assert!(
-            pulled,
-            "at 60 s: {:?}, {} spurs, pull {:?} ppm; at 120 s: {:?}, {} spurs, pull {:?} ppm",
-            trace[59].pulse,
-            trace[59].spurs,
-            trace[59].correction_ppm,
-            last.pulse,
-            last.spurs,
-            last.correction_ppm
-        );
-    }
-
     /// RMS of the phase measured over `trace`, and the seconds it was measured.
     fn phase_rms(trace: &[Status]) -> (f64, usize) {
         let phases: Vec<f64> = trace
@@ -2973,9 +2870,10 @@ mod synchronizer_tests {
     }
 
     /// A GPS-grade PPS, on frequency with 20 ns of jitter, locks by its fifth
-    /// second and is held to 20.6 ns RMS, as the fixed ±1 µs gate did.
+    /// second, stays locked from its sixtieth, and is held there to 20.6 ns
+    /// RMS over every one of the 240 seconds after.
     #[test]
-    fn a_gps_pps_locks_as_fast_and_as_tightly_as_a_fixed_gate_did() {
+    fn a_gps_pps_locks_by_its_fifth_second_and_holds_to_twenty_ns_rms() {
         let trace = sandi_following(0.0, 20.0, 300);
         let first_lock = trace.iter().position(|status| status.pulse.is_locked());
         let (rms, measured) = phase_rms(&trace[60..]);

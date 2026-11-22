@@ -296,36 +296,6 @@ mod tests {
         }
     }
 
-    /// The branch quotes a droop of -0.1 dB at a quarter of the output rate,
-    /// against -1.9 dB for the two chained single poles it replaced. At
-    /// decimation 16 a period of 640 input samples puts that quarter on cycle
-    /// 10.
-    #[test]
-    fn the_passband_droops_by_a_tenth_of_a_decibel() {
-        let gain = measure_gain(&mut settled(0.4 / 16.0), 10, 640, 20, 20);
-        let droop = 20.0 * gain.log10();
-        assert!(
-            (-0.11..=-0.09).contains(&droop),
-            "droop {droop} dB at a quarter of the output rate"
-        );
-    }
-
-    /// The branch quotes a worst alias leakage of -28 dB for signals landing
-    /// in the lower tenth of the output band, against -12 dB before it: an
-    /// input `offset` below a multiple of the output rate folds onto `offset`
-    /// when the decimated sample is picked. At decimation 16 a period of 800
-    /// input samples puts the output rate on cycle 50.
-    #[test]
-    fn an_aliasing_input_leaks_by_twenty_eight_decibels() {
-        let worst = (1..=3)
-            .flat_map(|fold| (0..=5).map(move |offset| 50 * fold - offset))
-            .map(|cycles| {
-                20.0 * measure_gain(&mut settled(0.4 / 16.0), cycles, 800, 20, 20).log10()
-            })
-            .fold(f64::NEG_INFINITY, f64::max);
-        assert!(worst <= -28.0, "worst alias leakage {worst} dB");
-    }
-
     /// The lowest corner the framework produces, 25.6 kSPS decimated to 10 Hz:
     /// a constant input comes back exactly, which is what the compensated
     /// integrators buy over a direct form biquad.

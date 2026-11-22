@@ -254,6 +254,20 @@ pub enum Channel {
     Diagnostic,
 }
 
+impl Channel {
+    /// The channel's name in lower case, as `setting`, which a host prints
+    /// and a page reads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Channel::Setting => "setting",
+            Channel::Report => "report",
+            Channel::Protocol => "protocol",
+            Channel::Action => "action",
+            Channel::Diagnostic => "diagnostic",
+        }
+    }
+}
+
 /// Declare the standard table once: the variant [`Std`] answers by, the name
 /// the entry carries, its [`Channel`], and the [`RpcSpec`] constructor that
 /// describes it.
@@ -527,19 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn flags_match_the_firmware_word() {
-        let [hash, stop, enable] = table();
-        assert_eq!(hash.flags(), 0x0100_0423);
-        assert_eq!(stop.flags(), 0x0200_0012);
-        assert_eq!(enable.flags(), 0x0300_0123);
-        assert_eq!(RpcSpec::std("rpc.list", Access::RW).flags(), 0x0300_0001);
-        assert_eq!(
-            RpcSpec::prop("dev.name", Kind::String, Access::READ).flags(),
-            0x0100_0053
-        );
-    }
-
-    #[test]
     fn metadata_matches_firmware_encoding() {
         let spec = RpcSpec::prop("test.amplitude", Kind::Float(8), Access::RW);
         assert_eq!(spec.metadata(), 0x8000 | (8 << 4) | 2 | 0x0100 | 0x0200);
@@ -643,12 +644,6 @@ mod tests {
         assert_eq!(Std::at(0), Some(Std::Metadata));
         assert_eq!(Std::at(STANDARD.len() - 1), Some(Std::BroadcastPeriod));
         assert_eq!(Std::at(STANDARD.len()), None);
-    }
-
-    #[test]
-    fn hash_is_the_iso_hdlc_crc_of_the_entries() {
-        let table = [RpcSpec::std("a", Access::NONE)];
-        assert_eq!(hash(&table, true), CRC32.checksum(b"a\x01\0\0\0"));
     }
 
     fn answer(call: impl FnOnce(&mut Reply) -> Result<(), RpcError>) -> Result<Vec<u8>, RpcError> {

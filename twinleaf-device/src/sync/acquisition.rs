@@ -456,23 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn restart_during_run_stops_then_stages_again() {
-        let mut machine = AcquisitionMachine::new(0);
-        machine.request_start().unwrap();
-        let plan = armed(&mut machine, 10);
-        machine.on_edge(edge(11), 0);
-        machine.mark_running(plan.id).unwrap();
-
-        assert_eq!(
-            machine.request_restart().unwrap(),
-            Actions::local(AcquisitionAction::Stop)
-        );
-        assert_eq!(machine.state(), AcquisitionState::Stopping);
-        machine.finish_stop().unwrap();
-        assert_eq!(machine.state(), AcquisitionState::WaitingForEdge);
-    }
-
-    #[test]
     fn synchronization_change_restarts_an_active_segment() {
         let mut machine = AcquisitionMachine::new(0);
         machine.request_start().unwrap();

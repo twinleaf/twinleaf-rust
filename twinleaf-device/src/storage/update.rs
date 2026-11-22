@@ -15,17 +15,9 @@
 //! belonged: the next is refused, and the host resumes from the cursor.
 
 use twinleaf_proto::rpc::RpcError;
+use twinleaf_proto::update::{PackageHeader, FLAG_DEVELOPMENT, PACKAGE_OFFSET_SIZE};
+pub use twinleaf_proto::update::{FORMAT_VERSION, HEADER_SIZE};
 use twinleaf_proto::{BoardId, FirmwareMagic, HwRev};
-
-/// The package header: magic, layout, board, revision, flags, image length,
-/// and the signature over the image.
-pub const HEADER_SIZE: usize = 288;
-
-/// The header layout this crate reads.
-pub const FORMAT_VERSION: u16 = 1;
-
-/// The header flag a package signed with a development key carries.
-const FLAG_DEVELOPMENT: u16 = 1;
 
 /// How long an upload may sit idle before the next chunk starts a new one.
 ///
@@ -62,29 +54,32 @@ pub struct Manifest {
 impl Manifest {
     /// Read a package header against what this board takes.
     fn parse(package: &Package, data: &[u8]) -> Result<Self, RpcError> {
-        let word = |at: usize| u16::from_le_bytes([data[at], data[at + 1]]);
-        if data.len() != HEADER_SIZE || &data[..8] != package.magic.as_bytes() {
+        let Ok(data) = <&[u8; HEADER_SIZE]>::try_from(data) else {
+            return Err(RpcError::Invalid);
+        };
+        let header = PackageHeader::parse(data);
+        if header.magic != package.magic.as_bytes() {
             return Err(RpcError::Invalid);
         }
-        if word(8) != FORMAT_VERSION
-            || word(10) as usize != HEADER_SIZE
-            || &data[12..20] != package.board_id.as_bytes()
-            || word(20) != package.hw_rev.value()
+        if header.format != FORMAT_VERSION
+            || header.header_size as usize != HEADER_SIZE
+            || header.board_id != package.board_id.as_bytes()
+            || header.hw_rev != package.hw_rev.value()
         {
             return Err(RpcError::Invalid);
         }
-        let flags = word(22);
+        let flags = header.flags;
         if (flags & FLAG_DEVELOPMENT != 0) != package.development || flags & !FLAG_DEVELOPMENT != 0
         {
             return Err(RpcError::Invalid);
         }
-        let image_len = u32::from_le_bytes(data[24..28].try_into().unwrap());
+        let image_len = header.image_len;
         if !(8..=package.image_max as u32).contains(&image_len) {
             return Err(RpcError::Range);
         }
         Ok(Self {
             image_len,
-            signature: data[32..96].try_into().unwrap(),
+            signature: *header.signature,
         })
     }
 }
@@ -195,7 +190,7 @@ impl Upload {
                 Ok(Take::Header { discarded: false })
             }
             State::Payload(received) => {
-                let Some((offset, bytes)) = data.split_first_chunk::<4>() else {
+                let Some((offset, bytes)) = data.split_first_chunk::<PACKAGE_OFFSET_SIZE>() else {
                     return Err(RpcError::ArgsSize);
                 };
                 if u32::from_le_bytes(*offset) != received {
@@ -332,24 +327,38 @@ mod tests {
         }
     }
 
+    /// The fields of a package header the running firmware should take.
+    fn fields(package: &Package) -> PackageHeader<'_> {
+        PackageHeader {
+            magic: package.magic.as_bytes(),
+            format: FORMAT_VERSION,
+            header_size: HEADER_SIZE as u16,
+            board_id: package.board_id.as_bytes(),
+            hw_rev: package.hw_rev.value(),
+            flags: FLAG_DEVELOPMENT,
+            image_len: IMAGE_LEN,
+            signature: &SIGNATURE,
+        }
+    }
+
+    /// The bytes of a header with `fields`.
+    fn written(fields: PackageHeader<'_>) -> [u8; HEADER_SIZE] {
+        let mut data = [0; HEADER_SIZE];
+        fields.write(&mut data);
+        data
+    }
+
     /// A package header the running firmware should take.
     fn header(package: &Package) -> [u8; HEADER_SIZE] {
-        let mut data = [0; HEADER_SIZE];
-        data[..8].copy_from_slice(package.magic.as_bytes());
-        data[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        data[10..12].copy_from_slice(&(HEADER_SIZE as u16).to_le_bytes());
-        data[12..20].copy_from_slice(package.board_id.as_bytes());
-        data[20..22].copy_from_slice(&package.hw_rev.to_le_bytes());
-        data[22..24].copy_from_slice(&FLAG_DEVELOPMENT.to_le_bytes());
-        data[24..28].copy_from_slice(&IMAGE_LEN.to_le_bytes());
-        data[32..96].copy_from_slice(&SIGNATURE);
-        data
+        written(fields(package))
     }
 
     /// A header for an image of `len` bytes, and the image itself.
     fn small(package: &Package, len: u32) -> ([u8; HEADER_SIZE], Vec<u8>) {
-        let mut header = header(package);
-        header[24..28].copy_from_slice(&len.to_le_bytes());
+        let header = written(PackageHeader {
+            image_len: len,
+            ..fields(package)
+        });
         (header, (0..len).map(|byte| byte as u8).collect())
     }
 
@@ -595,29 +604,38 @@ mod tests {
     fn rejects_a_package_for_another_board_or_revision() {
         let package = package();
 
-        let mut wrong_magic = header(&package);
-        wrong_magic[..8].copy_from_slice(b"ETHANFW\0");
+        let wrong_magic = written(PackageHeader {
+            magic: b"ETHANFW\0",
+            ..fields(&package)
+        });
         assert_eq!(
             Manifest::parse(&package, &wrong_magic),
             Err(RpcError::Invalid)
         );
 
-        let mut wrong_board = header(&package);
-        wrong_board[12..20].copy_from_slice(BoardId::from_ascii("ETHAN").as_bytes());
+        let other_board = BoardId::from_ascii("ETHAN");
+        let wrong_board = written(PackageHeader {
+            board_id: other_board.as_bytes(),
+            ..fields(&package)
+        });
         assert_eq!(
             Manifest::parse(&package, &wrong_board),
             Err(RpcError::Invalid)
         );
 
-        let mut wrong_revision = header(&package);
-        wrong_revision[20..22].copy_from_slice(&HwRev::new(7).to_le_bytes());
+        let wrong_revision = written(PackageHeader {
+            hw_rev: HwRev::new(7).value(),
+            ..fields(&package)
+        });
         assert_eq!(
             Manifest::parse(&package, &wrong_revision),
             Err(RpcError::Invalid)
         );
 
-        let mut wrong_version = header(&package);
-        wrong_version[8..10].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+        let wrong_version = written(PackageHeader {
+            format: FORMAT_VERSION + 1,
+            ..fields(&package)
+        });
         assert_eq!(
             Manifest::parse(&package, &wrong_version),
             Err(RpcError::Invalid)
@@ -629,8 +647,10 @@ mod tests {
     #[test]
     fn development_and_release_packages_do_not_cross_over() {
         let development = package();
-        let mut release_package = header(&development);
-        release_package[22..24].copy_from_slice(&0u16.to_le_bytes());
+        let release_package = written(PackageHeader {
+            flags: 0,
+            ..fields(&development)
+        });
         assert_eq!(
             Manifest::parse(&development, &release_package),
             Err(RpcError::Invalid)
@@ -650,8 +670,10 @@ mod tests {
     #[test]
     fn rejects_unknown_flag_bits() {
         let package = package();
-        let mut data = header(&package);
-        data[22..24].copy_from_slice(&(FLAG_DEVELOPMENT | 0x8000).to_le_bytes());
+        let data = written(PackageHeader {
+            flags: FLAG_DEVELOPMENT | 0x8000,
+            ..fields(&package)
+        });
         assert_eq!(Manifest::parse(&package, &data), Err(RpcError::Invalid));
     }
 
@@ -659,8 +681,10 @@ mod tests {
     fn rejects_an_image_that_does_not_fit_the_running_partition() {
         let package = package();
         let with_len = |len: u32| {
-            let mut data = header(&package);
-            data[24..28].copy_from_slice(&len.to_le_bytes());
+            let data = written(PackageHeader {
+                image_len: len,
+                ..fields(&package)
+            });
             Manifest::parse(&package, &data)
         };
         assert_eq!(with_len(0), Err(RpcError::Range));

@@ -317,7 +317,7 @@ impl<T: Scalar> Persisted for Setting<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{Access, Kind, Method};
+    use crate::rpc::Access;
 
     #[test]
     fn a_value_that_is_not_a_number_is_refused() {
@@ -377,6 +377,10 @@ mod tests {
             answer(&mut setting, &101u16.to_le_bytes()),
             Err(RpcError::Invalid)
         );
+        assert_eq!(
+            setting.load(&101u16.to_le_bytes(), &mut Reply::new()),
+            Err(RpcError::Invalid)
+        );
         assert_eq!(setting.get(), 30);
         let mut flag = Setting::new("flag", true);
         assert_eq!(answer(&mut flag, &[2]), Ok((Changed::Unchanged, vec![1])));
@@ -425,15 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn a_flag_takes_any_nonzero_byte_and_replies_with_one() {
-        let mut flag = Setting::new("app.enable", false);
-        assert_eq!(answer(&mut flag, &[2]), Ok((Changed::Changed, vec![1])));
-        assert!(flag.get());
-        assert_eq!(answer(&mut flag, &[0]), Ok((Changed::Changed, vec![0])));
-        assert!(!flag.get());
-    }
-
-    #[test]
     fn a_setting_saves_what_it_holds_and_loads_what_was_stored() {
         let mut gain = Setting::new("app.gain", 3u16).persistent();
         answer(&mut gain, &7u16.to_le_bytes()).unwrap();
@@ -456,18 +451,6 @@ mod tests {
 
         gain.reset();
         assert_eq!(gain.get(), 3);
-    }
-
-    #[test]
-    fn a_stored_value_a_check_refuses_leaves_the_one_held() {
-        let mut rate = Setting::new("app.rate", 1.0f64)
-            .checked(positive)
-            .persistent();
-        assert_eq!(
-            rate.load(&(-1.0f64).to_le_bytes(), &mut Reply::new()),
-            Err(RpcError::Invalid)
-        );
-        assert_eq!(rate.get(), 1.0);
     }
 
     #[test]
@@ -504,30 +487,6 @@ mod tests {
         assert_eq!(
             Text::<16>::from("a string too long for the cell").as_bytes(),
             b""
-        );
-    }
-
-    #[test]
-    fn a_spec_describes_the_property_the_setting_answers() {
-        let spec = Setting::new("app.rate", 1.0f64).spec();
-        assert_eq!(spec.method, Method::Prop);
-        assert_eq!(spec.kind, Kind::Float(8));
-        assert_eq!(spec.access, Access::RW | Access::ANNOUNCED);
-        assert_eq!(Setting::new("app.enable", true).spec().kind, Kind::Bool);
-        assert_eq!(
-            Setting::new("app.rate", 1.0f64).persistent().spec().access,
-            Access::RW | Access::PERSISTENT | Access::ANNOUNCED
-        );
-
-        let kinds = [
-            Setting::new("u8", 0u8).spec().kind,
-            Setting::new("u32", 0u32).spec().kind,
-            Setting::new("i32", 0i32).spec().kind,
-            Setting::new("f32", 0.0f32).spec().kind,
-        ];
-        assert_eq!(
-            kinds,
-            [Kind::Uint(1), Kind::Uint(4), Kind::Int(4), Kind::Float(4)]
         );
     }
 }

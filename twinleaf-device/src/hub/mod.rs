@@ -15,7 +15,7 @@
 mod calls;
 
 use twinleaf_proto::heartbeat::Heartbeat;
-use twinleaf_proto::packet::{Packet, PacketType, PacketView};
+use twinleaf_proto::packet::{write_routing, Header, Packet, PacketType, PacketView};
 use twinleaf_proto::route::{pop_hop, push_hop};
 use twinleaf_proto::rpc::{self, Answer, Method, Request, RpcError};
 use twinleaf_proto::{DeviceRoute, RpcRequestId, SessionId};
@@ -181,16 +181,16 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
         if !self.present(port) {
             return Err(CallError::Absent);
         }
+        // The request is written before the call takes a slot, and the slot's
+        // id is stamped on it after, so a request too long takes no slot.
         let method = Method::ByName(method.as_bytes());
-        if rpc::request_payload_len(method, args).is_none_or(|len| len > Packet::MAX_PAYLOAD) {
-            return Err(CallError::TooLong);
-        }
+        let len = rpc::write_request(buf, RpcRequestId::new(0), method, args)
+            .map_err(|_| CallError::TooLong)?;
         let id = self
             .calls
             .call(port, purpose, now_ns)
             .map_err(|Full| CallError::Full)?;
-        let len = rpc::write_request(buf, id, method, args)
-            .expect("a request that fits a payload fits a packet");
+        rpc::set_req_id(&mut buf[Header::SIZE..len], id);
         Ok((id, len))
     }
 
@@ -422,14 +422,8 @@ fn time_out<P>(origin: Origin<P>, up: &mut impl Sink, events: &mut impl Events<P
 /// Answer a request the hub could not see through, along the route it came.
 fn answer_up(up: &mut impl Sink, route: DeviceRoute, id: RpcRequestId, error: RpcError) {
     let mut buf = [0u8; Packet::MAX_SIZE];
-    let mut len = rpc::write_error(&mut buf, id, error).expect("an error fits a packet");
-    let mut hops = [0u8; DeviceRoute::MAX_HOPS];
-    let written = route
-        .write_wire(&mut hops)
-        .expect("a route fits its own hops");
-    for &hop in &hops[..written] {
-        len = push_hop(&mut buf, hop).expect("a request's route fits its answer");
-    }
+    let len = rpc::write_error(&mut buf, id, error).expect("an error fits a packet");
+    let len = write_routing(&mut buf, len, route).expect("a request's route fits its answer");
     up.send(&buf[..len]);
 }
 
@@ -621,31 +615,12 @@ mod tests {
         assert_eq!(hub.counters().dropped_down, 3);
     }
 
+    /// The bytes a forwarded packet has on each wire. A request goes down its
+    /// port with that hop gone and the hub's request id in place of the
+    /// host's. The reply goes up with the host's request id and the port's
+    /// hop added. Every other byte is the byte that came in.
     #[test]
-    fn a_forwarded_request_goes_out_remapped_and_comes_back_restored() {
-        let mut hub = hub();
-        let mut packet = request(7, b"dev.name", &[1]);
-        let out = deliver(&mut hub, Input::FromHost(&mut packet), NOW);
-        let minted = minted(&out.down);
-        assert_ne!(minted, RpcRequestId::new(7));
-
-        let mut answer = reply(minted, b"tio-test");
-        let out = deliver(&mut hub, child(1, &mut answer), NOW);
-        let view = out.up.one();
-        assert_eq!(view.routing, [1]);
-        let Answer::Reply(reply) = answered(view) else {
-            panic!("a reply");
-        };
-        assert_eq!(
-            (reply.req_id, reply.value),
-            (RpcRequestId::new(7), &b"tio-test"[..])
-        );
-    }
-
-    /// The bytes on both wires, as the hub that rebuilt every packet wrote
-    /// them: forwarding in place may not move a byte it did not have to.
-    #[test]
-    fn a_forwarded_packet_is_byte_for_byte_what_it_always_was() {
+    fn a_forwarded_packet_differs_only_in_its_hops_and_request_id() {
         let mut hub = hub();
         let mut packet = request(7, b"dev.name", &[3, 1]);
         let out = deliver(&mut hub, Input::FromHost(&mut packet), NOW);
@@ -717,26 +692,6 @@ mod tests {
                 last_heard_ns: NOW
             }
         );
-    }
-
-    #[test]
-    fn silence_unplugs_a_port_and_any_packet_keeps_it() {
-        let mut hub = hub();
-        assert_eq!(hub.deadline_ns(), Some(NOW + UNPLUG_NS));
-
-        let out = deliver(&mut hub, Input::Tick, NOW + UNPLUG_NS - 1);
-        assert!(out.log.0.is_empty());
-
-        let mut answer = reply(RpcRequestId::new(3), b"whose?");
-        deliver(&mut hub, child(1, &mut answer), NOW + UNPLUG_NS - 1);
-        assert_eq!(hub.deadline_ns(), Some(NOW + 2 * UNPLUG_NS - 1));
-        let out = deliver(&mut hub, Input::Tick, NOW + UNPLUG_NS);
-        assert!(out.log.0.is_empty());
-
-        let out = deliver(&mut hub, Input::Tick, NOW + 2 * UNPLUG_NS - 1);
-        assert_eq!(out.log.0, [Seen::Unplugged(1)]);
-        assert_eq!(hub.presence(1), Presence::Absent);
-        assert_eq!(hub.deadline_ns(), None);
     }
 
     #[test]

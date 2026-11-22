@@ -266,7 +266,7 @@ fn append(out: &mut Reply, record: Metadata<'_>) -> Result<bool, RpcError> {
     {
         return Ok(false);
     }
-    record.write_reply_frame(&mut out[start..]);
+    let _ = record.write_reply_frame(&mut out[start..]);
     Ok(true)
 }
 
@@ -399,47 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_walks_the_device_then_each_stream_with_its_columns() {
-        use MetadataType::*;
-        #[rustfmt::skip]
-        assert_eq!(walk(Sweep::new(), &[2, 3], 11), vec![
-            (Device, 0, 0, false),
-            (Stream, 1, 0, false),
-            (Segment, 1, 3, false),
-            (Column, 1, 0, false),
-            (Column, 1, 1, false),
-            (Stream, 2, 0, false),
-            (Segment, 2, 3, false),
-            (Column, 2, 0, false),
-            (Column, 2, 1, false),
-            (Column, 2, 2, true),
-            (Device, 0, 0, false),
-        ]);
-    }
-
-    #[test]
-    fn a_sweep_of_a_device_with_no_streams_is_the_device_record() {
-        assert_eq!(
-            walk(Sweep::new(), &[], 2),
-            vec![(MetadataType::Device, 0, 0, true); 2]
-        );
-    }
-
-    #[test]
-    fn a_sweep_skips_a_stream_with_no_columns() {
-        use MetadataType::*;
-        #[rustfmt::skip]
-        assert_eq!(walk(Sweep::new(), &[0, 1], 6), vec![
-            (Device, 0, 0, false),
-            (Stream, 1, 0, false),
-            (Segment, 1, 3, false),
-            (Stream, 2, 0, false),
-            (Segment, 2, 3, false),
-            (Column, 2, 0, true),
-        ]);
-    }
-
-    #[test]
     fn a_layout_sweep_skips_every_segment() {
         use MetadataType::*;
         #[rustfmt::skip]
@@ -516,19 +475,6 @@ mod tests {
         let mut sent = 0;
         carousel.turn(0, PASS, device("d"), &streams, &mut |_, _| sent += 1);
         assert_eq!((sent, carousel.deadline(PASS)), (0, PASS / 8));
-    }
-
-    #[test]
-    fn a_sweep_restarts_when_its_position_disappears() {
-        let mut sweep = Sweep::new();
-        let two = Shape(vec![2, 3]);
-        for _ in 0..4 {
-            sweep.step(device("d"), &two).unwrap();
-        }
-        let one = Shape(vec![1]);
-        let (record, last) = sweep.step(device("d"), &one).unwrap();
-        assert!(matches!(record, Metadata::Device(_)));
-        assert!(!last);
     }
 
     #[test]

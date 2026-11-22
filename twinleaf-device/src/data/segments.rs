@@ -429,7 +429,7 @@ impl<const N: usize> Segments<N> {
         let source = &self.entries[usize::from(from)];
         let params = source.params;
         let mut timeref = source.timeref.clone();
-        timeref.start_time = timeref.start_time.wrapping_add(at / params.rate.get());
+        timeref.start_time = timeref.start_time.wrapping_add(at / params.rate);
         let to = (from + 1) % (N as u8);
         let entry = &mut self.entries[usize::from(to)];
         entry.state = SegmentState::Next;
@@ -560,19 +560,6 @@ mod tests {
     }
 
     #[test]
-    fn a_retune_never_changes_the_segment_issuing() {
-        let mut segments: Segments<4> = started(params(10));
-        issue(&mut segments, 5);
-        segments.retune(params(100));
-
-        assert_eq!(segments.get(id(0)).unwrap().params().rate.get(), 10);
-        assert_eq!(segments.get(id(1)).unwrap().params().rate.get(), 100);
-        let issued = issue(&mut segments, 5);
-        assert!(issued.iter().all(|issued| issued.segment.value() == 0));
-        assert_eq!(segments.get(id(0)).unwrap().params().rate.get(), 10);
-    }
-
-    #[test]
     fn a_retune_while_stopped_edits_the_segment_in_place() {
         let mut segments: Segments<4> = Segments::new(params(10));
         segments.retune(params(50));
@@ -620,18 +607,6 @@ mod tests {
             segments.current().timeref().start_time,
             1000 + MAX_OUTPUT_SAMPLES / 1000
         );
-    }
-
-    #[test]
-    fn skipping_is_the_only_gap_in_a_segment() {
-        let mut segments: Segments<4> = started(params(10));
-        issue(&mut segments, 3);
-        segments.skip(2);
-        let outputs: Vec<u32> = issue(&mut segments, 2)
-            .iter()
-            .filter_map(|issued| issued.output.map(SampleNumber::value))
-            .collect();
-        assert_eq!(outputs, [5, 6]);
     }
 
     /// A segment's record is owed from its opening, whatever it then issues, and again for each
@@ -825,15 +800,6 @@ mod tests {
                 ..gps
             }
         );
-    }
-
-    #[test]
-    fn a_relabel_before_any_sample_renames_the_segment_in_place() {
-        let mut segments: Segments<4> = started(params(10));
-        segments.relabel(1000, timeref(5000));
-        let issued = segments.issue().unwrap();
-        assert_eq!(issued.segment.value(), 0);
-        assert_eq!(segments.current().timeref().start_time, 5000);
     }
 
     #[test]

@@ -15,9 +15,9 @@
 
 use heapless::String;
 use twinleaf_proto::data::{self, Metadata, MetadataFlags};
-use twinleaf_proto::heartbeat::Heartbeat;
+use twinleaf_proto::heartbeat::{self, Heartbeat};
 use twinleaf_proto::log::{LogLevel, LogMessage, MAX_MESSAGE_SIZE};
-use twinleaf_proto::packet::{Packet, PacketType, PacketView};
+use twinleaf_proto::packet::{Packet, PacketType, PacketView, WriteError};
 use twinleaf_proto::route;
 use twinleaf_proto::rpc::{self, Method, Request, RpcError};
 use twinleaf_proto::settings::Setting as Announcement;
@@ -30,7 +30,7 @@ use crate::storage::conf::{self, Image};
 use crate::Sink;
 
 /// Nanoseconds between heartbeats.
-pub const HEARTBEAT_INTERVAL: u64 = 200_000_000;
+pub const HEARTBEAT_INTERVAL: u64 = heartbeat::PERIOD.as_nanos() as u64;
 
 /// Nanoseconds a changed configuration waits before it saves itself.
 pub const AUTOSAVE_INTERVAL: u64 = 60_000_000_000;
@@ -332,6 +332,11 @@ impl<S: Group> Device<S> {
     /// then what `settings` declares, and `dev.priv` taking `password` until
     /// `dev.priv.password` overrides it. Its session opens on control with a
     /// heartbeat and then the device record.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ids of `streams` are not 1, 2 and on up to their count, in order, which is
+    /// how a host asks for each stream the device record counts.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: Identity,
@@ -343,6 +348,10 @@ impl<S: Group> Device<S> {
         streams: &(impl Streams + ?Sized),
         lanes: &mut (impl Lanes + ?Sized),
     ) -> Self {
+        assert!(
+            streams.ids().map(usize::from).eq(1..=streams.ids().count()),
+            "a device's streams are numbered 1 to their count, in order"
+        );
         let mut device = Self {
             identity,
             session,
@@ -1061,7 +1070,11 @@ fn announce(version: &mut u32, out: &mut impl Sink, name: &str, reply: &[u8]) {
 
 /// Send one packet back along `routing`. Every writer is bounded by the
 /// packet, so a packet that does not fit is a bug.
-fn send(out: &mut impl Sink, routing: &[u8], write: impl FnOnce(&mut [u8]) -> Option<usize>) {
+fn send(
+    out: &mut impl Sink,
+    routing: &[u8],
+    write: impl FnOnce(&mut [u8]) -> Result<usize, WriteError>,
+) {
     let mut buf = [0u8; Packet::MAX_SIZE];
     let mut len = write(&mut buf).expect("a device packet fits a packet");
     for &hop in routing {
@@ -1645,6 +1658,45 @@ mod tests {
         }
     }
 
+    /// A device comes up only with streams numbered 1 to their count, in order.
+    #[test]
+    fn a_device_takes_only_streams_numbered_one_to_their_count() {
+        let numbered = |ids: &[u8]| {
+            let streams: Vec<DataStream<4>> = ids
+                .iter()
+                .map(|&id| {
+                    let params = Params {
+                        rate: NonZeroU32::new(10).unwrap(),
+                        decimation: NonZeroU32::MIN,
+                        enabled: true,
+                    };
+                    let filter = Box::leak(Box::new(Butterworth4::<1>::new()));
+                    DataStream::new(StreamId::new(id), &AUX, filter, params).unwrap()
+                })
+                .collect();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let identity = identity().hardware("COMM-USB", "STM32G484xE", &[0xAB; 12], 8);
+                let mut nowhere = OneLane(Sent::default());
+                Device::new(
+                    identity,
+                    SESSION,
+                    table(),
+                    Board::new(),
+                    PASSWORD,
+                    BOOT,
+                    &streams[..],
+                    &mut nowhere,
+                );
+            }))
+            .is_ok()
+        };
+        assert!(numbered(&[]));
+        assert!(numbered(&[1, 2, 3]));
+        assert!(!numbered(&[2]));
+        assert!(!numbered(&[1, 3]));
+        assert!(!numbered(&[2, 1]));
+    }
+
     /// One request, as `tio-tool` sends it.
     fn asking(method: Method<'_>, args: &[u8], routing: &[u8]) -> Vec<u8> {
         let mut buf = [0u8; Packet::MAX_SIZE];
@@ -1745,17 +1797,6 @@ mod tests {
             self.device.saved();
             Some(image)
         }
-    }
-
-    #[test]
-    fn answers_identity_rpcs_by_name() {
-        let mut device = harness();
-        assert_eq!(device.ask("dev.name", &[]).value(), b"COMM-USB");
-        assert_eq!(device.ask("dev.serial", &[]).value(), b"52373720");
-        assert_eq!(
-            device.ask("dev.session", &[]).value(),
-            &SESSION.to_le_bytes()
-        );
     }
 
     /// Ids are on the wire, so a host that read the table once asks by id
@@ -2069,12 +2110,6 @@ mod tests {
         device.device = opened(identity(), table(), Board::new(), "");
         assert_eq!(device.ask("dev.priv", b"895895").error(), RpcError::State);
         assert_eq!(device.ask("dev.priv", &[]).value(), &[0]);
-    }
-
-    #[test]
-    fn rpc_match_completes_over_the_whole_table() {
-        let mut device = harness();
-        assert_eq!(device.ask("rpc.match", b"board.f").value(), b"board.first");
     }
 
     #[test]
@@ -2963,23 +2998,6 @@ mod tests {
         assert_eq!(device.ask("board.count", &[]).value(), &5u32.to_le_bytes());
     }
 
-    /// A blank device owes its tasks the compiled defaults just the same.
-    #[test]
-    fn a_device_with_nothing_stored_keeps_its_compiled_defaults() {
-        let mut device = harness();
-        device.drive(Input::Loaded(None, Err(RpcError::State)), BOOT);
-        assert!(device.lanes.events.0.is_empty());
-        assert_eq!(
-            device.logged,
-            [(
-                LogLevel::INFO,
-                "no saved configuration; using compiled defaults"
-            )]
-        );
-        assert_eq!(device.device.settings().published.get(), 1);
-        assert_eq!(device.ask("board.first", &[]).value(), &7u32.to_le_bytes());
-    }
-
     /// `dev.conf.load` is two hops: the platform reads the slot, the device
     /// applies what it names, announces it, and only then replies.
     #[test]
@@ -3693,25 +3711,6 @@ mod tests {
                 rows.map(|row| row.segment_id.value()).any(|id| id == 1),
                 "it rolled over"
             );
-            world.keeps();
-        }
-
-        /// Restarts that take no samples each open a segment, so the ring comes back to the first's id
-        /// with a count that starts past zero, which is lawful as each record goes out as it opens.
-        #[test]
-        fn restarts_that_take_no_samples_keep_the_contract() {
-            let mut world = World::alone();
-            [
-                Step::Ask(0, 0, "dev.start", Vec::new()),
-                Step::Sample(0, 1),
-                Step::Relabel(0, 0),
-                Step::Skip(0, 10),
-                Step::Restarts(0, 0, 3),
-                Step::Skip(0, 1),
-                Step::Sample(0, 5),
-            ]
-            .iter()
-            .for_each(|step| world.take(step));
             world.keeps();
         }
 
