@@ -4,8 +4,9 @@
 use super::progress::ByteProgress;
 use std::collections::HashSet;
 use std::convert::Infallible;
-use twinleaf::data::{LogFile, PacketOutcome, PacketParser, SampleBatch};
-use twinleaf::tio::{packet::Payload, Packet};
+use twinleaf::data::{LogError, LogFile, PacketOutcome, PacketParser, SampleBatch};
+use twinleaf::proto::packet::Checked;
+use twinleaf::tio::packet::Payload;
 use twinleaf::DeviceRoute;
 
 /// Log files read in order, each as far as it decodes.
@@ -58,7 +59,7 @@ impl LogReader {
 
     /// Hands `visit` every packet of every log in order. A log stops at its
     /// first packet that does not decode, with a warning, and the next starts.
-    pub(super) fn packets(&self, mut visit: impl FnMut(&Packet)) {
+    pub(super) fn packets(&self, mut visit: impl FnMut(Checked<'_>)) {
         let Ok(_) = self.each_packet::<Infallible>(|_, _, packet| {
             visit(packet);
             Ok(true)
@@ -73,13 +74,13 @@ impl LogReader {
     pub(super) fn batches(
         &self,
         mut parser: PacketParser,
-        decode: impl Fn(&Packet) -> bool,
+        decode: impl Fn(&Checked<'_>) -> bool,
         mut visit: impl FnMut(SampleBatch) -> eyre::Result<()>,
     ) -> eyre::Result<Read> {
         let mut parsed = HashSet::new();
         let mut waiting = HashSet::new();
         let truncated = self.each_packet::<eyre::Report>(|path, offset, packet| {
-            if matches!(packet.payload(), Payload::Samples(_)) && !decode(packet) {
+            if matches!(packet.payload(), Payload::Samples(_)) && !decode(&packet) {
                 return Ok(true);
             }
             match parser.push_packet(packet) {
@@ -90,8 +91,9 @@ impl LogReader {
                     waiting.insert(packet.route());
                 }
                 Ok(_) => {}
-                Err(error) => {
-                    log::warn!("{path}: invalid data at byte offset {offset}: {error}; stopping");
+                Err(source) => {
+                    let error = LogError::Data { offset, source };
+                    log::warn!("{path}: {error}; stopping");
                     return Ok(false);
                 }
             }
@@ -116,33 +118,32 @@ impl LogReader {
     /// Returns `true` if any log stopped short of its end.
     fn each_packet<E>(
         &self,
-        mut visit: impl FnMut(&str, usize, &Packet) -> Result<bool, E>,
+        mut visit: impl FnMut(&str, usize, Checked<'_>) -> Result<bool, E>,
     ) -> Result<bool, E> {
         let mut truncated = false;
         for (path, log) in &self.logs {
             let mut progress = self.progress.then(|| ByteProgress::new(log.len() as u64));
-            let mut packets = log.packets();
-            loop {
-                let offset = packets.position();
-                let packet = match packets.next() {
-                    Some(Ok(packet)) => packet,
-                    Some(Err(error)) => {
+            let mut reached = 0;
+            for packet in log.packets() {
+                let (offset, packet) = match packet {
+                    Ok(packet) => packet,
+                    Err(error) => {
                         log::warn!("{path}: {error}; stopping");
                         truncated = true;
                         break;
                     }
-                    None => break,
                 };
+                reached = offset + packet.as_bytes().len();
                 if let Some(progress) = &mut progress {
-                    progress.update(packets.position() as u64);
+                    progress.update(reached as u64);
                 }
-                if !visit(path, offset, &packet)? {
+                if !visit(path, offset, packet)? {
                     truncated = true;
                     break;
                 }
             }
             if let Some(progress) = progress {
-                progress.finish_and_clear(packets.position() as u64);
+                progress.finish_and_clear(reached as u64);
             }
         }
         Ok(truncated)

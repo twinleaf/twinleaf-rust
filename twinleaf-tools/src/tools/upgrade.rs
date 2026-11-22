@@ -9,11 +9,11 @@ use color_eyre::Help;
 use console::style;
 use eyre::WrapErr;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use twinleaf::device::Device;
 use twinleaf::firmware::{
-    self, github::GithubCatalog, FlashEvent, StopOutcome, UpdateReport, UpdateStatus,
+    self, FirmwareCatalog, FlashEvent, StopOutcome, UpdateReport, UpdateStatus,
 };
 use twinleaf::Connection;
 
@@ -50,6 +50,7 @@ fn firmware_upgrade_all(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
         tio.root
     );
 
+    let (catalog, cache) = firmware::catalog_from_env();
     let mut failures = 0usize;
     for (i, route) in routes.into_iter().enumerate() {
         let label = if route.is_empty() {
@@ -65,7 +66,7 @@ fn firmware_upgrade_all(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
 
         // One device's failure shouldn't stop the rest.
         let result = match tree.device(route) {
-            Ok(device) => check_and_upgrade(&device, skip_confirm),
+            Ok(device) => check_and_upgrade(&device, &*catalog, cache.as_deref(), skip_confirm),
             Err(error) => Err(error.into()),
         };
         if let Err(e) = result {
@@ -135,18 +136,23 @@ pub fn firmware_upgrade(
 /// firmware, and downloads and flashes a newer one.
 fn firmware_upgrade_latest(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
     let (_proxy, device) = open_device(tio)?;
-    check_and_upgrade(&device, skip_confirm)
+    let (catalog, cache) = firmware::catalog_from_env();
+    check_and_upgrade(&device, &*catalog, cache.as_deref(), skip_confirm)
 }
 
-/// Checks one open device against the catalog and, if a newer release
-/// exists, downloads and flashes it.
-fn check_and_upgrade(device: &Device, skip_confirm: bool) -> eyre::Result<()> {
+/// Checks one open device against `catalog` and, if a newer release
+/// exists, downloads it through `cache` and flashes it.
+fn check_and_upgrade(
+    device: &Device,
+    catalog: &dyn FirmwareCatalog,
+    cache: Option<&Path>,
+    skip_confirm: bool,
+) -> eyre::Result<()> {
     let installed = firmware::query_installed(device)
         .wrap_err("could not read installed firmware info")
         .with_proxy_help()?;
-    let catalog = GithubCatalog::twinleaf();
     let report =
-        firmware::check_for_update(installed, &catalog).wrap_err("firmware update check failed")?;
+        firmware::check_for_update(installed, catalog).wrap_err("firmware update check failed")?;
 
     let UpdateReport {
         installed,
@@ -221,7 +227,7 @@ fn check_and_upgrade(device: &Device, skip_confirm: bool) -> eyre::Result<()> {
         return Ok(());
     }
 
-    download_and_flash(device, &catalog, &release)
+    download_and_flash(device, catalog, cache, &release)
 }
 
 /// Detects the sensor, lists every published firmware, and lets the user pick
@@ -232,9 +238,9 @@ fn firmware_select(tio: &TioOpts) -> eyre::Result<()> {
     let installed = firmware::query_installed(&device)
         .wrap_err("could not read installed firmware info")
         .with_proxy_help()?;
-    let catalog = GithubCatalog::twinleaf();
+    let (catalog, cache) = firmware::catalog_from_env();
     let report =
-        firmware::check_for_update(installed, &catalog).wrap_err("firmware lookup failed")?;
+        firmware::check_for_update(installed, &*catalog).wrap_err("firmware lookup failed")?;
 
     let UpdateReport {
         installed,
@@ -267,16 +273,12 @@ fn firmware_select(tio: &TioOpts) -> eyre::Result<()> {
     let items: Vec<String> = releases
         .iter()
         .map(|rel| {
-            let installed_here = installed
-                .hash
-                .as_deref()
-                .is_some_and(|h| h.eq_ignore_ascii_case(&rel.short_hash));
-            format!(
-                "{}  {}{}",
-                rel.date,
-                rel.short_hash,
-                if installed_here { "  (installed)" } else { "" }
-            )
+            let mark = if installed.runs(rel) {
+                "  (installed)"
+            } else {
+                ""
+            };
+            format!("{}  {}{}", rel.date, rel.short_hash, mark)
         })
         .collect();
 
@@ -288,7 +290,7 @@ fn firmware_select(tio: &TioOpts) -> eyre::Result<()> {
         .wrap_err("failed to read selection")?;
     let release = &releases[selection];
 
-    download_and_flash(&device, &catalog, release)
+    download_and_flash(&device, &*catalog, cache.as_deref(), release)
 }
 
 /// Prints the `Sensor` or `Device` and the `Installed` header lines for a
@@ -329,15 +331,14 @@ fn print_dev_build_notice() {
     );
 }
 
-/// Downloads a release through the cache and flashes it, with progress.
+/// Downloads a release through `cache`, if any, and flashes it, with progress.
 fn download_and_flash(
     device: &Device,
-    catalog: &GithubCatalog,
+    catalog: &dyn FirmwareCatalog,
+    cache: Option<&Path>,
     release: &firmware::FirmwareRelease,
 ) -> eyre::Result<()> {
-    let cache_root = firmware::default_cache_dir()
-        .ok_or_else(|| eyre::eyre!("could not determine a cache directory"))?;
-    let firmware_data = download_with_progress(catalog, release, &cache_root)?;
+    let firmware_data = download_with_progress(catalog, release, cache)?;
     log::debug!("loaded {} bytes firmware", firmware_data.len());
 
     flash_with_progress(device, &firmware_data)
@@ -363,9 +364,9 @@ fn confirm(prompt: &str, skip_confirm: bool) -> eyre::Result<bool> {
 }
 
 fn download_with_progress(
-    catalog: &GithubCatalog,
+    catalog: &dyn FirmwareCatalog,
     release: &firmware::FirmwareRelease,
-    cache_root: &std::path::Path,
+    cache: Option<&Path>,
 ) -> eyre::Result<Vec<u8>> {
     let spinner = crate::logging::multi_progress().add(ProgressBar::new_spinner());
     spinner.set_style(
@@ -376,15 +377,17 @@ fn download_with_progress(
     spinner.set_message(format!("Downloading firmware {}...", release.filename));
     spinner.enable_steady_tick(Duration::from_millis(100));
 
-    let result = firmware::download_cached(catalog, release, cache_root);
+    let result = firmware::download(catalog, release, cache);
     spinner.finish_and_clear();
     let data = result.wrap_err("failed to download firmware")?;
 
-    // Report what was fetched and where it lives.
-    let path = firmware::cache_path(cache_root, release);
+    // Report what was fetched and, when it was cached, where it lives.
     let label = |s: &str| style(format!("{:11}", s)).bold().cyan();
     println!(" {} {}", label("Downloaded:"), release.filename);
-    println!(" {} {}", label("Location:"), path.display());
+    if let Some(cache) = cache {
+        let path = firmware::cache_path(cache, release);
+        println!(" {} {}", label("Location:"), path.display());
+    }
 
     Ok(data)
 }
@@ -499,9 +502,6 @@ fn flash_with_progress(device: &Device, firmware_data: &[u8]) -> eyre::Result<()
 /// Re-reads `dev.desc` after a flash, retrying while the device reboots, and
 /// prints the firmware now running. Prints a warning if it cannot be read.
 fn verify_new_firmware(device: &Device) {
-    const ATTEMPTS: usize = 6;
-    const INTERVAL: Duration = Duration::from_millis(1500);
-
     let spinner = crate::logging::multi_progress().add(ProgressBar::new_spinner());
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -511,16 +511,7 @@ fn verify_new_firmware(device: &Device) {
     spinner.set_message("Verifying new firmware (re-reading dev.desc)...");
     spinner.enable_steady_tick(Duration::from_millis(100));
 
-    let mut installed = None;
-    for attempt in 0..ATTEMPTS {
-        if attempt > 0 {
-            std::thread::sleep(INTERVAL);
-        }
-        if let Ok(fw) = firmware::query_installed(device) {
-            installed = Some(fw);
-            break;
-        }
-    }
+    let installed = firmware::reread_installed(device);
     spinner.finish_and_clear();
 
     let label = |s: &str| style(format!("{:11}", s)).bold().cyan();

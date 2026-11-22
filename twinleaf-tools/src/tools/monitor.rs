@@ -39,9 +39,8 @@ use twinleaf::{
 };
 
 const MIN_PLOT_WINDOW_SECONDS: f64 = 0.5;
-const MAX_PLOT_WINDOW_SECONDS: f64 = 60.0;
+const MAX_PLOT_WINDOW_SECONDS: f64 = 300.0;
 const PLOT_WINDOW_FINE_STEP_SECONDS: f64 = 0.5;
-const PLOT_WINDOW_COARSE_STEP_SECONDS: f64 = 5.0;
 const MIN_PLOT_BUCKETS: usize = 64;
 const PLOT_POINTS_PER_CELL: usize = 4;
 const MONITOR_BUFFER_CAPACITY_SAMPLES: usize = 2_000_000;
@@ -965,6 +964,15 @@ fn column_label_units(buffer: &Buffer, key: &ColumnKey) -> Option<(String, Strin
     Some((column.description().to_string(), column.units().to_string()))
 }
 
+/// Returns the plot window one coarse step up or down from `window`. The
+/// step is 30 s where the window stays at 60 s or more, else 5 s.
+fn coarse_window(window: f64, up: bool) -> f64 {
+    let wide = if up { window >= 60.0 } else { window >= 90.0 };
+    let step = if wide { 30.0 } else { 5.0 };
+    let next = if up { window + step } else { window - step };
+    next.clamp(MIN_PLOT_WINDOW_SECONDS, MAX_PLOT_WINDOW_SECONDS)
+}
+
 fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
     if let Event::Key(k) = ev {
         if k.kind != KeyEventKind::Press {
@@ -998,8 +1006,10 @@ fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
             KeyCode::Char('l') => Some(Action::ToggleLegend),
             KeyCode::Char('=') => Some(Action::AdjustWindow(PLOT_WINDOW_FINE_STEP_SECONDS)),
             KeyCode::Char('-') => Some(Action::AdjustWindow(-PLOT_WINDOW_FINE_STEP_SECONDS)),
-            KeyCode::Char('+') => Some(Action::AdjustWindow(PLOT_WINDOW_COARSE_STEP_SECONDS)),
-            KeyCode::Char('_') => Some(Action::AdjustWindow(-PLOT_WINDOW_COARSE_STEP_SECONDS)),
+            KeyCode::Char(c @ ('+' | '_')) => {
+                let w = app.view.plot_window_seconds;
+                Some(Action::AdjustWindow(coarse_window(w, c == '+') - w))
+            }
             KeyCode::Char('[') => Some(Action::AdjustPlotWidth(5)),
             KeyCode::Char(']') => Some(Action::AdjustPlotWidth(-5)),
             KeyCode::Char(',') | KeyCode::Char('<') => Some(Action::AdjustPrecision(-1)),
@@ -1535,7 +1545,7 @@ fn render_footer(f: &mut Frame, app: &mut MonitorState, area: Rect) {
         key_span("+"),
         key_sep(),
         key_span("-"),
-        Span::raw(" Window (0.5s, Shift 5.0s)  "),
+        Span::raw(" Window (0.5s, Shift 5s or 30s)  "),
         key_span("["),
         key_sep(),
         key_span("]"),
@@ -1933,8 +1943,7 @@ fn generate_log_labels(
 fn fmt_value(v: &ColumnData) -> (String, f64) {
     match (v, v.try_as_f64()) {
         (ColumnData::F32(_) | ColumnData::F64(_), Some(x)) => (format!("{:15.4}", x), x),
-        (_, Some(x)) => (format!("{:>15}", v.to_string()), x),
-        (_, None) => ("           type?".to_string(), f64::NAN),
+        (_, x) => (format!("{:>15}", v.to_string()), x.unwrap_or(f64::NAN)),
     }
 }
 
@@ -2037,4 +2046,16 @@ pub fn run_monitor(cli: MonitorCli) -> eyre::Result<()> {
         buffer: Buffer::new(MONITOR_BUFFER_CAPACITY_SAMPLES),
     };
     tui::run(&tree, u64::from(cli.fps), &mut monitor)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_coarse_step_is_thirty_seconds_from_a_minute_up() {
+        let steps = [(55.0, true, 60.0), (60.0, true, 90.0), (90.0, false, 60.0)];
+        let ends = [(60.0, false, 55.0), (300.0, true, 300.0), (0.5, false, 0.5)];
+        for (window, up, next) in steps.into_iter().chain(ends) {
+            assert_eq!(super::coarse_window(window, up), next, "{window} up {up}");
+        }
+    }
 }

@@ -2,6 +2,8 @@ pub mod capture;
 pub mod dump;
 pub mod health;
 pub mod log;
+#[cfg(feature = "web")]
+pub mod mcp;
 pub mod monitor;
 pub mod proxy;
 pub mod rpc;

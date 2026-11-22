@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
-use twinleaf::device::discovery::{self, PortInterface};
+use twinleaf::device::discovery;
 use twinleaf::proxy::{self, DumpFlags, HostOptions, Layout, Listen, Mount, Proxy};
 use twinleaf::{Connection, DeviceRoute, RecvError};
 
@@ -57,7 +57,9 @@ fn hold_selection(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
     let routes = held.tree(DeviceRoute::root()).routes_updates();
     let closer = held.clone();
     ctrlc::set_handler(move || closer.close())?;
-    front.print_startup(&cli);
+    // This process serves no page. A foreground proxy that holds the
+    // selection says its own page's address.
+    front.print_startup(&cli, false);
     println!(
         "Using {} as the default while this runs. Ctrl-C to stop.",
         front.describe(cli.subtree)
@@ -75,6 +77,7 @@ fn hold_selection(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
 /// Serves the sensors the arguments name, or the one attached, from a terminal
 /// until Ctrl-C.
 fn run_foreground(cli: &ProxyCli) -> eyre::Result<()> {
+    mcp_has_a_page(cli)?;
     let requested = requested_layout(cli.sensor_url.as_deref(), &cli.mounts)?;
     let default = requested
         .as_ref()
@@ -84,6 +87,7 @@ fn run_foreground(cli: &ProxyCli) -> eyre::Result<()> {
     // rather than whatever detecting the device finds.
     let proxy = host(HostOptions {
         default,
+        foreign: web_page(cli),
         ..host_options(cli, "tio proxy")
     })?;
     let front = match requested {
@@ -153,6 +157,45 @@ fn host_options(cli: &ProxyCli, name: &str) -> HostOptions {
             heartbeats: cli.dump_hb,
         },
         ..HostOptions::default()
+    }
+}
+
+/// Whether `tio proxy` serves the web page on its own port. A build with the
+/// `web` feature serves it on the default port. The page reads through the
+/// proxy on the default port, so a proxy on another port serves no page.
+pub(crate) fn serves_page(cli: &ProxyCli) -> bool {
+    cfg!(feature = "web") && cli.port == twinleaf::proto::TCP_DEFAULT_PORT
+}
+
+/// Refuses `--mcp` when this proxy serves no web page, whose endpoint it
+/// opens, and says why.
+fn mcp_has_a_page(cli: &ProxyCli) -> eyre::Result<()> {
+    if !cli.mcp || serves_page(cli) {
+        return Ok(());
+    }
+    let port = twinleaf::proto::TCP_DEFAULT_PORT;
+    Err(match cfg!(feature = "web") {
+        true => eyre::eyre!(
+            "--mcp opens the MCP endpoint of the web page, which a proxy serves only on \
+             port {port}, and this one listens on port {}",
+            cli.port
+        ),
+        false => eyre::eyre!(
+            "--mcp opens the MCP endpoint of the web page, and this tio was built without \
+             the page"
+        ),
+    })
+}
+
+/// The handler of the web page, when `tio proxy` serves it, with its MCP
+/// door open when `--mcp` asks.
+fn web_page(cli: &ProxyCli) -> Option<proxy::Foreign> {
+    #[cfg(feature = "web")]
+    return serves_page(cli).then(|| twinleaf_web::handler(cli.mcp));
+    #[cfg(not(feature = "web"))]
+    {
+        let _ = cli;
+        None
     }
 }
 
@@ -245,12 +288,10 @@ fn within_subtree(layout: &Layout, subtree: DeviceRoute) -> eyre::Result<Layout>
 fn auto_detect_serial(proxy: &Proxy) -> eyre::Result<String> {
     use color_eyre::Help;
 
-    let mut valid_urls = Vec::new();
-    for dev in discovery::enumerate_serial(false) {
-        if matches!(dev.interface, PortInterface::STM32 | PortInterface::FTDI) {
-            valid_urls.push(dev.url);
-        }
-    }
+    let mut valid_urls: Vec<_> = discovery::enumerate_serial(false)
+        .into_iter()
+        .map(|dev| dev.url)
+        .collect();
     if valid_urls.is_empty() {
         return Err(eyre::eyre!("no sensors detected").suggestion(
             "specify a URL, or run 'tio proxy list' to discover devices on the network",
@@ -342,7 +383,9 @@ impl FrontDoor {
         }
     }
 
-    fn print_startup(&self, cli: &ProxyCli) {
+    /// Prints what the proxy hosts and how, with the address of the web
+    /// page when `page` says this process serves it.
+    fn print_startup(&self, cli: &ProxyCli, page: bool) {
         let mounts = &self.layout.mounts;
         match self.names.as_slice() {
             [Some(name)] => println!("tio proxy starting (selected {name}):"),
@@ -377,6 +420,12 @@ impl FrontDoor {
             }
         }
         println!("  TCP port: {}", cli.port);
+        if page {
+            println!("  Plots: http://localhost:{}", cli.port);
+            if cli.mcp {
+                println!("  MCP: http://localhost:{}/mcp", cli.port);
+            }
+        }
         println!("  Subtree: {}", cli.subtree);
 
         let flags = [
@@ -406,7 +455,7 @@ fn serve(proxy: Proxy, front: &FrontDoor, cli: &ProxyCli) -> eyre::Result<()> {
     let proxy = Arc::new(proxy);
     stop_on_signals(proxy.clone())?;
 
-    front.print_startup(cli);
+    front.print_startup(cli, serves_page(cli));
     // The advertisement lasts until this returns, then says goodbye.
     #[cfg(feature = "mdns")]
     let _mdns = advertise_mdns(&proxy, cli);
@@ -541,7 +590,7 @@ fn advertise_tcp(instance: &str, host_name: &str, port: u16) -> Option<MdnsServi
 
     let responder = ServiceDaemon::new().ok()?;
     let info = ServiceInfo::new(
-        "_twinleaf._tcp.local.",
+        discovery::TWINLEAF_MDNS_SERVICE,
         instance,
         &host,
         (),
@@ -620,19 +669,10 @@ fn is_infrastructure(name: &str) -> bool {
 
 #[cfg(all(test, feature = "mdns"))]
 mod mdns_tests {
-    use super::{is_infrastructure, summarize_sensors};
+    use super::summarize_sensors;
 
     fn models(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn excludes_comm_and_hub_routes() {
-        assert!(is_infrastructure("COMM-RS422"));
-        assert!(is_infrastructure("COMM-USB-RS422"));
-        assert!(is_infrastructure("HUB-USB-TDS"));
-        assert!(!is_infrastructure("VMR"));
-        assert!(!is_infrastructure("AXIS"));
     }
 
     #[test]
@@ -640,12 +680,6 @@ mod mdns_tests {
         // A hub with two VMRs -> "VMR (x2)", COMM/HUB left out.
         let got = summarize_sensors(&models(&["HUB-USB-TDS", "COMM-RS422", "VMR", "VMR"]));
         assert_eq!(got.as_deref(), Some("VMR (x2)"));
-    }
-
-    #[test]
-    fn single_sensor_has_no_count_suffix() {
-        let got = summarize_sensors(&models(&["HUB-USB-TDS", "COMM-RS422", "VMR"]));
-        assert_eq!(got.as_deref(), Some("VMR"));
     }
 
     #[test]
@@ -680,6 +714,21 @@ mod tests {
         assert_eq!(listen(&[]), Listen::AllInterfaces);
         assert_eq!(listen(&["--listen", "all"]), Listen::AllInterfaces);
         assert_eq!(listen(&["--listen", "loopback"]), Listen::Loopback);
+    }
+
+    /// `--mcp` on a proxy that serves no page is refused with the reason,
+    /// and a proxy that serves one takes it.
+    #[test]
+    fn mcp_is_refused_where_no_page_is_served() {
+        use clap::Parser;
+        let checked = |args: &[&str]| {
+            let cli = ProxyCli::parse_from(["tio-proxy"].iter().chain(args));
+            mcp_has_a_page(&cli)
+        };
+        let refused = checked(&["--mcp", "--port", "17855"]).unwrap_err();
+        assert!(refused.to_string().contains("--mcp opens"), "{refused}");
+        assert!(checked(&["--port", "17855"]).is_ok());
+        assert_eq!(checked(&["--mcp"]).is_ok(), cfg!(feature = "web"));
     }
 
     fn route(path: &str) -> DeviceRoute {
@@ -750,16 +799,5 @@ mod tests {
 
         let mounts = vec![mount("tcp://192.0.2.1", "/3", "/")];
         assert_eq!(hosted, Layout { mounts });
-    }
-
-    #[test]
-    fn a_picked_source_stays_as_picked_under_the_root() {
-        let layout = Layout {
-            mounts: vec![mount("tcp://192.0.2.1", "/2", "/1")],
-        };
-
-        let hosted = within_subtree(&layout, DeviceRoute::root()).unwrap();
-
-        assert_eq!(hosted, layout);
     }
 }

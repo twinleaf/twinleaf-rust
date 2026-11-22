@@ -30,6 +30,10 @@ pub struct ProxyCli {
     #[arg(long = "listen", value_enum, default_value_t = ListenOn::All)]
     pub(crate) listen: ListenOn,
 
+    /// Open the web page's MCP endpoint at /mcp, for LLM agents on this machine (off by default)
+    #[arg(long = "mcp")]
+    pub(crate) mcp: bool,
+
     /// Advertise this proxy over mDNS (off by default)
     #[arg(long = "mdns")]
     pub(crate) mdns: bool,

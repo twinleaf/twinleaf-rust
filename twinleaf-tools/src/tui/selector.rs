@@ -14,9 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use twinleaf::device::discovery::{
-    DiscoveredDevice, Discovery, DiscoveryConfig, DiscoveryEvent, PortInterface,
-};
+use twinleaf::device::discovery::{DiscoveredDevice, Discovery, DiscoveryConfig, DiscoveryEvent};
 use twinleaf::device::NamedRoute;
 use twinleaf::DeviceRoute;
 const SPINNER: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
@@ -295,15 +293,6 @@ fn parent_route(route: DeviceRoute) -> DeviceRoute {
         .expect("parent route")
 }
 
-fn interface_tag(interface: &PortInterface) -> &'static str {
-    match interface {
-        PortInterface::FTDI | PortInterface::STM32 => "usb",
-        PortInterface::Network => "net",
-        PortInterface::Unknown(..) => "ser",
-        _ => "?",
-    }
-}
-
 fn device_name(device: &DiscoveredDevice) -> &str {
     device.name.as_deref().unwrap_or("(resolving…)")
 }
@@ -407,10 +396,9 @@ fn render(frame: &mut Frame, list: &DeviceList, spin: usize) {
                     .unwrap_or("(no name)")
             };
             let mounted = entry.mounts.iter().find_map(|(source, n)| {
-                source
-                    .relative_route(route)
-                    .ok()
-                    .map(|relative| (source, mount_route(*n).absolute_route(&relative)))
+                route
+                    .starts_with(source)
+                    .then(|| (source, route.rerooted(source, &mount_route(*n))))
             });
             let mut spans = vec![
                 Span::raw(glyph.clone()),
@@ -428,11 +416,7 @@ fn render(frame: &mut Frame, list: &DeviceList, spin: usize) {
             }
             if route.is_empty() {
                 spans.push(Span::styled(
-                    format!(
-                        "  {}  {}",
-                        interface_tag(&entry.device.interface),
-                        entry.device.url
-                    ),
+                    format!("  {}  {}", entry.device.interface.label(), entry.device.url),
                     Style::new().fg(Color::DarkGray),
                 ));
             }
@@ -519,8 +503,10 @@ fn run_picker(discovery: Discovery) -> eyre::Result<Outcome> {
 
 fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
-        interface_tag(&a.device.interface)
-            .cmp(interface_tag(&b.device.interface))
+        a.device
+            .interface
+            .label()
+            .cmp(b.device.interface.label())
             .then(a.device.url.cmp(&b.device.url))
     });
 }
@@ -571,7 +557,7 @@ fn print_devices(entries: &[Entry]) {
         let root_label = format!(
             "{:<width$}  {}  {}",
             e.device.url,
-            interface_tag(&e.device.interface),
+            e.device.interface.label(),
             device_name(&e.device),
             width = width
         );
@@ -594,7 +580,7 @@ fn print_devices_json(entries: &[Entry]) -> eyre::Result<()> {
                 .collect();
             serde_json::json!({
                 "url": e.device.url,
-                "interface": interface_tag(&e.device.interface),
+                "interface": e.device.interface.label(),
                 "name": e.device.name,
                 "routes": routes,
             })
@@ -641,6 +627,7 @@ pub fn list_devices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use twinleaf::device::discovery::PortInterface;
 
     fn snapshot(list: &mut DeviceList, url: &str, paths: &[&str]) {
         list.apply(DiscoveryEvent::Subdevices {

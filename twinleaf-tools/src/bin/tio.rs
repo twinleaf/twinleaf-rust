@@ -24,6 +24,8 @@ fn main() -> eyre::Result<()> {
     match cli.command {
         Commands::List(list_cli) => run_list(list_cli),
         Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),
+        #[cfg(feature = "web")]
+        Commands::Mcp(mcp_cli) => twinleaf_tools::tools::mcp::run_mcp(mcp_cli),
         Commands::Simulate(simulate_cli) => run_simulate(simulate_cli),
         Commands::Monitor(monitor_cli) => run_monitor(monitor_cli),
         Commands::Health(health_cli) => run_health(health_cli),

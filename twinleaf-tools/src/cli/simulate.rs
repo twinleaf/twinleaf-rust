@@ -3,7 +3,7 @@
 use clap::{Parser, ValueEnum};
 use twinleaf::DeviceRoute;
 
-use super::{nonneg_f64, parse_device_route, ListenOn};
+use super::{nonneg_f64, parse_device_route, positive_f64, ListenOn};
 
 #[derive(Parser, Debug)]
 pub struct SimulateCli {
@@ -27,6 +27,22 @@ pub struct SimulateCli {
     /// Initial white noise level in V/sqrt(Hz)
     #[arg(long = "noise", default_value = ".01", value_parser = nonneg_f64)]
     pub(crate) noise: f64,
+
+    /// Initial precession frequency of the FID capture in Hz
+    #[arg(long = "fid-frequency", default_value = "175000", value_parser = nonneg_f64)]
+    pub(crate) fid_frequency: f64,
+
+    /// Initial decay time T2 of the FID capture in seconds
+    #[arg(long = "fid-t2", default_value = "250e-6", value_parser = positive_f64)]
+    pub(crate) fid_t2: f64,
+
+    /// Initial amplitude of the FID capture in V
+    #[arg(long = "fid-amplitude", default_value = "1", value_parser = nonneg_f64)]
+    pub(crate) fid_amplitude: f64,
+
+    /// Initial noise in each sample of the FID capture in V
+    #[arg(long = "fid-noise", default_value = ".01", value_parser = nonneg_f64)]
+    pub(crate) fid_noise: f64,
 
     /// Segment duration in seconds
     #[arg(
@@ -60,6 +76,41 @@ pub struct SimulateCli {
     /// The kind of firmware the devices take, as a real device of that kind does
     #[arg(long = "upload", value_enum, default_value_t = UploadKind::Image)]
     pub(crate) upload: UploadKind,
+
+    /// The name the devices report as `dev.name`, at most 32 bytes
+    #[arg(long = "name", default_value = "tio-test", value_parser = name)]
+    pub(crate) name: String,
+
+    /// The build the devices report in `dev.desc`, as DATE/BUILD. A build that contains DEV is a development build
+    #[arg(
+        long = "build",
+        value_name = "DATE/BUILD",
+        default_value = "2026-06-08/000001-DEV",
+        value_parser = build
+    )]
+    pub(crate) build: String,
+}
+
+/// The longest name `dev.name` holds.
+const NAME_MAX: usize = 32;
+
+/// Parses a name of at most [`NAME_MAX`] bytes.
+fn name(text: &str) -> Result<String, String> {
+    match text.len() <= NAME_MAX {
+        true => Ok(text.to_string()),
+        false => Err(format!("a name is at most {NAME_MAX} bytes")),
+    }
+}
+
+/// The longest build `dev.desc` holds beside the rest of the description.
+const BUILD_MAX: usize = 64;
+
+/// Parses a build of at most [`BUILD_MAX`] bytes.
+fn build(text: &str) -> Result<String, String> {
+    match text.len() <= BUILD_MAX {
+        true => Ok(text.to_string()),
+        false => Err(format!("a build is at most {BUILD_MAX} bytes")),
+    }
 }
 
 /// What kind of firmware image a simulated device takes.

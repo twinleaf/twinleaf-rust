@@ -6,6 +6,8 @@ mod dump;
 mod health;
 mod list;
 mod log;
+#[cfg(feature = "web")]
+mod mcp;
 mod monitor;
 mod proxy;
 mod rpc;
@@ -21,6 +23,8 @@ pub use log::{
     LogMetaCli, LogSubcommands, MetaRerouteCli, MetaSubcommands, SplitLevel, SplitPolicy,
     StreamSel,
 };
+#[cfg(feature = "web")]
+pub use mcp::McpCli;
 pub use monitor::MonitorCli;
 pub use proxy::{MountArg, ProxyCli, ProxySubcommands};
 pub use rpc::{RPCSubcommands, RpcCli};
@@ -56,6 +60,17 @@ pub(crate) fn nonneg_f64(s: &str) -> Result<f64, String> {
         Err("must be >= 0".into())
     } else {
         Ok(v)
+    }
+}
+
+pub(crate) fn positive_f64(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if v.is_finite() && v > 0.0 {
+        Ok(v)
+    } else {
+        Err("must be > 0".into())
     }
 }
 
@@ -123,11 +138,18 @@ pub enum Commands {
     Capture(CaptureCli),
 
     /// Upgrade device firmware
-    #[command(alias = "firmware-upgrade")]
+    #[command(
+        alias = "firmware-upgrade",
+        after_help = "Set TWINLEAF_FIRMWARE_DIR to a folder laid out as the published repository to list and download releases from that folder."
+    )]
     Upgrade(UpgradeCli),
 
     /// Multiplex a sensor over TCP
     Proxy(ProxyCli),
+
+    /// Bridge an MCP host's stdio to the MCP endpoint of `tio proxy --mcp`
+    #[cfg(feature = "web")]
+    Mcp(McpCli),
 
     /// Run a simulated sine wave Twinleaf device over UDP
     Simulate(SimulateCli),

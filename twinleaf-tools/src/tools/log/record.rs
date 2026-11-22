@@ -9,7 +9,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 use twinleaf::data::LogFile;
 use twinleaf::device::record::{RecordMode, Recorder, Step};
-use twinleaf::tio;
+use twinleaf::tio::Packet;
 use twinleaf::Connection;
 use twinleaf::DeviceRoute;
 
@@ -127,13 +127,13 @@ pub fn log_metadata(cli: LogMetaCli) -> eyre::Result<()> {
 
     let mut file_out: Option<File> = None;
 
-    let write_packet = |fo: &mut Option<File>, pkt: tio::Packet| -> eyre::Result<()> {
+    let write_packet = |fo: &mut Option<File>, pkt: Vec<u8>| -> eyre::Result<()> {
         let f = ensure_open(fo, &file)?;
-        f.write_all(pkt.as_bytes())
+        f.write_all(&pkt)
             .wrap_err_with(|| format!("failed to write {}", file))
     };
 
-    for packet in meta.metadata_packets()? {
+    for packet in meta.metadata_packets(meta.route())? {
         write_packet(&mut file_out, packet)?;
     }
     Ok(())
@@ -154,15 +154,15 @@ pub fn meta_reroute(cli: MetaRerouteCli) -> eyre::Result<()> {
     let mut routes: HashSet<DeviceRoute> = HashSet::new();
     let mut rerouted = Vec::new();
     for packet in log.packets() {
-        let pkt = packet.wrap_err_with(|| format!("could not parse packet in {}", input))?;
-        if pkt.ptype() != twinleaf::proto::PacketType::METADATA {
+        let (_, pkt) = packet.wrap_err_with(|| format!("could not parse packet in {}", input))?;
+        if pkt.header().ptype != twinleaf::proto::PacketType::METADATA {
             bail!(
                 "{} does not look like a metadata file (found non-metadata packet)",
                 input
             );
         }
         routes.insert(pkt.route());
-        rerouted.extend_from_slice(pkt.with_route(route).as_bytes());
+        rerouted.extend_from_slice(Packet::from(pkt).with_route(route).as_bytes());
     }
     drop(log);
 

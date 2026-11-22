@@ -44,7 +44,7 @@ pub(in crate::tools::log) fn metadata() -> Vec<Packet> {
         wire::Metadata::Segment(wire::Segment {
             stream_id: StreamId::new(1),
             segment_id: SegmentId::new(0),
-            flags: wire::SegmentFlags::default(),
+            flags: wire::SegmentFlags::VALID,
             epoch: Epoch::UNIX,
             timeref_serial: "clock",
             timeref_session: SessionId::new(1),

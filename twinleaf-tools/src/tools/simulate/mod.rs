@@ -1,6 +1,7 @@
 //! tio simulate
 //!
-//! Simulates a small Twinleaf device that publishes a noisy sine wave on stream 1.
+//! Simulates a small Twinleaf device that publishes a noisy sine wave on stream 1,
+//! and serves captures of it, of a free induction decay and of that decay's phase.
 //! With `--layout`, it simulates one such device at each route given, all
 //! behind the one UDP port, as a hub and the devices on its ports are.
 //!
@@ -8,6 +9,15 @@
 //! this loop's clock instead of an executor. It answers the standard table,
 //! announces its settings, and streams its samples with their segments and
 //! metadata as firmware does.
+//!
+//! The loop that steps the devices and sends their samples does nothing
+//! else. Its thread runs at the priority of the threads that carry packets,
+//! so other work on a busy machine does not hold the samples up, and a
+//! thread of its own waits on the keyboard. The simulator serves one host
+//! address at a time. It takes another once the host it serves has been
+//! silent for two seconds, or at once when a send to that host came back
+//! unreachable, as a host that closed its socket and opened another leaves
+//! it.
 
 use crate::SimulateCli;
 use ratatui::crossterm::{
@@ -17,8 +27,9 @@ use ratatui::crossterm::{
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::proto::packet::{Packet, PacketView};
+use twinleaf::proto::packet::{Packet, PacketError, PacketView};
 use twinleaf::proto::DeviceRoute;
 
 // In raw mode, '\n' does not reliably return the cursor to column 0.
@@ -52,6 +63,45 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 struct Client {
     addr: SocketAddr,
     last_rx: Instant,
+    /// Whether a send to it came back unreachable since it last spoke.
+    unreachable: bool,
+}
+
+/// What a key asks of the simulator.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Command {
+    /// Every device drops one sample now.
+    Drop,
+    /// Every device reboots.
+    Reboot,
+    Quit,
+}
+
+/// Starts the thread that reads the keyboard, and returns the commands its
+/// keys ask for. The thread waits on the terminal, so the loop that sends
+/// the samples never does.
+fn keys() -> io::Result<mpsc::Receiver<Command>> {
+    let (asked, commands) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("tio-simulate keys".to_string())
+        .spawn(move || loop {
+            let command = match event::read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('d') => Command::Drop,
+                    KeyCode::Char('r') => Command::Reboot,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Command::Quit
+                    }
+                    _ => continue,
+                },
+                Ok(_) => continue,
+                Err(_) => return,
+            };
+            if asked.send(command).is_err() {
+                return;
+            }
+        })?;
+    Ok(commands)
 }
 
 struct RawModeGuard;
@@ -178,11 +228,14 @@ impl Simulator {
     }
 
     fn run(&mut self, cli: &SimulateCli) -> io::Result<()> {
-        let raw_mode = match RawModeGuard::enable() {
-            Ok(guard) => Some(guard),
+        // Raw mode takes Ctrl-C as a key, so it is on only while the keys
+        // are read.
+        let keyboard = RawModeGuard::enable().and_then(|guard| Ok((guard, keys()?)));
+        let (raw_mode, commands) = match keyboard {
+            Ok((guard, commands)) => (Some(guard), Some(commands)),
             Err(err) => {
                 terminal_eprintln!("keyboard shortcuts disabled: {err}");
-                None
+                (None, None)
             }
         };
 
@@ -211,12 +264,15 @@ impl Simulator {
                 "  press d to drop one sample now (test.drop), r to reboot (dev.reboot), Ctrl-C to quit"
             );
         }
-        terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
+        terminal_println!("  connect with: tio proxy udp://127.0.0.1:{port}");
 
+        twinleaf::device::raise_thread_priority();
         loop {
-            if raw_mode.is_some() && !self.handle_keyboard()? {
-                terminal_println!("stopping tio test");
-                return Ok(());
+            for command in commands.iter().flat_map(mpsc::Receiver::try_iter) {
+                if !self.obey(command)? {
+                    terminal_println!("stopping tio test");
+                    return Ok(());
+                }
             }
             self.step()?;
             std::thread::sleep(Duration::from_millis(1));
@@ -269,6 +325,20 @@ impl Simulator {
             device::CAPTURE_SAMPLES_MAX,
             device::CAPTURE_DELAY_NS as f64 / 1e9
         );
+        terminal_println!(
+            "  capture fid.capture: one FID shot, {} i16 samples at {} MS/s, frequency={} Hz T2={} s amplitude={} V noise={} V, ready {} ms after its trigger",
+            device::FID_SAMPLES,
+            device::FID_SAMPLE_RATE / 1e6,
+            board.fid_frequency(),
+            board.fid_t2(),
+            board.fid_amplitude(),
+            board.fid_noise(),
+            device::FID_DELAY_NS as f64 / 1e6
+        );
+        terminal_println!(
+            "  capture phase.capture: the unwrapped phase of such a shot, {} f32 samples in rad",
+            device::FID_SAMPLES
+        );
         match cli.upload {
             crate::UploadKind::Image => {
                 terminal_println!(
@@ -291,33 +361,24 @@ impl Simulator {
         }
     }
 
-    fn handle_keyboard(&mut self) -> io::Result<bool> {
-        while event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                let now_ns = self.now_ns();
-                let mut sent = Queue::default();
-                match key.code {
-                    KeyCode::Char('d') => {
-                        self.tree.each(now_ns, &mut sent, &mut |device, _| {
-                            device.drop_samples_now()
-                        });
-                    }
-                    KeyCode::Char('r') => {
-                        self.tree.each(now_ns, &mut sent, &mut |device, up| {
-                            device.reboot(now_ns, up)
-                        });
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(false);
-                    }
-                    _ => {}
-                }
-                self.send(sent)?;
+    /// Does what `command` asks, and returns `false` once it asks to quit.
+    fn obey(&mut self, command: Command) -> io::Result<bool> {
+        let now_ns = self.now_ns();
+        let mut sent = Queue::default();
+        match command {
+            Command::Drop => {
+                self.tree.each(now_ns, &mut sent, &mut |device, _| {
+                    device.drop_samples_now()
+                });
             }
+            Command::Reboot => {
+                self.tree.each(now_ns, &mut sent, &mut |device, up| {
+                    device.reboot(now_ns, up)
+                });
+            }
+            Command::Quit => return Ok(false),
         }
+        self.send(sent)?;
         Ok(true)
     }
 
@@ -329,13 +390,13 @@ impl Simulator {
                     if !self.accept_packet_from(addr)? {
                         continue;
                     }
-                    match PacketView::parse_prefix(&buf[..size]) {
-                        Ok((_, len)) if len == size => {
+                    match PacketView::parse_exact(&buf[..size]) {
+                        Ok(_) => {
                             let mut sent = Queue::default();
                             self.tree.route_down(&mut buf, self.now_ns(), &mut sent);
                             self.send(sent)?;
                         }
-                        Ok(_) => {
+                        Err(PacketError::TrailingBytes) => {
                             terminal_eprintln!(
                                 "Ignoring UDP datagram with trailing bytes from {addr}"
                             );
@@ -348,35 +409,61 @@ impl Simulator {
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 // Windows reports a port unreachable reply to an earlier send,
                 // as when the host closed its socket, on the next receive.
-                Err(err) if err.kind() == io::ErrorKind::ConnectionReset => continue,
+                Err(err) if err.kind() == io::ErrorKind::ConnectionReset => self.unreachable(),
                 Err(err) => return Err(err),
             }
         }
     }
 
     /// Sends the host what the devices sent, or nothing while none is
-    /// connected.
+    /// connected. A packet the socket has no room for is lost, as a link
+    /// loses a packet it cannot take.
     fn send(&self, sent: Queue) -> io::Result<()> {
         let Some(client) = self.client else {
             return Ok(());
         };
         for packet in sent.0 {
-            self.socket.send_to(&packet, client.addr)?;
+            match self.socket.send_to(&packet, client.addr) {
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) => return Err(err),
+                Ok(_) => {}
+            }
         }
         Ok(())
     }
 
+    /// Notes that a send to the host came back unreachable. The host is
+    /// served on until another address speaks, which is then taken as the
+    /// host at once, or until it speaks again itself.
+    fn unreachable(&mut self) {
+        if let Some(client) = &mut self.client {
+            client.unreachable = true;
+        }
+    }
+
+    /// Returns whether a packet from `addr` is the host's. The host's address
+    /// is the one served, or `addr` from now on when none is served, or the
+    /// one served is unreachable or has been silent for [`CLIENT_TIMEOUT`].
     fn accept_packet_from(&mut self, addr: SocketAddr) -> io::Result<bool> {
         let now = Instant::now();
         match self.client {
             Some(mut client) if client.addr == addr => {
                 client.last_rx = now;
+                client.unreachable = false;
                 self.client = Some(client);
                 Ok(true)
             }
-            Some(client) if now.duration_since(client.last_rx) < CLIENT_TIMEOUT => Ok(false),
+            Some(client)
+                if !client.unreachable && now.duration_since(client.last_rx) < CLIENT_TIMEOUT =>
+            {
+                Ok(false)
+            }
             _ => {
-                self.client = Some(Client { addr, last_rx: now });
+                self.client = Some(Client {
+                    addr,
+                    last_rx: now,
+                    unreachable: false,
+                });
                 terminal_println!("client connected: {addr}");
                 let now_ns = self.now_ns();
                 let mut sent = Queue::default();
@@ -399,19 +486,30 @@ impl Simulator {
     }
 }
 
-/// Returns the arguments `args` give a simulator that a test starts, on a
-/// free port of loopback.
-#[cfg(test)]
+/// Returns the arguments `args` give a simulator that a test starts, on
+/// loopback, at a free port unless `args` name one.
 fn test_cli(args: &[&str]) -> SimulateCli {
     use clap::Parser;
-    let on_loopback = ["tio-simulate", "--port", "0", "--listen", "loopback"];
-    SimulateCli::parse_from(on_loopback.iter().chain(args))
+    let free: &[&str] = if args.contains(&"--port") {
+        &[]
+    } else {
+        &["--port", "0"]
+    };
+    let on_loopback = ["tio-simulate", "--listen", "loopback"];
+    SimulateCli::parse_from(on_loopback.iter().chain(free).chain(args))
 }
 
-/// Serves the simulator `args` start on a free port of loopback from a
-/// thread until `stop` is set, and returns the URL a proxy opens it at.
-#[cfg(test)]
-pub(crate) fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
+/// Serves the simulator `args` start on loopback, at a free port unless
+/// `args` name one, from a
+/// thread until `stop` is set, and returns the URL a proxy opens it at. A
+/// test of what needs a device serves one so, with no terminal and no
+/// keys.
+///
+/// # Panics
+///
+/// Panics if `args` are not arguments of `tio simulate`, or the simulator
+/// cannot start. Its thread panics if serving fails.
+pub fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
     let cli = test_cli(args);
     let (bound, port) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -419,6 +517,7 @@ pub(crate) fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::Atomi
         bound
             .send(simulator.socket.local_addr().unwrap().port())
             .unwrap();
+        twinleaf::device::raise_thread_priority();
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             simulator.step().unwrap();
             std::thread::sleep(Duration::from_millis(1));
@@ -431,7 +530,12 @@ pub(crate) fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::Atomi
 mod tests {
     use super::*;
     use clap::Parser;
+    use twinleaf::proto::capture::{Selector, Status};
     use twinleaf::proto::rpc::RpcError;
+    use twinleaf::proto::update::{
+        PackageHeader, FLAG_DEVELOPMENT, FORMAT_VERSION, HEADER_SIZE, IMAGE_CHUNK_ENVELOPE,
+        IMAGE_CHUNK_SIZE, PACKAGE_OFFSET_SIZE,
+    };
     use twinleaf::tio::packet;
 
     /// Returns the simulator `args` start on a free port of loopback, and a
@@ -509,6 +613,90 @@ mod tests {
         let (from, answered) = answer(&exchange(simulator, host, &request), 9).unwrap();
         assert_eq!(from, route(at));
         answered
+    }
+
+    /// A host socket of its own, connected to `simulator`.
+    fn another_host(simulator: &Simulator) -> UdpSocket {
+        let port = simulator.socket.local_addr().unwrap().port();
+        let host = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        host.connect(("127.0.0.1", port)).unwrap();
+        host.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        host
+    }
+
+    /// Whether `simulator` answers a call from `host`, as it does its host's
+    /// and no other's.
+    fn answers(simulator: &mut Simulator, host: &UdpSocket) -> bool {
+        let request = packet::Packet::rpc_request("dev.name", &[], 9, route("/")).unwrap();
+        answer(&exchange(simulator, host, &request), 9).is_some()
+    }
+
+    /// A second address is ignored while the host the simulator serves
+    /// speaks, and is taken as the host at once when a send to the first
+    /// came back unreachable. A host that speaks again after such a send is
+    /// still the host.
+    #[test]
+    fn another_address_is_the_host_at_once_when_the_first_is_unreachable() {
+        let (mut simulator, first) = start_simulator(&[]);
+        let second = another_host(&simulator);
+        assert!(answers(&mut simulator, &first));
+        assert!(!answers(&mut simulator, &second));
+
+        simulator.unreachable();
+        assert!(answers(&mut simulator, &first));
+        assert!(
+            !answers(&mut simulator, &second),
+            "the first host spoke again"
+        );
+
+        simulator.unreachable();
+        assert!(answers(&mut simulator, &second));
+        assert!(!answers(&mut simulator, &first));
+    }
+
+    /// A host that closes its socket is unreachable once the simulator has
+    /// sent to it, as Windows reports on the next receive, so the socket
+    /// the host opens in its place is served at once.
+    #[cfg(windows)]
+    #[test]
+    fn a_host_that_closed_its_socket_is_replaced_by_its_next_at_once() {
+        let (mut simulator, first) = start_simulator(&[]);
+        assert!(answers(&mut simulator, &first));
+        drop(first);
+        // The devices send their samples to the closed socket.
+        let closed = Instant::now();
+        while !simulator.client.is_some_and(|client| client.unreachable) {
+            assert!(closed.elapsed() < Duration::from_secs(1), "no reset came");
+            simulator.step().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let second = another_host(&simulator);
+        let request = packet::Packet::rpc_request("dev.name", &[], 9, route("/")).unwrap();
+        second.send(request.as_bytes()).unwrap();
+        let asked = Instant::now();
+        loop {
+            // Each send to the closed socket came back, and the call after them.
+            simulator.receive_packets().unwrap();
+            if answer(&received(&second), 9).is_some() {
+                break;
+            }
+            assert!(asked.elapsed() < CLIENT_TIMEOUT, "the next socket waited");
+        }
+    }
+
+    /// The keys' commands do what the keys say. A drop and a reboot go on,
+    /// a reboot starts each device's next session, and a quit ends the loop.
+    #[test]
+    fn a_command_drops_reboots_or_quits() {
+        let (mut simulator, _host) = start_simulator(&[]);
+        let session = |simulator: &Simulator| simulator.tree.devices()[0].session();
+        let booted = session(&simulator);
+        assert!(simulator.obey(Command::Drop).unwrap());
+        assert_eq!(session(&simulator), booted);
+        assert!(simulator.obey(Command::Reboot).unwrap());
+        assert_ne!(session(&simulator), booted);
+        assert!(!simulator.obey(Command::Quit).unwrap());
     }
 
     /// Each device of a layout tells a host that connects it is there, at its
@@ -621,27 +809,27 @@ mod tests {
     #[test]
     fn a_capture_serves_its_blocks_once_taken() {
         let (mut simulator, host) = start_simulator(&[]);
-        let selector = |value: i16| value.to_le_bytes();
+        let capture = |simulator: &mut Simulator, selector: Selector| {
+            let arg = selector.arg().expect("the selector has an argument");
+            call(simulator, &host, "test.capture", &arg, "/")
+        };
 
+        assert_eq!(capture(&mut simulator, Selector::Trigger), Ok(Vec::new()));
         assert_eq!(
-            call(&mut simulator, &host, "test.capture", &selector(-1), "/"),
-            Ok(Vec::new())
+            capture(&mut simulator, Selector::Status),
+            Ok(vec![Status::Capturing.code()])
         );
         assert_eq!(
-            call(&mut simulator, &host, "test.capture", &selector(-2), "/"),
-            Ok(vec![1])
-        );
-        assert_eq!(
-            call(&mut simulator, &host, "test.capture", &selector(0), "/"),
+            capture(&mut simulator, Selector::Block(0)),
             Err(RpcError::Busy.value())
         );
 
         std::thread::sleep(Duration::from_nanos(device::CAPTURE_DELAY_NS));
         assert_eq!(
-            call(&mut simulator, &host, "test.capture", &selector(-2), "/"),
-            Ok(vec![2])
+            capture(&mut simulator, Selector::Status),
+            Ok(vec![Status::Done.code()])
         );
-        let block = call(&mut simulator, &host, "test.capture", &selector(0), "/").unwrap();
+        let block = capture(&mut simulator, Selector::Block(0)).unwrap();
         assert_eq!(block.len(), 256);
     }
 
@@ -714,10 +902,11 @@ mod tests {
             Err(RpcError::Invalid.value())
         );
         call(&mut simulator, &host, "test.drop", b"rollover", "/").unwrap();
+        // The device acquires from the simulator's start. A tick at 1.1 s
+        // of it ends one segment and starts the next, however long the
+        // calls took.
         let mut sent = Queue::default();
-        simulator
-            .tree
-            .tick(simulator.now_ns() + 1_100_000_000, &mut sent);
+        simulator.tree.tick(1_100_000_000, &mut sent);
 
         // The main clock's sine stream and the aux stream, each sample 16
         // bytes, at 1000 and 25 samples a segment.
@@ -745,6 +934,27 @@ mod tests {
         }
     }
 
+    /// A device reports the build `--build` names, a development build by
+    /// default, and a build too long for `dev.desc` is refused.
+    #[test]
+    fn a_device_reports_the_build_it_was_given() {
+        let desc = |args: &[&str]| {
+            let (mut simulator, host) = start_simulator(args);
+            let desc = call(&mut simulator, &host, "dev.desc", &[], "/").unwrap();
+            String::from_utf8(desc).unwrap()
+        };
+        assert_eq!(
+            desc(&[]),
+            "Twinleaf tio-test R1 ((null)) [2026-06-08/000001-DEV]"
+        );
+        assert_eq!(
+            desc(&["--build", "2026-01-10/aaaaaa"]),
+            "Twinleaf tio-test R1 ((null)) [2026-01-10/aaaaaa]"
+        );
+        let long = "x".repeat(65);
+        assert!(SimulateCli::try_parse_from(["tio-simulate", "--build", &long]).is_err());
+    }
+
     /// An upload counts the image bytes of each chunk, and an upgrade reboots
     /// into a new build.
     #[test]
@@ -752,10 +962,18 @@ mod tests {
         let (mut simulator, host) = start_simulator(&[]);
         let session = simulator.tree.devices()[0].session();
 
-        call(&mut simulator, &host, "dev.firmware.upload", &[0; 288], "/").unwrap();
+        call(
+            &mut simulator,
+            &host,
+            "dev.firmware.upload",
+            &[0; IMAGE_CHUNK_SIZE],
+            "/",
+        )
+        .unwrap();
+        let image_bytes = (IMAGE_CHUNK_SIZE - IMAGE_CHUNK_ENVELOPE) as u32;
         assert_eq!(
             call(&mut simulator, &host, "dev.firmware.upload", &[], "/"),
-            Ok(256u32.to_le_bytes().to_vec())
+            Ok(image_bytes.to_le_bytes().to_vec())
         );
         call(&mut simulator, &host, "dev.firmware.upgrade", &[], "/").unwrap();
 
@@ -774,15 +992,19 @@ mod tests {
     /// The header of a signed package for the simulator, around an image of
     /// `len` bytes.
     fn package_header(len: u32) -> Vec<u8> {
-        let mut header = vec![0u8; 288];
-        header[..8].copy_from_slice(device::PACKAGE.magic.as_bytes());
-        header[8..10].copy_from_slice(&1u16.to_le_bytes());
-        header[10..12].copy_from_slice(&288u16.to_le_bytes());
-        header[12..20].copy_from_slice(device::PACKAGE.board_id.as_bytes());
-        header[20..22].copy_from_slice(&device::PACKAGE.hw_rev.to_le_bytes());
-        header[22..24].copy_from_slice(&1u16.to_le_bytes());
-        header[24..28].copy_from_slice(&len.to_le_bytes());
-        header
+        let mut header = [0; HEADER_SIZE];
+        PackageHeader {
+            magic: device::PACKAGE.magic.as_bytes(),
+            format: FORMAT_VERSION,
+            header_size: HEADER_SIZE as u16,
+            board_id: device::PACKAGE.board_id.as_bytes(),
+            hw_rev: device::PACKAGE.hw_rev.value(),
+            flags: FLAG_DEVELOPMENT,
+            image_len: len,
+            signature: &[0; 64],
+        }
+        .write(&mut header);
+        header.to_vec()
     }
 
     /// With `--upload signed`, the simulator takes a package as a device built
@@ -796,12 +1018,12 @@ mod tests {
         };
         let chunk = |offset: u32, len: usize| {
             let mut chunk = offset.to_le_bytes().to_vec();
-            chunk.resize(4 + len, 0xa5);
+            chunk.resize(PACKAGE_OFFSET_SIZE + len, 0xa5);
             chunk
         };
 
         assert_eq!(
-            upload(&mut simulator, &[0; 288]),
+            upload(&mut simulator, &[0; HEADER_SIZE]),
             Err(RpcError::Invalid.value()),
             "an image chunk is no package header"
         );

@@ -223,8 +223,9 @@ impl RpcConsole {
     }
 
     /// Takes the RPC list of `route`, or why it could not be loaded, and
-    /// suggests from it when it belongs to the target. A failed load keeps
-    /// the list before it.
+    /// suggests from it when it belongs to the target. A new list drops the
+    /// settings read with the one before it. A failed load keeps the list
+    /// before it and its settings.
     pub(super) fn on_registry(
         &mut self,
         route: DeviceRoute,
@@ -235,6 +236,7 @@ impl RpcConsole {
         match registry {
             Ok(registry) => {
                 rpc.registry = Some(registry);
+                rpc.settings = None;
                 rpc.failed = false;
             }
             Err(_) => rpc.failed = true,
@@ -416,5 +418,30 @@ impl ListStatus {
             ListStatus::Previous => ("RPC list failed; using previous list", "Using previous"),
             ListStatus::Current => ("", ""),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use twinleaf::device::rpc::RpcRegistryError;
+
+    /// A new table drops the settings the palette kept, and a failed load
+    /// keeps them with the table they were read with.
+    #[test]
+    fn a_new_table_drops_the_kept_settings_and_a_failed_load_keeps_them() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let proxy = crate::tools::capture::tests::simulated(&stop);
+        let connection = twinleaf::Connection::open(&proxy.endpoint()).unwrap();
+        let root = DeviceRoute::root();
+        let device = connection.device(root);
+        let mut console = RpcConsole::new(connection.tree(root));
+        console.on_settings(root, device.settings().unwrap());
+        console.on_registry(root, Err(RpcRegistryError::TableChanged), root);
+        assert!(console.routes[&root].settings().is_some());
+        console.on_registry(root, Ok(device.rpc_registry().unwrap()), root);
+        assert!(console.routes[&root].settings().is_none());
+        stop.store(true, Ordering::Relaxed);
     }
 }
