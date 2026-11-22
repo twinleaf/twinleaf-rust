@@ -53,7 +53,7 @@ const RECONNECT: u64 = 10_000;
 /// loses a silent device or hub child.
 const QUIET: u64 = 3_000;
 /// How long the proxy's worker waits between attempts to reach the device.
-const RECONNECT_INTERVAL: u64 = 1_000;
+const RECONNECT_INTERVAL: u64 = crate::proxy::worker::RECONNECT_INTERVAL.as_millis() as u64;
 /// A connect timeout and the reconnect interval after it, the longest the
 /// proxy takes to reach a device whose link is usable again.
 const RECONNECT_TRY: u64 = 4_000;
@@ -97,7 +97,8 @@ const LONGEST_BLIP: u64 = 2_500;
 /// mutant is equivalent, with the reason.
 /// - S1. In `Mounts::feed` in `proxy/engine/mod.rs`, queue each packet twice,
 ///   `mount.outbox.stream(shown.clone())` before `mount.outbox.stream(shown)`.
-/// - S2. In `StreamTracker::detect_boundary` in `data/state.rs`, count one
+/// - S2. In `StreamTracker::detect_boundary` in
+///   `twinleaf-data/src/decode/state.rs`, count one
 ///   more, `first_sample_n.value() - expected.value() + 1`. In the same
 ///   function, drop `opened &&` from the condition `opened && self.relearned`
 ///   of the `Restarted` branch, so a gap after a link loss is told as

@@ -50,12 +50,13 @@ pub(crate) use control::{
 };
 pub use control::{Layout, Mount};
 pub use state::{
-    MetadataState, Presence, RegistryState, SettingChange, SettingValueError, Settings,
+    LinkState, LostCause, MetadataState, Presence, RegistryState, SettingChange, SettingValueError,
+    Settings,
 };
 #[cfg(test)]
 pub(crate) use store::CHANGE_QUEUE_LEN;
 pub(crate) use store::{
-    end_sinks, prune, pruned, rpc_hash, Field, Store, CHANGES, METADATA, PRESENCE, REGISTRY,
+    end_sinks, prune, pruned, rpc_hash, Field, Store, CHANGES, LINK, METADATA, PRESENCE, REGISTRY,
     SETTINGS,
 };
 pub(crate) use subscription::{BatchLane, End, Lane, Queued, Scope, Sink};
@@ -482,6 +483,19 @@ async fn open_again(
     tokio::time::timeout(REOPEN_FOR, tries).await.ok()
 }
 
+/// Returns the next id from the counter `next` that is not `taken`, or `None`
+/// if every id is taken.
+pub(crate) fn free_id(next: &mut u16, taken: impl Fn(u16) -> bool) -> Option<u16> {
+    for _ in 0..=u16::MAX {
+        let id = *next;
+        *next = next.wrapping_add(1);
+        if !taken(id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
 /// Returns `wait` made up to a quarter longer or shorter at random.
 fn jittered(wait: Duration) -> Duration {
     use std::hash::BuildHasher;
@@ -628,7 +642,7 @@ impl Worker {
     /// Sends `call` with an id no pending call has, and keeps it until its
     /// reply or its deadline. Fails it if it cannot be sent.
     fn call(&mut self, call: Call) {
-        let Some(id) = self.free_id() else {
+        let Some(id) = free_id(&mut self.next_id, |id| self.pending.contains_key(&id)) else {
             return (call.complete)(Err(CallError::RequestNotSubmitted));
         };
         if let Err(error) = self.socket.send(call.request.with_rpc_id(id)) {
@@ -641,19 +655,6 @@ impl Worker {
             self.next_deadline
                 .map_or(deadline, |next| next.min(deadline)),
         );
-    }
-
-    /// Returns the next id from the counter that no pending call has, or
-    /// `None` if every id is taken.
-    fn free_id(&mut self) -> Option<u16> {
-        for _ in 0..=u16::MAX {
-            let id = self.next_id;
-            self.next_id = self.next_id.wrapping_add(1);
-            if !self.pending.contains_key(&id) {
-                return Some(id);
-            }
-        }
-        None
     }
 
     /// Handles one transport event, leaving queued calls and deadlines a turn.
@@ -693,7 +694,10 @@ impl Worker {
         }
         match packet.payload() {
             Payload::ProxyRx(ProxyRx::Alive) => return true,
-            Payload::ProxyRx(ProxyRx::Reply(_) | ProxyRx::Error(_)) => {
+            // The replies to the pump's requests go in however full the
+            // inlet is, and so does the proxy's count of the samples it
+            // dropped, which says where the samples after it are missing.
+            Payload::ProxyRx(ProxyRx::Reply(_) | ProxyRx::Error(_) | ProxyRx::Dropped { .. }) => {
                 if let Some(inlet) = &mut self.inlet {
                     inlet.send_always(Received::Packet(packet));
                 }
@@ -806,11 +810,7 @@ impl Handle {
         args: &[u8],
         complete: Completion,
     ) {
-        let relative = match self.scope.relative_route(&route) {
-            Ok(relative) => relative,
-            Err(error) => return complete(Err(CallError::InvalidRoute(error))),
-        };
-        if relative.len() > self.depth {
+        if route.depth_left_in(&self.scope, self.depth).is_none() {
             return complete(Err(CallError::InvalidRoute(RouteError::OutsideSubtree)));
         }
         self.session
@@ -830,10 +830,9 @@ impl Handle {
     /// the depth that remains below it. Fails with
     /// [`RouteError::OutsideSubtree`] if this handle does not cover `scope`.
     pub(crate) fn subtree(&self, scope: DeviceRoute) -> Result<Handle, RouteError> {
-        let below = self.scope.relative_route(&scope)?.len();
-        let Some(depth) = self.depth.checked_sub(below) else {
-            return Err(RouteError::OutsideSubtree);
-        };
+        let depth = scope
+            .depth_left_in(&self.scope, self.depth)
+            .ok_or(RouteError::OutsideSubtree)?;
         Ok(Handle {
             session: self.session.clone(),
             scope,
@@ -954,6 +953,8 @@ impl Session {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub(crate) mod packets;
+
     use super::*;
     use crate::proto::rpc::{Method, RpcError};
     use crate::proto::PacketType;
@@ -1804,6 +1805,38 @@ pub(crate) mod tests {
             Some(crate::chan::RecvTimeoutError::Disconnected),
             "a second pump gets an inlet that has ended"
         );
+    }
+
+    /// The proxy's count of the samples it dropped goes into a full inlet,
+    /// behind the count of the packets the inlet had no room for, as it
+    /// says where the samples after it are missing.
+    #[test]
+    fn the_proxys_count_of_dropped_samples_goes_into_a_full_inlet() {
+        let (session, proxy) = Session::test_pair();
+        let root = Handle::root(session.clone());
+        let inlet = session.attach(1);
+        for _ in 0..2 {
+            proxy.send(Packet::heartbeat(DeviceRoute::root()));
+        }
+        proxy.send(Packet::dropped(1, 5));
+        // A reply comes after every packet sent ahead of it.
+        let reply = root.submit(DeviceRoute::root(), "dev.name", &[]);
+        let (route, _, _, id) = proxy.call();
+        proxy.reply(id, b"after", route);
+        assert_eq!(reply.recv_timeout(WAIT).unwrap().unwrap(), b"after");
+
+        assert!(matches!(inlet.try_recv(), Ok(Queued::Item(_))));
+        assert!(matches!(inlet.try_recv(), Ok(Queued::Gap(1))));
+        let Ok(Queued::Item(Received::Packet(count))) = inlet.try_recv() else {
+            panic!("the count did not go in");
+        };
+        assert!(matches!(
+            count.payload(),
+            Payload::ProxyRx(ProxyRx::Dropped {
+                stream_id: 1,
+                packets: 5
+            })
+        ));
     }
 
     /// A reply to the pump's control request goes into a full inlet, in the

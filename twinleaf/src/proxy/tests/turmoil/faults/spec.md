@@ -250,7 +250,7 @@ sample numbers the app receives strictly increase across all its
 connections, and step by one within a batch. The checker compares the
 numbers themselves, since a repeat of the last sample makes no boundary
 at all (the gap and step back checks of `StreamTracker::detect_boundary`
-in `data/state.rs` see neither a gap nor a step back).
+in `twinleaf-data/src/decode/state.rs` see neither a gap nor a step back).
 - Safety invariant, checked at every batch.
 - Source the module doc of `proxy`, where a client that falls behind
   loses samples and nothing else, and its section How a packet reaches a
@@ -266,9 +266,9 @@ last, the second has no boundary at all. When it is not, the boundary's
 change is none and its `Loss` counts exactly the missing numbers. The fake
 device sends one segment, so no rollover or other change is due.
 - Safety postcondition, checked at every batch.
-- Source the doc of `Boundary` in `data/continuity.rs` (no boundary when
-  nothing changed or was lost), the doc of `Loss::samples`, and the
-  section How a packet reaches a client in the module doc of `proxy`,
+- Source the doc of `Boundary` in `twinleaf-data/src/model/continuity.rs`
+  (no boundary when nothing changed or was lost), the doc of `Loss::samples`,
+  and the section How a packet reaches a client in the module doc of `proxy`,
   where each place a sample can be lost counts what it lost.
 - It rules out a count off by one, a phantom loss, a boundary with nothing
   behind it, and a gap after a link loss told as `Restarted`, which counts
@@ -465,7 +465,7 @@ fault, and drops them if that stops holding.
   1 s and `d`, also while its open waits for an unreachable device.
   Source the hung up item of the section When the proxy lets a client go
   in the module doc of `proxy`, with the promptness taken from the doc of
-  the test `a_client_that_hangs_up_mid_wait_is_let_go` in `proxy/mod.rs`,
+  the test `a_client_that_hangs_up_mid_wait_is_let_go` in `proxy/tests/real.rs`,
   open question 4.
 - (d) Once no app has held the device open for 5 s, on an untainted and
   usable device link, the device logs the end of the proxy's connection
@@ -797,8 +797,8 @@ often each is reached.
   alone.
 - turmoil cannot lose, repeat or corrupt a single segment, skew a clock,
   or crash a client. Serial, mDNS, UDP and rate negotiation are out of
-  reach. The restart check in `Device::received` in `proxy/worker.rs`
-  runs only while a rate is negotiated, so it never runs here.
+  reach. `Device::received` in `proxy/worker.rs` checks for a new root
+  session on one connection, which never comes, as each serves one boot.
 - No timing law covers a failing link, since the driver does not know
   when `FailRate` repairs it.
 - Settings are not checked, as S7 and L4 say.
@@ -895,29 +895,29 @@ is heard in its new session and its new table is loaded. Generated cases
 reach this too seldom to hold the engine to the heartbeat's session, and
 this example does, through L1.
 
-One fixed example holds a regression of the proxy, and is ignored until
-the proxy is fixed. With `reconnect_timeout` of 10 s and three apps, a
-device killed for 20 s, the kill placed 860 to 960 ms into the chaos.
-Every app hears `FailedToReconnect` 10 s to 10.6 s after the kill and the
-laws hold. An app whose request reaches a port the worker has closed,
-before the engine hears the worker gave up, has its connection closed
-with `ForwardFailed` in `proxy/client.rs`, without the status, and opens
-again and again.
+One fixed example lands a device given up against every app's calls.
+With `reconnect_timeout` of 10 s and three apps, a device killed for
+20 s, the kill placed 860 to 960 ms into the chaos, one case for each
+millisecond. Every app hears `FailedToReconnect` 10 s to 10.6 s after the
+kill, and every law not in `OPEN` holds. An app whose request reaches a
+port the worker has closed, before the engine hears the worker gave up,
+keeps its connection, as `proxy/client.rs` drops the packet, and hears
+the status.
 
 The suite covers two real socket tests, which stay beside it.
 - The test `a_client_that_hangs_up_mid_wait_is_let_go` in
-  `proxy/mod.rs`, by L6 (c) and class C10. Its probe half is covered only
+  `proxy/tests/real.rs`, by L6 (c) and class C10. Its probe half is covered only
   if an app also probes.
 - The test `a_slow_reply_within_the_calls_timeout_arrives` in
   `device/connection.rs`, by L9 and S6 under `SlowLink`.
 
 The suite does not reach the tests of threads, panics, ports and
-loopback in `proxy/mod.rs`, the task leak test
+loopback in `proxy/tests/real.rs`, the task leak test
 `a_dropped_connection_and_proxy_leave_no_task` and the handles a close
 ends in `a_close_ends_every_handle_on_the_connection`, both in
 `device/connection.rs`, and the proxy behind a proxy in
 `a_device_lost_behind_a_mounted_proxy_is_a_status_at_its_mount` in
-`proxy/mod.rs` and `clients_of_a_proxy_behind_a_proxy_share_its_state`
+`proxy/tests/real.rs` and `clients_of_a_proxy_behind_a_proxy_share_its_state`
 in `device/connection.rs`.
 
 # Running

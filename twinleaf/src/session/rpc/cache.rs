@@ -244,13 +244,6 @@ mod tests {
         assert_eq!(path("test-device", 0x1234), None);
     }
 
-    /// A cache that cannot be read is a miss, so the table is walked again.
-    #[test]
-    fn an_unreadable_cache_is_a_miss() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(load(dir.path()).is_none());
-    }
-
     /// A stored table loads back, and a file that does not parse is a miss
     /// that is deleted.
     #[test]

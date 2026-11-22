@@ -72,11 +72,11 @@ impl Port {
     }
 
     #[cfg(feature = "serial")]
-    fn open_serial(serial_config: &str, rx: Delivery, tasks: &Supervisor) -> io::Result<Port> {
-        let (stream, rates) = serial::open(serial_config, tasks)?;
+    fn open_serial(path: &str, rates: &str, rx: Delivery, tasks: &Supervisor) -> io::Result<Port> {
+        let (stream, info) = serial::open(path, rates, tasks)?;
         let (port, task) = Port::with_task(
             TransportKind::Serial,
-            Some(rates),
+            Some(info),
             serial::RULES,
             rx,
             DEFAULT_TX_CHANNEL_SIZE,
@@ -84,7 +84,7 @@ impl Port {
         let framing =
             codec::serial::Codec::with_timing(serial::RULES.holdoff, serial::RULES.stale_after);
         let run = task.run_stream(stream, framing);
-        Ok(port.start(tasks, format_args!("twinleaf port {serial_config}"), run))
+        Ok(port.start(tasks, format_args!("twinleaf port {path}{rates}"), run))
     }
 
     /// Opens a [`Port`] over `link` to `address`, with its task on `tasks`.
@@ -166,35 +166,26 @@ impl Port {
     ///
     /// Returns an error if `url` is not valid or the link cannot be opened.
     pub(crate) fn new_on(url: &str, rx: Delivery, tasks: &Supervisor) -> io::Result<Port> {
-        // Special case: serial ports can be given directly
-        #[cfg(all(feature = "serial", unix))]
-        if url.starts_with("/dev/") {
-            return Self::open_serial(url, rx, tasks);
+        match super::serial_locator(url) {
+            #[cfg(feature = "serial")]
+            Some((path, rates)) => return Self::open_serial(path, rates, rx, tasks),
+            #[cfg(not(feature = "serial"))]
+            Some(_) => {
+                let disabled = "serial support is disabled";
+                return Err(io::Error::new(io::ErrorKind::Unsupported, disabled));
+            }
+            None => {}
         }
-        #[cfg(all(feature = "serial", target_os = "windows"))]
-        if url.starts_with("COM") {
-            return Self::open_serial(url, rx, tasks);
-        }
-
         if Port::opens_as_future(url) {
             let (url, on) = (url.to_string(), tasks.clone());
             return tasks.run("twinleaf port open", async move {
                 Port::open(&url, rx, &on).await
             });
         }
-        match url.split_once("://") {
-            #[cfg(feature = "serial")]
-            Some(("serial", port)) => Self::open_serial(port, rx, tasks),
-            #[cfg(not(feature = "serial"))]
-            Some(("serial", _)) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "serial support is disabled",
-            )),
-            Some(_) | None => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid TIO transport locator: {url}"),
-            )),
-        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid TIO transport locator: {url}"),
+        ))
     }
 
     /// Opens a [`Port`] for `url` as [`new_on`](Self::new_on) does, without
@@ -237,30 +228,8 @@ impl Port {
         false
     }
 
-    /// Creates a [`Port`] over the connected TCP `stream`, such as the one a
-    /// control call opens to the proxy, with Nagle's algorithm off. Its task
-    /// runs on `tasks`. It delivers what it receives to `rx` as
-    /// [`new_on`](Self::new_on) does, and queues up to `tx_size` packets to
-    /// send.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if Nagle's algorithm cannot be turned off.
-    pub(crate) fn over_tcp(
-        stream: crate::net::TcpStream,
-        rx: Delivery,
-        tx_size: usize,
-        tasks: &Supervisor,
-    ) -> io::Result<Port> {
-        // TIO packets are small and latency sensitive, and Nagle's algorithm
-        // with delayed acknowledgement would serialize a burst of requests.
-        stream.set_nodelay(true)?;
-        Ok(Port::start_tcp(stream, tcp::RULES, rx, tx_size, tasks))
-    }
-
     /// Creates a [`Port`] over the connected TCP `stream`, a socket of no
-    /// runtime yet, as [`over_tcp`](Self::over_tcp) does on the crate's
-    /// runtime.
+    /// runtime yet, with Nagle's algorithm off, on the crate's runtime.
     #[cfg(all(test, not(turmoil)))]
     pub(crate) fn from_tcp_stream(
         stream: std::net::TcpStream,
@@ -269,11 +238,12 @@ impl Port {
     ) -> io::Result<Port> {
         let tasks = Supervisor::new();
         stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
         let stream = {
             let _runtime = tasks.enter();
             crate::net::TcpStream::from_std(stream)?
         };
-        Port::over_tcp(stream, rx, tx_size, &tasks)
+        Ok(Port::start_tcp(stream, tcp::RULES, rx, tx_size, &tasks))
     }
 
     /// Creates a [`Port`] over `stream`, a connected TCP stream of the

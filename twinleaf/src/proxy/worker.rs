@@ -38,20 +38,22 @@
 //! with an RPC error. Control packets a port sends go to the proxy and never
 //! reach the device.
 //!
-//! The worker logs its device's events under the target `proxy::<url>`, the
-//! device's own log packets under `device::<route>` at their own level, and
-//! the traffic [`DumpFlags`] asks for.
+//! The worker logs its device's events under the target `proxy::<url>`, and
+//! those that say a link status it also announces to the engine, which the
+//! proxy's clients hear as a device lost or back, under `status::<url>`. It
+//! logs the device's own log packets under `device::<route>` at their own
+//! level, and the traffic [`DumpFlags`] asks for.
 
 use super::engine::Mount;
 use super::DumpFlags;
 use crate::chan::StreamMap;
-use crate::proto::heartbeat::Heartbeat;
+use crate::proto::heartbeat::{self, Heartbeat};
 use crate::proto::log::LogLevel;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture, Supervisor};
 use crate::session::{
-    decode, older_build, Introduction, Layout, Request, Session, AUTO, CLIENT_KEEPALIVE,
+    decode, free_id, older_build, Introduction, Layout, Request, Session, AUTO, CLIENT_KEEPALIVE,
     HELLO_TIMEOUT, MAX_RPC_TIMEOUT,
 };
 use crate::tio::packet::{self, Packet};
@@ -453,7 +455,7 @@ pub(super) fn opener(tasks: &Supervisor, url: &str) -> Opener {
         return Opener::droppable(move |results| {
             let (url, tasks) = (url.clone(), tasks.clone());
             async move {
-                match url.starts_with("tcp") {
+                match transport::is_tcp(&url) {
                     true => open_tcp(&url, results, &tasks).await,
                     false => HardwarePort::open(&url, results, &tasks)
                         .await
@@ -612,34 +614,27 @@ impl Device {
     /// negotiation on, and marks the device restarted when its session
     /// changes.
     fn received(&mut self, result: &ReceiveResult) {
-        // Any received packet (text included) refreshes liveness, for every
-        // device — the watchdog needs a timestamp regardless of rate state.
         if let Ok(TransportEvent::Packet(_) | TransportEvent::Text(_)) = result {
             self.last_rx = Instant::now();
         }
-        if !self.has_static_rate() {
-            if let Ok(TransportEvent::Packet(pkt)) = result {
-                if let packet::Payload::Heartbeat(Heartbeat::Session { session, .. }) =
-                    pkt.payload()
-                {
-                    let session = session.value();
-                    if pkt.route().is_empty() {
-                        // This is a heartbeat for the root sensor
-                        let old_session = self.last_session.replace(session);
-                        if let RateChange::WaitingForSession = self.rate_change_state {
-                            self.rate_change_state = RateChange::QueryDeviceRate;
-                        } else if (self.last_session != old_session) && old_session.is_some() {
-                            // It has restarted, restart autonegotiation if needed.
-                            self.rate_change_state = match self.rate_change_state {
-                                RateChange::DoNothing => RateChange::DoNothing,
-                                RateChange::WaitingForSession => RateChange::WaitingForSession, // never happens
-                                _ => RateChange::QueryDeviceRate,
-                            };
-                            self.restarted = true;
-                        }
-                    }
-                }
+        let Ok(TransportEvent::Packet(pkt)) = result else {
+            return;
+        };
+        // Every packet passes here, so its type is read before its payload.
+        if pkt.ptype() != PacketType::HEARTBEAT || !pkt.route().is_empty() {
+            return;
+        }
+        let packet::Payload::Heartbeat(Heartbeat::Session { session, .. }) = pkt.payload() else {
+            return;
+        };
+        let old_session = self.last_session.replace(session.value());
+        if let RateChange::WaitingForSession = self.rate_change_state {
+            self.rate_change_state = RateChange::QueryDeviceRate;
+        } else if old_session.is_some_and(|old| old != session.value()) {
+            if !self.has_static_rate() {
+                self.rate_change_state = RateChange::QueryDeviceRate;
             }
+            self.restarted = true;
         }
     }
 }
@@ -684,6 +679,8 @@ struct Worker {
     command_queue: mpsc::Receiver<OpenPort>,
     /// The target the worker logs under, `proxy::<url>`.
     log_target: String,
+    /// The target it logs a link status it announces under, `status::<url>`.
+    status_target: String,
     /// The traffic to log.
     dump: DumpFlags,
     /// The worker's readiness, which the link watches.
@@ -721,8 +718,9 @@ struct Worker {
 }
 
 /// How long a device on a serial or UDP port that has already sent a packet
-/// may stay silent before its port is torn down and reopened.
-const LIVENESS_TIMEOUT: Duration = Duration::from_millis(1000);
+/// may stay silent before its port is torn down and reopened. It may miss
+/// five heartbeats.
+const LIVENESS_TIMEOUT: Duration = heartbeat::PERIOD.saturating_mul(5);
 
 /// How long a device on a TCP connection may stay silent. It allows one RTO
 /// plus slack. The silence counts from the start of the attempt to open the
@@ -744,7 +742,7 @@ const LIVENESS_TIMEOUT_PROXY: Duration = Duration::from_secs(10);
 
 /// How long the worker waits after an attempt to reopen a device fails, or
 /// opens a port the device never answers on, before the next attempt.
-const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+pub(super) const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long a port at a new rate may go without receiving before it goes
 /// back to its default rate.
@@ -773,6 +771,7 @@ impl Worker {
         inputs.insert(ENGINE, from_engine);
         Worker {
             log_target: format!("proxy::{url}"),
+            status_target: format!("status::{url}"),
             url,
             reconnect_timeout,
             command_queue,
@@ -808,11 +807,8 @@ impl Worker {
             .flat_map(|layout| &layout.mounts)
             .filter(|mount| mount.url == self.url)
             .filter_map(|mount| {
-                let relative = mount.source.relative_route(&route).ok()?;
-                Some((
-                    mount.source.len(),
-                    mount.prefix.absolute_route(&relative).ok()?,
-                ))
+                let shown = route.rerooted(&mount.source, &mount.prefix).ok()?;
+                Some((mount.source.len(), shown))
             })
             .max_by_key(|(depth, _)| *depth);
         match mounted {
@@ -843,7 +839,7 @@ impl Worker {
             self.reconnect_deadline = self.reconnect_timeout.map(|timeout| now + timeout);
         }
         if device.seen_since_connect {
-            log::warn!(target: &self.log_target, "Sensor disconnected");
+            log::warn!(target: &self.status_target, "Sensor disconnected");
             self.status_to_engine(packet::LinkStatus::SensorDisconnected);
         } else {
             log::debug!("lost {} before it answered", self.url);
@@ -902,24 +898,13 @@ impl Worker {
         Some(remap)
     }
 
-    fn next_wire_rpc_id(&mut self) -> Option<u16> {
-        for _ in 0..=u16::MAX {
-            let wire_id = self.next_rpc_id;
-            self.next_rpc_id = self.next_rpc_id.wrapping_add(1);
-            if !self.rpc_map.contains_key(&wire_id) {
-                return Some(wire_id);
-            }
-        }
-        None
-    }
-
     /// Forwards a packet from port `port` to the device. Drops a control
-    /// packet, and answers a request the device cannot be sent with an RPC
-    /// error.
+    /// packet, and answers a request the device cannot be sent with the RPC
+    /// error its forwarding failed with.
     async fn port_packet(&mut self, port: u64, pkt: Packet) {
         // A control packet talks to the proxy itself, never to a device.
-        // Type 64 is also USER, which apps may send, so it is forwarded like
-        // any other packet.
+        // Only PROXY_TX and PROXY_RX talk to the proxy, so a packet of type
+        // 64 from a port is forwarded like any other packet.
         if matches!(pkt.ptype(), PacketType::PROXY_TX | PacketType::PROXY_RX) {
             log::debug!("dropping a control packet from port {port}: {pkt:?}");
             return;
@@ -951,7 +936,8 @@ impl Worker {
             _ => None,
         };
         if let Some(original_id) = request {
-            let Some(wire_id) = self.next_wire_rpc_id() else {
+            let Some(wire_id) = free_id(&mut self.next_rpc_id, |id| self.rpc_map.contains_key(&id))
+            else {
                 return Err(RpcError::NoBufs);
             };
             let (target, timeout) = match origin {
@@ -993,10 +979,9 @@ impl Worker {
                 return Ok(());
             }
         }
-        // If we got here, the packet was not sent. avoid erroring out since if
-        // there is something wrong with the device we'll notice in the main
-        // loop soon but remove the rpc from the map and send back an error to
-        // the port.
+        // The packet was not sent. A fault of the device shows in the main
+        // loop, so the worker carries on here. The request leaves the map,
+        // and `port_packet` answers its port.
         if let Some((rpc_id, _)) = mapped {
             self.rpc_map
                 .remove(&rpc_id)
@@ -1044,7 +1029,7 @@ impl Worker {
                 if first_packet {
                     self.reconnect_deadline = None;
                     if self.ever_connected {
-                        log::info!(target: &self.log_target, "Sensor reconnected");
+                        log::info!(target: &self.status_target, "Sensor reconnected");
                         self.status_to_engine(packet::LinkStatus::SensorReconnected);
                     } else {
                         // Initial connect needs no wire status.
@@ -1106,9 +1091,10 @@ impl Worker {
     }
 
     /// Fails every request whose timeout has come by `until`, or every
-    /// request with `None`. Each port gets an RPC error for `failure` in
-    /// place of its reply. It times requests out, and fails those still
-    /// waiting when the device disconnects or restarts.
+    /// request with `None`. Each port gets the RPC error `Timeout` in place
+    /// of its reply, as the request was sent and may have taken effect. It
+    /// times requests out, and fails those still waiting when the device
+    /// disconnects or restarts or the worker shuts down.
     fn dispatch_rpc_errors(&mut self, failure: RpcFailure, until: Option<Instant>) {
         let mut to_remove = Vec::new();
         let mut failed = Vec::new();
@@ -1134,7 +1120,7 @@ impl Worker {
         for remap in failed {
             match remap.target {
                 RpcTarget::Port { port, original_id } => {
-                    let error = Packet::rpc_error(original_id, failure.wire_error(), remap.route);
+                    let error = Packet::rpc_error(original_id, RpcError::Timeout, remap.route);
                     self.answer(port, error);
                 }
                 RpcTarget::Internal(_) => {
@@ -1401,7 +1387,7 @@ impl Worker {
             .is_some_and(|deadline| now >= deadline)
         {
             log::error!(
-                target: &self.log_target,
+                target: &self.status_target,
                 "Stopping reconnection attempts due to timeout"
             );
             self.status_to_engine(packet::LinkStatus::FailedToReconnect);
@@ -1525,10 +1511,6 @@ fn log_device_packet(pkt: &Packet, dump: DumpFlags, shown: impl Fn() -> String) 
     }
 }
 
-fn is_serial(url: &str) -> bool {
-    url.starts_with("serial://") || url.starts_with("/dev/") || url.starts_with("COM")
-}
-
 fn key_from(identity: &str) -> String {
     identity
         .chars()
@@ -1542,20 +1524,13 @@ fn key_from(identity: &str) -> String {
         .collect()
 }
 
-fn serial_locator(url: &str) -> (&str, &str) {
-    let locator = url.strip_prefix("serial://").unwrap_or(url);
-    let path = locator.split(':').next().unwrap_or_default();
-    (path, &locator[path.len()..])
-}
-
 /// Returns the key the proxy files a device's link under. A network URL is
 /// its own key. A serial port is keyed by its USB serial number if it
 /// reports one, else by its path. The baud rate is ignored.
 pub(super) fn device_key(url: &str) -> String {
-    if !is_serial(url) {
+    let Some((path, _)) = transport::serial_locator(url) else {
         return key_from(url);
-    }
-    let (path, _) = serial_locator(url);
+    };
     let path = match path.strip_prefix("/dev/tty.") {
         Some(rest) if cfg!(target_os = "macos") => format!("/dev/cu.{rest}"),
         _ => path.to_string(),
@@ -1568,14 +1543,13 @@ pub(super) fn device_key(url: &str) -> String {
 
 /// Returns the key of a serial `url`, or `None` for a network transport.
 fn identity(url: &str) -> Option<String> {
-    is_serial(url).then(|| device_key(url))
+    transport::serial_locator(url).map(|_| device_key(url))
 }
 
 /// Returns the URL of the device with `identity` if a replug moved it off
 /// `url`.
 fn relocate(url: &str, identity: Option<&str>) -> Option<String> {
-    let key = identity?;
-    let (_, baud) = serial_locator(url);
+    let (key, (_, baud)) = (identity?, transport::serial_locator(url)?);
     transport::enumerate_serial(true)
         .into_iter()
         .map(|device| device.url)
@@ -1760,8 +1734,8 @@ mod tests {
     }
 
     /// A control packet talks to the proxy, so neither control type a port
-    /// sends reaches the device. Type 64 is also `USER`, which apps may send,
-    /// so it still does.
+    /// sends reaches the device. A packet of type 64 is no control packet, so
+    /// it still does.
     #[test]
     fn a_ports_control_packets_never_reach_the_device() {
         use std::io::Read;
@@ -1926,11 +1900,7 @@ mod tests {
         worker.process_rpc_timeouts();
 
         let packet = answers(&outbox).remove(0);
-        let packet::Payload::RpcError(error) = packet.payload() else {
-            panic!("expected an RPC timeout packet");
-        };
-        assert_eq!(error.req_id.value(), original_id);
-        assert!(matches!(RpcError::from(error.code), RpcError::Timeout));
+        assert_eq!(rpc_error(&packet), (original_id, RpcError::Timeout));
         assert!(worker.rpc_map.is_empty());
         assert!(worker.rpc_timeouts.is_empty());
     }
@@ -1954,10 +1924,63 @@ mod tests {
         for (delivered, id) in [(first_delivered, 100), (second_delivered, 200)] {
             let failed = answers(&delivered);
             assert_eq!(failed.len(), 1, "a request was failed twice");
-            assert_eq!(rpc_error(&failed[0]), (id, RpcError::Undefined));
+            assert_eq!(rpc_error(&failed[0]), (id, RpcError::Timeout));
         }
         assert!(worker.rpc_map.is_empty());
         assert!(worker.rpc_timeouts.is_empty());
+    }
+
+    /// A worker that shuts down answers every port with a request waiting
+    /// with the RPC error `Timeout`, under the id it asked with, at the
+    /// request's route.
+    #[tokio::test]
+    async fn a_shutdown_fails_every_ports_request_as_sent() {
+        let mut worker = idle_worker();
+        let (port, delivered) = mount("/");
+        worker.mounts.insert(1, port);
+        let at: DeviceRoute = "/3".parse().unwrap();
+        insert_rpc(
+            &mut worker,
+            20,
+            1,
+            100,
+            at,
+            Instant::now() + Duration::from_secs(3),
+        );
+
+        worker.shutdown().await;
+
+        let failed = answers(&delivered);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(rpc_error(&failed[0]), (100, RpcError::Timeout));
+        assert_eq!(failed[0].route(), at);
+    }
+
+    /// A restart of the root device fails the calls waiting on it at once,
+    /// on a link whose rate is fixed too.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_fails_the_calls_in_flight_on_a_link_with_a_fixed_rate() {
+        let (open, mut ends) = fakes(TransportKind::Tcp);
+        let (_commands, command_queue) = mpsc::channel(1);
+        let mut worker = Worker {
+            open,
+            command_queue,
+            ..idle_worker()
+        };
+        worker.device = Some(worker.open_device().await.unwrap());
+        let mut device = opened(&mut ends).await;
+        let (port, delivered) = mount("/");
+        worker.mounts.insert(1, port);
+        let deadline = Instant::now() + MAX_RPC_TIMEOUT;
+        insert_rpc(&mut worker, 20, 1, 100, DeviceRoute::root(), deadline);
+        let began = Instant::now();
+        let session = |n| Packet::heartbeat_session(n, DeviceRoute::root());
+        device.send(&session(1)).await;
+        device.send(&session(2)).await;
+        let turns = async { while worker.turn().await.is_continue() {} };
+        let failed = tokio::select! { pkt = answered(&delivered) => pkt, _ = turns => panic!() };
+        assert_eq!(rpc_error(&failed), (100, RpcError::Timeout));
+        assert_eq!(began.elapsed(), Duration::ZERO, "the call waited");
     }
 
     /// Returns an opener whose attempt number `n`, counted from 0, runs
@@ -2511,7 +2534,7 @@ mod tests {
         );
         assert_eq!(
             rpc_error(&next(&mut worker.port).await),
-            (7, RpcError::Undefined)
+            (7, RpcError::Timeout)
         );
         let (mount, joined) = mount("/");
         let (to_device, rx) = mpsc::channel(1);

@@ -17,6 +17,7 @@ mod tests;
 pub(crate) mod udp;
 
 use super::{ReceiveResult, RecvError, TransportEvent};
+use crate::proto::packet::{Checked, PacketError};
 use crate::tio::packet::{self, Packet};
 
 /// Why received bytes did not decode as a packet.
@@ -40,15 +41,13 @@ pub(crate) enum Error {
 /// with [`PacketTooSmall`](packet::DecodeError::PacketTooSmall) if it ends
 /// before the packet does.
 fn decode_exact(raw: &[u8]) -> Result<Packet, Error> {
-    match Packet::from_slice_prefix(raw) {
-        Ok((packet, size)) if size == raw.len() => Ok(packet),
-        Ok(_) => Err(Error::TrailingBytes),
+    match Checked::exact(raw) {
+        Ok(checked) => Ok(Packet::from(checked)),
+        Err(PacketError::TrailingBytes) => Err(Error::TrailingBytes),
         // A frame is a whole packet or nothing, so a short one is not a
         // packet still arriving.
-        Err(packet::DecodeError::NeedMore) => {
-            Err(Error::Invalid(packet::DecodeError::PacketTooSmall))
-        }
-        Err(error) => Err(Error::Invalid(error)),
+        Err(PacketError::NeedMore) => Err(Error::Invalid(packet::DecodeError::PacketTooSmall)),
+        Err(error) => Err(Error::Invalid(error.into())),
     }
 }
 

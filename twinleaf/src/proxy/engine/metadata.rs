@@ -110,7 +110,8 @@ impl MetadataSchedule {
                 ..
             }) = self.schedule.get(&route)
             {
-                if *generation == query.generation && same_selectors(selectors, &query.selectors) {
+                if *generation == query.generation() && same_selectors(selectors, &query.selectors)
+                {
                     self.back_off(parser, query);
                     continue;
                 }
@@ -143,7 +144,7 @@ impl MetadataSchedule {
                     Some(Schedule::Due { delay }) => Some(*delay),
                     _ => None,
                 };
-                let current = parser.metadata_generation(route) == Some(query.generation);
+                let current = parser.metadata_generation(route) == Some(query.generation());
                 let selectors = query.selectors.clone();
                 parser.apply_metadata_reply(query, &reply);
                 // A reply to a query a relearn or a reset overtook applies

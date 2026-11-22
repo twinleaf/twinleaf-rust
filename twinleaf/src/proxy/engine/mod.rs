@@ -51,11 +51,10 @@ use crate::session::rpc::{PendingReply, RpcRegistry};
 use crate::session::Queued;
 use crate::session::{pruned, rpc_hash, Store, METADATA, PRESENCE};
 use crate::session::{Handle, Inlet, RawCallResult, Received, Session, Update, Watch};
-use crate::session::{MetadataState, Presence, Settings};
+use crate::session::{LostCause, MetadataState, Presence, Settings};
 use crate::tio::packet::{self, LinkStatus, Packet};
 use metadata::{Completed, MetadataSchedule};
 use settings::{CacheAction, DeviceEvent, SettingsCache};
-use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
@@ -149,16 +148,14 @@ impl Mount {
     /// route can be. A link status whose route is above the subtree concerns
     /// the subtree's root.
     fn shown(&self, packet: &Packet) -> Option<Packet> {
-        let route = packet.route();
-        let below = match self.source.relative_route(&route) {
-            Ok(below) => below,
-            Err(_) if packet.link_status().is_some() && self.source.starts_with(&route) => {
-                DeviceRoute::root()
+        let mut route = packet.route();
+        if packet.link_status().is_some() && self.source.starts_with(&route) {
+            route = self.source;
+        }
+        let Some(shown) = self.to_client(route) else {
+            if let Ok(below) = self.source.relative_route(&route) {
+                log::warn!("Dropping a packet whose route {below} exceeds the max depth");
             }
-            Err(_) => return None,
-        };
-        let Ok(shown) = self.prefix.absolute_route(&below) else {
-            log::warn!("Dropping a packet whose route {below} exceeds the max depth");
             return None;
         };
         Some(packet.with_route(shown))
@@ -172,15 +169,15 @@ impl Mount {
     /// Returns an error if the route on the link would be deeper than a
     /// route can be.
     pub(super) fn to_device(&self, route: DeviceRoute) -> Option<Result<DeviceRoute, RouteError>> {
-        let below = self.prefix.relative_route(&route).ok()?;
-        Some(self.source.absolute_route(&below))
+        route
+            .starts_with(&self.prefix)
+            .then(|| route.rerooted(&self.prefix, &self.source))
     }
 
     /// Returns the route the client sees of `route`, a route on the link, or
     /// `None` if the mount does not show it.
     pub(super) fn to_client(&self, route: DeviceRoute) -> Option<DeviceRoute> {
-        let below = self.source.relative_route(&route).ok()?;
-        self.prefix.absolute_route(&below).ok()
+        route.rerooted(&self.source, &self.prefix).ok()
     }
 
     /// Returns the subtree on the link that the client sees at or below
@@ -310,8 +307,6 @@ struct Engine {
     inlet: Inlet,
     parser: PacketParser,
     schedule: MetadataSchedule,
-    /// The metadata revision of each route last published.
-    metadata_seen: HashMap<DeviceRoute, u32>,
     /// When each device alive or connecting was last heard, or set
     /// connecting.
     heard: BTreeMap<DeviceRoute, Instant>,
@@ -354,7 +349,6 @@ impl Engine {
             handle: Handle::root(session),
             inlet,
             parser: PacketParser::new(false),
-            metadata_seen: HashMap::new(),
             heard: BTreeMap::new(),
             demand: BTreeSet::new(),
             tasks: tasks.clone(),
@@ -506,6 +500,10 @@ impl Engine {
         if held != Some(session) {
             store.set(route, PRESENCE, Presence::Alive { session });
         }
+        let restarted = held.flatten().is_some_and(|known| session != Some(known));
+        if restarted || store.restarted(route) {
+            self.reconnect(&mut store, route);
+        }
         drop(store);
         if new {
             self.follow_demand();
@@ -542,26 +540,20 @@ impl Engine {
         self.publish_metadata(route);
     }
 
-    /// Applies a link's status to the subtree it concerns. A device it sets
+    /// Applies a link's status to the subtree it concerns. A device it loses
+    /// has the status as the cause in its lost presence. A device it sets
     /// connecting is lost unless it speaks within [`QUIET`].
     fn apply_status(&mut self, subtree: DeviceRoute, status: LinkStatus) {
-        let presence = match status {
-            LinkStatus::SensorDisconnected
-            | LinkStatus::Stopped
-            | LinkStatus::FailedToConnect
-            | LinkStatus::FailedToReconnect => Presence::Lost {
-                since: Instant::now().into_std(),
-            },
-            LinkStatus::SensorReconnected => Presence::Connecting,
-            LinkStatus::Unknown(_) => return,
-        };
+        let cause = LostCause::from_status(status);
+        if cause.is_none() && status != LinkStatus::SensorReconnected {
+            return;
+        }
+        let since = Instant::now().into_std();
         self.heard.retain(|route, _| !route.starts_with(&subtree));
-        let forget = matches!(status, LinkStatus::SensorDisconnected | LinkStatus::Stopped);
+        let forget = status.forgets_device();
         if forget {
             self.parser.reset_subtree(subtree);
             self.schedule.forget(subtree);
-            self.metadata_seen
-                .retain(|route, _| !route.starts_with(&subtree));
         }
         // A device a receiver follows that was not heard yet goes with its
         // link too.
@@ -577,15 +569,14 @@ impl Engine {
             .copied()
             .collect();
         for route in served {
-            // A loss keeps the moment of the first.
-            let lost = matches!(store.value(route, PRESENCE), Some(Presence::Lost { .. }));
-            if presence == Presence::Connecting || !lost {
-                store.set(route, PRESENCE, presence);
+            match cause {
+                Some(_) => store.lose(route, since, cause),
+                None => store.set(route, PRESENCE, Presence::Connecting),
             }
             if forget {
                 forgotten.push(route);
             }
-            if presence == Presence::Connecting {
+            if cause.is_none() {
                 self.reconnect(&mut store, route);
             }
         }
@@ -595,8 +586,9 @@ impl Engine {
         }
     }
 
-    /// Takes the device at `route` as reconnected, as its link reconnected
-    /// or it was heard again after it was lost. A reconnected device may run
+    /// Takes the device at `route` as reconnected, as its link reconnected,
+    /// it was heard again after it was lost or it restarted. A reconnected
+    /// device may run
     /// another table, so `store` holds its table out of force until the
     /// worker loads it again, and the engine loses the device unless it
     /// speaks within [`QUIET`].
@@ -606,15 +598,17 @@ impl Engine {
         self.tell(route, DeviceEvent::NewHash(None));
     }
 
-    /// Loses each device silent for [`QUIET`].
+    /// Loses each device silent for [`QUIET`], with that as the cause in its
+    /// lost presence.
     fn lose_quiet(&mut self) {
         let now = Instant::now();
         let mut store = lock(&self.store);
+        let cause = Some(LostCause::Quiet);
         self.heard.retain(|route, at| {
             let heard = *at + QUIET > now;
             if !heard {
                 let since = now.into_std();
-                store.set(*route, PRESENCE, Presence::Lost { since });
+                store.set(*route, PRESENCE, Presence::Lost { since, cause });
             }
             heard
         });
@@ -624,17 +618,15 @@ impl Engine {
     /// not yet published. Metadata that is not complete is not published, so
     /// a client has none of the device's metadata until then.
     fn publish_metadata(&mut self, route: DeviceRoute) {
-        let seen = self.metadata_seen.get(&route).copied();
-        let Some((revision, snapshot)) = self.parser.revised_metadata(route, seen) else {
+        let Some((first, snapshot)) = self.parser.revised_metadata(route) else {
             return;
         };
-        if seen.is_none() && snapshot.device().protocol() == 0 {
+        if first && !snapshot.device().marks_starts_and_stops() {
             log::warn!(
                 "the device at {route} runs deprecated C firmware, which Twinleaf is porting to \
                  Rust. Its stops and starts read as lost data. Ask Twinleaf for its Rust firmware."
             );
         }
-        self.metadata_seen.insert(route, revision);
         self.set_metadata(route, MetadataState::Ready(snapshot));
     }
 
@@ -742,6 +734,10 @@ impl Worker {
                     return;
                 }
                 store.set_loaded(self.route, registry.clone(), started);
+                if store.restarted(self.route) {
+                    store.reconnect(self.route);
+                    continue;
+                }
             }
             let tracked = match registry {
                 Ok(registry) => self.track(&registry).await,
@@ -768,10 +764,6 @@ impl Worker {
             match &event {
                 DeviceEvent::NewHash(None) => return true,
                 DeviceEvent::NewHash(Some(hash)) if Some(*hash) != registry.hash => return true,
-                DeviceEvent::Heartbeat {
-                    session_id: Some(session),
-                    ..
-                } if registry.session.is_some_and(|read_in| read_in != *session) => return true,
                 _ => {}
             }
             let before = cache.version();
@@ -779,7 +771,6 @@ impl Worker {
                 CacheAction::Keep if cache.version() == before => {}
                 CacheAction::Keep => self.publish(registry, &cache),
                 CacheAction::Snapshot => self.snapshot(registry, &mut cache).await,
-                CacheAction::Reload => return true,
             }
         }
     }

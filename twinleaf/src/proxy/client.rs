@@ -19,7 +19,7 @@ use super::worker;
 use crate::chan::oneshot::{self, error::TryRecvError};
 use crate::chan::{lock, StreamMap};
 use crate::proto::rpc::{Method, RpcError};
-use crate::proto::{DeviceRoute, PacketType, SessionId, TCP_DEFAULT_PORT};
+use crate::proto::{DeviceRoute, PacketType, SessionId};
 use crate::rt::{finish, sleep_until_some, BoxFuture};
 use crate::session::{answer, encode, Introduction, AUTO, HELLO_TIMEOUT, PROXY_KEEPALIVE};
 use crate::session::{Layout, Scope};
@@ -286,7 +286,7 @@ impl Client {
         } = self.outbox.take();
         if dropped > 0 {
             log::debug!(
-                "Client {} is not keeping up and lost {dropped} samples",
+                "Client {} is not keeping up and dropped {dropped} sample packets",
                 self.addr
             );
         }
@@ -771,9 +771,10 @@ impl Binding {
         let Some((mounted, route)) = device else {
             return Ok(routes);
         };
-        let store = mounted.lease.link().store();
+        let link = mounted.lease.link();
+        let store = link.store();
         mounted.mount.watch_metadata(id, route, &store);
-        let device = device_updates(&store, route);
+        let device = device_updates(&store, route, link.url());
         Ok(stream::select(routes, device).boxed())
     }
 
@@ -827,13 +828,17 @@ impl Binding {
 
 /// Returns the updates of the presence and announced settings of the device
 /// at `route` that `store` holds, each setting after the table it was
-/// recorded under.
+/// recorded under. Each presence carries `url`, the URL of the link that
+/// serves the device, and a lost presence carries its own cause.
 pub(super) fn device_updates(
     store: &Mutex<Store>,
     route: DeviceRoute,
+    url: &str,
 ) -> BoxStream<'static, Update> {
     let mut store = lock(store);
-    let presence = values(store.follow(route, PRESENCE)).map(Update::presence);
+    let url = url.to_string();
+    let presence = values(store.follow(route, PRESENCE))
+        .map(move |presence| Update::presence(presence, Some(&url)));
     let changes = announced(store.follow(route, CHANGES));
     stream::select_all([presence.boxed(), changes]).boxed()
 }
@@ -907,10 +912,7 @@ fn announced(changes: Receiver<SettingChange>) -> BoxStream<'static, Update> {
 /// Returns `true` if `url` is a TCP URL on this machine whose port is that
 /// of `endpoint`, the address this proxy answers at on this machine.
 fn names_this_proxy(url: &str, endpoint: &str) -> bool {
-    let port = |url: &str| {
-        let port = url.rsplit_once(':').and_then(|(_, port)| port.parse().ok());
-        port.unwrap_or(TCP_DEFAULT_PORT)
-    };
+    let port = |url| transport::tcp_host_port(url).map(|(_, port)| port);
     is_local_tcp(url) && port(url) == port(endpoint)
 }
 
@@ -943,6 +945,15 @@ mod tests {
 
     /// The device a test opens.
     const DEVICE: &str = "tcp://device";
+
+    /// A local URL with no port names the proxy on the default port.
+    #[test]
+    fn a_url_with_no_port_names_the_proxy_on_the_default_port() {
+        let endpoint = crate::proxy::endpoint_at(crate::proto::TCP_DEFAULT_PORT);
+        for url in ["tcp://::1", "tcp://[::1]", "tcp://localhost", &endpoint] {
+            assert!(names_this_proxy(url, &endpoint), "{url}");
+        }
+    }
 
     /// What resolves to why a client's session ended.
     type Served = JoinHandle<Option<Result<(), ClientError>>>;
@@ -1270,7 +1281,8 @@ mod tests {
 
     /// A client that falls behind loses samples, the oldest first, and
     /// nothing else, and holds up neither its link nor another client of the
-    /// link, which hears every packet the device sent. Once more than the
+    /// link, which hears every packet the device sent. It is told how many
+    /// samples it lost, where they are missing. Once more than the
     /// hard limit of other packets waits for it, it is let go as too slow,
     /// and the link and the other client go on.
     #[tokio::test(start_paused = true)]
@@ -1300,20 +1312,33 @@ mod tests {
         assert!(whole, "the other client lost a packet");
 
         let (mut kept, mut kept_samples) = (Vec::new(), Vec::new());
+        // The samples the proxy said it dropped, and the last sample kept
+        // ahead of each time it said so.
+        let (mut told, mut told_after) = (0, Vec::new());
         while let Some(pkt) = timeout(PAUSED_WAIT, behind.end.recv()).await.unwrap() {
             kept.extend(beat_number(&pkt));
-            if let Payload::Samples(data) = pkt.payload() {
-                kept_samples.push(data.first.value());
+            match pkt.payload() {
+                Payload::Samples(data) => kept_samples.push(data.first.value()),
+                Payload::ProxyRx(ProxyRx::Dropped { packets, .. }) => {
+                    told += packets;
+                    told_after.push(kept_samples.last().copied());
+                }
+                _ => {}
             }
         }
         let in_order = kept.iter().copied().eq(0..kept.len() as u32);
         assert!(in_order, "a beat was lost");
         let refused_early = kept.len() * big_beat(0).as_bytes().len() <= limit;
         assert!(!refused_early, "beats were refused below the hard limit");
-        let gaps = kept_samples
+        let gaps: Vec<_> = kept_samples
             .windows(2)
-            .filter(|pair| pair[1] - pair[0] > 400);
-        assert_eq!(gaps.count(), 1, "the oldest samples waiting were lost");
+            .filter(|pair| pair[1] - pair[0] > 400)
+            .collect();
+        assert_eq!(gaps.len(), 1, "the oldest samples waiting were lost");
+        let (before, after) = (gaps[0][0], gaps[0][1]);
+        assert_eq!(told, (after - before) / 400 - 1, "the count told");
+        let at_the_gap = told_after.iter().all(|last| *last == Some(before));
+        assert!(at_the_gap, "a count came away from the gap: {told_after:?}");
         let served = timeout(PAUSED_WAIT, &mut behind.served).await.unwrap();
         assert!(matches!(served, Ok(Some(Err(ClientError::TooSlow)))));
 
@@ -1698,8 +1723,10 @@ mod tests {
     fn a_slow_watch_converges_to_the_newest_presence() {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
-        let mut updates = device_updates(&store, route);
-        assert_eq!(ready(&mut updates), [Update::Presence(Err(None))]);
+        let mut updates = device_updates(&store, route, "tcp://device");
+        let url = Some("tcp://device".to_string());
+        let connecting = [Update::Presence(Err(None), None, url.clone())];
+        assert_eq!(ready(&mut updates), connecting);
 
         for session in 0..1000 {
             let alive = crate::session::Presence::Alive {
@@ -1708,7 +1735,35 @@ mod tests {
             lock(&store).set(route, PRESENCE, alive);
         }
 
-        assert_eq!(ready(&mut updates), [Update::Presence(Ok(Some(999)))]);
+        let newest = [Update::Presence(Ok(Some(999)), None, url)];
+        assert_eq!(ready(&mut updates), newest);
+    }
+
+    /// A watch says the link's URL in each presence. A lost presence is one
+    /// update, which carries the cause of the loss.
+    #[test]
+    fn a_watch_says_why_a_device_was_lost_in_its_lost_presence() {
+        use crate::session::{LostCause, Presence};
+        let store = Mutex::new(Store::new(true));
+        let route = DeviceRoute::root();
+        let mut updates = device_updates(&store, route, "tcp://device");
+        let url = Some("tcp://device".to_string());
+        let connecting = [Update::Presence(Err(None), None, url.clone())];
+        assert_eq!(ready(&mut updates), connecting);
+        lock(&store).set(route, PRESENCE, Presence::Alive { session: None });
+        let alive = [Update::Presence(Ok(None), None, url.clone())];
+        assert_eq!(ready(&mut updates), alive);
+        let since = std::time::Instant::now();
+        let cause = Some(LostCause::Disconnected);
+        lock(&store).set(route, PRESENCE, Presence::Lost { since, cause });
+        let said = ready(&mut updates);
+        let disconnected = LostCause::Disconnected.code();
+        assert!(
+            matches!(&said[..], [Update::Presence(Err(Some(_)), code, sent)] if *code == disconnected && *sent == url),
+            "{said:?}"
+        );
+        lock(&store).set(route, PRESENCE, Presence::Connecting);
+        assert_eq!(ready(&mut updates), connecting);
     }
 
     /// A watch that falls behind the device's announcements says how many
@@ -1717,7 +1772,7 @@ mod tests {
     fn a_watch_that_misses_announcements_says_how_many() {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
-        let mut updates = device_updates(&store, route);
+        let mut updates = device_updates(&store, route, "tcp://device");
         ready(&mut updates);
         let change = |seq: usize| {
             let seq = u32::try_from(seq).ok();
@@ -1747,7 +1802,7 @@ mod tests {
     fn a_watch_names_each_table_ahead_of_the_settings_recorded_under_it() {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
-        let mut updates = device_updates(&store, route);
+        let mut updates = device_updates(&store, route, "tcp://device");
         ready(&mut updates);
         let table = |hash| Arc::new(RpcRegistry::from_entries(Vec::new(), Some(hash), None));
         let (old, new) = (table(1), table(2));

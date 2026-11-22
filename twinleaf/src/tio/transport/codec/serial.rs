@@ -198,9 +198,7 @@ mod tests {
     //!   packet gives one error, and the frame after it decodes. Bytes after
     //!   the packet give `TrailingBytes`. A frame that ends before its packet
     //!   does gives `PacketTooSmall`. A header that does not decode, or a
-    //!   payload not valid for its type, gives the error the packet gives,
-    //!   unless it is a metadata record that does not parse and can be
-    //!   repaired, which decodes as the packet [`repaired`] gives. A
+    //!   payload not valid for its type, gives the error the packet gives. A
     //!   frame of 516 bytes, the largest packet and its CRC, is held whole,
     //!   and a longer one gives `PacketTooBig` at its 517th byte, after which
     //!   decoding starts over within the same frame. Source, the
@@ -276,7 +274,7 @@ mod tests {
     use super::*;
     use crate::proto::rpc::RpcError;
     use crate::proto::DeviceRoute;
-    use crate::tio::transport::codec::tests::{repaired, strategy};
+    use crate::tio::transport::codec::tests::strategy;
     use proptest::prelude::*;
     use proptest::sample::Index;
 
@@ -607,8 +605,7 @@ mod tests {
         }
 
         /// S4. A frame whose CRC matches and that is not one packet gives the
-        /// error its bytes give, unless its metadata record can be repaired,
-        /// and the frame after it decodes.
+        /// error its bytes give, and the frame after it decodes.
         #[test]
         fn a_frame_that_is_not_one_packet_is_its_error(
             (raw, error, _) in s4_frame(),
@@ -618,11 +615,10 @@ mod tests {
             let mut stream = encoded(std::slice::from_ref(&first));
             stream.extend(frame_of(&raw));
             stream.extend(encoded(std::slice::from_ref(&after)));
-            let outcome = repaired(&raw).map(Seen::Packet).ok_or(error);
 
             prop_assert_eq!(
                 decode_pieces([&stream[..]]),
-                vec![seen(&first), outcome, seen(&after)]
+                vec![seen(&first), Err(error), seen(&after)]
             );
         }
 

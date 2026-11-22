@@ -9,44 +9,6 @@
 /// names its class, and [`tally`] prints how often a run draws each class.
 pub(crate) mod strategy;
 
-/// The bytes the whole packet `packet` decodes as when it is a metadata
-/// packet whose record does not parse and can be repaired, or `None`
-/// otherwise. The record is repaired by the function whose laws the
-/// metadata record properties of `twinleaf-proto` state, with room for the
-/// record or 255 bytes, whichever is larger. The header keeps its type, TTL
-/// and route, and its payload size is the repaired payload's.
-pub(crate) fn repaired(packet: &[u8]) -> Option<Vec<u8>> {
-    use crate::proto::data as wire;
-    let [11, routing, low, high, ref rest @ ..] = *packet else {
-        return None;
-    };
-    let size = usize::from(u16::from_le_bytes([low, high]));
-    let hops = usize::from(routing & 0x0f);
-    if size > 500 || hops > 8 || rest.len() != size + hops {
-        return None;
-    }
-    let (payload, route) = rest.split_at(size);
-    let [kind, flags, ref record @ ..] = *payload else {
-        return None;
-    };
-    if wire::Metadata::parse(payload).is_some() {
-        return None;
-    }
-    let mut out = vec![0; record.len().max(255)];
-    let len = wire::repair_record_text(kind, record, &mut out)?;
-    let size = (2 + len) as u16;
-    Some(
-        [
-            &[11, routing][..],
-            &size.to_le_bytes(),
-            &[kind, flags],
-            &out[..len],
-            route,
-        ]
-        .concat(),
-    )
-}
-
 /// The TTL, routing and payload size classes of the packet `raw`.
 fn header(raw: &[u8]) -> Vec<&'static str> {
     let ttl = match raw[1] >> 4 {

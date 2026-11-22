@@ -5,9 +5,10 @@
 //! Time is simulated. Each host waits on its calls as a state machine and
 //! handles its events one at a time, as the engine's worker does. It takes
 //! a snapshot only when its cache asks for one. It loads the registry at its
-//! first event, and again when the cache asks, a heartbeat of another
-//! session comes or its link reconnects to a device that rebooted, keeping
-//! the events queued meanwhile for the cache the load builds. After a load
+//! first event, and again when a heartbeat of another session comes, as the
+//! engine takes that for a restart, or its link reconnects to a device that
+//! rebooted, keeping the events queued meanwhile for the cache the load
+//! builds. After a load
 //! that fails it drops its events for `RELOAD_DELAY` and loads again at the
 //! first event after. The cache's own [`SettingsCache::snapshot_with`] is a
 //! future the world polls as each read is answered or times out. The world
@@ -85,14 +86,15 @@
 //!    [`CacheAction::Snapshot`] when an announcement past a gap or a
 //!    heartbeat ahead drops it, [`CacheAction::Snapshot`] again for every
 //!    numbered announcement and every heartbeat of its session with the count
-//!    while it claims nothing, and [`CacheAction::Reload`] at a heartbeat of
-//!    another session. Source, the doc of [`SettingsCache`], "kept by the
+//!    while it claims nothing. A heartbeat of another session reaches no
+//!    cache. Its host drops the cache and claims nothing until it has loaded
+//!    the registry again. Source, the doc of [`SettingsCache`], "kept by the
 //!    numbered announcements after it", "An announcement numbered at or
 //!    before the last one applied is already held and changes nothing",
 //!    "One numbered past the next, or a heartbeat ahead of the last one
 //!    applied, drops every value until the next snapshot" and "While it
 //!    waits for a snapshot, every numbered announcement and every heartbeat
-//!    of its session that carries the count asks for one", the docs of
+//!    that carries the count asks for one", the docs of
 //!    [`CacheAction`], and the doc of the engine worker's `snapshot`, where a
 //!    cache whose snapshot failed "asks for another at the next heartbeat".
 //!    Rules out an announcement applied past a gap, a heartbeat ahead
@@ -109,34 +111,27 @@
 //!    the two, still to be observed, bring it up to date". Rules out an
 //!    announcement's value stored under another entry, or a snapshot that
 //!    keeps values read before the count moved.
-//! 5. Another session, postcondition. Once a cache that caches anything hears
-//!    a heartbeat of another session, it returns [`CacheAction::Reload`] and
-//!    claims and holds nothing until its host reads the registry again.
-//!    Source, the doc of [`SettingsCache`], "a new session drops the cache",
-//!    and the doc of [`CacheAction::Reload`], "Read the registry again and
-//!    build a new cache". Rules out values kept across a reboot. Law 3
-//!    checks it.
-//! 6. Legacy firmware, invariant. A cache of a device without
+//! 5. Legacy firmware, invariant. A cache of a device without
 //!    `settings.version` holds nothing. Once its host is handed an
 //!    announcement without a sequence number or a heartbeat without the
 //!    count, the cache holds nothing until the registry is read again.
 //!    Source, the doc of [`SettingsCache`], "is never cached" and "at most
 //!    one heartbeat old", which a heartbeat without the count cannot show.
 //!    Rules out caching what an unnumbered announcement says.
-//! 7. Quiet, completeness. A quiet period is one in which nothing moves and
+//! 6. Quiet, completeness. A quiet period is one in which nothing moves and
 //!    no link loses, duplicates or holds back a packet, and every packet
 //!    comes after those sent before it. It ends once the device has beaten
 //!    since its last request, no packet is in flight, and every host waits on
 //!    nothing, has nothing queued, owes no load and holds a cache at the
 //!    device's count or one that caches nothing. Then every cache claims the
 //!    device's count and holds exactly its cacheable values, or, under law
-//!    6, holds nothing. A quiet period still open after `QUIET_LIMIT` is
+//!    5, holds nothing. A quiet period still open after `QUIET_LIMIT` is
 //!    checked all the same, so a cache stuck short of the device fails this
 //!    law. Source, the doc of [`SettingsCache`], "at most one heartbeat old",
 //!    and the doc of [`CacheAction::Keep`], "as exact as the events so far
 //!    show". Rules out a cache that never snapshots or always holds nothing,
-//!    which passes laws 1 to 6.
-//! 8. Own write, a completeness check on the model. A host's write is
+//!    which passes laws 1 to 5.
+//! 7. Own write, a completeness check on the model. A host's write is
 //!    answered, and the events queued ahead of the reply are in. Let `w` be
 //!    the device's position when it sent the reply. If the cache claims a
 //!    position at or past `w`, and the device held the written value at
@@ -150,13 +145,13 @@
 //!    reply sent after them. The floors of [`Class::OwnHeld`],
 //!    [`Class::OwnHeldFaulty`] and [`Class::OwnOrdered`] make sure the cases
 //!    reach it. Rules out a model whose claims drift from the device.
-//! 9. A failed snapshot, postcondition. Every snapshot starts from a cache
+//! 8. A failed snapshot, postcondition. Every snapshot starts from a cache
 //!    that claims and holds nothing, which the world checks, as a new cache
 //!    holds nothing and one that asks for a snapshot has dropped its values
 //!    under law 3. A snapshot that ends at an error, a timeout among them,
 //!    leaves the cache so, and law 3 keeps it so until a snapshot succeeds.
 //!    What a timed out write did reaches the cache through its announcement
-//!    or the next snapshot, under laws 3, 4 and 7. Source, the doc of
+//!    or the next snapshot, under laws 3, 4 and 6. Source, the doc of
 //!    [`SettingsCache::version`], "`None` while the cache waits for a
 //!    snapshot", the doc of [`SettingsCache`], "read in one snapshot", and
 //!    the doc of the engine worker's `snapshot`, "A failed snapshot is
@@ -187,7 +182,7 @@
 //! run of at least [`FLOOR_CASES`] cases fails when a class falls short of
 //! its floor, which covers the reloads, the wraps, the replies that come
 //! after their call timed out, the snapshots that fail at one, and the own
-//! writes of law 8. It fails too when the checks that skip laws 3 and 4 for
+//! writes of law 7. It fails too when the checks that skip laws 3 and 4 for
 //! an unknown claim number more than one in ten of the checks of law 4.
 //!
 //! # Exclusions
@@ -203,8 +198,6 @@
 //!   next after its snapshot. It then claims a count ahead of the device
 //!   and holds values the new session never had, and every heartbeat after
 //!   is behind it, so it stays so until the device counts past it.
-//! - The world hands a heartbeat of another session to the cache, which the
-//!   engine's worker does not, so that law 5 can check what the cache says.
 //! - The time a host takes to catch up, which the engine does not bound. A
 //!   host takes at most one snapshot for each event it was handed past the
 //!   count its snapshot read, which after a reboot may be every event the old
@@ -587,7 +580,7 @@ enum Class {
     Exact,
     /// The end of a quiet period.
     Quiet,
-    /// An own write law 8 holds strictly.
+    /// An own write law 7 holds strictly.
     OwnHeld,
     /// The same, on links that lose or reorder packets.
     OwnHeldFaulty,
@@ -595,7 +588,7 @@ enum Class {
     OwnOverwritten,
     /// An own write ahead of the cache's claim, on links that lose or reorder.
     OwnShort,
-    /// An own write on links that lose nothing and keep order, where law 8
+    /// An own write on links that lose nothing and keep order, where law 7
     /// allows no shortfall.
     OwnOrdered,
     /// An own write answered while the cache claims nothing.
@@ -830,9 +823,6 @@ struct Client {
     /// Whether the cache was handed an event of legacy firmware since it
     /// was built.
     legacy: bool,
-    /// Whether the cache was handed a heartbeat of another session since it
-    /// was built.
-    foreign: bool,
     rebuilt: u64,
 }
 
@@ -1025,7 +1015,6 @@ impl<'c> World<'c> {
                 claim: Claim::Nothing,
                 settled: None,
                 legacy: false,
-                foreign: false,
                 rebuilt: 0,
             })
             .collect();
@@ -1093,10 +1082,10 @@ impl<'c> World<'c> {
     }
 
     /// Whether host `c`'s cache still caches, as one of firmware with the
-    /// counter does until an event shows it legacy or of another session.
+    /// counter does until an event shows it legacy.
     fn live(&self, c: usize) -> bool {
         let client = &self.clients[c];
-        self.case.firmware.counter && !client.legacy && !client.foreign
+        self.case.firmware.counter && !client.legacy
     }
 
     /// Where the device stands now.
@@ -1228,19 +1217,23 @@ impl<'c> World<'c> {
                     ..setting
                 }
                 .write(&mut buf)
+                .ok()
             }),
             PacketType::HEARTBEAT => match Heartbeat::parse(view.payload) {
                 Some(Heartbeat::Session { session, settings }) => Heartbeat::Session {
                     session,
                     settings: settings.filter(|_| firmware.beat_settings).map(offset),
                 }
-                .write(&mut buf),
+                .write(&mut buf)
+                .ok(),
                 Some(Heartbeat::Any(_)) | None => None,
             },
             PacketType::RPC_REP => wire::Reply::parse(view.payload)
                 .filter(|reply| Some(reply.req_id) == version)
                 .and_then(|reply| Some((reply.req_id, u32::decode_reply(reply.value).ok()?)))
-                .and_then(|(id, seq)| wire::write_reply(&mut buf, id, &offset(seq).to_le_bytes())),
+                .and_then(|(id, seq)| {
+                    wire::write_reply(&mut buf, id, &offset(seq).to_le_bytes()).ok()
+                }),
             _ => None,
         };
         written.map_or_else(|| packet.to_vec(), |len| buf[..len].to_vec())
@@ -1642,7 +1635,7 @@ impl<'c> World<'c> {
     /// and does what each asks before the next, as the engine's worker does.
     /// It snapshots only when the cache asks. It loads the registry with an
     /// event queued and keeps that event for the cache the load builds, and
-    /// loads again at once when the cache asks or a heartbeat of another
+    /// drops the cache and loads again at once when a heartbeat of another
     /// session comes. After a failed load it drops every event until
     /// [`RELOAD_DELAY`] has passed and loads again at the first event after.
     /// Returns how many events it took.
@@ -1658,8 +1651,20 @@ impl<'c> World<'c> {
                 break;
             };
             taken += 1;
-            if let DeviceEvent::NewHash(_) = event {
+            let foreign = match &event {
+                DeviceEvent::Heartbeat {
+                    session_id: Some(session),
+                    ..
+                } => self.clients[c].cache.is_some() && self.clients[c].session != Some(*session),
+                _ => false,
+            };
+            if foreign && self.live(c) {
+                self.stats.bump(Class::Foreign);
+            }
+            if foreign || matches!(event, DeviceEvent::NewHash(_)) {
                 let client = &mut self.clients[c];
+                client.cache = None;
+                client.claim = Claim::Nothing;
                 client.reload = true;
                 client.reload_at = None;
                 self.read_registry(c);
@@ -1672,21 +1677,8 @@ impl<'c> World<'c> {
                 }
                 continue;
             }
-            let foreign = match &event {
-                DeviceEvent::Heartbeat {
-                    session_id: Some(session),
-                    ..
-                } => self.clients[c]
-                    .session
-                    .is_some_and(|known| known != *session),
-                _ => false,
-            };
             let action = self.observe(c, event, stamp);
-            let client = &mut self.clients[c];
-            client.reload |= foreign || action == CacheAction::Reload;
-            if client.reload {
-                self.read_registry(c);
-            } else if action == CacheAction::Snapshot {
+            if action == CacheAction::Snapshot {
                 self.start_snapshot(c);
             }
         }
@@ -1717,17 +1709,9 @@ impl<'c> World<'c> {
         let keep = Some(CacheAction::Keep);
         Ok(match event {
             DeviceEvent::Heartbeat {
-                session_id: Some(session),
+                session_id: Some(_),
                 settings,
             } => {
-                if client.session != Some(*session) {
-                    let action = match live {
-                        true => CacheAction::Reload,
-                        false => CacheAction::Keep,
-                    };
-                    let class = live.then_some(Class::Foreign);
-                    return Ok(expected(Claim::Nothing, Some(action), class));
-                }
                 let Some(count) = settings else {
                     return Ok(expected(Claim::Nothing, keep, None));
                 };
@@ -1789,12 +1773,9 @@ impl<'c> World<'c> {
         let client = &mut self.clients[c];
         match &event {
             DeviceEvent::Heartbeat {
-                session_id: Some(session),
+                session_id: Some(_),
                 settings,
-            } => {
-                client.legacy |= settings.is_none();
-                client.foreign |= client.session.is_some_and(|known| known != *session);
-            }
+            } => client.legacy |= settings.is_none(),
             DeviceEvent::Setting(SettingChange { seq: None, .. }) => client.legacy = true,
             DeviceEvent::Heartbeat {
                 session_id: None, ..
@@ -1861,7 +1842,9 @@ impl<'c> World<'c> {
     /// the cache and waits [`RELOAD_DELAY`] before the next.
     fn registry(&mut self, c: usize, answers: Vec<Answer>) {
         let decoded = |reply: &Result<Vec<u8>, CallError>| match reply {
-            Ok(reply) => u32::decode_reply(reply).map_err(CallError::InvalidReply),
+            Ok(reply) => {
+                u32::decode_reply(reply).map_err(|error| CallError::InvalidReply(error.into()))
+            }
             Err(error) => Err(error.clone()),
         };
         let read = match answers.as_slice() {
@@ -1909,7 +1892,6 @@ impl<'c> World<'c> {
         client.claim = Claim::Nothing;
         client.settled = None;
         client.legacy = false;
-        client.foreign = false;
         client.rebuilt += 1;
         self.stats.bump(Class::Reload);
         self.note(format!(
@@ -1928,7 +1910,7 @@ impl<'c> World<'c> {
         if cache.version().is_some() || !cache.values().is_empty() {
             let (claimed, held) = (cache.version(), cache.values().len());
             self.fail(format!(
-                "law 9, host {c} snapshots a cache that claims {claimed:?} with {held} values"
+                "law 8, host {c} snapshots a cache that claims {claimed:?} with {held} values"
             ));
         }
         let submitted = Rc::new(RefCell::new(VecDeque::new()));
@@ -2048,7 +2030,7 @@ impl<'c> World<'c> {
     }
 
     /// Hands host `c` its cache back from a snapshot that read `reads` and
-    /// ended at `taken`, checking laws 2 and 9.
+    /// ended at `taken`, checking laws 2 and 8.
     fn snapshot_done(&mut self, c: usize, reads: &[Read], (cache, taken): Taken) {
         let client = &mut self.clients[c];
         client.cache = Some(cache);
@@ -2072,7 +2054,7 @@ impl<'c> World<'c> {
                 if cache.version().is_some() || !cache.values().is_empty() {
                     let (claimed, held) = (cache.version(), cache.values().len());
                     self.fail(format!(
-                        "law 9, host {c}'s snapshot failed at {error}, but it claims {claimed:?} with {held} values"
+                        "law 8, host {c}'s snapshot failed at {error}, but it claims {claimed:?} with {held} values"
                     ));
                 }
             }
@@ -2143,7 +2125,7 @@ impl<'c> World<'c> {
         }
     }
 
-    /// What every cache promises at every moment, laws 1, 3, 4 and 6.
+    /// What every cache promises at every moment, laws 1, 3, 4 and 5.
     fn check(&mut self, c: usize) {
         let client = &self.clients[c];
         let Some(cache) = &client.cache else {
@@ -2162,7 +2144,7 @@ impl<'c> World<'c> {
         if (!self.case.firmware.counter || client.legacy) && !cache.values().is_empty() {
             let names: Vec<&String> = cache.values().keys().collect();
             return self.fail(format!(
-                "law 6, host {c} caches {names:?} of legacy firmware"
+                "law 5, host {c} caches {names:?} of legacy firmware"
             ));
         }
         let claimed = cache.version();
@@ -2209,7 +2191,7 @@ impl<'c> World<'c> {
     }
 
     /// Runs a quiet period until every host has caught up, then checks law
-    /// 7 and lets the faults resume. Past [`QUIET_LIMIT`] it checks law 7
+    /// 6 and lets the faults resume. Past [`QUIET_LIMIT`] it checks law 6
     /// all the same, and fails as the harness's fault if the law holds.
     fn settle(&mut self) {
         while self.failure.is_none() && !self.caught_up() {
@@ -2265,7 +2247,7 @@ impl<'c> World<'c> {
     }
 
     /// The end of a quiet period, by which the device has announced all it
-    /// holds and every cache holds exactly that, law 7.
+    /// holds and every cache holds exactly that, law 6.
     fn quiet_check(&mut self) {
         self.stats.bump(Class::Quiet);
         if self.off {
@@ -2287,7 +2269,7 @@ impl<'c> World<'c> {
         let nothing = BTreeMap::new();
         let failure = self.clients.iter().enumerate().find_map(|(c, client)| {
             let Some(cache) = client.cache.as_ref().filter(|_| client.calling.is_none()) else {
-                return Some(format!("law 7, host {c} has no cache after a quiet period"));
+                return Some(format!("law 6, host {c} has no cache after a quiet period"));
             };
             let (claim, held) = match self.case.firmware.counter && !client.legacy {
                 true => (Some(count), state),
@@ -2295,7 +2277,7 @@ impl<'c> World<'c> {
             };
             (cache.version() != claim || cache.values() != held).then(|| {
                 format!(
-                    "law 7, host {c} claims {:?} with {:?} after a quiet period, the device #{count} {state:?}",
+                    "law 6, host {c} claims {:?} with {:?} after a quiet period, the device #{count} {state:?}",
                     cache.version(),
                     cache.values()
                 )
@@ -2371,7 +2353,7 @@ impl<'c> World<'c> {
         }
     }
 
-    /// Law 8, for host `c`'s write of `reply` to `name`, answered from where
+    /// Law 7, for host `c`'s write of `reply` to `name`, answered from where
     /// `stamp` says the device stood.
     fn own_write(&mut self, c: usize, name: &str, reply: &[u8], stamp: Stamp) {
         let client = &self.clients[c];
@@ -2409,7 +2391,7 @@ impl<'c> World<'c> {
                     (true, false) => {
                         let held = cache.get(name).map(<[u8]>::to_vec);
                         return self.fail(format!(
-                            "law 8, host {c} wrote {name} = {reply:?} at #{}, but at #{} its cache holds {held:?}",
+                            "law 7, host {c} wrote {name} = {reply:?} at #{}, but at #{} its cache holds {held:?}",
                             oracle.count(w),
                             oracle.count(p)
                         ));
@@ -2418,7 +2400,7 @@ impl<'c> World<'c> {
             }
             Claim::At(p) if ordered => {
                 return self.fail(format!(
-                    "law 8, host {c} wrote {name} at #{}, but its cache is at #{} on links that keep order",
+                    "law 7, host {c} wrote {name} at #{}, but its cache is at #{} on links that keep order",
                     oracle.count(w),
                     oracle.count(p)
                 ));

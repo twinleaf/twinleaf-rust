@@ -41,7 +41,12 @@
 //!
 //! Only samples are ever dropped. Once the samples on the stream take more
 //! than [`SAMPLE_BUDGET`] bytes, the oldest sample goes. The writer learns
-//! how many went, and logs it at debug level. The client is not told. The
+//! how many went, and logs it at debug level. The client is told too. Each
+//! take puts a count of the packets dropped of each stream since the last
+//! take, a [`ProxyRx::Dropped`], behind the urgent queue and ahead of the
+//! stream. Every sample dropped was queued after every sample taken before
+//! and before every sample the stream still holds, so the count reaches the
+//! client where the samples are missing. The
 //! packets that are not samples are never dropped, so a client whose other
 //! packets take more than [`HARD_LIMIT`] bytes is let go as
 //! [`ClientError::TooSlow`]. The client counts as too slow while the packets
@@ -63,10 +68,10 @@
 
 use crate::chan::lock;
 use crate::chan::Notify;
-use crate::proto::data::FIRST_STREAM_ID;
+use crate::proto::DeviceRoute;
 use crate::session::{decode, parts, Part, Update};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
 /// Why a client's connection ended. The task serving the client logs it
@@ -132,8 +137,9 @@ pub(super) struct Outbox {
 
 /// What the writer takes from an [`Outbox`] at once.
 pub(super) struct Taken {
-    /// The urgent queue, then the oldest part of the stream, and last the
-    /// status that the proxy stopped once the stream is empty.
+    /// The urgent queue, then the counts of the samples dropped since the
+    /// last take, then the oldest part of the stream, and last the status
+    /// that the proxy stopped once the stream is empty.
     pub(super) packets: VecDeque<Packet>,
     /// How many samples were dropped since the last take.
     pub(super) dropped: u64,
@@ -149,8 +155,9 @@ struct Queues {
     sample_bytes: usize,
     /// The bytes of the packets held that are not samples.
     other_bytes: usize,
-    /// How many samples were dropped since the writer last took.
-    dropped: u64,
+    /// How many sample packets of each stream of each device were dropped
+    /// since the writer last took.
+    dropped: BTreeMap<(DeviceRoute, u8), u32>,
     /// Why the client must be let go.
     end: Option<ClientError>,
     stop: Stop,
@@ -179,7 +186,7 @@ impl Queues {
     /// Takes `packet` out of the byte counts, as it leaves the outbox.
     fn uncount(&mut self, packet: &Packet) {
         let size = packet.as_bytes().len();
-        if is_sample(packet) {
+        if packet.is_data() {
             self.sample_bytes -= size;
         } else {
             self.other_bytes -= size;
@@ -188,19 +195,16 @@ impl Queues {
 
     /// Drops the oldest sample on the stream, and counts it.
     fn drop_oldest_sample(&mut self) {
-        let at = self.stream.iter().position(is_sample);
+        let at = self.stream.iter().position(Packet::is_data);
         let at = at.expect("a sample on the stream past the budget");
         let oldest = self.stream.remove(at).expect("the sample found");
         self.sample_bytes -= oldest.as_bytes().len();
-        self.dropped += 1;
+        let stream = oldest.ptype().sample_stream().expect("a sample's stream");
+        *self
+            .dropped
+            .entry((oldest.route(), stream.value()))
+            .or_default() += 1;
     }
-}
-
-/// Returns `true` if `packet` holds samples, as its type says. It reads the
-/// type alone, as the eviction scans the stream with it.
-fn is_sample(packet: &Packet) -> bool {
-    let stream = packet.ptype().stream_id();
-    stream.is_some_and(|stream| stream >= FIRST_STREAM_ID)
 }
 
 /// Returns the watch id and the part of the update that `packet` carries,
@@ -223,7 +227,7 @@ impl Outbox {
     /// Queues `packet`, an answer or a status, on the urgent queue, ahead of
     /// the stream.
     pub(super) fn urgent(&self, packet: Packet) {
-        debug_assert!(!is_sample(&packet), "a sample is never urgent");
+        debug_assert!(!packet.is_data(), "a sample is never urgent");
         self.queue([packet], Queue::Urgent);
     }
 
@@ -248,7 +252,7 @@ impl Outbox {
         }
         for packet in packets {
             let size = packet.as_bytes().len();
-            if is_sample(&packet) {
+            if packet.is_data() {
                 queues.sample_bytes += size;
             } else {
                 queues.other_bytes += size;
@@ -292,13 +296,18 @@ impl Outbox {
     /// would take it past the limit. A take that reaches the limit inside an
     /// update takes the rest of the update too. Once the stream is empty, the
     /// status that the proxy stopped goes last if it is due. Says how many
-    /// samples were dropped since the last take, and the first reason to let
-    /// the client go asked for since the last take that handed one.
+    /// samples were dropped since the last take, in a count per stream ahead
+    /// of the stream and in all, and the first reason to let the client go
+    /// asked for since the last take that handed one.
     pub(super) fn take(&self) -> Taken {
         let mut queues = lock(&self.queues);
         let mut packets = std::mem::take(&mut queues.urgent);
         for packet in &packets {
             queues.uncount(packet);
+        }
+        let dropped = std::mem::take(&mut queues.dropped);
+        for (&(route, stream), &count) in &dropped {
+            packets.push_back(Packet::dropped(stream, count).with_route(route));
         }
         let mut taken = 0;
         while let Some(next) = queues.stream.front() {
@@ -319,7 +328,7 @@ impl Outbox {
         }
         Taken {
             packets,
-            dropped: std::mem::take(&mut queues.dropped),
+            dropped: dropped.values().map(|&count| u64::from(count)).sum(),
             end: queues.end.take(),
         }
     }
@@ -335,7 +344,7 @@ impl Outbox {
         let (mut sample_bytes, mut other_bytes, mut others) = (0, 0, 0);
         for packet in queues.urgent.iter().chain(&queues.stream) {
             let size = packet.as_bytes().len();
-            if is_sample(packet) {
+            if packet.is_data() {
                 sample_bytes += size;
             } else {
                 other_bytes += size;

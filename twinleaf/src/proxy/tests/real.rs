@@ -625,8 +625,8 @@ fn a_proxy_refuses_to_mount_itself() {
     assert!(proxy.links.urls().is_empty(), "a link to the proxy opened");
 }
 
-/// Type 64 is also `USER`, which a device and an app may send. Such a
-/// packet is no status of the proxy's, so it passes untouched both
+/// Type 64 is also `USER`. A packet of this type from a device or a port
+/// is no status of the proxy's, so it passes untouched both
 /// ways, but for its route.
 #[test]
 fn a_user_packet_passes_through_untouched() {
@@ -972,4 +972,95 @@ fn clients_lists_who_said_hello_and_what_they_opened() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(proxy.clients()[0].name.as_deref(), Some("mine"));
+}
+
+/// Returns a handler that sends each connection it is given to the test,
+/// as a blocking socket, and the receiver of those.
+fn foreign_handler() -> (Foreign, std::sync::mpsc::Receiver<TcpStream>) {
+    let (sender, handed) = std::sync::mpsc::channel();
+    let foreign = Foreign::new(move |stream, _peer| {
+        let stream = stream.into_std().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        let _ = sender.send(stream);
+    });
+    (foreign, handed)
+}
+
+/// A proxy with a handler still serves a client, whose first byte is a
+/// packet type, as it serves one without.
+#[test]
+fn a_proxy_with_a_handler_still_serves_a_client() {
+    let (foreign, handed) = foreign_handler();
+    let proxy = Proxy::host(HostOptions {
+        foreign: Some(foreign),
+        ..options()
+    })
+    .unwrap();
+    let client = TestClient::connect(&proxy.endpoint());
+    client.hello(4242, "client");
+    assert!(handed.try_recv().is_err(), "the client went to the handler");
+}
+
+/// An HTTP request goes to the handler, with none of its bytes read.
+#[test]
+fn an_http_request_goes_to_the_handler_whole() {
+    use std::io::{Read, Write};
+    let (foreign, handed) = foreign_handler();
+    let proxy = Proxy::host(HostOptions {
+        foreign: Some(foreign),
+        ..options()
+    })
+    .unwrap();
+    let address = proxy.endpoint().trim_start_matches("tcp://").to_string();
+    let mut browser = TcpStream::connect(address).unwrap();
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    browser.write_all(request).unwrap();
+
+    let mut served = handed
+        .recv_timeout(WAIT)
+        .expect("no connection reached the handler");
+    let mut read = vec![0; request.len()];
+    served.read_exact(&mut read).unwrap();
+    assert_eq!(read, request);
+    assert!(proxy.clients().is_empty(), "the request became a client");
+}
+
+/// A connection that sends nothing is served as a client after the first
+/// byte's wait, and a client that connects meanwhile is served at once.
+#[test]
+fn a_quiet_connection_is_a_client_and_holds_up_no_other() {
+    let (foreign, handed) = foreign_handler();
+    let proxy = Proxy::host(HostOptions {
+        foreign: Some(foreign),
+        ..options()
+    })
+    .unwrap();
+    let address = proxy.endpoint().trim_start_matches("tcp://").to_string();
+    let started = Instant::now();
+    let quiet = TcpStream::connect(address).unwrap();
+    let quiet_peer = quiet.local_addr().unwrap();
+
+    let client = TestClient::connect(&proxy.endpoint());
+    client.hello(4242, "client");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the client waited behind the quiet connection"
+    );
+
+    let deadline = Instant::now() + WAIT;
+    while !proxy.clients().iter().any(|info| info.peer == quiet_peer) {
+        assert!(
+            Instant::now() < deadline,
+            "the quiet connection was not served"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "it was served before its wait"
+    );
+    assert!(
+        handed.try_recv().is_err(),
+        "the quiet connection went to the handler"
+    );
 }

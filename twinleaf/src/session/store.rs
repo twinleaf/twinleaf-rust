@@ -1,7 +1,7 @@
 //! The [`Store`] of the state of every device in one tree.
 //!
-//! It holds each device's latest presence, metadata, RPC table and settings,
-//! and the routes heard, and sends each new value to the receivers that
+//! It holds each device's latest presence, link, metadata, RPC table and
+//! settings, and the routes heard, and sends each new value to the receivers that
 //! follow it. A receiver that follows a value already held gets it at once,
 //! on a latest-value lane, so one that falls behind skips to the newest.
 //! Setting changes are the one ordered stream, queued in full for each
@@ -23,10 +23,12 @@
 
 use super::control::{Update, Watch, CHANGED, TIMED_OUT, UNANSWERED};
 use super::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
-use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
+use super::state::{
+    LinkState, LostCause, MetadataState, Presence, RegistryState, SettingChange, Settings,
+};
 use super::subscription::{End, Lane, Receiver, Scope, Sink};
 use crate::chan::Notify;
-use crate::data::PacketParser;
+use crate::data::{DeviceMetadataSnapshot, PacketParser};
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, SessionId};
 use crate::tio::packet::Packet;
@@ -35,7 +37,7 @@ use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 use tokio::time::Instant;
 
 /// How many setting changes a receiver's queue holds.
@@ -81,13 +83,14 @@ impl<T: Clone> Slot<T> {
 /// The state of one device.
 pub(crate) struct Entry {
     presence: Slot<Presence>,
+    link: Slot<LinkState>,
     metadata: Slot<MetadataState>,
     registry: Slot<RegistryState>,
     settings: Slot<Arc<Settings>>,
     changes: Slot<SettingChange>,
-    /// The last `rpc.hash` the device announced to the proxy, and the
-    /// session it reported then.
-    announced: Option<(Option<SessionId>, u32)>,
+    /// The last `rpc.hash` the device announced to the proxy since it last
+    /// reconnected.
+    announced: Option<u32>,
     /// How many times the device has reconnected.
     epoch: u64,
     /// The epoch the load of the table the store holds started in.
@@ -99,27 +102,15 @@ pub(crate) struct Entry {
 impl Entry {
     /// Returns the table the proxy's store holds in force for the device.
     /// That is the table it holds when its load started after the device
-    /// last reconnected, while the device reports the session the
-    /// table was read in or reports none, and while the table has the hash
-    /// the device last announced in that session.
+    /// last reconnected, while the table has the hash the device last
+    /// announced since then.
     fn in_force(&self) -> Option<Arc<RpcRegistry>> {
         let Some(Ok(table)) = &self.registry.value else {
             return None;
         };
-        let session = match self.presence.value {
-            Some(Presence::Alive { session }) => session,
-            _ => None,
-        };
-        let same_boot = match (table.session, session) {
-            (Some(read_in), Some(reported)) => read_in == reported,
-            _ => true,
-        };
-        let same_hash = match self.announced {
-            Some((announced_in, hash)) if announced_in == session => table.hash == Some(hash),
-            _ => true,
-        };
+        let same_hash = self.announced.is_none_or(|hash| table.hash == Some(hash));
         let current = self.loaded_in == self.epoch;
-        (current && same_boot && same_hash).then(|| Arc::clone(table))
+        (current && same_hash).then(|| Arc::clone(table))
     }
 
     /// Returns the table of this device the store holds with `hash` and
@@ -169,6 +160,10 @@ macro_rules! each_slot {
                 let $sinks = &mut entry.changes.sinks;
                 $body
             },
+            {
+                let $sinks = &mut entry.link.sinks;
+                $body
+            },
         ]
     }};
 }
@@ -176,6 +171,7 @@ macro_rules! each_slot {
 /// Picks one value of a device's state.
 pub(crate) type Field<T> = fn(&mut Entry) -> &mut Slot<T>;
 pub(crate) const PRESENCE: Field<Presence> = |entry| &mut entry.presence;
+pub(crate) const LINK: Field<LinkState> = |entry| &mut entry.link;
 pub(crate) const METADATA: Field<MetadataState> = |entry| &mut entry.metadata;
 pub(crate) const REGISTRY: Field<RegistryState> = |entry| &mut entry.registry;
 pub(crate) const SETTINGS: Field<Arc<Settings>> = |entry| &mut entry.settings;
@@ -212,6 +208,7 @@ impl Store {
         let proxy = self.proxy;
         self.devices.entry(route).or_insert_with(|| Entry {
             presence: Slot::new(proxy.then_some(Presence::Connecting), false),
+            link: Slot::new(None, false),
             metadata: Slot::new(proxy.then_some(MetadataState::Pending), false),
             registry: Slot::new(None, false),
             settings: Slot::new(None, false),
@@ -289,7 +286,21 @@ impl Store {
     /// may have restarted with another table. The table held is out of force
     /// until a table whose load started after this is set.
     pub(crate) fn reconnect(&mut self, route: DeviceRoute) {
-        self.entry(route).epoch += 1;
+        let entry = self.entry(route);
+        entry.epoch += 1;
+        entry.announced = None;
+    }
+
+    /// Whether the table in force for the device at `route` was read in
+    /// another session than the one the device reports, as it restarted.
+    pub(crate) fn restarted(&mut self, route: DeviceRoute) -> bool {
+        let entry = self.entry(route);
+        let reported = match entry.presence.value {
+            Some(Presence::Alive { session }) => session,
+            _ => None,
+        };
+        let read_in = entry.in_force().and_then(|table| table.session);
+        matches!((read_in, reported), (Some(read_in), Some(reported)) if read_in != reported)
     }
 
     /// Sets the settings of the device at `route` if they were read with the
@@ -321,11 +332,7 @@ impl Store {
         let entry = self.entry(route);
         let table = if proxy {
             if let Some(hash) = rpc_hash(name.as_bytes(), &reply) {
-                let session = match entry.presence.value {
-                    Some(Presence::Alive { session }) => session,
-                    _ => None,
-                };
-                entry.announced = Some((session, hash));
+                entry.announced = Some(hash);
             }
             entry.in_force()
         } else {
@@ -366,6 +373,19 @@ impl Store {
         if let Some(entry) = self.devices.get_mut(&route) {
             entry.changes.sinks.retain_mut(|sink| sink.lane.lag(missed));
         }
+    }
+
+    /// Returns the complete metadata the store holds of each device in
+    /// `scope`.
+    pub(crate) fn described(&self, scope: Scope) -> Vec<DeviceMetadataSnapshot> {
+        self.devices
+            .iter()
+            .filter(|(route, _)| scope.covers(**route))
+            .filter_map(|(_, entry)| match &entry.metadata.value {
+                Some(MetadataState::Ready(snapshot)) => Some(snapshot.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Returns the routes heard, sorted.
@@ -412,10 +432,10 @@ impl Store {
         });
         let client = !self.proxy;
         let devices = self.devices.iter_mut().flat_map(move |(route, entry)| {
-            let [presence, metadata, registry, settings, changes] =
+            let [presence, metadata, registry, settings, changes, link] =
                 each_slot!(entry, |sinks| !sinks.is_empty());
             [
-                (presence || metadata || changes, false),
+                (presence || metadata || changes || link, false),
                 (registry || settings || (client && changes), true),
             ]
             .into_iter()
@@ -464,6 +484,7 @@ impl Store {
                 true => (entry.registry.value, entry.settings.value) = (None, None),
                 false => {
                     (entry.presence.value, entry.metadata.value) = (None, None);
+                    entry.link.value = None;
                     entry.named = None;
                 }
             }
@@ -477,14 +498,23 @@ impl Store {
         }
     }
 
-    /// Makes every device the store holds lost, as no one can say more of
-    /// them. A device lost already keeps the moment it was lost.
+    /// Makes every device the store holds lost, as the client lost its
+    /// connection to the proxy and no one can say more of them. A device
+    /// lost already keeps the moment it was lost and why.
     pub(crate) fn mark_lost(&mut self) {
         let since = tokio::time::Instant::now().into_std();
-        for entry in self.devices.values_mut() {
-            if !matches!(entry.presence.value, Some(Presence::Lost { .. })) {
-                entry.presence.set(Presence::Lost { since });
-            }
+        let cause = Some(LostCause::ProxyLost);
+        for route in self.devices.keys().copied().collect::<Vec<_>>() {
+            self.lose(route, since, cause);
+        }
+    }
+
+    /// Makes the device at `route` lost since `since` for `cause`. A device
+    /// lost already keeps the moment and the cause of its first loss.
+    pub(crate) fn lose(&mut self, route: DeviceRoute, since: StdInstant, cause: Option<LostCause>) {
+        let presence = &mut self.entry(route).presence;
+        if !matches!(presence.value, Some(Presence::Lost { .. })) {
+            presence.set(Presence::Lost { since, cause });
         }
     }
 
@@ -506,9 +536,13 @@ impl Store {
     /// session of the one held keeps them. A table with the hash and session
     /// of one the store holds already is that one, so the device's table and
     /// the table its changes carry are one value while they are the same.
+    /// The URL a presence carries is set ahead of the presence.
     pub(crate) fn apply(&mut self, route: DeviceRoute, update: Update, parser: &mut PacketParser) {
         match update {
-            Update::Presence(presence) => {
+            Update::Presence(presence, cause, url) => {
+                if let Some(url) = url {
+                    self.set(route, LINK, LinkState { url });
+                }
                 let now = Instant::now().into_std();
                 let presence = match presence.map(|session| session.map(SessionId::new)) {
                     Ok(session) => Presence::Alive { session },
@@ -517,6 +551,7 @@ impl Store {
                         let since = now.checked_sub(Duration::from_millis(ago));
                         Presence::Lost {
                             since: since.unwrap_or(now),
+                            cause: cause.and_then(LostCause::from_code),
                         }
                     }
                 };
@@ -672,7 +707,7 @@ mod tests {
     /// The proxy's store records each change under the table in force for
     /// its device then. None is in force before the first table loads, from
     /// an `rpc.hash` that names another table until that table loads, or
-    /// from a new session until its table loads. A change recorded meanwhile
+    /// from a reconnect until its table loads. A change recorded meanwhile
     /// reaches each receiver all the same, with no table.
     #[test]
     fn a_change_carries_the_table_in_force_when_it_is_recorded() {
@@ -689,7 +724,7 @@ mod tests {
         record(&mut store, "test.amplitude", &[3]);
         store.set_registry(route, Ok(Arc::clone(&new)));
         record(&mut store, "test.amplitude", &[4]);
-        alive(&mut store, 8);
+        store.reconnect(route);
         record(&mut store, "test.amplitude", &[5]);
 
         let carried: Vec<_> = std::iter::from_fn(|| changes.try_recv().unwrap())
@@ -727,21 +762,6 @@ mod tests {
         assert!(beat.rpc_registry().is_none());
         assert!(across.rpc_registry().is_none());
         assert!(Arc::ptr_eq(loaded.rpc_registry().unwrap(), &reloaded));
-    }
-
-    /// A device whose heartbeats carry no session has its table in force
-    /// once it loads, though the table was read in a session, and its
-    /// changes decode.
-    #[test]
-    fn a_table_is_in_force_for_a_device_whose_heartbeats_carry_no_session() {
-        let mut store = Store::new(true);
-        let route = DeviceRoute::root();
-        store.set(route, PRESENCE, Presence::Alive { session: None });
-        store.set_registry(route, Ok(table_in(1, 7, Some(BYTE))));
-
-        let change = record(&mut store, "test.amplitude", &[5]);
-
-        assert_eq!(change.value().unwrap(), RpcValue::U64(5));
     }
 
     /// A change decodes with the table it was recorded under, after the
@@ -844,21 +864,26 @@ mod tests {
         assert_eq!(store.devices.keys().copied().collect::<Vec<_>>(), [heard]);
     }
 
-    /// A device lost already keeps the moment it was lost when every device
-    /// is made lost.
+    /// A device lost already keeps the moment it was lost and why when every
+    /// device is made lost.
     #[test]
-    fn a_device_lost_already_keeps_its_moment() {
+    fn a_device_lost_already_keeps_its_moment_and_its_cause() {
         let mut store = Store::new(false);
         let route = DeviceRoute::root();
         let since = std::time::Instant::now() - Duration::from_secs(60);
-        store.set(route, PRESENCE, Presence::Lost { since });
+        let quiet = Presence::Lost {
+            since,
+            cause: Some(LostCause::Quiet),
+        };
+        store.set(route, PRESENCE, quiet);
 
         store.mark_lost();
 
-        assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
+        assert_eq!(store.value(route, PRESENCE), Some(quiet));
     }
 
-    /// Every device made lost is lost at that moment on the paused clock.
+    /// Every device made lost is lost at that moment on the paused clock, as
+    /// the proxy was lost.
     #[tokio::test(start_paused = true)]
     async fn a_device_made_lost_is_dated_on_the_paused_clock() {
         let mut store = Store::new(false);
@@ -869,7 +894,11 @@ mod tests {
         store.mark_lost();
 
         let since = tokio::time::Instant::now().into_std();
-        assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
+        let cause = Some(LostCause::ProxyLost);
+        assert_eq!(
+            store.value(route, PRESENCE),
+            Some(Presence::Lost { since, cause })
+        );
     }
 
     /// Setting changes are queued in full, and a receiver that overflows its

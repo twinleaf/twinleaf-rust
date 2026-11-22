@@ -11,7 +11,6 @@ use futures_util::stream::{FusedStream, Stream};
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
@@ -504,39 +503,5 @@ impl<T> FusedStream for RecvStream<'_, T> {
 impl<T> fmt::Debug for RecvStream<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecvStream").finish_non_exhaustive()
-    }
-}
-
-/// A wait on several receivers at once, which builds and panics when it
-/// waits.
-pub struct Selector<'a, R>(PhantomData<&'a R>);
-
-/// The time bound of a [`Selector`] passed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SelectError;
-
-impl<'a, R> Selector<'a, R> {
-    /// Returns a selector over no receiver.
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Selector(PhantomData)
-    }
-
-    /// Adds `receiver`, whose item `mapper` would map.
-    pub fn recv<T, F>(self, _receiver: &'a Receiver<T>, _mapper: F) -> Self
-    where
-        F: FnMut(Result<T, RecvError>) -> R + 'a,
-    {
-        self
-    }
-
-    /// Panics, as the stand-in has no selector.
-    pub fn wait(self) -> R {
-        unimplemented!("the shuttle stand-in has no selector")
-    }
-
-    /// Panics, as the stand-in has no selector.
-    pub fn wait_deadline(self, _deadline: Instant) -> Result<R, SelectError> {
-        unimplemented!("the shuttle stand-in has no selector")
     }
 }

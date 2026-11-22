@@ -80,15 +80,12 @@ mod tests {
     //!   one error. Bytes after the packet give `TrailingBytes`, a datagram
     //!   that ends before its packet does, the empty one too, gives
     //!   `PacketTooSmall`, and an invalid header or payload gives the error
-    //!   the packet gives, unless it is a metadata record that does not
-    //!   parse and can be repaired, which decodes as the packet [`repaired`]
-    //!   gives. Source, the doc of `decode`. It rules out a codec that
-    //!   ignores trailing bytes.
+    //!   the packet gives. Source, the doc of `decode`. It rules out a codec
+    //!   that ignores trailing bytes.
     //! - U3, the decoder adapter. Each datagram gives exactly one event, a
     //!   packet or a rejected frame, then `None`, and leaves the buffer
-    //!   empty. A metadata record that can be repaired gives the packet
-    //!   [`repaired`] gives. Source, the doc of [`Codec`]. It rules out an
-    //!   adapter that repeats a datagram or loses the next one.
+    //!   empty. Source, the doc of [`Codec`]. It rules out an adapter that
+    //!   repeats a datagram or loses the next one.
     //!
     //! # Generator obligations
     //!
@@ -100,7 +97,7 @@ mod tests {
     //! None. U1 and U2 hold every case the examples held.
 
     use super::*;
-    use crate::tio::transport::codec::tests::{repaired, strategy};
+    use crate::tio::transport::codec::tests::strategy;
     use crate::tio::transport::TransportEvent;
     use bytes::BytesMut;
     use proptest::prelude::*;
@@ -114,14 +111,12 @@ mod tests {
             prop_assert_eq!(decoded.as_bytes(), packet.as_bytes());
         }
 
-        /// U2. A datagram that is not exactly one packet gives its error,
-        /// unless its metadata record can be repaired.
+        /// U2. A datagram that is not exactly one packet gives its error.
         #[test]
         fn a_datagram_that_is_not_one_packet_is_its_error(
             (datagram, error, _) in strategy::not_one_packet(),
         ) {
-            let decoded = decode(&datagram).map(|packet| packet.as_bytes().to_vec());
-            prop_assert_eq!(decoded, repaired(&datagram).ok_or(error));
+            prop_assert_eq!(decode(&datagram).err(), Some(error));
         }
 
         /// U3. The decoder gives one event for each datagram, then `None`,
@@ -138,12 +133,9 @@ mod tests {
                 let mut src = BytesMut::from(&datagram[..]);
                 let event = codec.decode(&mut src).unwrap();
                 prop_assert!(src.is_empty());
-                let repaired = repaired(&datagram);
-                let error = error.filter(|_| repaired.is_none());
                 match (error, event) {
                     (None, Some(TransportEvent::Packet(packet))) => {
-                        let expected = repaired.as_deref().unwrap_or(&datagram);
-                        prop_assert_eq!(packet.as_bytes(), expected);
+                        prop_assert_eq!(packet.as_bytes(), &datagram[..]);
                     }
                     (Some(Error::TrailingBytes), Some(TransportEvent::RejectedFrame(rejected))) => {
                         prop_assert_eq!(rejected, crate::tio::packet::DecodeError::PacketTooBig);

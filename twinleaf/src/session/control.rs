@@ -5,10 +5,10 @@
 //! [`handshake`] make requests as a client.
 
 use super::rpc::{CallError, RpcRegistry, RpcRegistryError};
-use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
+use super::state::{LostCause, MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
-use crate::proto::{DeviceRoute, SessionId, TCP_DEFAULT_PORT};
+use crate::proto::{DeviceRoute, SessionId};
 use crate::rt::Supervisor;
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, KeepAlive, ReceiveResult, RecvError, TransportEvent};
@@ -18,7 +18,6 @@ use minicbor::{Decode, Encode};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
@@ -256,9 +255,15 @@ pub(crate) enum Update {
     /// The device's presence. `Ok` holds the session its heartbeats report
     /// while it sends. `Err(None)` says it is connecting, and `Err(Some)`
     /// says its link lost it this many milliseconds before the update went
-    /// out, as the two ends share no clock.
+    /// out, as the two ends share no clock. The second field is the code of
+    /// why a lost device was lost, if the proxy says. The third is the URL
+    /// of the link that serves the device, if the proxy says.
     #[n(0)]
-    Presence(#[n(0)] Result<Option<u32>, Option<u64>>),
+    Presence(
+        #[n(0)] Result<Option<u32>, Option<u64>>,
+        #[n(1)] Option<u8>,
+        #[n(2)] Option<String>,
+    ),
     /// The device's complete metadata as its own metadata packets, each
     /// addressed to the root, none while it is collected, or `None` for a
     /// device with no `dev.metadata`.
@@ -297,31 +302,35 @@ pub(crate) enum Update {
 }
 
 impl Update {
-    /// Returns the update of a device's presence.
-    pub(crate) fn presence(presence: Presence) -> Update {
-        Update::Presence(match presence {
-            Presence::Connecting => Err(None),
-            Presence::Alive { session } => Ok(session.map(SessionId::value)),
-            Presence::Lost { since } => {
-                let ago = Instant::now().into_std().saturating_duration_since(since);
-                Err(Some(u64::try_from(ago.as_millis()).unwrap_or(u64::MAX)))
+    /// Returns the update of a device's presence on the link at `url`.
+    pub(crate) fn presence(presence: Presence, url: Option<&str>) -> Update {
+        let url = url.map(str::to_string);
+        match presence {
+            Presence::Connecting => Update::Presence(Err(None), None, url),
+            Presence::Alive { session } => {
+                Update::Presence(Ok(session.map(SessionId::value)), None, url)
             }
-        })
+            Presence::Lost { since, cause } => {
+                let ago = Instant::now().into_std().saturating_duration_since(since);
+                let ago = u64::try_from(ago.as_millis()).unwrap_or(u64::MAX);
+                Update::Presence(Err(Some(ago)), cause.and_then(LostCause::code), url)
+            }
+        }
     }
 
     /// Returns the update of a device's metadata, or `None` if a record
     /// does not fit a packet.
     pub(crate) fn metadata(state: &MetadataState) -> Option<Update> {
         let packets = match state {
-            MetadataState::Ready(snapshot) => snapshot.metadata_packets().ok()?,
+            MetadataState::Ready(snapshot) => {
+                snapshot.metadata_packets(DeviceRoute::root()).ok()?
+            }
             MetadataState::Pending => Vec::new(),
             MetadataState::Unsupported => return Some(Update::Metadata(None)),
         };
-        let root = DeviceRoute::root();
-        let records = packets
-            .iter()
-            .map(|packet| packet.with_route(root).as_bytes().to_vec());
-        Some(Update::Metadata(Some(records.map(ByteVec::from).collect())))
+        Some(Update::Metadata(Some(
+            packets.into_iter().map(ByteVec::from).collect(),
+        )))
     }
 
     /// Returns the update of an RPC table as loaded, or of why it did not
@@ -614,32 +623,31 @@ pub(crate) fn call(
     args: &[u8],
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
-    let address = socket_addr(endpoint)?;
     let (endpoint, method, args) = (endpoint.to_string(), method.to_string(), args.to_vec());
     let tasks = Supervisor::new();
     let on = tasks.clone();
     tasks.run("proxy control call", async move {
-        call_at(address, &endpoint, &method, &args, timeout, &on).await
+        call_at(&endpoint, &method, &args, timeout, &on).await
     })
 }
 
-/// Makes one control request of the proxy at `endpoint`, whose address is
-/// `address`, as [`call`] does, without blocking. The connection's task runs
-/// on `tasks`.
+/// Makes one control request of the proxy at `endpoint` as [`call`] does,
+/// without blocking. Opens `endpoint` as a connection does. The
+/// connection's task runs on `tasks`.
 pub(crate) async fn call_at(
-    address: SocketAddr,
     endpoint: &str,
     method: &str,
     args: &[u8],
     timeout: Duration,
     tasks: &Supervisor,
 ) -> io::Result<Vec<u8>> {
-    let connect = timeout.min(HELLO_TIMEOUT);
-    let connected = match tokio::time::timeout(connect, crate::net::connect(address)).await {
-        Ok(connected) => connected,
+    let (sender, received) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+    let opening = transport::Port::open(endpoint, sender, tasks);
+    let opened = match tokio::time::timeout(timeout.min(HELLO_TIMEOUT), opening).await {
+        Ok(opened) => opened,
         Err(_elapsed) => Err(io::ErrorKind::TimedOut.into()),
     };
-    let stream = connected.map_err(|error| match error.kind() {
+    let port = opened.map_err(|error| match error.kind() {
         // A firewall can drop a connection to a closed port rather than
         // refuse it.
         io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut => {
@@ -647,9 +655,6 @@ pub(crate) async fn call_at(
         }
         _ => error,
     })?;
-    let (sender, received) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
-    let port =
-        transport::Port::over_tcp(stream, sender, transport::DEFAULT_TX_CHANNEL_SIZE, tasks)?;
     let goal = format!("answer {method}");
     let (_, reply) = handshake(&port, &received, endpoint, method, args, &goal, timeout).await?;
     Ok(reply)
@@ -777,22 +782,6 @@ pub(crate) fn older_build(endpoint: &str) -> io::Error {
 /// Wraps `error` in an [`io::ErrorKind::InvalidInput`] error.
 fn invalid_input(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
-}
-
-/// Returns the socket address of a `tcp://` endpoint, on the default port if
-/// it names none. Returns an error if the endpoint does not resolve.
-fn socket_addr(endpoint: &str) -> io::Result<SocketAddr> {
-    let address = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
-    let mut addresses = match address.to_socket_addrs() {
-        Ok(addresses) => addresses,
-        Err(_) => (address, TCP_DEFAULT_PORT).to_socket_addrs()?,
-    };
-    addresses.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{endpoint} names no address"),
-        )
-    })
 }
 
 /// Returns the name of this process's executable without its extension, or
@@ -1046,14 +1035,6 @@ mod tests {
         assert_eq!(decode_layout(cut).unwrap_err().code, RpcError::ArgsSize);
     }
 
-    #[test]
-    fn replies_decode_as_they_were_encoded() {
-        let host = Introduction::of_this_process("tio proxy");
-        assert_eq!(decode::<Introduction>(&encode(&host)).unwrap(), host);
-        let target = "tcp://127.0.0.1:7856".to_string();
-        assert_eq!(decode::<String>(&encode(&target)).unwrap(), target);
-    }
-
     /// This build introduces itself with its own pid and crate version.
     #[test]
     fn this_process_gives_its_pid_and_version() {
@@ -1099,18 +1080,6 @@ mod tests {
         assert_eq!(RpcError::from(error.code), RpcError::Invalid);
         assert!(error.message.len() <= MAX_MESSAGE);
         assert!(std::str::from_utf8(error.message).is_ok());
-    }
-
-    #[test]
-    fn endpoints_resolve_with_or_without_a_port() {
-        assert_eq!(
-            socket_addr("tcp://127.0.0.1:7856").unwrap(),
-            SocketAddr::from(([127, 0, 0, 1], 7856))
-        );
-        assert_eq!(
-            socket_addr("tcp://127.0.0.1").unwrap(),
-            SocketAddr::from(([127, 0, 0, 1], TCP_DEFAULT_PORT))
-        );
     }
 
     /// A client's store records each change under the table the proxy
@@ -1174,10 +1143,141 @@ mod tests {
         let route = DeviceRoute::root();
         tokio::time::sleep(Duration::from_secs(60)).await;
 
-        store.apply(route, Update::Presence(Err(Some(1500))), &mut parser);
+        let update = Update::Presence(Err(Some(1500)), None, None);
+        store.apply(route, update, &mut parser);
         let since = (Instant::now() - Duration::from_millis(1500)).into_std();
-        assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
-        let again = Update::presence(Presence::Lost { since });
-        assert_eq!(again, Update::Presence(Err(Some(1500))));
+        let lost = Presence::Lost { since, cause: None };
+        assert_eq!(store.value(route, PRESENCE), Some(lost));
+        let again = Update::presence(lost, None);
+        assert_eq!(again, Update::Presence(Err(Some(1500)), None, None));
+    }
+
+    /// A client keeps each cause a lost presence carries, and none for a
+    /// presence that carries none or a cause this build does not know. It
+    /// keeps the URL of the link a presence carries. A cause that is never
+    /// sent goes out as none, and each update reads back as written.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_presence_carries_each_cause_of_its_loss() {
+        use crate::session::store::LINK;
+        let (mut store, mut parser) = (Store::new(false), PacketParser::new(false));
+        let route = DeviceRoute::root();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let since = (Instant::now() - Duration::from_millis(1500)).into_std();
+        let causes = [
+            (LostCause::Disconnected, Some(0)),
+            (LostCause::Stopped, Some(4)),
+            (LostCause::FailedToConnect, Some(3)),
+            (LostCause::FailedToReconnect, Some(2)),
+            (LostCause::Quiet, Some(5)),
+            (LostCause::ProxyLost, None),
+        ];
+        for ((cause, code), url) in causes
+            .into_iter()
+            .flat_map(|row| [(row, None), (row, Some("tcp://device"))])
+        {
+            let cause = Some(cause);
+            let update = Update::presence(Presence::Lost { since, cause }, url);
+            let sent = url.map(str::to_string);
+            assert_eq!(update, Update::Presence(Err(Some(1500)), code, sent));
+            store.apply(route, update.clone(), &mut parser);
+            let kept = Presence::Lost {
+                since,
+                cause: code.and(cause),
+            };
+            assert_eq!(store.value(route, PRESENCE), Some(kept));
+            if let Some(url) = url {
+                let link = store.value(route, LINK).map(|link| link.url);
+                assert_eq!(link.as_deref(), Some(url));
+            }
+            let wire = decode::<Update>(&encode(&update)).expect("an update decodes");
+            assert_eq!(wire, update);
+        }
+        let unknown = Update::Presence(Err(Some(1500)), Some(200), None);
+        store.apply(route, unknown, &mut parser);
+        let lost = Presence::Lost { since, cause: None };
+        assert_eq!(store.value(route, PRESENCE), Some(lost));
+    }
+
+    /// A cause from a link status has that status's byte as its code.
+    #[test]
+    fn a_cause_from_a_link_status_has_the_status_byte() {
+        for status in (0..=u8::MAX).map(LinkStatus::from) {
+            if let Some(cause) = LostCause::from_status(status) {
+                assert_eq!(cause.code(), Some(u8::from(status)), "{status:?}");
+            }
+        }
+    }
+
+    /// A client whose presence update has one field reads a presence with a
+    /// URL as the same presence, and a presence with no cause and no URL is
+    /// written as that client writes it.
+    #[test]
+    fn a_presence_with_a_url_reads_in_the_one_field_layout() {
+        #[derive(Debug, PartialEq, Encode, Decode)]
+        enum OneField {
+            #[n(0)]
+            Presence(#[n(0)] Result<Option<u32>, Option<u64>>),
+        }
+        let url = Some("tcp://device".to_string());
+        let update = Update::Presence(Err(Some(1500)), None, url);
+        let read = decode::<OneField>(&encode(&update)).expect("a presence decodes");
+        assert_eq!(read, OneField::Presence(Err(Some(1500))));
+        let bare = Update::Presence(Ok(Some(7)), None, None);
+        assert_eq!(encode(&bare), encode(&OneField::Presence(Ok(Some(7)))));
+    }
+
+    /// The replies that carry `update` to watch 1, as their values.
+    fn parts_of(update: &Update) -> Vec<Vec<u8>> {
+        parts(1, update)
+            .iter()
+            .map(|packet| match packet.payload() {
+                Payload::ProxyRx(ProxyRx::Reply(reply)) => reply.value.to_vec(),
+                other => panic!("a part is a reply, not {other:?}"),
+            })
+            .collect()
+    }
+
+    fn watched() -> Joined {
+        Joined::default()
+    }
+
+    fn large_table(entries: usize) -> Update {
+        let entries = (0..entries).map(|index| (format!("test.entry{index}"), 0x8140));
+        Update::Table(Ok((Some(1), None, entries.collect())))
+    }
+
+    /// An update too large for one reply arrives in parts, and is whole once
+    /// its last part is in. An update that lost a part is dropped, and the
+    /// next one joins whole.
+    #[test]
+    fn a_watched_update_joins_from_its_parts_and_one_missing_a_part_is_dropped() {
+        let update = large_table(100);
+        let parts = parts_of(&update);
+        assert!(parts.len() > 2, "the table takes several replies");
+        let mut watched = watched();
+
+        let lost_one = parts.iter().enumerate().filter(|(index, _)| *index != 1);
+        let joined: Vec<_> = lost_one
+            .filter_map(|(_, part)| watched.join(part))
+            .collect();
+        assert!(joined.is_empty(), "an update that lost a part is dropped");
+        let joined: Vec<_> = parts.iter().filter_map(|part| watched.join(part)).collect();
+        assert_eq!(joined.len(), 1, "only the last part completes the update");
+        assert_eq!(joined[0], update);
+    }
+
+    /// An update starts at its first part. The tail of a later one whose
+    /// first parts were lost is never spliced onto the one before.
+    #[test]
+    fn the_tail_of_an_update_is_never_joined_without_its_head() {
+        let (first, second) = (large_table(100), large_table(101));
+        let (first, second) = (parts_of(&first), parts_of(&second));
+        let mut watched = watched();
+        let joined: Vec<_> = first.iter().filter_map(|part| watched.join(part)).collect();
+        assert_eq!(joined.len(), 1);
+
+        let tail = second.iter().skip(1);
+        let spliced: Vec<_> = tail.filter_map(|part| watched.join(part)).collect();
+        assert!(spliced.is_empty(), "a tail was joined without its head");
     }
 }

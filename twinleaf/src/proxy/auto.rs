@@ -3,7 +3,7 @@
 
 use super::link::{Candidate, Link};
 use crate::session::Layout;
-use crate::tio::transport::{self, PortInterface};
+use crate::tio::transport;
 
 /// The target that opens the host's default layout.
 pub(super) const DEFAULT: &str = "default";
@@ -68,7 +68,6 @@ pub(super) fn resolve<'a>(
 pub(super) fn attached() -> Vec<String> {
     transport::enumerate_serial(false)
         .into_iter()
-        .filter(|device| matches!(device.interface, PortInterface::STM32 | PortInterface::FTDI))
         .map(|device| device.url)
         .collect()
 }

@@ -8,7 +8,6 @@
 //!
 //! - A receive with a timeout or a deadline never times out, as shuttle has
 //!   no clock.
-//! - A [`Selector`](chan::Selector) builds, and waiting on it panics.
 //! - A `bounded(0)` channel panics, as it has no rendezvous.
 //! - An async send that waits for room blocks its task, as a blocking send
 //!   blocks its thread.
@@ -40,8 +39,8 @@ pub(crate) mod chan {
     pub(crate) use super::super::real::chan::*;
 
     pub(crate) use super::channel::{
-        bounded, unbounded, Receiver, RecvError, RecvFut, RecvStream, RecvTimeoutError, Selector,
-        Sender, TryRecvError, TrySendError,
+        bounded, unbounded, Receiver, RecvError, RecvFut, RecvStream, RecvTimeoutError, Sender,
+        TryRecvError, TrySendError,
     };
     pub(crate) use shuttle_tokio::sync::{oneshot, Notify};
     pub(crate) use shuttle_tokio::task::JoinHandle;

@@ -1,11 +1,11 @@
 //! Properties of the lanes under shuttle's schedulers. The pump's end of a
 //! lane sends on one thread while its reader takes items on another.
 
-use crate::data::tests::fixtures::{description, samples};
 use crate::data::{Change, PacketParser, SampleBatch};
 use crate::proto::{DeviceRoute, SessionId};
 use crate::seam::shuttle::check;
 use crate::session::subscription::{BatchLane, End, Queued, Receiver, RecvError, Scope, Sink};
+use crate::session::tests::packets::{description, samples};
 use ::shuttle::future::block_on;
 use ::shuttle::sync::atomic::{AtomicBool, Ordering};
 use ::shuttle::thread;
@@ -227,11 +227,17 @@ fn a_batch_lane_carries_the_change_and_loss_of_dropped_batches_onto_the_next() {
             .batches
             .iter()
             .filter_map(|batch| batch.boundary().and_then(|b| b.loss.clone()));
-        let (lost, dropped) = losses.fold((0, 0), |(lost, dropped), loss| {
-            (lost + loss.samples, dropped + loss.dropped_batches)
-        });
+        let (lost, dropped, dropped_rows) =
+            losses.fold((0, 0, 0), |(lost, dropped, rows), loss| {
+                (
+                    lost + loss.samples,
+                    dropped + loss.dropped_batches,
+                    rows + loss.dropped_samples,
+                )
+            });
         let delivered: u64 = taken.batches.iter().map(|batch| batch.len() as u64).sum();
         assert_eq!(delivered + lost, rows, "rows went missing");
+        assert_eq!(dropped_rows, lost, "the lane dropped every row lost");
         let missing = (sent.len() - taken.batches.len()) as u64;
         assert_eq!((taken.gaps, dropped), (missing, missing));
 

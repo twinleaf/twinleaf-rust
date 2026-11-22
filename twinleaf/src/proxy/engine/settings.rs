@@ -1,8 +1,10 @@
 //! The [`SettingsCache`] of setting values a device announces.
 
-use crate::proto::rpc::RpcMetaFlags;
+use crate::proto::rpc::{RpcMetaFlags, RpcValueType};
 use crate::proto::SessionId;
-use crate::session::rpc::{CallError, PendingReply, ReadPipeline, RpcRegistry, READ_WINDOW};
+use crate::session::rpc::{
+    CallError, Outcome, PendingReply, ReadPipeline, RpcRegistry, READ_WINDOW,
+};
 use crate::session::SettingChange;
 use crate::tio::rpc::RpcReply;
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,9 +45,6 @@ pub(crate) enum CacheAction {
     /// Take a snapshot with [`SettingsCache::snapshot_with`], since an
     /// announcement was missed.
     Snapshot,
-    /// The device started a new session, which may run another table. Read
-    /// the registry again and build a new cache from it.
-    Reload,
 }
 
 /// The values of a device's announced settings and reports, exactly as the
@@ -56,9 +55,9 @@ pub(crate) enum CacheAction {
 /// by the numbered announcements after it. An announcement numbered at or
 /// before the last one applied is already held and changes nothing. One
 /// numbered past the next, or a heartbeat ahead of the last one applied,
-/// drops every value until the next snapshot, and a new session drops the
-/// cache. While it waits for a snapshot, every numbered announcement and
-/// every heartbeat of its session that carries the count asks for one. A
+/// drops every value until the next snapshot. While it waits for a snapshot,
+/// every numbered announcement and every heartbeat that carries the count
+/// asks for one. A
 /// value it holds is at most one heartbeat old. A device without
 /// `settings.version`, or one that does not number its announcements, is
 /// never cached.
@@ -66,7 +65,6 @@ pub(crate) enum CacheAction {
 pub(crate) struct SettingsCache {
     cached: BTreeSet<String>,
     values: BTreeMap<String, Vec<u8>>,
-    session: Option<SessionId>,
     applied: Option<u32>,
 }
 
@@ -90,7 +88,6 @@ impl SettingsCache {
         SettingsCache {
             cached,
             values: BTreeMap::new(),
-            session: registry.session,
             applied: None,
         }
     }
@@ -104,14 +101,9 @@ impl SettingsCache {
         }
         match event {
             DeviceEvent::Heartbeat {
-                session_id: Some(session),
+                session_id: Some(_),
                 settings,
             } => {
-                if self.session.is_some_and(|known| known != *session) {
-                    self.forget();
-                    return CacheAction::Reload;
-                }
-                self.session = Some(*session);
                 let Some(settings) = settings else {
                     self.forget();
                     return CacheAction::Keep;
@@ -172,9 +164,9 @@ impl SettingsCache {
     /// again through `submit`, until both reads agree. If they never do, the
     /// last read is kept at the first version, and the announcements between
     /// the two, still to be observed, bring it up to date. A value the device
-    /// refuses to read is not held. A read that times out is asked again as
-    /// [`ReadPipeline`] does. The third timeout of one read, or any other
-    /// error, ends the snapshot.
+    /// refuses to read, which [`Outcome`] classes as an error, is not held. A
+    /// read that times out is asked again as [`ReadPipeline`] does. The third
+    /// timeout of one read, or any other error, ends the snapshot.
     pub(crate) async fn snapshot_with(
         &mut self,
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
@@ -200,8 +192,11 @@ impl SettingsCache {
                         Ok(value) => {
                             values.insert(name.clone(), value);
                         }
-                        Err(CallError::DeviceError(_)) => {}
-                        Err(error) => return Err(error),
+                        Err(error) => match Outcome::of_reply(RpcValueType::Unit, Err(error)) {
+                            Outcome::Error(CallError::DeviceError(_)) => {}
+                            Outcome::Error(error) | Outcome::Unknown(error) => return Err(error),
+                            _ => unreachable!("a call that failed is an error or unknown"),
+                        },
                     }
                 }
             }
@@ -232,7 +227,7 @@ impl SettingsCache {
 
 /// Decodes the reply to a read of `settings.version`.
 fn version(reply: Result<Vec<u8>, CallError>) -> Result<u32, CallError> {
-    u32::decode_reply(&reply?).map_err(CallError::InvalidReply)
+    u32::decode_reply(&reply?).map_err(|error| CallError::InvalidReply(error.into()))
 }
 
 /// Whether sequence number `seq` comes after `applied`, across a wrap.
@@ -493,23 +488,6 @@ mod tests {
             cache.observe(&heartbeat(SESSION, Some(1))),
             CacheAction::Snapshot
         );
-    }
-
-    /// A new session may run another table, so the cache is dropped and the
-    /// registry read again.
-    #[test]
-    fn a_new_session_drops_the_cache() {
-        let mut cache = snapshotted(4);
-        assert_eq!(
-            cache.observe(&heartbeat(SessionId::new(2), Some(0))),
-            CacheAction::Reload
-        );
-        assert_eq!(cache.get("test.amplitude"), None);
-        assert_eq!(
-            cache.observe(&setting("test.amplitude", Some(1), 1)),
-            CacheAction::Keep
-        );
-        assert_eq!(cache.get("test.amplitude"), None);
     }
 
     /// Firmware without the counter, or that does not number what it

@@ -73,7 +73,7 @@ pub fn pipelined(
 
 /// The most reads in flight at once to one device while the host reads many
 /// entries in a row.
-pub(crate) const READ_WINDOW: usize = 4;
+pub const READ_WINDOW: usize = 4;
 
 /// The most times a [`ReadPipeline`] asks for one read.
 const READ_ASKS: u8 = 3;

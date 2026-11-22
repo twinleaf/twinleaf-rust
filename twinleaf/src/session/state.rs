@@ -9,6 +9,7 @@
 use super::rpc::{RpcRegistry, RpcRegistryError, RpcValue, RpcValueDecodeError, RpcValueTypeExt};
 use crate::data::DeviceMetadataSnapshot;
 use crate::proto::SessionId;
+use crate::tio::packet::LinkStatus as Status;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,12 +27,96 @@ pub enum Presence {
         /// The session its last heartbeat reported, when one did.
         session: Option<SessionId>,
     },
-    /// The proxy lost the device, as the link that serves it lost it or
-    /// stopped, or as the device was silent for 3 s.
+    /// The device is lost. The proxy lost it, as the link that serves it
+    /// lost it or stopped, or as the device was silent for 3 s. Or this
+    /// client lost its connection to the proxy.
     Lost {
-        /// When the proxy lost it.
+        /// When it was lost.
         since: Instant,
+        /// Why it was lost, or `None` when the proxy that lost it did not
+        /// say.
+        cause: Option<LostCause>,
     },
+}
+
+/// Why a device was lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LostCause {
+    /// The device went quiet on its link, or the link's transport closed.
+    Disconnected,
+    /// The proxy stopped.
+    Stopped,
+    /// The link's transport did not open.
+    FailedToConnect,
+    /// The proxy gave up reconnecting the link.
+    FailedToReconnect,
+    /// The device was silent for 3 s while its link stayed up.
+    Quiet,
+    /// This client lost its connection to the proxy.
+    ProxyLost,
+}
+
+/// Each cause with the link status it comes from.
+const CAUSES: [(LostCause, Option<Status>); 6] = [
+    (LostCause::Disconnected, Some(Status::SensorDisconnected)),
+    (LostCause::Stopped, Some(Status::Stopped)),
+    (LostCause::FailedToConnect, Some(Status::FailedToConnect)),
+    (
+        LostCause::FailedToReconnect,
+        Some(Status::FailedToReconnect),
+    ),
+    (LostCause::Quiet, None),
+    (LostCause::ProxyLost, None),
+];
+
+impl LostCause {
+    /// The cause as a watch's update carries it, or `None` for a cause
+    /// that is never sent. A cause from a link status has that status's
+    /// byte as its code.
+    pub(crate) fn code(self) -> Option<u8> {
+        match self {
+            LostCause::Disconnected => Some(0),
+            LostCause::Stopped => Some(4),
+            LostCause::FailedToConnect => Some(3),
+            LostCause::FailedToReconnect => Some(2),
+            LostCause::Quiet => Some(5),
+            LostCause::ProxyLost => None,
+        }
+    }
+
+    /// The cause a watch's update carries as `code`, or `None` for a code
+    /// this build does not know.
+    pub(crate) fn from_code(code: u8) -> Option<LostCause> {
+        let row = CAUSES.into_iter().find(|row| row.0.code() == Some(code))?;
+        Some(row.0)
+    }
+
+    /// The cause a link status gives, or `None` for a status that loses
+    /// no device.
+    pub(crate) fn from_status(status: Status) -> Option<LostCause> {
+        let row = CAUSES.into_iter().find(|row| row.1 == Some(status))?;
+        Some(row.0)
+    }
+
+    /// The cause's name in snake case.
+    pub fn name(self) -> &'static str {
+        match self {
+            LostCause::Disconnected => "disconnected",
+            LostCause::Stopped => "stopped",
+            LostCause::FailedToConnect => "failed_to_connect",
+            LostCause::FailedToReconnect => "failed_to_reconnect",
+            LostCause::Quiet => "quiet",
+            LostCause::ProxyLost => "proxy_lost",
+        }
+    }
+}
+
+/// The link that serves a device, as the proxy says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkState {
+    /// The URL the proxy opened the link at.
+    pub url: String,
 }
 
 /// How far a device's metadata has been collected.

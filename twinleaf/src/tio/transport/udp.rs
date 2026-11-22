@@ -10,7 +10,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
-/// The rules of a UDP port's task. A heartbeat goes out every 200 ms.
+/// The rules of a UDP port's task. The port sends a heartbeat when it has
+/// sent nothing for 200 ms.
 pub(super) const RULES: Rules = Rules {
     heartbeat: Some(Duration::from_millis(200)),
     ..Rules::NONE

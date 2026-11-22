@@ -33,9 +33,8 @@ fn parse_rate(value: &str) -> io::Result<u32> {
         .map_err(|_| invalid_input(format!("invalid serial data rate: {value}")))
 }
 
-fn parse_config(url: &str) -> io::Result<(&str, u32, u32)> {
-    let mut fields = url.split(':');
-    let port = fields.next().unwrap_or_default();
+fn parse_config<'a>(port: &'a str, rates: &str) -> io::Result<(&'a str, u32, u32)> {
+    let mut fields = rates.split(':').skip(1);
     let target_rate = fields
         .next()
         .map(parse_rate)
@@ -48,7 +47,7 @@ fn parse_config(url: &str) -> io::Result<(&str, u32, u32)> {
         .unwrap_or(DEFAULT_RATE);
     if port.is_empty() || fields.next().is_some() {
         return Err(invalid_input(format!(
-            "invalid serial configuration: {url}"
+            "invalid serial configuration: {port}{rates}"
         )));
     }
     Ok((port, target_rate, default_rate))
@@ -57,9 +56,10 @@ fn parse_config(url: &str) -> io::Result<(&str, u32, u32)> {
 /// The default data rate of a serial port.
 static DEFAULT_RATE: u32 = 115200;
 
-/// The rules of a serial port's task. A heartbeat goes out every 100 ms.
-/// Everything received in the first 50 ms is discarded. Bytes that wait over
-/// 200 ms for the rest of their frame are discarded as stale.
+/// The rules of a serial port's task. The port sends a heartbeat when it has
+/// sent nothing for 100 ms. Everything received in the first 50 ms is
+/// discarded. Bytes that wait over 200 ms for the rest of their frame are
+/// discarded as stale.
 pub(super) const RULES: Rules = Rules {
     heartbeat: Some(Duration::from_millis(100)),
     quiet: None,
@@ -68,22 +68,25 @@ pub(super) const RULES: Rules = Rules {
     half_close: None,
 };
 
-/// Opens the serial port `url`, which looks like
-/// `serial_port[:target_rate[:default_rate]]`. It starts with a serial
-/// port, like `/dev/tty??` or `COMn`. `target_rate` is the rate tio tries
-/// to configure the device to. `default_rate` is the rate the device
-/// starts at, and the rate tio falls back to if communication fails. Both
-/// rates default to 115200. Returns the stream at `default_rate`, with both
-/// rates. The stream belongs to the runtime of `tasks`.
+/// Opens the serial `port`, such as `/dev/tty??` or `COMn`, at `rates`,
+/// which look like `[:target_rate[:default_rate]]`. `target_rate` is the
+/// rate tio tries to configure the device to. `default_rate` is the rate the
+/// device starts at, and the rate tio falls back to if communication fails.
+/// Both rates default to 115200. Returns the stream at `default_rate`, with
+/// both rates. The stream belongs to the runtime of `tasks`.
 ///
 /// For example, `COM3:400000:115200` starts at 115.2k and tries to
 /// negotiate 400k. It falls back to 115.2k if that fails, then or later.
 ///
 /// # Errors
 ///
-/// Returns an error if `url` is malformed or the port cannot be opened.
-pub(super) fn open(url: &str, tasks: &Supervisor) -> io::Result<(SerialStream, RateInfo)> {
-    let (port_name, target_rate, default_rate) = parse_config(url)?;
+/// Returns an error if `rates` is malformed or the port cannot be opened.
+pub(super) fn open(
+    port: &str,
+    rates: &str,
+    tasks: &Supervisor,
+) -> io::Result<(SerialStream, RateInfo)> {
+    let (port_name, target_rate, default_rate) = parse_config(port, rates)?;
     let port = {
         let _runtime = tasks.enter();
         tokio_serial::new(port_name, default_rate)

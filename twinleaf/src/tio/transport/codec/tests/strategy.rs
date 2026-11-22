@@ -267,9 +267,9 @@ fn setting() -> impl Strategy<Value = Vec<u8>> {
 
 /// A metadata payload, the record type and the flags, then one record.
 /// The record is a device record laid out as the wire format gives it,
-/// with a head of 9 bytes or longer and three strings, or a record of a
-/// type no layout defines, framed by the head length its first byte
-/// declares.
+/// with a head of 9 bytes or longer and three strings, a device record
+/// whose name is not UTF8, or a record of a type no layout defines, framed
+/// by the head length its first byte declares.
 fn metadata() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
         (
@@ -289,6 +289,10 @@ fn metadata() -> impl Strategy<Value = Vec<u8>> {
                 p.extend(name.bytes().chain(serial.bytes()).chain(firmware.bytes()));
                 p
             }),
+        (any::<u8>(), 1..=40u8).prop_map(|(flags, len)| {
+            let head = vec![1, flags, 9, len, 0, 0, 0, 0, 0, 0, 0];
+            [head, vec![0xff; usize::from(len)]].concat()
+        }),
         (
             prop_oneof![Just(0u8), 5..=255u8],
             any::<u8>(),
@@ -305,8 +309,8 @@ fn metadata() -> impl Strategy<Value = Vec<u8>> {
 }
 
 /// A proxy reply payload, a kind byte then that kind's body. Kind 0 holds
-/// a reply, 1 an error, 2 a link status and 3 nothing, and any other
-/// kind holds any bytes.
+/// a reply, 1 an error, 2 a link status, 3 nothing and 4 a count of
+/// dropped packets, and any other kind holds any bytes.
 fn proxy_rx() -> impl Strategy<Value = Vec<u8>> {
     let kind = |kind: u8, body: Vec<u8>| [vec![kind], body].concat();
     prop_oneof![
@@ -314,7 +318,8 @@ fn proxy_rx() -> impl Strategy<Value = Vec<u8>> {
         payload(4, MAX - 1).prop_map(move |b| kind(1, b)),
         payload(1, MAX - 1).prop_map(move |b| kind(2, b)),
         payload(0, MAX - 1).prop_map(move |b| kind(3, b)),
-        (4..=255u8, payload(0, MAX - 1)).prop_map(move |(k, b)| kind(k, b)),
+        payload(5, MAX - 1).prop_map(move |b| kind(4, b)),
+        (5..=255u8, payload(0, MAX - 1)).prop_map(move |(k, b)| kind(k, b)),
     ]
 }
 
@@ -324,8 +329,7 @@ fn proxy_rx() -> impl Strategy<Value = Vec<u8>> {
 pub(crate) struct Invalid {
     /// The header, the payload and the routing.
     pub(crate) bytes: Vec<u8>,
-    /// The error the payload gives, unless it is a metadata record that
-    /// [`repaired`](super::repaired) repairs.
+    /// The error the payload gives.
     pub(crate) error: DecodeError,
     /// What is wrong with the payload.
     pub(crate) class: &'static str,
@@ -335,9 +339,7 @@ pub(crate) struct Invalid {
 /// type, on any route and with any TTL. Each type whose layout has a
 /// shortest payload is drawn shorter, from empty to one byte less. The
 /// RPC request, setting and metadata layouts are also drawn with a name
-/// or a record that runs past the payload, and a metadata record with a
-/// string that is not UTF8. That record does not parse, but it decodes as
-/// the packet [`repaired`](super::repaired) gives.
+/// or a record that runs past the payload.
 pub(crate) fn invalid_body() -> impl Strategy<Value = Invalid> {
     (bad_body(), 0..=15u8, routing()).prop_map(|((ptype, payload, error, class), ttl, hops)| {
         Invalid {
@@ -378,12 +380,7 @@ fn bad_body() -> impl Strategy<Value = (u8, Vec<u8>, DecodeError, &'static str)>
         proxy_rx_short().prop_map(|p| (67, p, PayloadTooShort, "proxy reply short")),
         payload(0, 1).prop_map(|p| (11, p, PayloadTooShort, "metadata short")),
         unframed().prop_map(|p| (11, p, InvalidPayload, "metadata record unframed")),
-        device_overrun().prop_map(|p| (
-            11,
-            p,
-            InvalidPayload,
-            "metadata strings overrun or repaired"
-        )),
+        device_overrun().prop_map(|p| (11, p, InvalidPayload, "metadata strings overrun")),
         (129..=255u8, payload(0, 4)).prop_map(|(t, p)| (t, p, PayloadTooShort, "samples short")),
     ]
 }
@@ -414,14 +411,15 @@ fn setting_short() -> impl Strategy<Value = Vec<u8>> {
 }
 
 /// A proxy reply payload cut short. It is empty, or a reply under its
-/// request id, an error under its id and code, or a link status with no
-/// status byte.
+/// request id, an error under its id and code, a link status with no
+/// status byte, or a count of dropped packets under its stream and count.
 fn proxy_rx_short() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
         Just(vec![]),
         payload(0, 1).prop_map(|b| [vec![0], b].concat()),
         payload(0, 3).prop_map(|b| [vec![1], b].concat()),
         Just(vec![2]),
+        payload(0, 4).prop_map(|b| [vec![4], b].concat()),
     ]
 }
 
@@ -440,23 +438,16 @@ fn unframed() -> impl Strategy<Value = Vec<u8>> {
         .prop_map(|(kind, flags, record)| [vec![kind, flags], record].concat())
 }
 
-/// A device record payload whose strings run past the record, which is an
-/// invalid payload, or whose name is not UTF8, which decodes repaired.
+/// A device record payload whose strings run past the record.
 fn device_overrun() -> impl Strategy<Value = Vec<u8>> {
-    let head =
-        |flags: u8, lens: [u8; 3]| vec![1, flags, 9, lens[0], 0, 0, 0, 0, lens[1], lens[2], 0];
-    prop_oneof![
-        (any::<u8>(), any::<[u8; 3]>(), any::<Index>())
-            .prop_filter("names a string", |(_, lens, _)| lens != &[0; 3])
-            .prop_map(move |(flags, lens, cut)| {
-                let total: usize = lens.iter().map(|&len| usize::from(len)).sum();
-                let strings = vec![b'a'; cut.index(total.min(MAX - 11 + 1))];
-                [head(flags, lens), strings].concat()
-            }),
-        (any::<u8>(), 1..=40u8).prop_map(move |(flags, len)| {
-            [head(flags, [len, 0, 0]), vec![0xff; usize::from(len)]].concat()
-        }),
-    ]
+    (any::<u8>(), any::<[u8; 3]>(), any::<Index>())
+        .prop_filter("names a string", |(_, lens, _)| lens != &[0; 3])
+        .prop_map(|(flags, lens, cut)| {
+            let total: usize = lens.iter().map(|&len| usize::from(len)).sum();
+            let strings = vec![b'a'; cut.index(total.min(MAX - 11 + 1))];
+            let head = vec![1, flags, 9, lens[0], 0, 0, 0, 0, lens[1], lens[2], 0];
+            [head, strings].concat()
+        })
 }
 
 /// A header that does not decode, of one to four bytes, with the error

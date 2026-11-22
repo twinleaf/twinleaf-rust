@@ -92,7 +92,7 @@
 //! batch of each stream that lost batches carries a
 //! [`Loss`](crate::data::Loss). The
 //! state the proxy sends goes into the connection's store, whose presence,
-//! metadata, RPC table and settings hold only their latest value, so a slow
+//! link, metadata, RPC table and settings hold only their latest value, so a slow
 //! reader sees the newest and misses none it needs. Announced settings
 //! queue in order, and a reader that falls behind them hears how many it
 //! missed. So a sample can be lost in the proxy's outbox, in the pump's
@@ -145,7 +145,8 @@
 //!   other update may overtake the device's packets, and keeps its order
 //!   among the watch's updates of its kind.
 //!   An update is the device's presence, which is connecting, alive in a
-//!   session, or lost some milliseconds before the update went out, one
+//!   session, or lost some milliseconds before the update went out and why
+//!   if the proxy says, the URL of the link that serves it, one
 //!   setting it announced, its complete metadata as its own metadata
 //!   packets, that it has no `dev.metadata`, its RPC table as the hash, the
 //!   session and each entry's name and metadata word, why the table did not
@@ -202,10 +203,28 @@
 //! need permission for the local network and for serial devices. Where an
 //! app's network is isolated from the host, its proxy serves only that app.
 //!
+//! # Other protocols on the port
+//!
+//! A proxy hosted with a [`Foreign`] handler in [`HostOptions::foreign`]
+//! shares its port with another protocol, as `tio proxy` shares it with the
+//! web page of `twinleaf-web`. Each client of the proxy speaks first, with
+//! `proxy.hello`, so the proxy reads the first byte of each connection,
+//! leaving it in the socket. A byte that begins an HTTP method, one of
+//! `C D G H O P T`, hands the connection to the handler. No packet type a
+//! client sends is one of those bytes. Any other byte, or nothing for two
+//! seconds, `FIRST_BYTE_TIMEOUT`, makes the connection a client. A
+//! connection that closes first is dropped. Each connection waits for its
+//! first byte in a task of its own, so a quiet one holds up no other.
+//!
+//! A proxy without a handler reads no byte first and serves every
+//! connection as a client.
+//!
 //! # Logging
 //!
 //! The proxy logs through the `log` crate. Each device's events are logged
-//! under the target `proxy::<url>`. The device's own log packets are logged
+//! under the target `proxy::<url>`, but for those that say a link status the
+//! proxy's clients also hear, which are under `status::<url>`. The device's
+//! own log packets are logged
 //! under `device::<route>` at the level the device gave them. The traffic
 //! [`HostOptions::dump`] asks for is logged at info level.
 
@@ -218,6 +237,7 @@ mod server;
 mod table;
 mod worker;
 
+pub use crate::seam::{Foreign, ForeignStream};
 pub use crate::session::{Layout, Mount};
 pub(crate) use server::host;
 pub use server::Proxy;
@@ -260,6 +280,20 @@ pub(crate) fn named() -> Option<String> {
 /// `variable`.
 fn named_by(variable: Option<String>) -> Option<String> {
     variable.filter(|url| !url.is_empty())
+}
+
+/// Returns the URL of the proxy a tool on this machine goes through, the
+/// one `TWINLEAF_PROXY` names or else the one on the default port, such as
+/// `tcp://127.0.0.1:7855`.
+pub fn chosen() -> String {
+    named().unwrap_or_else(|| endpoint_at(TCP_DEFAULT_PORT))
+}
+
+/// Returns the host and port of the proxy [`chosen`] names, as an HTTP URL
+/// takes them, such as `127.0.0.1:7855`. Returns `None` for a URL not TCP.
+pub fn chosen_http_address() -> Option<String> {
+    let (host, port) = crate::tio::transport::tcp_host_port(&chosen())?;
+    Some(format!("{host}:{port}"))
 }
 
 /// Returns the URL at which a client on this machine reaches the proxy on
@@ -350,12 +384,17 @@ pub struct HostOptions {
     pub reconnect_timeout: Option<Duration>,
     /// The traffic to log.
     pub dump: DumpFlags,
+    /// What serves the connections that do not speak the packet protocol,
+    /// or `None` to serve every connection as a client. See
+    /// [Other protocols on the port](self#other-protocols-on-the-port).
+    pub foreign: Option<Foreign>,
 }
 
 /// The options a tool hosts the machine's proxy with. The proxy listens on
 /// loopback at the default port and runs until it is shut down. No client
 /// may stop it, it has no default layout, and its name is this executable's.
-/// It reconnects forever and logs no traffic.
+/// It reconnects forever, logs no traffic, and serves every connection as a
+/// client.
 impl Default for HostOptions {
     fn default() -> Self {
         HostOptions {
@@ -367,6 +406,7 @@ impl Default for HostOptions {
             name: executable_name(),
             reconnect_timeout: None,
             dump: DumpFlags::default(),
+            foreign: None,
         }
     }
 }
@@ -419,7 +459,7 @@ pub struct ClientInfo {
 pub fn stop(proxy: Option<&str>) -> io::Result<()> {
     let url = match proxy {
         Some(url) => url.to_string(),
-        None => named().unwrap_or_else(|| endpoint_at(TCP_DEFAULT_PORT)),
+        None => chosen(),
     };
     call(&url, STOP, &[], STOP_TIMEOUT).map(drop)
 }

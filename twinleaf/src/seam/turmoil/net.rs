@@ -84,6 +84,19 @@ pub(crate) struct Counted<T> {
 /// A turmoil stream, counted on its host while it lives.
 pub(crate) type TcpStream = Counted<turmoil::net::TcpStream>;
 
+/// Returns the first byte `stream` has received, as the real backend's
+/// `peek_first` does.
+pub(crate) async fn peek_first(stream: &mut TcpStream) -> io::Result<Option<u8>> {
+    stream.peek_first().await
+}
+
+/// Returns `None`. A simulated socket is no socket a
+/// [`Foreign`](crate::seam::Foreign) handler can take, so the simulation
+/// closes a connection that does not speak the protocol.
+pub(crate) fn into_foreign(_stream: TcpStream) -> Option<crate::seam::ForeignStream> {
+    None
+}
+
 /// The read half of a counted stream.
 pub(crate) type ReadHalf = Counted<turmoil::net::tcp::OwnedReadHalf>;
 
@@ -115,6 +128,13 @@ impl TcpStream {
 
     pub(crate) fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.inner.set_nodelay(nodelay)
+    }
+
+    /// Returns the first byte the stream has received, leaving it to be
+    /// read, or `None` once the peer has closed without sending one.
+    pub(crate) async fn peek_first(&mut self) -> io::Result<Option<u8>> {
+        let mut first = [0];
+        Ok((self.inner.peek(&mut first).await? == 1).then_some(first[0]))
     }
 
     /// Splits the stream into its halves.

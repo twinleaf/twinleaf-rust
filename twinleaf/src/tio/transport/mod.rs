@@ -156,17 +156,40 @@ fn preferred(found: &[SocketAddr], family: &AddrFamilyRestrict) -> Option<Socket
 /// Returns `true` if `url` is a TCP URL whose host is this machine, by
 /// [`IpAddr::is_loopback`] or the name `localhost`. Resolves nothing.
 pub(crate) fn is_local_tcp(url: &str) -> bool {
-    let Some(("tcp" | "tcp4" | "tcp6", addr)) = url.split_once("://") else {
+    let Some((host, _)) = tcp_host_port(url) else {
         return false;
     };
-    let ip = addr
-        .parse::<SocketAddr>()
-        .map(|sa| sa.ip())
-        .or_else(|_| addr.trim_matches(['[', ']']).parse::<IpAddr>());
-    match ip {
+    match host.trim_matches(['[', ']']).parse::<IpAddr>() {
         Ok(ip) => ip.is_loopback(),
-        Err(_) => addr.rsplit_once(':').map_or(addr, |(host, _)| host) == "localhost",
+        Err(_) => host == "localhost",
     }
+}
+
+/// Returns `true` if `url` names a TCP link.
+pub(crate) fn is_tcp(url: &str) -> bool {
+    matches!(ip_address(url), Some((IpLink::Tcp, ..)))
+}
+
+/// Returns the host and port of a TCP `url`, with the default port if it
+/// names none. An IPv6 host keeps its brackets.
+pub(crate) fn tcp_host_port(url: &str) -> Option<(String, u16)> {
+    let Some((IpLink::Tcp, address, _)) = ip_address(url) else {
+        return None;
+    };
+    let address = with_port(address);
+    let (host, port) = address.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+/// Returns the path and the rate suffix of `url` if the transport opens it
+/// as a serial port. A bare `COM` path on Windows or `/dev/` path on Unix
+/// is one with the `serial` feature only.
+pub(crate) fn serial_locator(url: &str) -> Option<(&str, &str)> {
+    let bare = cfg!(feature = "serial")
+        && (cfg!(windows) && url.starts_with("COM") || cfg!(unix) && url.starts_with("/dev/"));
+    let locator = url.strip_prefix("serial://").or(bare.then_some(url))?;
+    let path = locator.split(':').next().unwrap_or_default();
+    Some((path, &locator[path.len()..]))
 }
 
 /// How a discovered device is reached.
@@ -181,6 +204,17 @@ pub enum PortInterface {
     Network,
     /// Other serial port, identified by its USB `(vid, pid)`.
     Unknown(u16, u16),
+}
+
+impl PortInterface {
+    /// Returns the word a device list shows for this way of reaching a device.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PortInterface::FTDI | PortInterface::STM32 => "usb",
+            PortInterface::Network => "net",
+            PortInterface::Unknown(..) => "ser",
+        }
+    }
 }
 
 /// A device found during discovery.
