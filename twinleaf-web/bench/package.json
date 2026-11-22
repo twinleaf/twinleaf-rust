@@ -1,0 +1,13 @@
+{
+  "name": "twinleaf-web-bench",
+  "private": true,
+  "type": "module",
+  "description": "Load and latency profiles of the tio proxy web page",
+  "scripts": {
+    "bench": "node run.mjs",
+    "bench:quick": "node run.mjs --quick"
+  },
+  "dependencies": {
+    "playwright-core": "1.49.1"
+  }
+}
