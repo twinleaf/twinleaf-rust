@@ -1,0 +1,896 @@
+/* What Tailwind classes do not cover: the shared WebGL layer, tiling, chips and tabs. */
+/* The page fills the window and the document never scrolls: what reaches past the window's edge, as a layer may for a frame while it is placed, is cut off there and brings no scroll bars to take room from the page. */
+html { overflow: hidden; }
+html, body { height: 100%; margin: 0; background: var(--background); color: var(--foreground); }
+.gl-layer { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 0; }
+/* A stage (PlotStage.svelte): one plot, bare, over a canvas of its own that
+   fills its box. Its body is the whole box: no header and no border. Shown
+   at a scale, the box is laid out apart, cut from sight and from the
+   pointer by a room of no size, and the stage shows its picture. */
+.plot-stage { position: relative; flex: none; }
+.plot-stage .stage-box { position: relative; display: flex; }
+.plot-stage .stage-box > .stage-gl { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.plot-stage .stage-box > .plot-card { flex: 1; border: 0; }
+.plot-stage .plot-head { display: none; }
+.plot-stage.apart > .stage-room { position: absolute; left: 0; top: 0; width: 0; height: 0; overflow: hidden; }
+.plot-stage > .stage-shown { display: block; }
+/* The page is controls, not text: nothing but fields and readouts selects,
+   so a click or drag never starts the browser's text selection or its menu. */
+.app { position: relative; z-index: 1; display: flex; flex-direction: column; height: 100vh; user-select: none; }
+.app :is(input, textarea, [contenteditable]) { user-select: text; }
+.app.moving, .app.moving * { cursor: grabbing !important; user-select: none; }
+/* The sidebar and the tiles, two PaneForge panes, the sidebar's edge between them. */
+.layout { flex: 1 1 0; min-height: 0; height: auto; padding: 8px 12px; }
+/* The docks and the tiles above, and under them, while it is open, the log
+   drawer in a pane of its own, the handle between them as far from each as
+   a dock's is from the tiles: the drawer's frame keeps the page's margins,
+   and what is above it gives up its foot's. */
+.page-split { flex: 1 1 0; min-height: 0; height: auto; }
+.page-split.with-log .layout { padding-bottom: 0; }
+.log-pane { padding: 0 12px 8px; }
+
+/* Scrollbars: thin, in the theme's colours, over a clear track. */
+* { scrollbar-width: thin; scrollbar-color: color-mix(in oklch, var(--muted-foreground) 40%, transparent) transparent; }
+
+/* Tiling: each leaf holds one plot, at the box Tiles.svelte gives it, and a
+   separator is the gap between a split's sides. */
+.tiles { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; }
+.tile-box { position: absolute; inset: 0; }
+.leaf { position: absolute; display: flex; min-width: 0; min-height: 0; }
+.tiles.has-max .leaf:not(.max), .tiles.has-max .separator { visibility: hidden; }
+.tiles.has-max .leaf.max { z-index: 5; }
+/* The gap shows a line down its middle while the pointer is on it, and takes
+   the pointer a little past its edges. */
+.separator { position: absolute; z-index: 4; touch-action: none; }
+.separator[data-dir="row"] { cursor: col-resize; }
+.separator[data-dir="col"] { cursor: row-resize; }
+.separator::before { content: ""; position: absolute; inset: -2.5px 0; }
+.separator[data-dir="row"]::before { inset: 0 -2.5px; }
+.separator::after { content: ""; position: absolute; background: transparent; transition: background-color 150ms; }
+.separator[data-dir="row"]::after { top: 0; bottom: 0; left: 50%; width: 1px; transform: translateX(-50%); }
+.separator[data-dir="col"]::after { left: 0; right: 0; top: 50%; height: 1px; transform: translateY(-50%); }
+.separator:hover::after, .separator.active::after { background: color-mix(in oklch, var(--primary) 60%, transparent); }
+.drop-hint { position: absolute; pointer-events: none; z-index: 6; background: color-mix(in oklch, var(--primary) 12%, transparent); border: 1px solid var(--primary); }
+.drop-hint.left { left: 0; top: 0; bottom: 0; width: 50%; }
+.drop-hint.right { right: 0; top: 0; bottom: 0; width: 50%; }
+.drop-hint.top { left: 0; right: 0; top: 0; height: 50%; }
+.drop-hint.bottom { left: 0; right: 0; bottom: 0; height: 50%; }
+.drop-hint.center { inset: 22%; }
+/* The signal joins the plot under the pointer. */
+.drop-hint.add { inset: 0; background: color-mix(in oklch, var(--primary) 5%, transparent); border-color: color-mix(in oklch, var(--primary) 60%, transparent); }
+/* The plot being moved, shown where a drop would leave it. */
+.leaf.lifted::after { content: ""; position: absolute; inset: 0; z-index: 5; pointer-events: none; background: color-mix(in oklch, var(--primary) 6%, transparent); outline: 1px solid var(--primary); outline-offset: -1px; }
+/* The plot being moved, as a small panel under the pointer. */
+.move-ghost { position: fixed; z-index: 50; pointer-events: none; width: 220px; overflow: hidden; background: var(--card); border: 1px solid var(--primary); border-radius: var(--radius); box-shadow: 0 12px 32px rgb(0 0 0 / 0.5); font-size: 12px; }
+.move-ghost .ghost-head { padding: 4px 8px; background: var(--secondary); border-bottom: 1px solid var(--border); color: var(--foreground); }
+.move-ghost .ghost-body { display: flex; flex-direction: column; gap: 2px; min-height: 44px; padding: 6px 8px; font: 11px/16px var(--font-data); color: var(--muted-foreground); }
+.move-ghost .ghost-body i { display: inline-block; width: 10px; height: 3px; margin-right: 6px; vertical-align: middle; background: var(--c); border-radius: 2px; }
+/* Several plots: cards stacked behind the ghost, and a row per plot, its kind then a swatch per signal. */
+.move-ghost.stack { box-shadow: 4px 4px 0 -1px var(--card), 4px 4px 0 0 var(--primary), 8px 8px 0 -1px var(--card), 8px 8px 0 0 var(--primary), 0 12px 32px rgb(0 0 0 / 0.5); }
+.move-ghost .ghost-plot { display: flex; align-items: center; gap: 4px; }
+.move-ghost .ghost-plot b { min-width: 7ch; font-weight: 400; color: var(--foreground); }
+.move-ghost .ghost-plot i { margin-right: 0; }
+.move-ghost .ghost-action { padding: 3px 8px; border-top: 1px solid var(--border); color: var(--primary); font-size: 11px; }
+/* Property rows carried to Favorites: their names, the card no taller than they need. */
+.carry-ghost { width: auto; min-width: 140px; max-width: 260px; }
+.carry-ghost .ghost-head { font-family: var(--font-data); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.carry-ghost .ghost-body { min-height: 0; }
+.carry-ghost.left { transform: translateX(-100%); }
+/* The panel that takes property rows while some are carried, as a rail takes a panel; under the pointer, the drop's own look. */
+.dock-panel.awaiting { outline: 1px dashed var(--primary); outline-offset: -1px; border-radius: var(--radius); background: color-mix(in oklch, var(--primary) 5%, transparent); }
+.dock-panel.awaiting.drop-target { outline-style: solid; background: color-mix(in oklch, var(--primary) 12%, transparent); }
+/* A signal being dragged, as a compact tag, and a tab as itself, lifted.
+   The drag library copies the original's computed styles onto it inline,
+   so these must win. */
+#dnd-action-dragged-el:not(:has(.tab)):not(.dock-panel) { display: inline-flex !important; align-items: center !important; gap: 6px !important; width: auto !important; height: auto !important; padding: 1px 8px !important; font: 11px/18px var(--font-data) !important; white-space: nowrap !important; color: var(--foreground) !important; background: var(--popover) !important; border: 1px solid var(--primary) !important; border-radius: var(--radius) !important; box-shadow: 0 6px 16px rgb(0 0 0 / 0.45) !important; }
+#dnd-action-dragged-el .x { display: none !important; }
+#dnd-action-dragged-el .tab { box-shadow: 0 6px 16px rgb(0 0 0 / 0.45); }
+.tab-slot { display: flex; }
+#dnd-action-dragged-el.dock-panel { height: 28px !important; overflow: hidden !important; padding: 0 6px !important; background: var(--popover) !important; border: 1px solid var(--primary) !important; border-radius: var(--radius) !important; box-shadow: 0 6px 16px rgb(0 0 0 / 0.45) !important; }
+
+/* The docks beside the tiles, and their panels (Dock.svelte). Each dock is
+   a frame in its own pane, padded around its panels; hidden, the same frame
+   is its rail, bare, as wide as its pane collapses to. An empty dock's rail
+   is a strip without a frame, wide enough to drop on while a panel is
+   dragged. */
+.docked { flex: 1 1 0; min-height: 0; display: flex; }
+.docked.narrow { flex-direction: column; }
+.docked > .layout { flex: 1; min-width: 0; }
+/* A dock slides open over Material's duration-medium2 and shut over
+   medium1 (App.svelte sets --slide-ms), on its standard easing, every pane
+   on the same curve so the tiles' edge and the dock's move as one. */
+.layout.sliding > [data-pane] { transition: flex-grow var(--slide-ms, 250ms) cubic-bezier(0.2, 0, 0, 1); }
+/* The handle of a dock with no panels keeps its room, the gap between the
+   tiles and the rail as between the tiles and a dock, but shows nothing and
+   takes no pointer. A hidden dock's handle is dragged as a shown one's. */
+.layout > [data-pane-resizer][data-dock-empty] { visibility: hidden; pointer-events: none; }
+.dock-frame { position: relative; padding: 6px; }
+.dock-frame.rail { padding: 0; }
+.dock-frame.rail.holding { cursor: pointer; }
+.dock-frame.rail.holding:hover { border-color: var(--ring); }
+.dock-frame.rail:not(.holding) { border-color: transparent; background: transparent; }
+.dock-frame.awaiting { border: 1px dashed var(--primary); background: color-mix(in oklch, var(--primary) 8%, transparent); }
+/* While the frame slides, its panels keep the width they have open, pinned
+   to the outer edge, and the frame's moving edge cuts them off. Shutting,
+   they are gone by the slide's midpoint; opening, they come in after it. */
+.dock-frame.pinned > .dock-side { flex: none; width: var(--content); }
+.dock-frame.pinned.right > .dock-side { align-self: flex-end; }
+.dock-frame.pinned.left > .dock-side { align-self: flex-start; }
+.docked.narrow .dock-frame.pinned > .dock-side { flex: none; width: auto; height: var(--content); align-self: stretch; }
+.docked.narrow .dock-frame.pinned.right > .dock-side { margin-top: auto; }
+.dock-frame.closing :is(.dock, .dock-top) { opacity: 0; transition: opacity calc(var(--slide-ms, 250ms) / 2) linear; }
+.dock-frame.opening :is(.dock, .dock-top) { animation: dock-in calc(var(--slide-ms, 300ms) / 2) linear calc(var(--slide-ms, 300ms) / 2) both; }
+@keyframes dock-in { from { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .layout.sliding > [data-pane] { transition: none; }
+  .dock-frame.closing :is(.dock, .dock-top) { transition: none; }
+  .dock-frame.opening :is(.dock, .dock-top) { animation: none; }
+}
+/* The dock's button is placed from the frame, not from the dock in it. */
+.dock-side { position: static; display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.dock { display: flex; flex-direction: column; gap: 4px; min-height: 0; flex: 1; overflow-y: auto; }
+/* The dock scrolls its panels itself: the box panels are dragged within is
+   the box that holds them all and whose height their shares are of. So its
+   scroll bar is the browser's, given the look of a list's: a 10 px lane of
+   its own beside the panels, never over them, and in it a round thumb, 7 px
+   wide, 2 px in from the lane's left and 1 px from its other sides, with no
+   buttons. An open dock reaches 3 px into
+   its frame's padding on either side, as far as the focus ring stands
+   outside a header, so a header's ring lies within the dock and the bar's
+   lane outside the ring. A list that scrolls inside a dock that scrolls
+   keeps its own bar, inside its panel, the dock's bar outside every panel. */
+.dock-side:not(.rail) .dock { margin: 0 -3px; padding: 0 3px; }
+.dock { scrollbar-width: auto; scrollbar-color: auto; }
+.dock::-webkit-scrollbar { width: 10px; }
+.dock::-webkit-scrollbar-thumb { border: solid transparent; border-width: 1px 1px 1px 2px; border-radius: 9999px; background: var(--thumb-rest); background-clip: padding-box; }
+/* A dock's scroll bars, its own and its lists', are quiet at rest and plain
+   in use. At rest a thumb is faint, so a dock or a list cut short still
+   shows it has more. Every thumb of a dock has its full colour while the
+   pointer is over the dock, while the dock or a list in it scrolls
+   (scrolling.js), and while the keys have focus in it. Only the colour
+   changes: the lanes stay, so nothing moves. */
+.dock-frame { --thumb-rest: color-mix(in oklch, var(--muted-foreground) 14%, transparent); --thumb-used: color-mix(in oklch, var(--muted-foreground) 50%, transparent); }
+.dock-frame [data-slot=scroll-area-thumb] { background-color: var(--thumb-rest); }
+.dock-frame:is(:hover, [data-scrolling], :has(:focus-visible)) [data-slot=scroll-area-thumb] { background-color: var(--thumb-used); }
+.dock-frame:is(:hover, [data-scrolling], :has(:focus-visible)) .dock::-webkit-scrollbar-thumb { background-color: var(--thumb-used); }
+@supports not selector(::-webkit-scrollbar) {
+  .dock { scrollbar-width: thin; scrollbar-color: var(--thumb-rest) transparent; }
+  .dock-frame:is(:hover, [data-scrolling], :has(:focus-visible)) .dock { scrollbar-color: var(--thumb-used) transparent; }
+}
+/* The other look, on a root of class `scroll-fade`: no thumb at rest, and a
+   list that has more rows above or below fades out at that edge, by how
+   far it is scrolled. */
+@property --fade-top { syntax: '<length>'; inherits: false; initial-value: 0px; }
+@property --fade-bottom { syntax: '<length>'; inherits: false; initial-value: 0px; }
+@keyframes fade-top { from { --fade-top: 0px; } to { --fade-top: 20px; } }
+@keyframes fade-bottom { from { --fade-bottom: 20px; } to { --fade-bottom: 0px; } }
+:root.scroll-fade .dock-frame { --thumb-rest: transparent; }
+:root.scroll-fade .dock-body [data-slot=scroll-area-viewport] { mask-image: linear-gradient(to bottom, transparent, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent); animation: fade-top linear both, fade-bottom linear both; animation-timeline: scroll(self), scroll(self); animation-range: 0px 20px, calc(100% - 20px) 100%; }
+.dock-side:not(.rail) .dock.dock-target { outline: 1px dashed var(--primary); outline-offset: -1px; border-radius: var(--radius); }
+/* A dock's top row, as tall as a field, in a dock with a panel of
+   properties: the dock's button at its right end and, before it, the filter
+   of the dock's properties. The row keeps the button's width and a gap
+   clear of what it holds. The panels scroll below the row, not under it,
+   and no panel's fold moves it. */
+.dock-top { flex: none; display: flex; align-items: center; height: 28px; margin-bottom: 6px; padding-right: 26px; }
+/* The log drawer's frame is a dock's, and its bar a dock's top row
+   (LogDrawer.svelte): the drawer's name, in a panel header's type, then its
+   controls, each as tall as a toolbar's, 6 px apart; in a window too
+   narrow for one row they wrap. */
+.log-frame { cursor: default; }
+.log-bar { gap: 6px; height: auto; min-height: 28px; flex-wrap: wrap; }
+.log-title { padding: 0 2px; color: var(--muted-foreground); font: 600 12px var(--font-ui); }
+.log-bar .seg button { display: inline-flex; align-items: center; gap: 4px; }
+/* A level that is off dims its colour too, as a hidden signal's chip does. */
+.log-bar .seg button:not(.on) i { opacity: 0.45; }
+.log-bar .log-source { max-width: 14rem; }
+.log-bar .log-filter { min-width: 5rem; }
+.status-bar .log svg { width: 12px; height: 12px; }
+/* The log's rows, in the data face at a property row's height: a strip of
+   the level's colour at the row's edge and the level in that colour, then
+   who said it and what, the count of the lines it stands for, and its
+   button, shown as a property's star is. A row answers the pointer, and
+   the one the arrows are on is marked, as a property row is. */
+.log-rows { flex: 1 1 0; min-height: 0; font: 12px/18px var(--font-data); }
+.log-list { min-height: 100%; outline: none; }
+.log-row { --lv: var(--log-debug); display: grid; grid-template-columns: 12ch 5ch 14ch minmax(0, 1fr) auto 14px; align-items: center; column-gap: 8px; padding: 2px 4px 2px 9px; box-shadow: inset 3px 0 0 var(--lv); white-space: nowrap; cursor: default; }
+.log-row[data-level=error] { --lv: var(--log-error); }
+.log-row[data-level=warn] { --lv: var(--log-warn); }
+.log-row[data-level=info] { --lv: var(--log-info); }
+.log-row:hover { background: color-mix(in oklab, var(--muted) 50%, transparent); }
+.log-row[aria-selected=true] { background: var(--muted); }
+.log-row .t, .log-row .src, .log-row .n { color: var(--muted-foreground); }
+.log-row .t { font-variant-numeric: tabular-nums; }
+.log-row .lv { color: var(--lv); }
+.log-row .src, .log-row .msg { overflow: hidden; text-overflow: ellipsis; }
+.log-row .msg { color: var(--foreground); }
+/* An outage of a device's link: what it was, in the error's colour, a rule to either side, as a menu's caption has one after it. */
+.log-cut { display: flex; align-items: center; gap: 8px; padding: 2px 4px 2px 9px; color: var(--log-error); font-size: 11px; white-space: nowrap; }
+.log-cut::before, .log-cut::after { content: ''; flex: 1; min-width: 12px; height: 1px; background: color-mix(in oklch, var(--log-error) 50%, transparent); }
+/* A dock with nothing for a top row has none. Its button shares the first
+   panel header's row, centred in it as in a top row, so it is at one height
+   in every dock; that header, whichever panel is first, open or folded, and
+   the place a dragged panel would land there, end 4 px short of it. What
+   scrolls up past that row is cut away at the button's corner, and the
+   dock's scroll bar runs below it, so nothing of the dock is under it. */
+.dock-side.bare .dock { padding-top: 1px; clip-path: polygon(0 0, calc(100% - 26px) 0, calc(100% - 26px) 28px, 100% 28px, 100% 100%, 0 100%); }
+.dock-side.bare .dock > .dock-panel:first-child > .dock-head, .dock-side.bare .dock > .dock-panel.shadow:first-child { margin-right: 24px; }
+.dock-side.bare .dock::-webkit-scrollbar-track { margin-top: 28px; }
+/* A dock's button, which hides it and shows it, 6 px in from the frame's
+   border each way and centred in the top row's height, or the first
+   header's. Shown, it is in the
+   frame's top right corner: the right dock's at the page's edge, the left
+   dock's beside the tiles, moving with that edge as the dock slides. Hidden,
+   it is on the rail, which is as wide as the button and that inset each
+   side, at the left dock's page edge. */
+.dock-button { position: absolute; top: 10px; right: 6px; z-index: 2; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--muted-foreground); cursor: pointer; }
+.dock-button:hover { background: var(--secondary); color: var(--foreground); }
+.dock-button svg { width: 14px; height: 14px; }
+.dock-frame.left.rail .dock-button { right: auto; left: 6px; }
+/* The panels are lists inside a list. A panel is as tall as what it shows
+   while its dock has the room. Where the panels do not fit, a panel taller
+   than two thirds of the dock's height gives way, down to two thirds: its
+   list takes what the panel has left and scrolls, with its rows clear of
+   its scroll bar, and the dock scrolls the panels that still do not fit.
+   So a list hides rows only where its dock has no room left; at most one
+   panel is past two thirds, in the room the others leave; and every other
+   panel keeps its height whatever the rest do. Two thirds, so a panel that
+   has given way leaves a third of the dock to show there are others.
+   A panel shrinks from its content's height, its flex basis, and no
+   further than the lesser of that and the two thirds its `height` states,
+   which `min-height: auto` reads and which sets no height of its own. */
+.dock-panel { position: relative; display: flex; flex-direction: column; flex: 0 1 content; height: 66.667%; min-height: auto; }
+.dock-body [data-slot=scroll-area] { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
+.dock-body [data-slot=scroll-area-viewport] { flex: 0 1 auto; min-height: 0; height: auto; }
+.dock-body [data-slot=scroll-area]:has(> [data-slot=scroll-area-scrollbar]) > [data-slot=scroll-area-viewport] { padding-right: 10px; }
+.dock-panel + .dock-panel { border-top: 1px solid var(--border); padding-top: 4px; }
+/* A rail draws no panel: where one dragged onto it would land is a bare
+   place at its top, for the drop to settle on. */
+.dock-side.rail .dock-panel { border-color: transparent; }
+.dock-side.rail .dock-panel > * { display: none; }
+.dock-panel.shadow { flex: none; height: 28px; min-height: 0; opacity: 0.6; border: 1px dashed var(--primary); border-radius: var(--radius); }
+.dock-head { display: flex; align-items: center; gap: 4px; height: 26px; flex: none; padding: 0 2px; border-radius: var(--radius); cursor: grab; user-select: none; outline: none; color: var(--muted-foreground); font: 600 12px var(--font-ui); }
+.dock-head:hover { color: var(--foreground); }
+.dock-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dock-head .dock-grip { width: 14px; height: 14px; flex: none; opacity: 0; transition: opacity 0.1s; }
+.dock-head:hover .dock-grip, .dock-head:focus-visible .dock-grip { opacity: 0.7; }
+.dock-fold { display: grid; place-items: center; width: 16px; height: 16px; flex: none; color: inherit; }
+.dock-fold svg { width: 12px; height: 12px; transition: transform 0.15s; }
+.dock-panel.open .dock-fold svg { transform: rotate(90deg); }
+.dock-body { flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 6px; padding: 2px 2px 4px; overflow: hidden; }
+/* A key in a tooltip (Tip.svelte). */
+[data-slot=tooltip-content] kbd { padding: 0 4px; border-radius: 3px; font: 10px var(--font-data); background: color-mix(in oklch, var(--background) 25%, transparent); }
+
+/* The status bar along the page's foot (StatusBar.svelte). */
+.status-bar { display: flex; align-items: center; gap: 4px; height: 24px; flex: none; padding: 0 12px 2px; color: var(--muted-foreground); font-size: 11px; white-space: nowrap; overflow: hidden; }
+.status-bar .item { display: inline-flex; align-items: center; gap: 5px; padding: 0 6px; height: 20px; border-radius: 4px; }
+.status-bar .item + .item { border-left: 1px solid var(--border); border-radius: 0; }
+.status-bar .spacer { flex: 1; }
+/* What an item of the bar says keeps one width, that of the longest it says, `data-room`, each line of it one thing it may say, and a pixel over for how a run of text rounds: it is set from its start, its words close up to its numbers, and the room left over comes after it, so what follows stays put as it changes. */
+.status-bar .fit, .device .fit, .fw-all .fit { display: inline-grid; justify-items: start; font-variant-numeric: tabular-nums; }
+.status-bar .fit::before, .device .fit::before, .fw-all .fit::before { content: attr(data-room); grid-area: 1 / 1; height: 0; padding-right: 1px; overflow: hidden; white-space: pre; visibility: hidden; }
+.status-bar .fit > *, .device .fit > *, .fw-all .fit > * { grid-area: 1 / 1; }
+/* A count of the log's bar, which ends its button, keeps one width, `--digits` wide, four unless it says, set from its start. */
+.log-bar .num { display: inline-block; min-width: calc(var(--digits, 4) * 1ch); text-align: left; font-variant-numeric: tabular-nums; }
+.status-bar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--destructive); }
+.status-bar .dot.on { background: var(--primary); }
+.status-bar .warn { display: inline-flex; align-items: center; gap: 3px; color: var(--cursor-a); }
+.status-bar .warn svg, .status-bar .keys svg, .status-bar .loss svg { width: 12px; height: 12px; }
+.status-bar .meter, .device .meter { display: inline-block; width: 48px; height: 4px; border-radius: 2px; background: var(--secondary); overflow: hidden; }
+.status-bar .meter span, .device .meter span { display: block; height: 100%; background: var(--primary); }
+.status-bar .keys, .status-bar .history, .status-bar .loss, .status-bar .log { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.status-bar .keys:hover, .status-bar .history:hover, .status-bar .loss:hover, .status-bar .log:hover, .status-bar .log.on { color: var(--foreground); background: var(--secondary); }
+/* The Log item's count of what arrived unseen, in the warning's colour, or the error's while an error is among it. */
+.status-bar .log .num { color: var(--log-warn); }
+.status-bar .log .num.error { color: var(--log-error); }
+/* The loss mark: what is missing of the last minute, in the warning's colour, or a link down now, in the error's. */
+.status-bar .loss { color: var(--log-warn); }
+.status-bar .loss.down { color: var(--log-error); }
+/* A grouped form, as the settings popover and HistorySettings.svelte lay
+   theirs out: sections split by one rule, each a heading over rows of a
+   label and its control. The labels take one column, as wide in every
+   section so they line up across them, and the controls fill the other,
+   values and checkboxes at its trailing edge.
+   Every space in it is a step of one scale, set on the containers as
+   padding and gaps: 4 px between the rows of a group and between a thing
+   and its caption, 8 px under a heading and between controls in a row,
+   12 px between groups, between a label and its control, and around a
+   section's edges, so a heading sits three times as far from the section
+   above (12 + 12) as from its own rows (8). Text sits on 16 px lines; a
+   row holds a 24 px control. */
+.settings-pop, .history-set, .firmware-dialog { --space-1: 4px; --space-2: 8px; --space-3: 12px; --line: 16px; --row: 24px; }
+.settings-pop { font-size: 12px; line-height: var(--line); }
+.settings-pop section { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3); }
+.settings-pop section + section { border-top: 1px solid var(--border); }
+.settings-pop h3 { color: var(--muted-foreground); font: 600 11px/var(--line) var(--font-ui); }
+.set-grid { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); grid-auto-rows: minmax(var(--row), auto); align-items: center; gap: var(--space-1) var(--space-3); color: var(--foreground); font-size: 12px; line-height: var(--line); }
+.set-control { display: flex; align-items: center; gap: var(--space-2); }
+.set-value { justify-self: end; color: var(--muted-foreground); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.set-control .set-value { min-width: 3.5rem; text-align: right; }
+/* The raw history's settings (HistorySettings.svelte): its two limits, then
+   apart from them a footer: a waterline of the memory held with a tick
+   where the span of time would fill it and a band a full paused history
+   takes, and under it a caption naming the limit that comes first and a
+   line saying what a paused plot keeps. */
+.history-set { display: flex; flex-direction: column; gap: var(--space-3); font-size: 12px; line-height: var(--line); }
+/* The stepper matches the select above it: height, border and corners. */
+.stepper { display: flex; align-items: center; height: var(--row); border: 1px solid var(--input); border-radius: min(var(--radius-md), 10px); overflow: hidden; }
+.dark .stepper { background: color-mix(in oklch, var(--input) 30%, transparent); }
+.stepper button { display: grid; place-items: center; width: calc(var(--row) - 2px); height: 100%; padding: 0; border: 0; background: none; color: var(--muted-foreground); cursor: pointer; }
+.stepper button:hover:not(:disabled) { background: var(--secondary); color: var(--foreground); }
+.stepper button:disabled { opacity: 0.35; cursor: default; }
+.stepper button svg { width: 12px; height: 12px; }
+.stepper span.muted { color: var(--muted-foreground); }
+.stepper span { flex: 1; min-width: 56px; padding: 0 var(--space-1); border-inline: 1px solid var(--input); text-align: center; font-variant-numeric: tabular-nums; color: var(--foreground); line-height: calc(var(--row) - 2px); }
+.water { display: flex; flex-direction: column; gap: var(--space-1); }
+.waterline { position: relative; height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--muted-foreground) 25%, transparent); overflow: hidden; }
+.waterline .fill { height: 100%; background: var(--primary); transition: width 0.3s; }
+.waterline .tick { position: absolute; top: 0; bottom: 0; width: 3px; margin-left: -1.5px; background: var(--foreground); opacity: 0.8; }
+/* The band a full paused history takes, hatched from the tick to a thin
+   edge where it ends; past the bar's end, no edge, and an arrow after the
+   bar. */
+.water-bar { display: flex; align-items: center; gap: 2px; }
+.water-bar .waterline { flex: 1; }
+.waterline .paused { position: absolute; top: 0; bottom: 0; border-right: 1px solid var(--foreground); background: repeating-linear-gradient(-45deg, color-mix(in srgb, var(--foreground) 55%, transparent) 0 1.5px, transparent 1.5px 4px); }
+.waterline .paused.past { border-right: 0; }
+.water-bar .past-end { flex: none; width: 12px; height: 12px; margin-right: -4px; color: var(--foreground); }
+/* The caption's lines, one sentence each, set close as one paragraph. */
+.water-notes { color: var(--muted-foreground); font-size: 11px; line-height: var(--line); font-variant-numeric: tabular-nums; }
+.water-caption { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.water-caption b { color: var(--foreground); font-weight: 600; }
+.water-caption .info { display: grid; place-items: center; flex: none; width: var(--line); height: var(--line); padding: 0; border: 0; background: none; color: var(--muted-foreground); cursor: help; }
+.water-caption .info:hover { color: var(--foreground); }
+.water-caption .info svg { width: 12px; height: 12px; }
+.water-caption .short { color: var(--cursor-a); }
+/* The question a lower limit asks, in the waterline's place: its lines,
+   then its two buttons at the right, Keep before Drop. */
+.lower-ask { display: flex; flex-direction: column; gap: var(--space-2); }
+.lower-lines { display: flex; flex-direction: column; gap: var(--space-1); color: var(--foreground); }
+.lower-buttons { display: flex; justify-content: flex-end; gap: var(--space-2); }
+.status-bar kbd { font: 10px var(--font-data); padding: 0 3px; border: 1px solid var(--border); border-radius: 3px; }
+.action-grid { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px; }
+/* An action button picked as a row, and its number among several picked to run. */
+.action-grid button.picked { background: color-mix(in oklch, var(--primary) 12%, transparent); border-color: var(--primary); }
+.action-grid .run-order { display: inline-grid; place-items: center; min-width: 14px; height: 14px; margin-right: 2px; padding: 0 3px; border-radius: 7px; background: var(--primary); color: var(--primary-foreground); font: 600 10px var(--font-data); font-variant-numeric: tabular-nums; }
+.props-empty { padding: 4px; color: var(--muted-foreground); font-size: 12px; }
+
+/* The plot area is see-through: the WebGL layer behind draws it. */
+.plot-body { position: relative; flex: 1; min-height: 60px; background: transparent; }
+/* Copy image, first of the header's actions, shown while the pointer is on the plot: hidden, it keeps its room and takes no press. */
+.plot-actions > .copy-image { opacity: 0; pointer-events: none; transition: opacity 0.1s; }
+.plot-card:hover .plot-actions > .copy-image { opacity: 1; pointer-events: auto; }
+/* The plot takes focus for its context menu. The card's border shows focus and
+   selection, so the browser's ring, clipped to a bar under the header, is off. */
+.plot-body:focus, .plot-body:focus-visible { outline: none; }
+.plot-body canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+
+/* The plot body is a drop target for signals; it lets the pointer through to the plot. */
+.legend-zone { position: absolute; inset: 0; pointer-events: none; }
+.legend-zone .body-ghost { position: absolute; width: 1px; height: 1px; visibility: hidden; }
+/* An edge hint means the signal opens a new plot, so the plot itself is not the target. */
+
+/* The plot's signals, in its header, each with its value. The header is one
+   row at every size: signals past its end scroll sideways under a fade,
+   and the pinned legend shows them all at once. The fade's width, --fade,
+   is the one PlotCard.svelte judges a chip in view by. The row spans the
+   header's free room, which a drop or a right-click there is the row's.
+   It keeps room at its right end, --add, for the header's +, which
+   PlotCard.svelte lays over the row after its last chip, or in that room
+   while the row runs past its end; chips scrolled under that room are
+   masked out. */
+.trace-zone { flex: 1; min-width: calc(8px + var(--add, 0px)); height: 24px; display: flex; align-items: center; gap: 10px; padding: 0 calc(4px + var(--add, 0px)) 0 4px; overflow: auto hidden; scrollbar-width: none; border-radius: calc(var(--radius) - 4px); }
+.trace-zone::-webkit-scrollbar { display: none; }
+.trace-zone.more-right { mask-image: linear-gradient(to right, #000 calc(100% - var(--add, 0px) - var(--fade)), transparent calc(100% - var(--add, 0px))); }
+.trace-zone.more-left { mask-image: linear-gradient(to left, #000 calc(100% - var(--fade)), transparent); }
+.trace-zone.more-left.more-right { mask-image: linear-gradient(to right, transparent, #000 var(--fade), #000 calc(100% - var(--add, 0px) - var(--fade)), transparent calc(100% - var(--add, 0px))); }
+/* The + takes its place at once, as the chips do. */
+.plot-head > .add-signal { position: absolute; top: 2px; transition-property: color, background-color, opacity; }
+/* Under a row that runs past an edge, a dash per signal in its colour, dim
+   while its chip is out of view, on the header's foot below the chips. Each
+   is a 4 px band to press, its 2 px dash drawn in the middle. Too many to
+   fit at their least width, the strip fades at its end. */
+.chip-dashes { position: absolute; top: 24px; height: 4px; display: flex; overflow: hidden; }
+.chip-dashes.crowded { mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent); }
+.chip-dash { flex: 0 1 auto; height: 4px; padding: 0; border: 0; background: none; cursor: pointer; }
+.chip-dash::after { content: ''; display: block; height: 2px; margin-top: 1px; border-radius: 1px; background: var(--c); }
+.chip-dash.out::after { opacity: 0.25; }
+.chip-dash.hidden-signal { opacity: 0.45; }
+.trace-empty { color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
+.trace-chip { flex: none; display: inline-flex; align-items: baseline; gap: 5px; height: 20px; font: 11px/20px var(--font-data); white-space: nowrap; color: var(--foreground); cursor: grab; user-select: none; }
+.trace-chip .name { max-width: 18ch; overflow: hidden; text-overflow: ellipsis; }
+/* A narrow plot gives its header to its signals: the kind shortens, then
+   Back and Forward go, which a wider plot of the tab has, as they go
+   through the tab's steps, and Copy image, which its menu has; then the
+   kind and the grip, the empty header still picking the plot up. The
+   kind's trigger stays in the page at no width, for K to open it. */
+.plot-card { container: plot / inline-size; }
+@container plot (width < 480px) {
+	.plot-head [data-slot=select-trigger] { flex-shrink: 1; min-width: 0; }
+	.plot-head .trace-zone { min-width: calc(64px + var(--add, 0px)); }
+	.plot-head .view-step, .plot-head .copy-image { display: none; }
+}
+@container plot (width < 280px) {
+	.plot-head .grip, .plot-head .maximize { display: none; }
+	.plot-head .kind-select:not(:focus, [data-state=open]) { width: 0; padding: 0; border: 0; overflow: hidden; }
+}
+
+/* The legend in the plot: every signal and its value in one column. It is
+   never taller than part of the plot; past that it scrolls. It sits at --x,
+   --y, each a share of the room around it, so the same place holds as the
+   plot resizes. That room is the plot area, as plot.js gives its edges,
+   inset 8px, and 22px at the top, which clears the LIVE tag; --clear-top
+   clears a monitor's header. */
+.pinned-legend { --clear-top: 0px; --room-l: calc(var(--frame-l, 0px) + 8px); --room-t: max(calc(var(--frame-t, 0px) + 22px), var(--clear-top)); --room-r: calc(var(--frame-r, 0px) + 8px); --room-b: calc(var(--frame-b, 0px) + 8px); position: absolute; left: calc(var(--room-l) + var(--x) * (100% - var(--room-l) - var(--room-r))); top: calc(var(--room-t) + var(--y) * (100% - var(--room-t) - var(--room-b))); transform: translate(calc(var(--x) * -100%), calc(var(--y) * -100%)); z-index: 2; cursor: grab; touch-action: none; max-width: calc(100% - var(--room-l) - var(--room-r)); max-height: max(40%, 36px); overflow: hidden auto; scrollbar-width: thin; padding: 1px 6px; font: 10px/16px var(--font-data); font-variant-numeric: tabular-nums; background: color-mix(in oklch, var(--card) 85%, transparent); backdrop-filter: blur(2px); border: 1px solid var(--border); }
+/* A capture plot's state, in the plot's lower left corner. */
+.capture-state { position: absolute; left: calc(var(--frame-l, 0px) + 6px); bottom: calc(var(--frame-b, 0px) + 4px); max-width: calc(100% - var(--frame-l, 0px) - var(--frame-r, 0px) - 12px); font: 11px/15px var(--font-data); color: var(--muted-foreground); pointer-events: none; }
+.capture-state div { display: flex; gap: 6px; white-space: nowrap; overflow: hidden; }
+.capture-state b { font-weight: 600; color: var(--foreground); }
+.capture-state .state { overflow: hidden; text-overflow: ellipsis; }
+.capture-state .failed .state { color: var(--destructive); }
+.pinned-legend .row { display: flex; align-items: center; gap: 5px; height: 16px; white-space: nowrap; }
+.pinned-legend .swatch i { width: 8px; height: 3px; background: var(--c); }
+.pinned-legend .name { max-width: 16ch; overflow: hidden; text-overflow: ellipsis; color: var(--foreground); }
+.pinned-legend .val { margin-left: auto; min-width: 8ch; text-align: right; color: var(--c); }
+.pinned-legend .units { color: var(--muted-foreground); }
+/* A row's remove button keeps its room, so the legend never changes width on hover. */
+.pinned-legend .x { flex: none; width: 12px; padding: 0; border: 0; background: none; color: var(--muted-foreground); font-size: 12px; line-height: 1; cursor: pointer; opacity: 0; }
+.pinned-legend .row:hover .x { opacity: 1; }
+.pinned-legend .x:hover { color: var(--destructive); }
+@media (hover: none) { .pinned-legend .x { opacity: 1; } }
+.trace-chip .swatch i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; }
+.trace-chip .units { color: var(--muted-foreground); }
+/* A fixed slot, as wide as the longest value the chip formats, -0.0012345
+   or -1.2346e+5, so values changing or appearing never reflow the header. */
+.trace-chip .val { flex: none; width: 10ch; overflow: hidden; text-align: right; font-variant-numeric: tabular-nums; color: var(--c); }
+/* A spectrum chip's floor, after the eye that shows its line. */
+.trace-chip .val.floor { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; align-self: center; height: 20px; }
+.trace-chip .eye { display: inline-flex; padding: 0; border: 0; background: none; color: var(--muted-foreground); cursor: pointer; }
+.trace-chip .eye svg { width: 12px; height: 12px; }
+.trace-chip .eye:hover { color: var(--foreground); }
+.trace-chip .eye[aria-pressed=false] { opacity: 0.6; }
+/* What the hints switch shows: key caps and shortcuts, while the root's
+   data-hints is on (prefs.svelte.js). */
+:root[data-hints=off] [data-hint] { display: none; }
+/* Every menu, dropdown and submenu has one look: rows that lead with an
+   icon, muted beside the label, as the plot header's buttons show them, in
+   the room a check mark would take; and as wide as its widest row. */
+:is([data-slot$=-menu-content], [data-slot$=-menu-sub-content]) { min-width: max-content; }
+.menu-icons :is([data-slot^=context-menu-item], [data-slot=context-menu-sub-trigger], [data-slot^=dropdown-menu-item], [data-slot=dropdown-menu-sub-trigger], [data-slot$=-menu-label]) { padding-left: 8px; white-space: nowrap; }
+.menu-icon { color: var(--muted-foreground); }
+/* A group's name: an uppercase caption with a rule running after it to the
+   menu's edge, which is the break between groups. */
+[data-slot$=-menu-label] { display: flex; align-items: center; gap: 8px; padding: 10px 8px 3px; font-size: 10px; line-height: 14px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted-foreground); }
+[data-slot$=-menu-label]:first-child { padding-top: 4px; }
+[data-slot$=-menu-label]::after { content: ''; flex: 1; min-width: 12px; height: 1px; background: var(--border); }
+/* A menu whose copy fades in its place as a press closes it (overlay.svelte.js): gone at once, not over the menu's transition time. */
+[data-frozen] { visibility: hidden !important; transition: none !important; }
+/* A row's trailing column, on the row's right edge: its value, in
+   fixed-width digits and at least a column wide, so the values of a menu
+   line up; or while the hints show, its shortcut in the value's place. A
+   warning, its reason in its tooltip, and the value of a row that cannot be
+   chosen, which says why, keep the column. The arrow of a submenu follows
+   the value. */
+.menu-value { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; min-width: 76px; margin-left: auto; padding-left: 16px; color: var(--muted-foreground); font-size: 12px; line-height: 20px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.menu-value.warn { color: var(--warning, #d97706); pointer-events: auto; }
+.menu-value svg { width: 12px; height: 12px; }
+.menu-value + svg { margin-left: 4px; }
+[data-slot$=-menu-label] .menu-value { order: 1; min-width: 0; padding-left: 0; font-size: 11px; font-weight: 400; letter-spacing: normal; text-transform: none; }
+:root[data-hints=on] [role^=menuitem]:not([data-disabled]):has([data-slot$=-shortcut]) .menu-value:not(.warn), :root[data-hints=on] [role^=menuitem]:is([data-disabled], :has(.menu-value.warn)):has(.menu-value) [data-slot$=-shortcut] { display: none; }
+/* A menu's shortcuts as key caps, so | and _ read as the keys they are. */
+[data-slot$=-menu-shortcut] { display: inline-flex; gap: 3px; }
+[data-slot$=-menu-shortcut] kbd { min-width: 18px; padding: 0 4px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; background: var(--secondary); color: var(--muted-foreground); font: 11px/15px var(--font-data); text-align: center; }
+/* A colour's pill, as the chips draw it. */
+.menu-value i { display: inline-block; width: 12px; height: 3px; border-radius: 2px; vertical-align: middle; background: var(--c); }
+/* A chip answers the pointer as a whole, as Material and Fluent chips do;
+   a hidden signal's chip stays, dimmed. */
+.trace-chip { padding: 0 4px; border-radius: var(--radius); transition: background-color 120ms; }
+.trace-chip:hover { background: color-mix(in oklch, var(--c) 14%, transparent); }
+.trace-chip.hidden-signal { opacity: 0.45; }
+.trace-chip .x { opacity: 0; border: 0; background: none; padding: 0 2px; color: var(--muted-foreground); font-size: 13px; line-height: 1; cursor: pointer; }
+.trace-chip:hover .x, .trace-chip .x:focus-visible { opacity: 1; }
+.trace-chip .x:hover { color: var(--destructive); }
+/* Where a dragged chip would land, or its own place while it is over another
+   plot: the chip, faded and outlined in its colour. The drag library hides
+   its shadow with an inline style, which this overrides. */
+.trace-chip.ghost { visibility: visible !important; opacity: 0.4; outline: 1px dashed var(--c); outline-offset: -1px; }
+@media (hover: none) { .trace-chip .x { opacity: 1; } }
+
+/* The placed cursors, under the header while there are any, as a scope's
+   readout: a framed table of where A and B are and each signal there. */
+/* The cursors' readout, floating in the plot as the legend does, at --x, --y.
+   It and the legend each sit in a layer of no box of its own, which keeps
+   their menus from the plot's. */
+.readout-layer, .legend-layer { display: contents; }
+.cursor-readout { position: absolute; left: calc(4px + var(--x) * (100% - 8px)); top: calc(4px + var(--y) * (100% - 8px)); transform: translate(calc(var(--x) * -100%), calc(var(--y) * -100%)); z-index: 2; cursor: grab; touch-action: none; max-width: calc(100% - 8px); max-height: calc(100% - 8px); overflow: auto; scrollbar-width: thin; background: color-mix(in oklch, var(--card) 88%, transparent); backdrop-filter: blur(2px); border: 1px solid var(--border); }
+/* Moved off a cursor's tag or tab, or left out where no place is clear of them (plot.js `placeReadout`). */
+.plot-body[data-readout=moved] .cursor-readout { left: var(--readout-x); top: var(--readout-y); transform: none; }
+.plot-body[data-readout=moved][data-readout-from^=right] .cursor-readout { left: auto; right: var(--readout-x); }
+.plot-body[data-readout=moved][data-readout-from$=bottom] .cursor-readout { top: auto; bottom: var(--readout-y); }
+.plot-body[data-readout=hidden] .cursor-readout { visibility: hidden; }
+.cursor-readout table { border-collapse: collapse; font: 10px/16px var(--font-data); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cursor-readout th, .cursor-readout td { padding: 0 6px; }
+.cursor-readout thead th { font: 500 10px/16px var(--font-ui); color: var(--muted-foreground); text-align: right; border-bottom: 1px solid var(--border); }
+.cursor-readout thead th.a { color: var(--cursor-a); }
+.cursor-readout thead th.b { color: var(--cursor-b); }
+.cursor-readout td { text-align: right; color: var(--foreground); }
+.cursor-readout tbody th { text-align: left; font-weight: 400; color: var(--foreground); }
+.cursor-readout tbody th i { display: inline-block; width: 10px; height: 3px; margin-right: 6px; vertical-align: middle; background: var(--c); border-radius: 2px; }
+.cursor-readout tr.position td, .cursor-readout tr.position th { border-bottom: 1px solid var(--border); }
+.cursor-readout var { font: italic 12px/16px "Times New Roman", "STIX Two Text", Georgia, serif; color: var(--foreground); }
+.cursor-readout .rate { color: var(--muted-foreground); }
+.cursor-readout .rate span { margin-right: 6px; font-family: var(--font-ui); }
+
+/* Signal chips in the sidebar, dragged with svelte-dnd-action. */
+.palette-scroll { flex: 1; min-height: 40px; }
+.palette { display: flex; flex-direction: column; gap: 6px; outline: none; }
+.chips { flex: 1; display: flex; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; gap: 4px; min-height: 26px; min-width: 60px; padding: 1px 4px; border: 1px dashed transparent; border-radius: var(--radius); align-items: center; }
+.chips:empty::before { content: 'drop signals here'; color: var(--muted-foreground); font-size: 12px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: var(--radius); background: var(--secondary); border: 1px solid var(--border); color: var(--foreground); font: 12px var(--font-data); white-space: nowrap; cursor: grab; user-select: none; }
+.chip i, .chip .swatch i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; flex: none; }
+.chip small { color: var(--muted-foreground); margin-left: auto; }
+.chip .x { border: 0; background: none; padding: 0 0 0 2px; color: var(--muted-foreground); font-size: 14px; line-height: 1; cursor: pointer; }
+.chip .x:hover { color: var(--foreground); }
+.chip.ghost { opacity: 0.4; border-style: dashed; }
+.drop-target { border-color: var(--primary) !important; background: color-mix(in oklch, var(--primary) 8%, transparent); }
+.palette .chip { padding: 5px 8px; font-size: 13px; cursor: pointer; transition: background-color 120ms, border-color 120ms; }
+.palette .chip:hover { background: var(--accent); border-color: color-mix(in oklch, var(--foreground) 25%, var(--border)); }
+.palette .sig-key { overflow: hidden; text-overflow: ellipsis; }
+.palette .sig-units { color: var(--muted-foreground); font-size: 11px; }
+/* A device's captures, under its signals: the first is headed, in the room it keeps above it. */
+.palette .chip.captures-first { margin-top: 20px; position: relative; }
+.palette .chip.captures-first::before { content: 'Captures'; position: absolute; left: 1px; top: -19px; font: 600 11px/14px var(--font-ui); color: var(--muted-foreground); pointer-events: none; }
+.sig-empty { padding: 8px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
+.tiles.drop-target { border: 1px dashed var(--primary); border-radius: var(--radius); }
+
+/* Layout tabs. */
+.tab { display: inline-flex; align-items: center; gap: 4px; height: 30px; padding: 0 2px 0 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); color: var(--muted-foreground); font-size: 13px; cursor: pointer; user-select: none; }
+.tab.active { color: var(--foreground); background: var(--secondary); box-shadow: inset 0 -2px 0 var(--primary); }
+
+/* The signal Enter adds while the search has focus is highlighted, as the
+   row a filter field chooses is in a menu. */
+.palette .chip.chosen { background: var(--accent); color: var(--accent-foreground); }
+/* A signal picked has the look of a property row picked, on its own ground
+   and within its border, hovered or not. Lifted from the list, it counts
+   the signals that go with it. */
+.palette .chip.picked, .palette .chip.picked:hover { background: color-mix(in oklch, var(--primary) 12%, var(--secondary)); border-color: var(--primary); }
+.chip[data-count]::after { content: attr(data-count); flex: none; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: var(--primary); color: var(--primary-foreground); font: 600 10px/16px var(--font-data); text-align: center; font-variant-numeric: tabular-nums; }
+
+/* The keys sheet (KeysDialog.svelte): as many columns as the window has
+   room for, each section kept whole, its keys in a column as wide as its
+   widest, so no key runs into what it does. */
+.keys { columns: 3 15rem; column-gap: 32px; font-size: 12px; }
+.keys section { break-inside: avoid; padding-bottom: 16px; }
+.keys h3 { margin-bottom: 4px; color: var(--muted-foreground); font: 600 11px/16px var(--font-ui); }
+.keys dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 12px; align-items: baseline; }
+.keys dt { display: flex; align-items: baseline; gap: 3px; white-space: nowrap; }
+.keys dt .on { margin-left: 2px; color: var(--muted-foreground); }
+.keys kbd { display: inline-block; min-width: 18px; padding: 0 4px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: var(--radius); background: var(--secondary); font: 11px/16px var(--font-data); text-align: center; }
+.tab.target { border-color: var(--primary); background: color-mix(in oklch, var(--primary) 15%, transparent); }
+
+@media (max-width: 760px) {
+  .app { height: auto; min-height: 100vh; }
+  .palette { flex-direction: row; flex-wrap: wrap; }
+  .tiles { min-height: 80vh; }
+}
+
+
+/* The box a drag on the background draws to select plots. */
+.marquee { position: fixed; z-index: 40; pointer-events: none; border: 1px solid var(--primary); background: color-mix(in oklch, var(--primary) 10%, transparent); }
+
+/* Typed bounds in a y axis's context menu. */
+/* A y axis's popover: a small header naming what it scales, Max and Min in
+   one aligned column, Fit, and the signal's colour. */
+.axis-anchor { position: absolute; width: 0; height: 0; pointer-events: none; }
+.axis-pop { font-size: 12px; }
+.axis-head { display: flex; align-items: center; gap: 6px; padding: 2px 4px 4px; color: var(--muted-foreground); font: 11px var(--font-data); }
+.axis-head i { width: 10px; height: 3px; border-radius: 2px; background: var(--c); }
+.axis-head .units { color: var(--muted-foreground); opacity: 0.7; }
+.axis-head .axis-tools { display: flex; gap: 2px; margin-left: auto; }
+/* The range: low "to" high, then the fit, one line. */
+.axis-range { display: flex; align-items: center; gap: 6px; padding: 2px 4px 4px; color: var(--muted-foreground); }
+.axis-range input { width: 64px; height: 24px; padding: 0 6px; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--foreground); font: 12px var(--font-data); font-variant-numeric: tabular-nums; text-align: right; }
+.axis-error { padding: 0 4px 4px; color: var(--destructive); font-size: 11px; }
+/* A square button holding only an icon, as the popover's tools are. */
+.icon-btn { display: grid; place-items: center; width: 24px; height: 24px; flex: none; padding: 0; border: 1px solid transparent; border-radius: var(--radius); background: none; color: var(--muted-foreground); cursor: pointer; }
+.icon-btn:hover { background: var(--secondary); color: var(--foreground); }
+.icon-btn:disabled { opacity: 0.5; cursor: default; background: none; color: var(--muted-foreground); }
+.icon-btn svg { width: 14px; height: 14px; }
+.axis-range .icon-btn { border-color: var(--input); }
+/* The axis's cursors: a label, then adding and clearing them. */
+/* The theme's three icons as one strip, the chosen one lit. */
+.theme-seg { display: flex; border: 1px solid var(--input); border-radius: var(--radius); overflow: hidden; }
+.theme-seg button { display: grid; place-items: center; width: 32px; height: 24px; padding: 0; border: 0; border-left: 1px solid var(--input); background: none; color: var(--muted-foreground); cursor: pointer; }
+.theme-seg button:first-child { border-left: 0; }
+.theme-seg button:hover { color: var(--foreground); }
+.theme-seg button.on { background: var(--secondary); color: var(--foreground); }
+.theme-seg svg { width: 14px; height: 14px; }
+/* The export dialog: its choices as an axis popover's rows, then a note. */
+.export-dialog .axis-row { padding: 0; font-size: 13px; }
+.firmware-dialog .axis-row { padding: 0; }
+.export-note { margin: 0; color: var(--muted-foreground); font-size: 12px; line-height: 16px; }
+/* A row of an axis's popover: a label, then its controls. */
+.axis-row { display: flex; align-items: center; gap: 4px; padding: 0 4px 4px; color: var(--muted-foreground); font-size: 12px; }
+.axis-row > span:first-child { flex: 1; min-width: 56px; }
+.axis-row .unit { font: 11px var(--font-data); }
+/* A choice of a few, as one strip of buttons, the chosen one lit; in the log's bar, each button a toggle of its own. */
+:is(.axis-row, .log-bar) .seg { display: flex; border: 1px solid var(--input); border-radius: var(--radius); overflow: hidden; }
+:is(.axis-row, .log-bar) .seg button { min-width: 26px; height: 22px; padding: 0 6px; border: 0; border-left: 1px solid var(--input); background: none; color: var(--muted-foreground); font: 11px var(--font-data); cursor: pointer; }
+:is(.axis-row, .log-bar) .seg button:first-child { border-left: 0; }
+:is(.axis-row, .log-bar) .seg button:hover { color: var(--foreground); }
+:is(.axis-row, .log-bar) .seg button.on { background: var(--secondary); color: var(--foreground); }
+.axis-sep { height: 1px; margin: 4px 0; background: var(--border); }
+/* A row whose choice fills it: its label in a column of its own, then the
+   strip's buttons, each as wide as the others, or the dropdown. */
+.axis-row.fill > span:first-child { flex: 0 0 56px; }
+.axis-row.fill .seg { flex: 1; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; }
+.axis-row.fill .axis-unit { flex: 1; height: 24px; padding: 0 6px 0 8px; font: 11px var(--font-data); }
+/* An axis's sample line: a value as the axis writes it, then − and +
+   stepping its digits around how many it writes. */
+.axis-sample { display: flex; align-items: center; gap: 8px; margin: 0 4px 4px; padding: 4px 6px 4px 8px; border-radius: var(--radius); background: color-mix(in oklch, var(--primary) 10%, transparent); color: var(--foreground); }
+.axis-sample output { font: 600 13px var(--font-data); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.axis-step { display: flex; align-items: center; gap: 4px; margin-left: auto; color: var(--muted-foreground); font: 11px var(--font-data); }
+.axis-step span { min-width: 34px; text-align: center; }
+.axis-step button { width: 22px; height: 20px; padding: 0; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--foreground); font: 12px var(--font-data); cursor: pointer; }
+.axis-step button:hover:not(:disabled) { background: var(--secondary); }
+.axis-step button:disabled { opacity: 0.4; cursor: default; }
+/* An independent plot's chips: the one whose scale the axis shows has a solid
+   line, the rest hollow, as a scope outlines the channels it is not set to. */
+.trace-chip.unscaled .swatch i { background: transparent; box-shadow: inset 0 0 0 1px var(--c); height: 5px; }
+/* A plot's kind and layout (KindPicker.svelte): ghost dropdowns, like the
+   header's other buttons, with no border or fill until hovered or open.
+   (A tooltip's trigger props replace the select's data-slot, so these go by
+   class.) */
+.plot-head .kind-select { height: 24px; gap: 2px; padding: 0 4px 0 6px; border-color: transparent; background: transparent; }
+.plot-head .kind-select:hover, .plot-head .kind-select[data-state=open] { background: var(--secondary); }
+.kind-select svg:first-child { width: 14px; height: 14px; color: var(--foreground); }
+
+/* The add-signal menu: a filter that names the menu, and rows as dense as
+   the page's other lists, aligned with the filter's text. */
+.add-filter { padding: 2px 2px 4px; }
+.add-filter input { width: 100%; height: 24px; padding: 0 6px; border: 1px solid var(--input); border-radius: min(var(--radius-md), 10px); background: var(--background); color: var(--foreground); font-size: 12px; outline: none; }
+.signal-list > [data-slot=scroll-area-viewport] { max-height: 260px; }
+.signal-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 22px; padding: 0 8px; border-radius: var(--radius); font-size: 12px; cursor: default; }
+.signal-row.active { background: var(--accent); color: var(--accent-foreground); }
+.signal-row .rate { color: var(--muted-foreground); font-size: 11px; letter-spacing: 0.04em; }
+.signal-option { display: inline-flex; align-items: center; gap: 6px; font: 12px var(--font-data); }
+/* A signal's colour line, which opens the colour picker (Swatch.svelte). */
+.swatch { display: inline-grid; place-items: center; flex: none; align-self: center; margin: -3px; padding: 3px; border: 0; border-radius: 3px; background: none; cursor: pointer; }
+.swatch:hover, .swatch[data-state=open] { background: var(--secondary); }
+/* The colour picker (ColorPicker.svelte): one width for its grid and its
+   custom view, so swapping one for the other never resizes it sideways. */
+.color-picker { display: flex; flex-direction: column; gap: 4px; width: 136px; }
+.picker-auto { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: var(--radius); font-size: 12px; color: var(--foreground); cursor: pointer; }
+.picker-auto:hover { background: var(--secondary); }
+.swatch-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; padding: 3px 4px; }
+.swatch-choice { aspect-ratio: 1; padding: 0; border: 1px solid color-mix(in oklch, var(--foreground) 15%, transparent); border-radius: 4px; background: var(--c); cursor: pointer; }
+.swatch-choice[aria-checked=true] { box-shadow: 0 0 0 2px var(--popover), 0 0 0 3px var(--foreground); }
+.picker-custom, .picker-back { display: flex; align-items: center; gap: 6px; width: 100%; padding: 3px 4px; border: 0; border-radius: var(--radius); background: none; color: var(--foreground); font-size: 12px; text-align: left; cursor: pointer; }
+.picker-custom:hover, .picker-back:hover { background: var(--secondary); }
+.picker-back { color: var(--muted-foreground); }
+.picker-back svg { width: 14px; height: 14px; }
+/* Custom's chip: an eyedropper until a custom colour is picked, then that colour. */
+.picker-custom-chip { display: grid; place-items: center; width: 16px; height: 16px; border: 1px solid color-mix(in oklch, var(--foreground) 15%, transparent); border-radius: 4px; background: var(--c, var(--secondary)); }
+.picker-custom-chip svg { width: 10px; height: 10px; }
+.picker-custom[aria-checked=true] .picker-custom-chip { box-shadow: 0 0 0 2px var(--popover), 0 0 0 3px var(--foreground); }
+.picker-sv { position: relative; height: 96px; margin: 0 4px; border-radius: 4px; cursor: crosshair; touch-action: none; background: linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, hsl(var(--hue) 100% 50%)); }
+.picker-hue { position: relative; height: 10px; margin: 2px 4px; border-radius: 5px; cursor: ew-resize; touch-action: none; background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00); }
+.picker-thumb { position: absolute; width: 12px; height: 12px; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px rgb(0 0 0 / 0.5); transform: translate(-50%, -50%); pointer-events: none; }
+.picker-row { display: flex; gap: 4px; padding: 0 4px 2px; }
+.picker-hex { flex: 1; min-width: 0; height: 24px; padding: 0 6px; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--foreground); font: 12px var(--font-data); }
+.picker-sample { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 1px solid var(--input); border-radius: var(--radius); background: none; color: var(--muted-foreground); cursor: pointer; }
+.picker-sample:hover { background: var(--secondary); color: var(--foreground); }
+.picker-sample svg { width: 13px; height: 13px; }
+.signal-option i, .log-bar .seg i { width: 10px; height: 3px; background: var(--c); border-radius: 2px; }
+.signal-option small { color: var(--muted-foreground); }
+.signal-none { padding: 2px 8px 4px; color: var(--muted-foreground); font-size: 12px; }
+
+/* The compass: drop cells over the plot under the pointer, and along the
+   layout's edge for a moved plot. Each cell's glyph shows the part of the
+   space a drop there takes. */
+.compass { position: fixed; inset: 0; z-index: 45; pointer-events: none; }
+.compass-cell { position: fixed; width: 34px; height: 34px; margin: -17px 0 0 -17px; border: 1px solid color-mix(in oklch, var(--foreground) 35%, transparent); border-radius: var(--radius); background: color-mix(in oklch, var(--popover) 88%, transparent); box-shadow: 0 4px 12px rgb(0 0 0 / 0.45); }
+.compass-cell::after { content: ""; position: absolute; inset: 5px; border-radius: 2px; background: color-mix(in oklch, var(--foreground) 45%, transparent); }
+.compass-cell.left::after { right: 50%; }
+.compass-cell.right::after { left: 50%; }
+.compass-cell.top::after { bottom: 50%; }
+.compass-cell.bottom::after { top: 50%; }
+.compass-cell.outer { border-style: dashed; }
+.compass-cell.outer.left::after, .compass-cell.outer.right::after { inset: 5px; width: 6px; }
+.compass-cell.outer.right::after { left: auto; }
+.compass-cell.outer.top::after, .compass-cell.outer.bottom::after { inset: 5px; height: 6px; }
+.compass-cell.outer.bottom::after { top: auto; }
+.compass-cell.active { border-color: var(--primary); background: color-mix(in oklch, var(--primary) 22%, var(--popover)); }
+.compass-cell.active::after { background: var(--primary); }
+.compass-label { position: fixed; transform: translate(-50%, -50%); padding: 2px 8px; border-radius: var(--radius); background: var(--popover); color: var(--foreground); border: 1px solid var(--primary); font-size: 12px; white-space: nowrap; box-shadow: 0 4px 12px rgb(0 0 0 / 0.45); }
+
+/* Where a moved plot would land: a tinted box over the layout, which slides
+   from one target to the next and fades in. A new row or column along the
+   layout's edge is dashed. */
+.drop-preview { position: fixed; z-index: 44; pointer-events: none; border: 2px solid var(--primary); border-radius: var(--radius); background: color-mix(in oklch, var(--primary) 16%, transparent); transition: left 90ms ease-out, top 90ms ease-out, width 90ms ease-out, height 90ms ease-out; animation: preview-in 150ms ease-out; }
+.drop-preview .drop-label { position: absolute; left: 50%; top: 8px; transform: translateX(-50%); padding: 1px 6px; border-radius: var(--radius); background: var(--popover); color: var(--foreground); font-size: 11px; white-space: nowrap; }
+.drop-preview.outer { border-style: dashed; background: color-mix(in oklch, var(--primary) 10%, transparent); }
+@keyframes preview-in { from { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .drop-preview { transition: none; animation: none; } }
+
+/* A plot that just landed, flashed for a moment so the eye finds it. */
+.leaf.landed::after { content: ""; position: absolute; inset: 0; z-index: 5; pointer-events: none; outline: 2px solid var(--primary); outline-offset: -2px; animation: landed 700ms ease-out forwards; }
+@keyframes landed { from { background: color-mix(in oklch, var(--primary) 18%, transparent); opacity: 1; } to { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .leaf.landed::after { animation: none; opacity: 0; } }
+
+/* The devices, and their RPCs with a column per checked device. */
+.devices { display: flex; flex-direction: column; gap: 8px; min-height: 0; flex: 1; font-size: 12px; }
+.device-list [role=list] { display: flex; flex-direction: column; gap: 1px; }
+.device { display: grid; grid-template-columns: auto auto auto 1fr auto; align-items: center; gap: 6px; padding: 2px 4px; border-radius: var(--radius); cursor: default; font-family: var(--font-data); }
+.device:hover { background: var(--accent); }
+/* A checkbox in a label is pressed through the label, so it reaches no
+   further than its own box: reach past a row would be rows out of view to
+   the list that holds it. */
+label > [data-slot=checkbox]::after { content: none; }
+.device .route { color: var(--muted-foreground); }
+.device .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.device .serial { color: var(--muted-foreground); font-size: 11px; }
+.presence { width: 7px; height: 7px; border-radius: 50%; background: var(--muted-foreground); }
+.presence.alive { background: var(--primary); }
+.presence.connecting { background: var(--cursor-a); }
+.presence.lost { background: var(--destructive); }
+.devices .empty { color: var(--muted-foreground); padding: 4px; }
+.device-buttons { display: flex; gap: 4px; }
+/* A device's firmware, one line under its name in every state, which a
+   row of one line has no room for: the version it runs, and at the right
+   what the catalog has for it, or, in the version's place, where its
+   upgrade is. It never wraps: the version gives way first, then the
+   words, each cut with an ellipsis. What can be pressed there reads as
+   the status bar's pressable items do. An upgrade's item is as wide
+   whatever its step while the line has room, its number always whole and
+   its meter never under 12 px. The line is no wider than the row shows
+   of it, 22 px in for the checkbox, where the row's first line is wider
+   than a narrow dock. */
+.device { container-type: inline-size; }
+.device .firmware { grid-column: 2 / -1; display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; max-width: calc(100cqw - 22px); height: 16px; overflow: hidden; color: var(--muted-foreground); font-size: 11px; line-height: 16px; white-space: nowrap; }
+.device .firmware .version { flex: 0 1000 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.device .firmware .said, .device .offer { flex: 0 1 auto; min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
+.device .offer { height: 16px; padding: 0 2px; border: 0; border-radius: 4px; background: none; color: var(--cursor-a); font: inherit; line-height: 16px; white-space: nowrap; cursor: pointer; }
+.device .offer:hover { color: var(--foreground); background: var(--secondary); }
+.device .offer.progress { display: flex; flex: 0 1 calc(12ch + 63px); align-items: center; justify-content: flex-end; gap: 5px; color: inherit; }
+.device .offer .word { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.device .offer .fit { flex: none; }
+.device .offer .meter { flex: 1 1 48px; min-width: 12px; max-width: 48px; }
+.device .offer.failed { color: var(--destructive); }
+/* The upgrade dialog (FirmwareDialog.svelte): the device and the source as
+   labelled rows, notes as the export dialog's, and the steps of an upgrade,
+   each an icon, its name, the upload's bar, as the export dialog's, and
+   what it says, at a width that holds as its numbers change. */
+.firmware-dialog .fact { font-family: var(--font-data); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.firmware-dialog .fact.file { flex: 1; min-width: 0; color: var(--muted-foreground); }
+.firmware-dialog .set-grid.facts { grid-auto-rows: minmax(var(--line), auto); }
+.firmware-dialog .set-grid > span:nth-child(odd), .firmware-dialog .axis-row { color: var(--muted-foreground); }
+.firmware-dialog .seg button:disabled { opacity: 0.45; cursor: default; }
+.export-note.bad { color: var(--destructive); }
+.export-note.done { color: var(--foreground); }
+.export-note.foot { margin-right: auto; align-self: center; }
+.fw-steps { display: grid; gap: var(--space-1); font-size: 12px; line-height: var(--line); }
+.fw-step { display: grid; grid-template-columns: 14px 6.5rem minmax(0, 1fr) 9.5rem; align-items: center; gap: var(--space-2); min-height: var(--row); color: var(--muted-foreground); }
+.fw-step svg { width: 14px; height: 14px; }
+.fw-step.now, .fw-step.done { color: var(--foreground); }
+.fw-step.done svg { color: var(--primary); }
+.fw-step.failed, .fw-step.failed svg { color: var(--destructive); }
+.fw-step .bar { height: 6px; background: var(--secondary); border-radius: 3px; overflow: hidden; }
+.fw-step .bar i { display: block; height: 100%; background: var(--primary); }
+.fw-all { display: flex; flex-direction: column; gap: 1px; font-size: 12px; }
+.fw-all .row { display: grid; grid-template-columns: 2rem minmax(0, 1fr) auto 7.5rem; gap: 8px; align-items: center; min-height: var(--row); font-family: var(--font-data); }
+.fw-all .route, .fw-all .fact { color: var(--muted-foreground); }
+.fw-all .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.props-head { display: flex; align-items: baseline; gap: 8px; border-top: 1px solid var(--border); padding-top: 8px; flex: none; }
+.props-head .title { font-weight: 600; font-size: 13px; }
+.props-head .cols { color: var(--muted-foreground); font-family: var(--font-data); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.props { flex: 1; min-height: 0; font-family: var(--font-data); font-size: 12px; }
+.props [data-slot=table-container] { overflow-x: visible; }
+.props-table { outline: none; table-layout: fixed; }
+.props-table th:first-child { width: 50%; }
+.props-table th, .props-table td { overflow: hidden; text-overflow: ellipsis; }
+.props-table th, .props-table td { height: auto; padding: 2px 4px; }
+.props-table th { position: sticky; top: 0; background: var(--card); color: var(--muted-foreground); font-size: 11px; z-index: 1; }
+.props-table tr { border-bottom: 0; }
+.props-table tr.picked { background: color-mix(in oklch, var(--primary) 12%, transparent); }
+.props-wrap { display: contents; }
+/* A property's star: shown on its row's hover, and always once starred. A log row's button is drawn the same, and shows on the row the arrows are on too. */
+.props-table .star, .log-row .go { display: inline-grid; place-items: center; width: 14px; height: 14px; margin-right: 4px; padding: 0; border: 0; background: none; color: var(--muted-foreground); vertical-align: -2px; cursor: pointer; opacity: 0; }
+.props-table .star svg, .log-row .go svg { width: 12px; height: 12px; }
+.props-table tr:hover .star, .props-table .star.on, .log-row:hover .go, .log-row[aria-selected=true] .go { opacity: 1; }
+.log-row .go { margin-right: 0; }
+.log-row .go:hover:not(:disabled) { color: var(--foreground); }
+.log-row .go:disabled { cursor: default; }
+.log-row:hover .go:disabled, .log-row[aria-selected=true] .go:disabled { opacity: 0.35; }
+.props-table .star.on { color: var(--cursor-a); }
+.props-table .star.on svg { fill: currentColor; }
+.props-table .cell { font-variant-numeric: tabular-nums; }
+.props-table .cell.ok { color: var(--primary); }
+.props-table .cell.busy, .props-table .cell.skipped { opacity: 0.6; }
+.props-table .cell.error, .props-table .cell.refused { color: var(--destructive); }
+.props-table .absent { color: var(--muted-foreground); }
+.props-table tr.group-row td { padding: 6px 4px 2px; color: var(--muted-foreground); font: 600 11px var(--font-ui); }
+.props-table tr.group-row:hover { background: transparent; }
+.mark { margin-left: 4px; font-weight: 600; color: var(--cursor-a); }
+.mark.warn { color: var(--cursor-a); }
+.mark.bad { color: var(--destructive); }
+.write-bar { display: flex; align-items: center; gap: 4px 6px; border-top: 1px solid var(--border); padding-top: 6px; flex: none; font-size: 12px; }
+.write-bar .wname { font-family: var(--font-data); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
+.write-bar .wvalue { flex: 1; min-width: 60px; font-family: var(--font-data); }
+.write-bar .reach { color: var(--muted-foreground); white-space: nowrap; }
+/* Several rows' label stays whole, what they are and their state, and the controls go under it when the panel is narrow. */
+.write-bar.several { flex-wrap: wrap; }
+.write-bar.several .wname { flex: 1 0 auto; }
+/* Why a value typed cannot be written, on a line of its own under the controls. */
+.write-bar.problem { flex-wrap: wrap; }
+.write-bar .why { flex: 1 0 100%; color: var(--destructive); }
+
+/* The device writes' notice, drawn as Sonner draws the page's other notices, and the lines under any notice's text. */
+[data-sonner-toast] [data-description] { white-space: pre-line; }
+.write-notice { display: flex; align-items: center; gap: 8px; width: var(--width); padding: 12px 14px; border: 1px solid var(--normal-border); border-radius: var(--border-radius); background: var(--normal-bg); color: var(--normal-text); box-shadow: 0 4px 12px rgb(0 0 0 / 0.1); font-size: 13px; }
+.write-notice-icon { width: 16px; height: 16px; flex: none; }
+.write-notice[data-level=warning] .write-notice-icon { color: var(--warning, #d97706); }
+.write-notice[data-level=error] .write-notice-icon { color: var(--destructive); }
+.write-notice-body { flex: 1; min-width: 0; line-height: 1.4; }
+.write-notice-text { font-weight: 500; }
+.write-notice-detail { color: var(--muted-foreground); font-size: 12px; }
+.write-notice-revert { flex: none; height: 24px; padding: 0 8px; border-radius: 4px; background: var(--normal-text); color: var(--normal-bg); font-size: 12px; font-weight: 500; cursor: pointer; }
+/* What Ctrl+Z says to use, and Revert as it says so: a ring that beats twice. */
+.write-notice-undo { color: var(--normal-text); }
+.write-notice-revert.pointed { background: var(--primary); color: var(--primary-foreground); animation: revert-pointed 600ms ease-in-out 2; }
+@keyframes revert-pointed { 50% { box-shadow: 0 0 0 4px color-mix(in oklch, var(--primary) 40%, transparent); } }
+
+/* The device picker. */
+.picker { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.picker .now, .picker .notice { color: var(--muted-foreground); font-size: 12px; }
+.picker .notice.bad { color: var(--destructive); }
+.picker .bar { display: flex; align-items: center; gap: 8px; }
+.picker .found > [data-slot=scroll-area-viewport] { max-height: 50vh; }
+.picker .found [role=list] { display: flex; flex-direction: column; gap: 1px; }
+.picker .row { display: grid; grid-template-columns: auto 4.5rem minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 3px 4px; border-radius: var(--radius); font-family: var(--font-data); }
+.picker .row:hover { background: var(--accent); }
+.picker .row.sub { padding-left: 24px; }
+.picker .iface { color: var(--muted-foreground); font-size: 11px; }
+.picker .url { color: var(--muted-foreground); font-size: 11px; }
+
+/* The top bar, one row. */
+.top-bar { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--card); flex: none; }
+.top-bar .brand { font-weight: 600; font-size: 13px; margin-right: auto; }
+.top-bar .search { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius); color: var(--muted-foreground); font-size: 12px; }
+.top-bar .search svg { width: 13px; height: 13px; }
+.top-bar .search kbd { font: 11px var(--font-data); color: var(--muted-foreground); }
+.top-bar .divider { width: 1px; height: 16px; background: var(--border); }
+
+/* A monitor: a plot too small for its header. The lines fill it, and the
+   header's one row shows over the top of the plot on hover or focus, with a
+   pinned legend moved down out from under it. A plot that becomes one, or
+   stops being one, as it is resized, slides its header over the plot or out
+   of it, the plot growing into the room or giving it back, rather than
+   jumping. */
+.plot-card { position: relative; }
+.plot-card .plot-head { position: relative; z-index: 3; transition: margin-bottom 160ms ease-out, opacity 160ms ease-out, background-color 160ms; }
+.plot-card.monitor .plot-head {
+	margin-bottom: -28px;
+	background: color-mix(in oklch, var(--card) 88%, transparent); backdrop-filter: blur(2px);
+	opacity: 0; pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) { .plot-card .plot-head { transition: none; } }
+.plot-card.monitor:is(:hover, :focus-visible, :has(:focus-visible, [data-state=open])) .plot-head { opacity: 1; pointer-events: auto; }
+.plot-card.monitor:is(:hover, :focus-visible, :has(:focus-visible, [data-state=open])) .pinned-legend { --clear-top: 32px; }
+
+/* Focus: one ring, which the page draws above everything (FocusRing.svelte),
+   around what has focus, a list's current item, or the item a menu is open
+   for. Nothing draws a ring of its own: no outline, and no border or shadow
+   that focus changes. */
+:focus-visible { outline: none; }
+/* Above the page and its drag overlays, under popovers, menus and tooltips (z 50); in a popover or dialog, above its content. */
+.focus-ring { position: fixed; z-index: 46; pointer-events: none; border-style: solid; border-color: var(--ring); box-sizing: border-box; }
+.focus-ring.in-layer { position: absolute; z-index: 1; }
+
+/* The time window's field: the number, then its unit, inside one outline,
+   each of a fixed width, as wide as the longest reading ("1.5 min" typed,
+   "18.3" and "min" shown), so nothing moves as the text changes. A window
+   refused marks the outline. The page's focus ring goes around the whole. */
+.window-field { display: inline-flex; flex: none; align-items: center; gap: 3px; height: 24px; padding-right: 6px; border: 1px solid var(--input); border-radius: var(--radius); background: var(--background); color: var(--muted-foreground); font: 11px var(--font-data); font-variant-numeric: tabular-nums; cursor: text; }
+.window-field.invalid { border-color: var(--destructive); }
+.window-field input { width: 7ch; height: 22px; padding: 0 0 0 6px; box-sizing: content-box; border: 0; outline: none; background: none; color: var(--foreground); font: 12px var(--font-data); font-variant-numeric: tabular-nums; text-align: right; }
+.window-field .unit { width: 3ch; }
