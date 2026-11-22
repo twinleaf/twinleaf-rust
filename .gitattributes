@@ -1,0 +1,3 @@
+# The messages the hub and the page record, compared byte for byte.
+twinleaf-web/ui/tests/fixtures/hub/** -text
+twinleaf-web/ui/tests/fixtures/page/** -text

@@ -2,9 +2,11 @@
 
 members = [
     "twinleaf",
+    "twinleaf-data",
     "twinleaf-device",
     "twinleaf-proto",
     "twinleaf-tools",
+    "twinleaf-web",
 ]
 
 resolver = "2"
