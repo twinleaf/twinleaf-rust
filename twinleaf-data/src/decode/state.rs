@@ -4,20 +4,19 @@
 //! materializing sample values. Packet consumers decide whether to decode the
 //! validated bytes immediately or retain only their metadata and boundaries.
 
-use super::continuity::{Boundary, Change, Generations, Loss};
-use super::decode::{decode_samples, decodes};
-use super::metadata::{
-    rate_hz, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery, SegmentRecord,
+use crate::decode::body::{decode_samples, decodes};
+use crate::model::continuity::{Boundary, Change, Generations, Loss, LossSite};
+use crate::model::sample::{BatchContext, RowSource, SampleBatchBuilder, SampleClock};
+use crate::model::schema::{
+    ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery, Record, SegmentRecord,
     StreamKey, StreamMetadataSnapshot, StreamRecord, StreamSchema,
 };
-use super::sample::{sample_time, BatchContext, RowSource, SampleBatchBuilder};
 use crate::proto::data as wire;
 use crate::proto::data::MAX_SAMPLE_NUMBER;
 use crate::proto::heartbeat::Heartbeat;
+use crate::proto::packet::Payload;
 use crate::proto::DeviceRoute;
 use crate::proto::{SampleNumber, SegmentId, SessionId, StreamId};
-use crate::tio;
-use crate::tio::packet;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -110,127 +109,202 @@ pub enum StreamDataError {
     },
 }
 
-/// Metadata and continuity state for one stream on one device.
+/// What a stream's parser knows of the segment slot its rows are expected
+/// in. A device sends a slot's record before the slot's first row, so the
+/// parser keeps the record of that one slot.
 #[derive(Debug, Clone)]
-struct StreamTracker {
-    metadata: Option<StreamRecord>,
-    segments: Vec<Option<SegmentRecord>>,
+enum Slot {
+    /// The parser holds no record of slot `slot`, and asks for one.
+    Unknown { slot: SegmentId },
+    /// The device said it holds nothing in the slot. The record is kept for
+    /// the snapshot, and rows of the slot wait for a populated record.
+    Unpopulated(SegmentRecord),
+    /// A populated record of the segment in the slot. Rows of the slot
+    /// decode with it.
+    Held(SegmentRecord),
+}
+
+impl Slot {
+    /// The slot `record` fills, by whether it is populated.
+    fn of(record: SegmentRecord) -> Self {
+        if record.get().is_populated() {
+            Slot::Held(record)
+        } else {
+            Slot::Unpopulated(record)
+        }
+    }
+
+    /// The number of the slot.
+    fn id(&self) -> SegmentId {
+        match self {
+            Slot::Unknown { slot } => *slot,
+            Slot::Unpopulated(record) | Slot::Held(record) => record.get().segment_id(),
+        }
+    }
+
+    /// Returns the populated record the slot holds.
+    fn populated(&self) -> Option<&SegmentRecord> {
+        match self {
+            Slot::Held(record) => Some(record),
+            Slot::Unknown { .. } | Slot::Unpopulated(_) => None,
+        }
+    }
+
+    /// Returns the record the device sent for the slot, populated or not.
+    fn record(&self) -> Option<&SegmentRecord> {
+        match self {
+            Slot::Held(record) | Slot::Unpopulated(record) => Some(record),
+            Slot::Unknown { .. } => None,
+        }
+    }
+}
+
+/// The records that describe a stream, as far as they have arrived.
+#[derive(Debug, Clone, Default)]
+struct Described {
+    stream: Option<StreamRecord>,
+    /// The column records from index 0 up to the first one missing.
     columns: Vec<ColumnRecord>,
     /// Built from the stream record and the columns once every column has
     /// arrived, and dropped whenever either changes.
     schema: Option<Arc<StreamSchema>>,
+}
 
+/// A stream's last accepted rows, which the next rows are told against.
+#[derive(Debug, Clone)]
+struct Last {
+    /// The record of the segment the rows were in, whose start and clock
+    /// place the rows a rollover lost.
+    record: SegmentRecord,
+    /// The number of the last row.
+    sample_number: SampleNumber,
+    /// The device session the rows came in.
+    session: SessionId,
+    /// The layout of the rows. Rows in another layout in the same session
+    /// start a new run, as nothing ties them to the rows before.
+    schema: Arc<StreamSchema>,
+    since: Since,
+}
+
+impl Last {
+    /// The output rate of the rows in hertz.
+    fn rate_hz(&self) -> f64 {
+        self.record
+            .get()
+            .rate_hz()
+            .expect("rows are accepted only under a segment with a rate")
+    }
+
+    /// The time at the end of the last row, in seconds.
+    fn timestamp(&self) -> f64 {
+        SampleClock::of(self.record.get()).end_of(self.sample_number)
+    }
+}
+
+/// What the parser was told of a stream since its last accepted rows.
+#[derive(Debug, Clone, Copy, Default)]
+struct Since {
+    /// Whether the device sent a record of the last rows' slot that may
+    /// open a new acquisition. Such a record is of another segment than the
+    /// last rows', or came after the stream's records were dropped to be
+    /// learned again. The last rows' own record sent again leaves the mark
+    /// as it is.
+    new_record: bool,
+    /// Whether the stream's records were dropped to be learned again, as
+    /// after its link was lost. Rows of another segment then may be of a
+    /// restart whose stop went unseen.
+    lost_track: bool,
+    /// Whether the device broadcast a closing record, or sent the record a
+    /// start opened of a segment other than the last rows'.
+    stop_or_start: bool,
+    /// Where the rows lost before the stream's next rows were lost, as far
+    /// as the parser was told.
+    blamed: LossSite,
+}
+
+/// Metadata and continuity state for one stream on one device.
+#[derive(Debug, Clone)]
+struct StreamTracker {
     key: StreamKey,
-    current_segment_id: SegmentId,
-
-    // Accepted sample history survives metadata invalidation, so the first
-    // rows under new metadata are told against the last rows.
-    run: u32,
-    last_sample_number: SampleNumber,
-    last_timestamp: f64,
-    last_session_id: SessionId,
-    last_time_ref_session_id: SessionId,
-    /// The record of the segment the last accepted rows were in, whose start
-    /// and clock place the rows a rollover lost.
-    last_segment: Option<SegmentRecord>,
-    /// The layout of the last accepted rows. Rows in another layout in the
-    /// same session start a new run, as nothing ties them to the rows before.
-    last_schema: Option<Arc<StreamSchema>>,
-    /// Whether the stream's records were dropped to be learned again since
-    /// its last rows, as after its link was lost. Rows of another segment
-    /// then may be of a restart whose stop went unseen.
-    relearned: bool,
-    /// Whether the device sent the record of the last rows' slot again since
-    /// them, so that the slot holds the record the device sent last.
-    renewed: bool,
-    rate_hz: f64,
-    /// Whether the device sent a closing record, or the record a start opened of a segment other
-    /// than the last rows', since them.
-    restarted: bool,
+    described: Described,
+    /// The slot rows are expected in, and what is known of it. It is the
+    /// slot rows or a broadcast populated record named last, or one a
+    /// bootstrap reply or an unpopulated broadcast named while it was
+    /// unknown.
+    slot: Slot,
+    /// The last accepted rows. They survive metadata being dropped, so the
+    /// first rows under new metadata are told against them.
+    last: Option<Last>,
+    /// The number of runs the stream's rows have begun, which numbers its
+    /// runs. Its first rows begin one, as each break after them does.
+    breaks: u32,
 }
 
 impl StreamTracker {
     fn new(key: StreamKey) -> Self {
         Self {
-            metadata: None,
-            segments: Vec::new(),
-            columns: Vec::new(),
-            schema: None,
             key,
-            current_segment_id: SegmentId::new(0),
-            run: 0,
-            last_sample_number: SampleNumber::new(0),
-            last_timestamp: 0.0,
-            last_session_id: SessionId::new(0),
-            last_time_ref_session_id: SessionId::new(0),
-            last_segment: None,
-            last_schema: None,
-            relearned: false,
-            renewed: false,
-            rate_hz: 0.0,
-            restarted: false,
+            described: Described::default(),
+            slot: Slot::Unknown {
+                slot: SegmentId::new(0),
+            },
+            last: None,
+            breaks: 0,
+        }
+    }
+
+    /// Blames `site` for the rows lost before the stream's next rows, unless
+    /// a place that explains more is blamed already.
+    fn blame(&mut self, site: LossSite) {
+        if let Some(last) = &mut self.last {
+            last.since.blamed = last.since.blamed.max(site);
         }
     }
 
     /// Whether `segment` is the segment of the last accepted rows.
     fn is_last(&self, segment: wire::SegmentView<'_>) -> bool {
-        self.last_segment.as_ref().is_some_and(|last| {
-            (last.get().segment_id(), last.get().start_time())
-                == (segment.segment_id(), segment.start_time())
-        })
-    }
-
-    fn segment(&self, segment_id: SegmentId) -> Option<&SegmentRecord> {
-        self.segments.get(usize::from(segment_id.value()))?.as_ref()
-    }
-
-    fn set_segment(&mut self, segment_id: SegmentId, segment: SegmentRecord) {
-        let index = usize::from(segment_id.value());
-        if self.segments.len() <= index {
-            self.segments.resize(index + 1, None);
-        }
-        self.segments[index] = Some(segment);
-        self.renewed |= self
-            .last_segment
+        self.last
             .as_ref()
-            .is_some_and(|last| last.get().segment_id() == segment_id);
+            .is_some_and(|last| last.record.get().is_same_segment(&segment))
     }
 
     /// Learns the stream record of a stream that had none.
     fn learn_stream(&mut self, stream: StreamRecord) {
-        self.metadata = Some(stream);
+        self.described.stream = Some(stream);
         self.update_schema();
     }
 
     /// Appends the column record whose index is the number of columns known.
     fn append_column(&mut self, column: ColumnRecord) {
-        self.columns.push(column);
+        self.described.columns.push(column);
         self.update_schema();
     }
 
     /// Builds the schema once the stream record and all of its columns are
     /// known, and drops it otherwise.
     fn update_schema(&mut self) {
-        self.schema = match &self.metadata {
-            Some(stream) if self.columns.len() == usize::from(stream.get().n_columns()) => {
+        let described = &mut self.described;
+        described.schema = match &described.stream {
+            Some(stream) if described.columns.len() == usize::from(stream.get().n_columns()) => {
                 Some(Arc::new(StreamSchema::new(
                     self.key,
                     stream.clone(),
-                    self.columns.clone(),
+                    described.columns.clone(),
                 )))
             }
             _ => None,
         };
     }
 
-    /// Returns selectors for the metadata this stream still needs before it
-    /// can be decoded.
+    /// Returns selectors for the records this stream lacks for a complete
+    /// snapshot. A slot the device said holds nothing lacks no record,
+    /// though no rows decode in it.
     fn missing_metadata(&self) -> Vec<wire::MetadataSelector> {
         let stream_id = self.key.stream_id.value();
         let mut missing = Vec::new();
-        match self.metadata.as_ref() {
-            Some(metadata) => {
-                for index in self.columns.len()..usize::from(metadata.get().n_columns()) {
+        match self.described.stream.as_ref() {
+            Some(stream) => {
+                for index in self.described.columns.len()..usize::from(stream.get().n_columns()) {
                     missing.push(wire::MetadataSelector::column(stream_id, index as u8))
                 }
             }
@@ -238,13 +312,73 @@ impl StreamTracker {
                 missing.push(wire::MetadataSelector::stream(stream_id));
             }
         }
-        if self.segment(self.current_segment_id).is_none() {
-            missing.push(wire::MetadataSelector::segment(
-                stream_id,
-                self.current_segment_id.value(),
-            ));
+        if let Slot::Unknown { slot } = self.slot {
+            missing.push(wire::MetadataSelector::segment(stream_id, slot.value()));
         }
         missing
+    }
+
+    /// Takes a segment record. A populated record of the expected slot
+    /// fills it while it holds no populated record. While it holds one, a
+    /// broadcast replaces it, and a reply, which can be older, is dropped.
+    /// An unpopulated record of the expected slot fills it only while the
+    /// slot is unknown. A record of another slot moves the expected slot
+    /// when it is a broadcast populated record, or a bootstrap record or an
+    /// unpopulated broadcast while the slot is unknown. Any other record is
+    /// dropped whole. Returns whether a complete snapshot may have changed.
+    fn take_segment(&mut self, incoming: SegmentRecord, source: MetadataSource) -> bool {
+        let segment_id = incoming.get().segment_id();
+        let unknown = matches!(self.slot, Slot::Unknown { .. });
+        if segment_id != self.slot.id() {
+            let moves = match (source, incoming.get().is_populated()) {
+                (MetadataSource::Broadcast, true) => true,
+                (MetadataSource::Broadcast | MetadataSource::Bootstrap, _) => unknown,
+                (MetadataSource::Reply, _) => false,
+            };
+            if !moves {
+                return false;
+            }
+            self.mark(incoming.get(), source);
+            self.slot = Slot::of(incoming);
+            return true;
+        }
+        let held = matches!(self.slot, Slot::Held(_));
+        match Slot::of(incoming) {
+            Slot::Held(_) if held && source != MetadataSource::Broadcast => false,
+            Slot::Held(incoming) => {
+                self.mark(incoming.get(), source);
+                let learned = self.slot.populated() != Some(&incoming);
+                self.slot = Slot::Held(incoming);
+                learned
+            }
+            unpopulated => {
+                // An unpopulated record only fills a slot with no record.
+                if unknown {
+                    self.slot = unpopulated;
+                }
+                unknown
+            }
+        }
+    }
+
+    /// Marks what a segment record from `source` that the stream takes says
+    /// of the rows after the last rows. An unpopulated record neither
+    /// closes nor opens a segment.
+    fn mark(&mut self, segment: wire::SegmentView<'_>, source: MetadataSource) {
+        if !segment.is_populated() {
+            return;
+        }
+        let is_last = self.is_last(segment);
+        let Some(last) = &mut self.last else {
+            return;
+        };
+        let since = &mut last.since;
+        let closes = source == MetadataSource::Broadcast
+            && !segment.flags().contains(wire::SegmentFlags::ACTIVE);
+        since.stop_or_start |=
+            closes || segment.flags().contains(wire::SegmentFlags::START) && !is_last;
+        let in_last_slot = last.record.get().segment_id() == segment.segment_id();
+        since.new_record |= in_last_slot && (!is_last || since.lost_track);
     }
 
     fn detect_boundary(
@@ -255,40 +389,41 @@ impl StreamTracker {
         segment: wire::SegmentView<'_>,
         new_rate: f64,
     ) -> Option<Boundary> {
-        let Some(last) = self.last_segment.as_ref().map(SegmentRecord::get) else {
+        let Some(rows) = self.last.as_ref() else {
             return Some(Boundary::of(Change::Initial));
         };
+        let last = rows.record.get();
 
-        let declared = device.protocol() > 0;
-        if !declared && device.session() != self.last_session_id {
+        let declared = device.marks_starts_and_stops();
+        if !declared && device.session() != rows.session {
             return Some(Boundary::of(Change::SessionChanged {
-                old: self.last_session_id,
+                old: rows.session,
                 new: device.session(),
             }));
         }
 
         // A new session may bring a new layout. In the same session, rows in
         // another layout are of another stream.
-        if self.last_schema != self.schema {
+        if self.described.schema.as_ref() != Some(&rows.schema) {
             return Some(Boundary::of(Change::Initial));
         }
 
-        if segment.timeref_session() != self.last_time_ref_session_id {
+        if segment.time_reference() != last.time_reference() {
             return Some(Boundary::of(Change::TimeRefSessionChanged {
-                old: self.last_time_ref_session_id,
+                old: last.timeref_session(),
                 new: segment.timeref_session(),
             }));
         }
 
-        if (new_rate - self.rate_hz).abs() > 1e-9 {
+        if (new_rate - rows.rate_hz()).abs() > 1e-9 {
             return Some(Boundary::of(Change::RateChanged {
-                old_rate: self.rate_hz,
+                old_rate: rows.rate_hz(),
                 new_rate,
             }));
         }
 
         let half_period = 0.5 / new_rate;
-        let time_gap = first_timestamp - self.last_timestamp;
+        let time_gap = first_timestamp - rows.timestamp();
 
         if time_gap < -half_period {
             return Some(Boundary::of(Change::TimeBackward {
@@ -296,24 +431,21 @@ impl StreamTracker {
             }));
         }
 
-        let expected = SampleNumber::new(self.last_sample_number.value() + 1);
-        let lost = |samples: u64| Loss {
-            samples,
-            expected: Some(expected),
-            dropped_batches: 0,
-        };
+        let expected = SampleNumber::new(rows.sample_number.value() + 1);
+        let lost = |samples: u64| Loss::at(rows.since.blamed, samples, Some(expected));
 
         // Rows in the last rows' slot are of a later lap of the ring when
-        // that slot's segment starts at another time. A device never moves a
-        // segment's start, and never starts two acquisitions of one slot in
-        // the same second.
+        // that slot's segment starts at another time. On one time reference a
+        // device never moves a segment's start, and never starts two
+        // acquisitions of one slot in the same second.
         // Rows are of the current segment. A device that declares a revision marks the segment a
         // start opens and closes the one a stop ends, so the time between holds no sample to
         // lose. Rows in another segment after the records were dropped may be of a restart that
         // went unseen, whose time cannot be told from time lost.
         let opened = !self.is_last(segment);
-        let started = segment.flags().contains(wire::SegmentFlags::START) || self.restarted;
-        if opened && (self.relearned || declared && started) {
+        let started =
+            segment.flags().contains(wire::SegmentFlags::START) || rows.since.stop_or_start;
+        if opened && (rows.since.lost_track || declared && started) {
             return Some(Boundary::of(Change::Restarted {
                 old_id: last.segment_id(),
                 new_id: segment.segment_id(),
@@ -353,14 +485,19 @@ impl StreamTracker {
     /// So the whole output periods from the last segment's start to the new
     /// one's are the rows the last segment held, and a split group leaves no
     /// gap of a whole period. The count is below 1 when no row was missed.
+    ///
+    /// The count rests on law `S6` of the contract in `twinleaf_proto::contract`, which says
+    /// how far a segment's rows number before the next segment on the same time reference. The
+    /// parser reaches this count only for a segment on the last rows' time reference.
     fn missing_before(&self, segment: wire::SegmentView<'_>, first: SampleNumber) -> i128 {
-        let Some(last) = self.last_segment.as_ref().map(SegmentRecord::get) else {
+        let Some(rows) = self.last.as_ref() else {
             return 0;
         };
+        let last = rows.record.get();
         let elapsed = i128::from(segment.start_time()) - i128::from(last.start_time());
         let held =
             (elapsed * i128::from(last.sampling_rate())).div_euclid(i128::from(last.decimation()));
-        held + i128::from(first.value()) - i128::from(self.last_sample_number.value()) - 1
+        held + i128::from(first.value()) - i128::from(rows.sample_number.value()) - 1
     }
 
     /// Validates one encoded payload and updates continuity state.
@@ -375,7 +512,7 @@ impl StreamTracker {
         global_generation: &mut u32,
         metadata_revision: &mut u32,
     ) -> Result<PacketEvent<'a>, StreamDataError> {
-        let Some(stream_metadata) = self.metadata.clone() else {
+        let Some(stream_metadata) = self.described.stream.clone() else {
             return Ok(PacketEvent::WaitingForMetadata);
         };
         let stream = stream_metadata.get();
@@ -392,44 +529,46 @@ impl StreamTracker {
                 segment_count: n_segments,
             });
         }
-        // The current segment is the one the last broadcast record or rows
-        // named, so a segment other than the last rows' is announced when
-        // the device broadcast its record since them.
+        // The expected slot is the one rows or a broadcast populated record
+        // named last, or one a bootstrap reply or an unpopulated broadcast
+        // named while it was unknown. So a segment other than the last rows'
+        // is announced when the device broadcast its record since them.
         // A segment's sample numbers only go up, so rows numbered at or
         // below the last rows, in their segment, while the device has sent
-        // no record of that slot since them, are of a new acquisition in the
-        // slot whose record has not come. A child behind a hub sends such
-        // rows after a reboot it has not yet announced.
-        let behind = !self.renewed
-            && self
-                .last_segment
-                .as_ref()
-                .is_some_and(|last| last.get().segment_id() == data.segment_id)
-            && data.first.value() <= self.last_sample_number.value();
-        let announced = self.current_segment_id == data.segment_id && !behind;
+        // no record of that slot since them that renews it, are of a new
+        // acquisition in the slot whose record has not come. A device sends
+        // a slot's record before its first row, so such rows mean the parser
+        // missed that record, after a reboot or a full lap of the ring.
+        let behind = self.last.as_ref().is_some_and(|last| {
+            !last.since.new_record
+                && last.record.get().segment_id() == data.segment_id
+                && data.first.value() <= last.sample_number.value()
+        });
+        // Rows in a slot the device said holds nothing are of a segment whose
+        // record has not come, as rows of a slot the device did not announce
+        // are.
+        let unpopulated = matches!(self.slot, Slot::Unpopulated(_));
+        let announced = self.slot.id() == data.segment_id && !behind && !unpopulated;
         // A device sends a segment's record before the segment's first
         // sample, so the record of the segment rows arrive in is announced.
-        // Rows in a segment the device did not announce find a ring record
-        // left from an earlier lap, and the parser drops it. The rows wait
-        // for the segment's record, and name the segment current, so the
-        // record a metadata reply brings for it stands.
+        // Rows in a segment the device did not announce drop the record the
+        // parser holds. The rows wait for the segment's record, and name
+        // the segment expected, so the record a metadata reply brings for it
+        // stands.
         if !announced {
-            if let Some(stale) = self.segments.get_mut(usize::from(data.segment_id.value())) {
-                *stale = None;
-            }
-        }
-        if !announced {
-            self.current_segment_id = data.segment_id;
+            self.slot = Slot::Unknown {
+                slot: data.segment_id,
+            };
             *metadata_revision = metadata_revision.wrapping_add(1);
         }
 
         let n_columns = usize::from(stream.n_columns());
-        match self.columns.len().cmp(&n_columns) {
+        match self.described.columns.len().cmp(&n_columns) {
             Ordering::Less => return Ok(PacketEvent::WaitingForMetadata),
             Ordering::Greater => {
                 return Err(StreamDataError::ColumnCount {
                     expected: n_columns,
-                    actual: self.columns.len(),
+                    actual: self.described.columns.len(),
                 });
             }
             Ordering::Equal => {}
@@ -437,6 +576,7 @@ impl StreamTracker {
         // A stream with a column this build cannot decode is refused whole,
         // so every batch has one array per column of its stream.
         if !self
+            .described
             .columns
             .iter()
             .all(|column| decodes(column.get().data_type()))
@@ -446,6 +586,7 @@ impl StreamTracker {
 
         let sample_size = usize::from(stream.sample_size());
         let expected_sample_size: usize = self
+            .described
             .columns
             .iter()
             .map(|column| column.get().data_type().size())
@@ -490,12 +631,12 @@ impl StreamTracker {
 
         // Rows decode only with their own segment's record. Rows without it
         // are lost, and the first batch once it is known reports them.
-        let Some(segment_record) = self.segment(data.segment_id).cloned() else {
+        let Some(segment_record) = self.slot.populated().cloned() else {
             return Ok(PacketEvent::WaitingForMetadata);
         };
         let segment = segment_record.get();
 
-        let Some(new_rate) = rate_hz(&segment) else {
+        let Some(new_rate) = segment.rate_hz() else {
             return Err(StreamDataError::InvalidRate {
                 sampling_rate: segment.sampling_rate(),
                 decimation: segment.decimation(),
@@ -504,46 +645,43 @@ impl StreamTracker {
 
         let boundary = self.detect_boundary(
             data.first,
-            sample_time(segment, data.first.value()),
+            SampleClock::of(segment).begin_of(data.first),
             device,
             segment,
             new_rate,
         );
 
         if let Some(boundary) = boundary.as_ref().filter(|b| !b.is_continuous()) {
-            self.run += 1;
+            self.breaks += 1;
             // Streams start up independently, so their first data must not bump
             // the generations their peers share. A stream that starts over
             // bumps them as any other break does.
-            if !boundary.is_initial() || self.last_segment.is_some() {
+            if !boundary.is_initial() || self.last.is_some() {
                 *device_generation += 1;
                 *global_generation += 1;
             }
         }
 
-        self.last_sample_number = last_sample_n;
-        self.last_timestamp = sample_time(segment, last_sample_n.value() + 1);
-        self.last_session_id = device.session();
-        self.last_time_ref_session_id = segment.timeref_session();
-        self.last_segment = Some(segment_record.clone());
-        self.last_schema = self.schema.clone();
-        self.relearned = false;
-        self.renewed = false;
-        self.restarted = false;
-        self.rate_hz = new_rate;
-
         let schema = self
+            .described
             .schema
             .as_ref()
             .expect("a stream with every column has a schema");
-        debug_assert!(schema.describes(&stream_metadata, &self.columns));
+        debug_assert!(schema.describes(&stream_metadata, &self.described.columns));
+        self.last = Some(Last {
+            record: segment_record.clone(),
+            sample_number: last_sample_n,
+            session: device.session(),
+            schema: schema.clone(),
+            since: Since::default(),
+        });
         Ok(PacketEvent::Rows(ScannedRows {
             schema,
             device: device_metadata,
             segment: segment_record,
             boundary,
             generations: Generations {
-                stream: self.run,
+                stream: self.breaks,
                 device: *device_generation,
                 global: *global_generation,
             },
@@ -554,29 +692,32 @@ impl StreamTracker {
         }))
     }
 
-    /// Drops the stream's records to learn them again. Its last rows stay, so the rows under the
-    /// new records are told against them.
+    /// Drops the stream's records to learn them again. Its expected slot
+    /// keeps its number. Its last rows stay, so the rows under the new
+    /// records are told against them.
     fn relearn(&mut self) {
-        self.metadata = None;
-        self.segments.clear();
-        self.columns.clear();
-        self.schema = None;
-        self.relearned = true;
+        self.described = Described::default();
+        self.slot = Slot::Unknown {
+            slot: self.slot.id(),
+        };
+        if let Some(last) = &mut self.last {
+            last.since.lost_track = true;
+        }
     }
 
-    /// Forgets metadata and ends the current run. The run counter is kept, and
-    /// the rebuilt stream numbers its runs after it.
+    /// Forgets metadata and ends the current run. The expected slot keeps
+    /// its number. The break counter is kept, and the rebuilt stream numbers
+    /// its runs after it.
     fn reset(&mut self) {
         self.relearn();
-        self.last_segment = None;
-        self.relearned = false;
+        self.last = None;
     }
 
     fn metadata_snapshot(&self, device: DeviceRecord) -> Option<StreamMetadataSnapshot> {
         Some(StreamMetadataSnapshot::new(
-            self.schema.clone()?,
+            self.described.schema.clone()?,
             device,
-            self.segment(self.current_segment_id)?.clone(),
+            self.slot.record()?.clone(),
         ))
     }
 }
@@ -584,14 +725,14 @@ impl StreamTracker {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataSource {
     /// A reply to a query that names its records may describe an older ring
-    /// segment.
+    /// segment. A record it holds never moves the expected slot.
     Reply,
     /// Broadcasts describe the current output segment.
     Broadcast,
     /// A bootstrap reply, to a query that names no records, holds the
-    /// records the device chose, its current segments among them. It names
-    /// a segment current only while the parser holds no record of the
-    /// current one, as a broadcast since the query names a newer segment.
+    /// records the device chose, its current segments among them. It moves
+    /// the expected slot only while the parser holds no record of it, as a
+    /// broadcast since the query names a newer segment.
     Bootstrap,
 }
 
@@ -635,6 +776,8 @@ struct DeviceState {
     /// Bumps whenever an applied record may change what a complete snapshot of
     /// this route would contain.
     metadata_revision: u32,
+    /// The revision last handed out, until the route is forgotten.
+    handed_out: Option<u32>,
     generation: u32,
     /// Each record logged as a warning since the metadata was last reset. A
     /// record logged again for the same reason logs at debug level.
@@ -652,6 +795,7 @@ impl DeviceState {
             query_in_flight: false,
             metadata_generation: 0,
             metadata_revision: 0,
+            handed_out: None,
             generation: 0,
             logged: Vec::new(),
         }
@@ -671,7 +815,7 @@ impl DeviceState {
     }
 
     /// Bootstraps this route again after metadata contradicted the state used
-    /// to decode earlier rows. Each stream keeps its run counter, and the
+    /// to decode earlier rows. Each stream keeps its break counter, and the
     /// global generation bumps.
     fn forget_all_metadata(&mut self, global_generation: &mut u32) {
         self.reset();
@@ -800,12 +944,10 @@ impl DeviceState {
         );
     }
 
-    /// Merges one metadata record into this route's decoding state. A record
-    /// that does not parse as the type it claims, of a stream the device
-    /// record does not count, or a column past the next one its stream can
-    /// append, is dropped and logged. Only the column waits at debug level,
-    /// as it is asked for again in its turn. A record that is kept with a
-    /// field whose text holds U+FFFD is logged once.
+    /// Merges one metadata record of `kind` into this route's decoding state,
+    /// as [`learn_metadata`](Self::learn_metadata) does. A record that does
+    /// not parse as the type it claims is dropped and logged. A record of a
+    /// kind this build does not know is dropped.
     fn apply_metadata(
         &mut self,
         kind: wire::MetadataType,
@@ -813,12 +955,30 @@ impl DeviceState {
         source: MetadataSource,
         global_generation: &mut u32,
     ) {
-        match kind {
-            wire::MetadataType::Device => {
-                let Some(incoming) = DeviceRecord::new(record) else {
-                    self.log_unparsed(kind);
-                    return;
-                };
+        if let wire::MetadataType::Unknown(_) = kind {
+            return;
+        }
+        match Record::new(kind, record) {
+            Some(record) => self.learn_metadata(record, source, global_generation),
+            None => self.log_unparsed(kind),
+        }
+    }
+
+    /// Merges one retained metadata record into this route's decoding state.
+    /// A record of a stream the device record does not count, or a column
+    /// past the next one its stream can append, is dropped and logged. Only
+    /// the column waits at debug level, as it is asked for again in its turn.
+    /// A record that is kept with a field whose text holds U+FFFD is logged
+    /// once.
+    fn learn_metadata(
+        &mut self,
+        record: Record,
+        source: MetadataSource,
+        global_generation: &mut u32,
+    ) {
+        match record {
+            Record::Device(incoming) => {
+                let kind = wire::MetadataType::Device;
                 let device = incoming.get();
                 let marked = replacements(&[
                     ("name", device.name()),
@@ -837,7 +997,7 @@ impl DeviceState {
                     let (old, new) = (previous.get(), incoming.get());
                     if old.serial() != new.serial() {
                         self.forget_all_metadata(global_generation);
-                    } else if old.session() != new.session() && new.protocol() == 0 {
+                    } else if old.session() != new.session() && !new.marks_starts_and_stops() {
                         // Keeping continuity state lets the first rows under the
                         // new metadata report a specific SessionChanged boundary.
                         if in_force {
@@ -853,11 +1013,8 @@ impl DeviceState {
                 self.metadata = Some(incoming);
                 self.log_replacement(kind, None, None, &marked);
             }
-            wire::MetadataType::Stream => {
-                let Some(incoming) = StreamRecord::new(record) else {
-                    self.log_unparsed(kind);
-                    return;
-                };
+            Record::Stream(incoming) => {
+                let kind = wire::MetadataType::Stream;
                 let stream_id = incoming.get().stream_id();
                 let marked = replacements(&[("name", incoming.get().name())]);
                 if !self.accepts_stream(stream_id) {
@@ -865,7 +1022,7 @@ impl DeviceState {
                     return;
                 }
                 let stream = self.stream_mut(stream_id);
-                let (contradicted, learned) = match &stream.metadata {
+                let (contradicted, learned) = match &stream.described.stream {
                     Some(current) => (*current != incoming, false),
                     None => {
                         stream.learn_stream(incoming);
@@ -881,11 +1038,8 @@ impl DeviceState {
                 }
                 self.log_replacement(kind, Some(stream_id), None, &marked);
             }
-            wire::MetadataType::Segment => {
-                let Some(incoming) = SegmentRecord::new(record) else {
-                    self.log_unparsed(kind);
-                    return;
-                };
+            Record::Segment(incoming) => {
+                let kind = wire::MetadataType::Segment;
                 let segment = incoming.get();
                 let (stream_id, segment_id) = (segment.stream_id(), segment.segment_id());
                 let marked = replacements(&[("timeref serial", segment.timeref_serial())]);
@@ -893,36 +1047,19 @@ impl DeviceState {
                     self.log_dropped_above(kind, stream_id);
                     return;
                 }
-                let closes = source == MetadataSource::Broadcast
-                    && !segment.flags().contains(wire::SegmentFlags::ACTIVE);
                 let stream = self.stream_mut(stream_id);
-                let learned = stream.segment(segment_id) != Some(&incoming);
-                stream.restarted |= closes
-                    || segment.flags().contains(wire::SegmentFlags::START)
-                        && !stream.is_last(segment);
-                stream.set_segment(segment_id, incoming);
-                let switched = stream.current_segment_id != segment_id
-                    && match source {
-                        MetadataSource::Broadcast => true,
-                        MetadataSource::Bootstrap => {
-                            stream.segment(stream.current_segment_id).is_none()
-                        }
-                        MetadataSource::Reply => false,
-                    };
-                if switched {
-                    stream.current_segment_id = segment_id;
-                }
-                if learned || switched {
+                let taken = stream.take_segment(incoming.clone(), source);
+                let retained = stream.slot.record() == Some(&incoming);
+                if taken {
                     self.revise_metadata();
                 }
-                let index = Some(("segment", segment_id.value()));
-                self.log_replacement(kind, Some(stream_id), index, &marked);
+                if retained {
+                    let index = Some(("segment", segment_id.value()));
+                    self.log_replacement(kind, Some(stream_id), index, &marked);
+                }
             }
-            wire::MetadataType::Column => {
-                let Some(incoming) = ColumnRecord::new(record) else {
-                    self.log_unparsed(kind);
-                    return;
-                };
+            Record::Column(incoming) => {
+                let kind = wire::MetadataType::Column;
                 let column = incoming.get();
                 let (stream_id, index) = (column.stream_id(), column.index().index());
                 let marked = replacements(&[
@@ -936,8 +1073,8 @@ impl DeviceState {
                     return;
                 }
                 let stream = self.stream_mut(stream_id);
-                let held = stream.columns.len();
-                let (contradicted, learned) = match stream.columns.get(index) {
+                let held = stream.described.columns.len();
+                let (contradicted, learned) = match stream.described.columns.get(index) {
                     Some(current) => (*current != incoming, false),
                     None => {
                         let appended = index == held;
@@ -972,16 +1109,21 @@ impl DeviceState {
                     self.log_replacement(kind, Some(stream_id), index, &marked);
                 }
             }
-            wire::MetadataType::Unknown(_) => {}
         }
     }
 
     /// Applies a packet that updates decoding state but carries no sample rows.
-    fn apply_control_packet(&mut self, packet: &tio::Packet, global_generation: &mut u32) {
-        match packet.payload() {
-            packet::Payload::Metadata(..) => {
-                let (kind, _, record) = wire::split_metadata(packet.payload_bytes())
-                    .expect("a metadata payload was framed when the packet was validated");
+    /// `bytes` are the payload's bytes.
+    fn apply_control_packet(
+        &mut self,
+        payload: Payload<'_>,
+        bytes: &[u8],
+        global_generation: &mut u32,
+    ) {
+        match payload {
+            Payload::Metadata(..) => {
+                let (kind, _, record) = wire::split_metadata(bytes)
+                    .expect("a metadata payload was framed when it was read");
                 self.apply_metadata(
                     kind.into(),
                     record,
@@ -989,11 +1131,11 @@ impl DeviceState {
                     global_generation,
                 );
             }
-            packet::Payload::Heartbeat(Heartbeat::Session { session, .. }) => {
+            Payload::Heartbeat(Heartbeat::Session { session, .. }) => {
                 if let Some(device) = &self.metadata {
                     let device = device.get();
-                    if device.session() != session && device.protocol() == 0 && !self.ignore_session
-                    {
+                    let rebooted = device.session() != session && !device.marks_starts_and_stops();
+                    if rebooted && !self.ignore_session {
                         self.relearn_metadata();
                     }
                 }
@@ -1093,6 +1235,8 @@ impl DeviceState {
     }
 
     /// Returns selectors for every piece of metadata this route still lacks.
+    /// It asks for streams 1 to `n_streams`, which law `M1` of the contract in
+    /// `twinleaf_proto::contract` says are the streams a device names.
     fn missing_metadata(&self) -> Vec<wire::MetadataSelector> {
         match self.metadata.as_ref() {
             Some(device) => (1..=device.get().n_streams())
@@ -1131,7 +1275,7 @@ impl DeviceState {
 }
 
 /// Result of applying one packet to the ordered metadata and continuity state.
-pub(super) enum PacketEvent<'a> {
+pub(crate) enum PacketEvent<'a> {
     Applied,
     WaitingForMetadata,
     /// The stream has a column of a type this build cannot decode.
@@ -1142,14 +1286,14 @@ pub(super) enum PacketEvent<'a> {
 
 /// Route-aware state machine shared by incremental and seekable packet readers.
 #[derive(Clone)]
-pub(super) struct ParseState {
+pub(crate) struct ParseState {
     ignore_session: bool,
     devices: Vec<DeviceState>,
     global_generation: u32,
 }
 
 impl ParseState {
-    pub(super) fn new(ignore_session: bool) -> Self {
+    pub(crate) fn new(ignore_session: bool) -> Self {
         Self {
             ignore_session,
             devices: Vec::new(),
@@ -1172,25 +1316,16 @@ impl ParseState {
         self.devices.iter().find(|device| device.route == route)
     }
 
-    pub(super) fn apply_packet<'a>(
+    /// Applies one packet from `route` that carries `payload`, whose bytes
+    /// are `bytes`.
+    pub(crate) fn apply_packet<'a>(
         &'a mut self,
-        packet: &'a tio::Packet,
+        route: DeviceRoute,
+        payload: Payload<'a>,
+        bytes: &[u8],
     ) -> Result<PacketEvent<'a>, DataError> {
-        let route = packet.route();
-
-        if let Some(status) = packet.link_status() {
-            if matches!(
-                status,
-                packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped
-            ) {
-                self.relearn(|device| device.starts_with(&route));
-                return Ok(PacketEvent::Reset);
-            }
-            return Ok(PacketEvent::Applied);
-        }
-
-        match packet.payload() {
-            packet::Payload::Samples(data) => {
+        match payload {
+            Payload::Samples(data) => {
                 let index = self.device_index(route);
                 self.devices[index]
                     .validate_stream_data(data, &mut self.global_generation)
@@ -1202,10 +1337,33 @@ impl ParseState {
             }
             _ => {
                 let index = self.device_index(route);
-                self.devices[index].apply_control_packet(packet, &mut self.global_generation);
+                self.devices[index].apply_control_packet(
+                    payload,
+                    bytes,
+                    &mut self.global_generation,
+                );
                 Ok(PacketEvent::Applied)
             }
         }
+    }
+
+    /// Blames `site` for the rows each stream of every route `routes`
+    /// accepts loses before its next rows.
+    pub(crate) fn blame(&mut self, site: LossSite, routes: impl Fn(&DeviceRoute) -> bool) {
+        for device in &mut self.devices {
+            if routes(&device.route) {
+                for stream in device.streams.iter_mut().flatten() {
+                    stream.blame(site);
+                }
+            }
+        }
+    }
+
+    /// Blames `site` for the rows stream `stream_id` of `route` loses before
+    /// its next rows, creating the route's state if it has none.
+    pub(crate) fn blame_stream(&mut self, route: DeviceRoute, stream_id: StreamId, site: LossSite) {
+        let index = self.device_index(route);
+        self.devices[index].stream_mut(stream_id).blame(site);
     }
 
     /// Drops the metadata of every route `routes` accepts, to learn it again,
@@ -1213,10 +1371,11 @@ impl ParseState {
     /// another device, or the same one with another layout. Each stream keeps
     /// its last rows, and each device's next record says whether it is the
     /// same device, as [`DeviceState::relearn_metadata`] does.
-    pub(super) fn relearn(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
+    pub(crate) fn relearn(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
         for device in &mut self.devices {
             if routes(&device.route) {
                 device.relearn_metadata();
+                device.handed_out = None;
             }
         }
     }
@@ -1224,16 +1383,17 @@ impl ParseState {
     /// Forgets the metadata of every route `routes` accepts and ends its
     /// runs. The generation counters keep counting, and no stamp from before
     /// the reset recurs after it.
-    pub(super) fn reset(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
+    pub(crate) fn reset(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
         self.global_generation += 1;
         for device in &mut self.devices {
             if routes(&device.route) {
                 device.reset();
+                device.handed_out = None;
             }
         }
     }
 
-    pub(super) fn take_metadata_queries_for(&mut self, route: DeviceRoute) -> Vec<MetadataQuery> {
+    pub(crate) fn take_metadata_queries_for(&mut self, route: DeviceRoute) -> Vec<MetadataQuery> {
         let index = self.device_index(route);
         self.devices[index]
             .take_metadata_query()
@@ -1241,30 +1401,52 @@ impl ParseState {
             .collect()
     }
 
-    pub(super) fn apply_metadata_reply(&mut self, query: MetadataQuery, reply: &[u8]) {
+    /// Merges `record` into the state of `route` as a broadcast of it would.
+    pub(crate) fn learn(&mut self, route: DeviceRoute, record: Record) {
+        let index = self.device_index(route);
+        let source = MetadataSource::Broadcast;
+        self.devices[index].learn_metadata(record, source, &mut self.global_generation);
+    }
+
+    pub(crate) fn apply_metadata_reply(&mut self, query: MetadataQuery, reply: &[u8]) {
         let index = self.device_index(query.route);
         self.devices[index].apply_metadata_reply(query, reply, &mut self.global_generation);
     }
 
     /// Gives up on `query`. Returns `false` if the query was already stale.
-    pub(super) fn fail_metadata_query(&mut self, query: MetadataQuery) -> bool {
+    pub(crate) fn fail_metadata_query(&mut self, query: MetadataQuery) -> bool {
         let index = self.device_index(query.route);
         self.devices[index].fail_metadata_query(query)
     }
 
-    pub(super) fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
+    pub(crate) fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
         self.device(route)?.metadata_snapshot()
     }
 
-    pub(super) fn metadata_generation(&self, route: DeviceRoute) -> Option<u32> {
+    pub(crate) fn metadata_generation(&self, route: DeviceRoute) -> Option<u32> {
         self.device(route).map(|device| device.metadata_generation)
     }
 
-    pub(super) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
+    #[cfg(test)]
+    pub(crate) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
         self.device(route).map(|device| device.metadata_revision)
     }
 
-    pub(super) fn routes(&self) -> Vec<DeviceRoute> {
+    pub(crate) fn revised_metadata(
+        &mut self,
+        route: DeviceRoute,
+    ) -> Option<(bool, DeviceMetadataSnapshot)> {
+        let device = self.devices.iter_mut().find(|d| d.route == route)?;
+        let revision = device.metadata_revision;
+        if device.handed_out == Some(revision) {
+            return None;
+        }
+        let snapshot = device.metadata_snapshot()?;
+        let first = device.handed_out.replace(revision).is_none();
+        Some((first, snapshot))
+    }
+
+    pub(crate) fn routes(&self) -> Vec<DeviceRoute> {
         self.devices.iter().map(|device| device.route).collect()
     }
 }

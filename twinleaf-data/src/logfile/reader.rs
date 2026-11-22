@@ -1,56 +1,63 @@
 //! Seekable and indexed access to immutable TIO log files.
 //!
-//! [`LogFile`] maps a log and iterates its packets. [`LogFile::scan`] builds a
-//! [`LogIndex`], which summarizes the log and decodes it in batches.
+//! [`LogFile`] holds a log's bytes. [`LogFile::scan`] builds a [`LogIndex`],
+//! which summarizes the log and decodes it in batches.
 
-use super::continuity::{Boundary, BoundaryClass};
-use super::metadata::{DeviceRecord, StreamKey, StreamMetadataSnapshot};
-use super::parser::{PacketParser, ParserCheckpoint};
-use super::sample::{sample_time, RowSource, SampleBatch};
-use super::state::{DataError, ScannedRows};
+use crate::decode::parser::{PacketParser, ParserCheckpoint};
+use crate::decode::state::{DataError, ScannedRows};
+use crate::model::continuity::{Boundary, BoundaryClass};
+use crate::model::sample::{RowSource, SampleBatch, SampleClock};
+use crate::model::schema::{DeviceRecord, StreamKey, StreamMetadataSnapshot};
 use crate::proto::data as wire;
-use crate::tio::{self, Packet};
-use bytes::{Buf, Bytes};
+use crate::proto::packet::{Checked, PacketError};
+use bytes::Bytes;
+#[cfg(not(target_family = "wasm"))]
 use memmap2::Mmap;
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(not(target_family = "wasm"))]
 use std::fs::File;
+#[cfg(not(target_family = "wasm"))]
 use std::io;
 use std::ops::Range;
+#[cfg(not(target_family = "wasm"))]
 use std::path::Path;
 
 const INDEX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const PROGRESS_BYTES: usize = 1024 * 1024;
 
-/// An immutable, memory-mapped TIO log.
+/// An immutable TIO log, memory-mapped by [`LogFile::open`] or read from
+/// bytes by [`LogFile::from_bytes`].
 ///
-/// Packet payloads share the mapping and copy no bytes. The file must not be
-/// modified or truncated while the log, its index, or its packets are alive.
-/// Each call to [`LogFile::packets`] creates an independent packet iterator.
+/// Packet payloads share the log's bytes and copy none. A mapped file must
+/// not be modified or truncated while the log, its index, or its packets are
+/// alive.
 ///
 /// # Examples
 ///
 /// Scan a log, list its runs, then decode it in batches.
 ///
 /// ```
-/// use twinleaf::data::LogFile;
+/// use twinleaf_data::LogFile;
 /// # use std::io::Write;
-/// # use twinleaf::proto::data::{self as wire, DataType};
-/// # use twinleaf::proto::sync::Epoch;
-/// # use twinleaf::tio::Packet;
-/// # use twinleaf::{ColumnId, DeviceRoute, SegmentId, SessionId, StreamId};
+/// # use twinleaf_data::proto::data::{self as wire, DataType};
+/// # use twinleaf_data::proto::sync::Epoch;
+/// # use twinleaf_data::proto::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # let (id, route) = (StreamId::new(1), DeviceRoute::root());
+/// # let (id, mut buf) = (StreamId::new(1), [0u8; 512]);
 /// # let mut file = tempfile::NamedTempFile::new()?;
 /// # for record in [
 /// #     wire::Metadata::Device(wire::Device { session: SessionId::new(1), n_streams: 1, name: "sensor", serial: "S1", firmware: "1", protocol: 0 }),
 /// #     wire::Metadata::Stream(wire::Stream { stream_id: id, n_columns: 1, n_segments: 1, sample_size: 4, buf_samples: 128, name: "field" }),
-/// #     wire::Metadata::Segment(wire::Segment { stream_id: id, segment_id: SegmentId::new(0), flags: wire::SegmentFlags::default(), epoch: Epoch::UNIX, timeref_serial: "", timeref_session: SessionId::new(1), start_time: 0, sampling_rate: 10, decimation: 1, filter_cutoff: 0.0, filter_type: wire::FilterType::NONE }),
+/// #     wire::Metadata::Segment(wire::Segment { stream_id: id, segment_id: SegmentId::new(0), flags: wire::SegmentFlags::VALID, epoch: Epoch::UNIX, timeref_serial: "", timeref_session: SessionId::new(1), start_time: 0, sampling_rate: 10, decimation: 1, filter_cutoff: 0.0, filter_type: wire::FilterType::NONE }),
 /// #     wire::Metadata::Column(wire::Column { stream_id: id, index: ColumnId::new(0), data_type: DataType::F32, name: "x", units: "nT", description: "" }),
 /// # ] {
-/// #     file.write_all(Packet::metadata(record, wire::MetadataFlags::UPDATE, route)?.as_bytes())?;
+/// #     let len = record.write(wire::MetadataFlags::UPDATE, &mut buf)?;
+/// #     file.write_all(&buf[..len])?;
 /// # }
 /// # let data: Vec<u8> = [1.0f32, 2.0, 3.0].iter().flat_map(|x| x.to_le_bytes()).collect();
-/// # file.write_all(Packet::samples(1, 0, 0, &data, route)?.as_bytes())?;
+/// # let samples = wire::Samples { stream_id: id, segment_id: SegmentId::new(0), first: SampleNumber::new(0), data: &data };
+/// # let len = samples.write(&mut buf)?;
+/// # file.write_all(&buf[..len])?;
 /// # let path = file.path();
 /// let log = LogFile::open(path)?;
 /// let index = log.scan(false);
@@ -84,25 +91,6 @@ impl std::fmt::Debug for LogFile {
     }
 }
 
-/// An iterator over the packets of a [`LogFile`] in file order, copying no
-/// payload bytes. It yields the first packet that fails to decode as an error
-/// and then ends.
-pub struct PacketIter {
-    remaining: Bytes,
-    position: usize,
-    failed: bool,
-}
-
-impl std::fmt::Debug for PacketIter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PacketIter")
-            .field("position", &self.position)
-            .field("remaining", &self.remaining.len())
-            .field("failed", &self.failed)
-            .finish_non_exhaustive()
-    }
-}
-
 /// Wire or semantic failure at a byte offset in a log.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -112,9 +100,9 @@ pub enum LogError {
     Packet {
         /// Byte offset at which the undecodable packet begins.
         offset: usize,
-        /// Which framing or header check rejected the bytes.
+        /// Which framing, header or payload check rejected the bytes.
         #[source]
-        source: tio::packet::DecodeError,
+        source: PacketError,
     },
     /// A well-formed packet contradicts the state built from earlier ones.
     #[error("invalid data at byte offset {offset}: {source}")]
@@ -136,35 +124,45 @@ impl LogError {
     }
 }
 
-impl PacketIter {
-    fn new(data: Bytes, position: usize) -> Self {
+/// The packets of a log's bytes in file order, each checked as one whole
+/// packet and borrowing those bytes, with the byte offset at which it begins.
+/// It yields the first packet that fails as an error, and then ends.
+struct Views<'a> {
+    remaining: &'a [u8],
+    position: usize,
+    failed: bool,
+}
+
+impl<'a> Views<'a> {
+    /// Reads the packets of `bytes`, which start at byte `position` of the
+    /// log.
+    fn new(bytes: &'a [u8], position: usize) -> Self {
         Self {
-            remaining: data,
+            remaining: bytes,
             position,
             failed: false,
         }
     }
 
     /// Returns the byte offset just after the last packet returned.
-    pub fn position(&self) -> usize {
+    fn position(&self) -> usize {
         self.position
     }
 }
 
-impl Iterator for PacketIter {
-    type Item = Result<Packet, LogError>;
+impl<'a> Iterator for Views<'a> {
+    type Item = Result<(usize, Checked<'a>), LogError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed || self.remaining.is_empty() {
             return None;
         }
-
         let offset = self.position;
-        match Packet::from_wire_prefix(&self.remaining) {
+        match Checked::prefix(self.remaining) {
             Ok((packet, len)) => {
-                self.remaining.advance(len);
+                self.remaining = &self.remaining[len..];
                 self.position += len;
-                Some(Ok(packet))
+                Some(Ok((offset, packet)))
             }
             Err(source) => {
                 self.failed = true;
@@ -301,8 +299,9 @@ impl LogSummary {
         stream.sample_count += rows.len() as u64;
 
         let (first_n, last_n) = rows.sample_number_bounds();
-        let first_timestamp = sample_time(rows.segment_record().get(), first_n.value() + 1);
-        let last_timestamp = sample_time(rows.segment_record().get(), last_n.value() + 1);
+        let clock = SampleClock::of(rows.segment_record().get());
+        let first_timestamp = clock.end_of(first_n);
+        let last_timestamp = clock.end_of(last_n);
         stream.first_timestamp = Some(
             stream
                 .first_timestamp
@@ -417,18 +416,14 @@ fn decode_chunk(
     chunk: &IndexedChunk,
     batch_rows: usize,
 ) -> Result<Vec<SampleBatch>, LogError> {
-    let mut packets = PacketIter::new(data.slice(chunk.bytes.clone()), chunk.bytes.start);
+    let packets = Views::new(&data[chunk.bytes.clone()], chunk.bytes.start);
     let mut parser = PacketParser::replay_from(&chunk.state).with_batch_rows(batch_rows);
     let mut batches = Vec::new();
 
-    loop {
-        let packet_offset = packets.position();
-        let Some(packet) = packets.next() else {
-            break;
-        };
-        let packet = packet?;
+    for packet in packets {
+        let (packet_offset, packet) = packet?;
         parser
-            .push_packet(&packet)
+            .push_packet(packet)
             .map_err(|source| LogError::Data {
                 offset: packet_offset,
                 source,
@@ -442,12 +437,19 @@ fn decode_chunk(
 }
 
 impl LogFile {
+    /// Reads a log from its bytes, as a dropped file in a browser gives them.
+    pub fn from_bytes(data: impl Into<Bytes>) -> Self {
+        Self { data: data.into() }
+    }
+
     /// Memory-maps the log at `path`. The file must stay unmodified while the
     /// log, its index, or its packets are alive.
     ///
     /// # Errors
     ///
     /// Returns the I/O error if the file cannot be opened or mapped.
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = File::open(path)?;
         // SAFETY: callers must keep log files immutable while the mapping is
@@ -467,10 +469,12 @@ impl LogFile {
         self.data.is_empty()
     }
 
-    /// Returns an iterator over the log's packets from the beginning, copying
-    /// no payload bytes.
-    pub fn packets(&self) -> PacketIter {
-        PacketIter::new(self.data.clone(), 0)
+    /// Returns the log's packets in file order, each checked as one whole
+    /// packet and borrowing the log's bytes, with the byte offset at which it
+    /// begins. The first packet that fails comes as an error with its byte
+    /// offset, and then the iterator ends.
+    pub fn packets(&self) -> impl Iterator<Item = Result<(usize, Checked<'_>), LogError>> {
+        Views::new(&self.data, 0)
     }
 
     /// Scans the log's packets, metadata, boundaries, and row counts without
@@ -488,7 +492,7 @@ impl LogFile {
         ignore_session: bool,
         mut progress: impl FnMut(usize),
     ) -> LogIndex {
-        let mut packets = self.packets();
+        let mut packets = Views::new(&self.data, 0);
         let mut parser = PacketParser::new(ignore_session);
         let mut summary = LogSummary::default();
         let mut chunks = Vec::new();
@@ -498,8 +502,7 @@ impl LogFile {
         let mut scanned = 0;
 
         loop {
-            let packet_offset = packets.position();
-            let packet = match packets.next() {
+            let (packet_offset, packet) = match packets.next() {
                 Some(Ok(packet)) => packet,
                 Some(Err(error)) => {
                     summary.error = Some(error);
@@ -507,7 +510,7 @@ impl LogFile {
                 }
                 None => break,
             };
-            let validated = match parser.scan_packet(&packet) {
+            let validated = match parser.scan_packet(packet) {
                 Ok(validated) => validated,
                 Err(source) => {
                     summary.error = Some(LogError::Data {
@@ -558,61 +561,26 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::continuity::Generations;
-    use crate::data::state::StreamDataError;
-    use crate::data::tests::fixtures::{column, device, segment, stream};
+    use crate::fixtures::{checked, packet};
+    use crate::fixtures::{column, device, segment, stream};
+    use crate::model::continuity::Generations;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
 
-    fn encoded_log(packets: impl IntoIterator<Item = Packet>) -> Bytes {
+    fn encoded_log(packets: impl IntoIterator<Item = Vec<u8>>) -> Bytes {
         let mut encoded = Vec::new();
         for packet in packets {
-            encoded.extend_from_slice(packet.as_bytes());
+            encoded.extend_from_slice(&packet);
         }
         Bytes::from(encoded)
     }
 
-    fn metadata_packet(record: wire::Metadata<'_>) -> Packet {
-        Packet::metadata(record, wire::MetadataFlags::default(), DeviceRoute::root())
-            .expect("a valid metadata record")
-    }
-
-    #[test]
-    fn packet_iterators_are_independent() {
-        let data = encoded_log([
-            Packet::heartbeat_session(1, DeviceRoute::root()),
-            Packet::heartbeat_session(2, DeviceRoute::root()),
-        ]);
-        let log = LogFile { data };
-        let mut first = log.packets();
-        let second = log.packets();
-
-        assert_eq!(first.position(), 0);
-        assert_eq!(second.position(), 0);
-        assert!(first.next().unwrap().is_ok());
-        assert!(first.position() > 0);
-        assert_eq!(second.position(), 0);
-        assert_eq!(first.count(), 1);
-        assert_eq!(second.count(), 2);
-    }
-
-    #[test]
-    fn packet_iterator_yields_a_wire_error_once() {
-        let log = LogFile {
-            data: Bytes::from_static(&[0]),
-        };
-        let mut packets = log.packets();
-
-        assert!(matches!(
-            packets.next(),
-            Some(Err(LogError::Packet { offset: 0, .. }))
-        ));
-        assert!(packets.next().is_none());
-        assert_eq!(packets.position(), 0);
+    fn metadata_packet(record: wire::Metadata<'_>) -> Vec<u8> {
+        packet::metadata(record, wire::MetadataFlags::default(), DeviceRoute::root())
     }
 
     /// One device with one 1 Hz stream of a single `f32` column.
-    fn schema_packets() -> Vec<Packet> {
+    fn schema_packets() -> Vec<Vec<u8>> {
         vec![
             metadata_packet(wire::Metadata::Device(device())),
             metadata_packet(wire::Metadata::Stream(stream(1))),
@@ -621,32 +589,25 @@ mod tests {
         ]
     }
 
-    fn data_packet(first_sample_n: u32, segment_id: u8) -> Packet {
-        Packet::samples(1, segment_id, first_sample_n, &[0; 4], DeviceRoute::root())
-            .expect("valid samples")
+    fn data_packet(first_sample_n: u32, segment_id: u8) -> Vec<u8> {
+        packet::samples(1, segment_id, first_sample_n, &[0; 4], DeviceRoute::root())
     }
 
     #[test]
-    fn scan_reports_semantically_invalid_stream_data() {
-        let mut packets = schema_packets();
-        let valid_prefix_len = encoded_log(packets.clone()).len();
-        packets.push(data_packet(0, 1));
-        let log = LogFile {
-            data: encoded_log(packets),
-        };
+    fn packet_iterator_yields_a_wire_error_once() {
+        let heartbeat = packet::heartbeat_session(1, DeviceRoute::root());
+        let log = LogFile::from_bytes(encoded_log([heartbeat.clone(), vec![0]]));
+        let mut packets = log.packets();
 
-        let index = log.scan(true);
-        assert_eq!(index.summary().bytes_scanned(), valid_prefix_len);
+        assert_eq!(packets.next().unwrap().unwrap().0, 0);
         assert!(matches!(
-            index.summary().error(),
-            Some(LogError::Data {
+            packets.next(),
+            Some(Err(LogError::Packet {
                 offset,
-                source: DataError::Stream {
-                    source: StreamDataError::SegmentOutOfRange { .. },
-                    ..
-                },
-            }) if *offset == valid_prefix_len
+                source: PacketError::InvalidPacketType,
+            })) if offset == heartbeat.len()
         ));
+        assert!(packets.next().is_none());
     }
 
     #[test]
@@ -745,7 +706,7 @@ mod tests {
     fn indexed_batches_carry_the_generations_of_a_linear_parse() {
         // Padding the log past a checkpoint forces the decode to resume from a
         // cloned parser state rather than from the beginning of the log.
-        let filler = Packet::rpc_reply(1, &[0; 400], DeviceRoute::root()).unwrap();
+        let filler = packet::rpc_reply(1, &[0; 400], DeviceRoute::root());
         let mut packets = schema_packets();
         packets.push(data_packet(0, 0));
         packets.extend(std::iter::repeat_n(filler, INDEX_CHUNK_BYTES / 400 + 1));
@@ -765,7 +726,7 @@ mod tests {
         let mut parser = PacketParser::new(true).with_batch_rows(1);
         let mut linear = Vec::new();
         for packet in &packets {
-            parser.push_packet(packet).expect("valid log");
+            parser.push_packet(checked(packet)).expect("valid log");
             while let Some(batch) = parser.pop_batch() {
                 linear.push(batch.generations());
             }
@@ -898,8 +859,8 @@ mod tests {
         }
 
         /// The packet a log cut short ends in part of.
-        fn whole() -> Packet {
-            Packet::heartbeat_session(3, DeviceRoute::root())
+        fn whole() -> Vec<u8> {
+            packet::heartbeat_session(3, DeviceRoute::root())
         }
 
         fn accepted() -> impl Strategy<Value = Accepted> {
@@ -913,7 +874,7 @@ mod tests {
         /// What follows a prefix, a refusal only after the stream's
         /// metadata, and a cut inside the header or after it.
         fn failure(described: bool) -> impl Strategy<Value = Failure> {
-            let len = whole().as_bytes().len();
+            let len = whole().len();
             let cut = prop_oneof![1usize..=3, 4..len].prop_map(Failure::CutShort);
             match described {
                 true => prop_oneof![
@@ -933,7 +894,7 @@ mod tests {
 
         /// The packets of the prefix, the metadata first if `described`.
         /// Samples come only after the metadata.
-        fn prefix(described: bool, items: &[Accepted]) -> Vec<Packet> {
+        fn prefix(described: bool, items: &[Accepted]) -> Vec<Vec<u8>> {
             let mut packets = if described {
                 schema_packets()
             } else {
@@ -942,10 +903,12 @@ mod tests {
             let mut sample = 0;
             for item in items {
                 match item {
-                    Accepted::Heartbeat => packets.push(Packet::heartbeat(DeviceRoute::root())),
-                    Accepted::Reply(id, len) => packets.push(
-                        Packet::rpc_reply(*id, &vec![0x5A; *len], DeviceRoute::root()).unwrap(),
-                    ),
+                    Accepted::Heartbeat => packets.push(packet::heartbeat(DeviceRoute::root())),
+                    Accepted::Reply(id, len) => packets.push(packet::rpc_reply(
+                        *id,
+                        &vec![0x5A; *len],
+                        DeviceRoute::root(),
+                    )),
                     Accepted::Samples if described => {
                         packets.push(data_packet(sample, 0));
                         sample += 1;
@@ -971,8 +934,8 @@ mod tests {
                 match failure {
                     Failure::None => {}
                     Failure::NotAPacket => log.push(0),
-                    Failure::CutShort(kept) => log.extend_from_slice(&whole().as_bytes()[..kept]),
-                    Failure::Refused => log.extend_from_slice(data_packet(0, 1).as_bytes()),
+                    Failure::CutShort(kept) => log.extend_from_slice(&whole()[..kept]),
+                    Failure::Refused => log.extend_from_slice(&data_packet(0, 1)),
                 }
                 if !matches!(failure, Failure::CutShort(_)) {
                     log.extend_from_slice(&encoded_log(prefix(true, &after)));
@@ -1035,8 +998,8 @@ mod tests {
                 failure in prop_oneof![Just(Failure::None), Just(Failure::NotAPacket)],
             ) {
                 const MIB: usize = 1 << 20;
-                let filler = Packet::rpc_reply(1, &vec![0; len], DeviceRoute::root()).unwrap();
-                let widest = filler.as_bytes().len();
+                let filler = packet::rpc_reply(1, &vec![0; len], DeviceRoute::root());
+                let widest = filler.len();
                 let mut log = encoded_log(std::iter::repeat_n(filler, fillers)).to_vec();
                 if failure == Failure::NotAPacket {
                     log.push(0);

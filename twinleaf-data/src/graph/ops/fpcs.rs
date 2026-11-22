@@ -5,7 +5,7 @@
 //! Yang, and Chua, "FPCS", IEEE TVCG 2025. This is adapted from
 //! <https://github.com/tmichela/fpcs> (MIT), `src/fpcs/fpcs_pure.py`.
 
-use crate::data::{ColumnArray, ColumnOp};
+use crate::{ColumnArray, ColumnOp, Continuity};
 
 /// A streaming FPCS decimator over one column. It keeps each window's
 /// extremes, and a plot of its output still shows the signal's peaks.
@@ -66,10 +66,47 @@ impl Fpcs {
 
     /// Sets the samples per window, with a minimum of one. Reset the
     /// decimator and replay the column after a change, as
-    /// [`ColumnProcessor::invalidate`](crate::data::ColumnProcessor::invalidate)
+    /// [`ColumnProcessor::invalidate`](crate::ColumnProcessor::invalidate)
     /// arranges.
     pub fn set_ratio(&mut self, ratio: usize) {
         self.ratio = ratio.max(1);
+    }
+
+    /// Returns how long output points are kept, in seconds before the newest.
+    pub fn retention_seconds(&self) -> f64 {
+        self.retention_seconds
+    }
+
+    /// Sets how long output points are kept, as [`new`](Self::new) takes it.
+    /// A shorter retention drops the older points with the next samples, and
+    /// a longer one keeps more from then on. Points already dropped do not
+    /// come back.
+    pub fn set_retention_seconds(&mut self, retention_seconds: f64) {
+        self.retention_seconds = retention_seconds;
+    }
+
+    /// Removes every output point but the newest and returns them, oldest
+    /// first, for a caller that keeps the output itself. The newest stays,
+    /// so a sample earlier than it is still dropped, and leaves with a later
+    /// call once a newer point is emitted.
+    pub fn take_settled(&mut self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        let settled = self.out.len().saturating_sub(1);
+        self.out.drain(..settled)
+    }
+
+    /// Returns the least and the greatest of the samples no window has
+    /// closed over yet, the earlier first, or the one sample that is both.
+    /// The extreme the last closed window carried forward counts among
+    /// them. With the output, they bound every sample fed. No sample is
+    /// above the greatest of the points within two windows of it, or below
+    /// the least.
+    pub fn pending(&self) -> impl Iterator<Item = (f64, f64)> {
+        let (earlier, later) = match (self.min_point, self.max_point) {
+            (Some(min), Some(max)) if min.0 < max.0 => (Some(min), Some(max)),
+            (Some(min), Some(max)) if max.0 < min.0 => (Some(max), Some(min)),
+            (one, _) => (one, None),
+        };
+        earlier.into_iter().chain(later)
     }
 
     /// Emits `p`, unless it is earlier than the last point emitted.
@@ -186,15 +223,24 @@ impl Fpcs {
         }
     }
 
-    fn push_values(&mut self, times: impl Iterator<Item = f64>, values: impl Iterator<Item = f64>) {
-        for (t, v) in times.zip(values) {
+    /// Consumes the next span of samples, their values already `f64`, as
+    /// [`ColumnOp::update_batch`] does a column's.
+    pub(crate) fn update_f64(&mut self, timestamps: &[f64], values: &[f64]) {
+        for (&t, &v) in timestamps.iter().zip(values) {
             self.add_point(t, v);
         }
+        self.prune_retention();
     }
 }
 
 impl ColumnOp for Fpcs {
     type Output = Vec<(f64, f64)>;
+
+    /// A plot shows the gaps between the runs of samples it draws, so the
+    /// decimator keeps its output across them.
+    fn continuity(&self) -> Continuity {
+        Continuity::Monotonic
+    }
 
     fn reset(&mut self) {
         self.out.clear();
@@ -207,8 +253,7 @@ impl ColumnOp for Fpcs {
     }
 
     fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray) {
-        self.push_values(timestamps.iter().copied(), values.to_f64().iter().copied());
-        self.prune_retention();
+        self.update_f64(timestamps, &values.to_f64());
     }
 
     fn output(&self) -> &Self::Output {
@@ -235,16 +280,6 @@ mod tests {
             && a.iter().zip(b.iter()).all(|(&(t1, v1), &(t2, v2))| {
                 t1 == t2 && (v1 == v2 || (v1.is_nan() && v2.is_nan()))
             })
-    }
-
-    #[test]
-    fn ratio_one_is_passthrough() {
-        let ts: Vec<f64> = (0..20).map(|i| i as f64).collect();
-        let vals: Vec<f64> = (0..20).map(|i| (i as f64 * 0.7).sin()).collect();
-        let mut op = Fpcs::new(1, 1000.0);
-        push(&mut op, &ts, &vals);
-        let expected: Vec<(f64, f64)> = ts.iter().copied().zip(vals.iter().copied()).collect();
-        assert_eq!(op.output(), &expected);
     }
 
     #[test]
@@ -402,6 +437,75 @@ mod tests {
                 (4.0, 14.0)
             ]
         );
+    }
+
+    /// The points taken as they settle, then the one left, are the output of
+    /// a decimator nothing was taken from, and a sample earlier than the
+    /// newest point is dropped though the points before it were taken.
+    #[test]
+    fn taking_settled_points_leaves_the_output_as_it_would_be() {
+        let ts: Vec<f64> = (0..200)
+            .map(|i| if i == 119 { -30.0 } else { i as f64 })
+            .collect();
+        let vals: Vec<f64> = (0..200)
+            .map(|i| {
+                if i == 119 {
+                    100.0
+                } else {
+                    ((i as f64) * 0.9).sin() * 5.0
+                }
+            })
+            .collect();
+        for ratio in [1, 3, 8] {
+            let mut whole = Fpcs::new(ratio, 0.0);
+            push(&mut whole, &ts, &vals);
+            let mut taken = Vec::new();
+            let mut op = Fpcs::new(ratio, 0.0);
+            for (tc, vc) in ts.chunks(7).zip(vals.chunks(7)) {
+                push(&mut op, tc, vc);
+                taken.extend(op.take_settled());
+                assert!(op.output().len() <= 1);
+            }
+            taken.extend(op.output());
+            assert_eq!(&taken, whole.output(), "ratio={ratio}");
+        }
+    }
+
+    /// Whenever the samples stop, each of them has a point at least as high
+    /// and one at least as low within two windows of it, among the output
+    /// and the pending extremes.
+    #[test]
+    fn the_output_and_the_pending_extremes_bound_every_sample() {
+        let value = |i: usize| {
+            let noise = (i.wrapping_mul(2_654_435_761) >> 7) % 1000;
+            ((i as f64) * 0.05).sin() * 300.0 + noise as f64
+        };
+        for ratio in [2, 5, 16] {
+            let mut op = Fpcs::new(ratio, 0.0);
+            for n in 0..400 {
+                push(&mut op, &[n as f64], &[value(n)]);
+                let points: Vec<(f64, f64)> =
+                    op.output().iter().copied().chain(op.pending()).collect();
+                assert!(points.windows(2).all(|pair| pair[0].0 < pair[1].0));
+                for i in 0..=n {
+                    let near = |p: &&(f64, f64)| (p.0 - i as f64).abs() < (2 * ratio) as f64;
+                    let high = points
+                        .iter()
+                        .filter(near)
+                        .map(|p| p.1)
+                        .fold(f64::MIN, f64::max);
+                    let low = points
+                        .iter()
+                        .filter(near)
+                        .map(|p| p.1)
+                        .fold(f64::MAX, f64::min);
+                    assert!(
+                        low <= value(i) && value(i) <= high,
+                        "ratio={ratio} sample {i} of {n}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

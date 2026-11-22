@@ -176,7 +176,9 @@ pub enum Change {
         /// Session the device reports now.
         new: SessionId,
     },
-    /// The time reference epoch changed.
+    /// The time reference changed, in its epoch, its session or its serial.
+    /// The two fields are the sessions of the two time references, which are
+    /// equal when only the epoch or the serial changed.
     TimeRefSessionChanged {
         /// Time reference session the preceding rows carried.
         old: SessionId,
@@ -261,9 +263,10 @@ impl Change {
     /// Returns how much of what happened before it the change stands for.
     /// Of two changes a receiver learns of at once, it is told the higher.
     ///
-    /// The ranks follow the order the parser tells changes in, so a receiver
-    /// told of two at once learns what the parser tells of both at once. A
-    /// restart ranks below a backward step in time, which it does not stand
+    /// The ranks follow the order the parser tells changes in but for one
+    /// pair. The parser tells a new session in a new layout of a device that
+    /// marks no starts as `SessionChanged`, and a receiver told of both `Initial`.
+    /// A restart ranks below a backward step in time, which it does not stand
     /// for, and above the rollover it stands for.
     pub(crate) fn rank(&self) -> u8 {
         match self {
@@ -300,7 +303,163 @@ pub struct Loss {
     pub expected: Option<SampleNumber>,
     /// The batches of this stream that this receiver's queue dropped, and 0
     /// when only the device or the link lost samples. For each stream, these
-    /// add up over its batches to that stream's share of the counts
-    /// [`RecvError::Lagged`](crate::RecvError::Lagged) reports.
+    /// add up over its batches to that stream's share of the counts a
+    /// receiver's `RecvError::Lagged` reports.
     pub dropped_batches: u64,
+    /// The rows of `samples` that reached the receiver's connection and that
+    /// it dropped. They are the rows of the batches its queue dropped, and
+    /// the rows lost next after its connection had no room for a packet.
+    pub dropped_samples: u64,
+    /// The rows of `samples` lost while the link to the device was down,
+    /// between the proxy and the device or between the receiver and its
+    /// proxy.
+    pub link_samples: u64,
+    /// The rows of `samples` the proxy dropped from its queue for this
+    /// receiver's connection, as the proxy said, because the connection read
+    /// too slowly.
+    pub proxy_samples: u64,
+}
+
+impl Loss {
+    /// Returns the rows the device never sent, or that a link that stayed up
+    /// lost. They are the rows of `samples` that no other field counts.
+    pub fn skipped_samples(&self) -> u64 {
+        self.samples
+            .saturating_sub(self.dropped_samples)
+            .saturating_sub(self.link_samples)
+            .saturating_sub(self.proxy_samples)
+    }
+}
+
+/// The rows one stream lost, summed over the [`Loss`]es of its batches, by
+/// the place they were lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Lost {
+    /// The rows the device never sent, or that a link that stayed up lost,
+    /// as [`Loss::skipped_samples`] counts them.
+    pub skipped: u64,
+    /// The rows lost while the link to the device was down, as
+    /// [`Loss::link_samples`] counts them.
+    pub link: u64,
+    /// The rows the proxy dropped for the receiver's connection, as
+    /// [`Loss::proxy_samples`] counts them.
+    pub proxy: u64,
+    /// The rows the receiver's own connection dropped, as
+    /// [`Loss::dropped_samples`] counts them.
+    pub dropped: u64,
+}
+
+impl Lost {
+    /// Adds the rows one batch's `loss` names, each to the place it was
+    /// lost.
+    pub fn add(&mut self, loss: &Loss) {
+        self.skipped += loss.skipped_samples();
+        self.link += loss.link_samples;
+        self.proxy += loss.proxy_samples;
+        self.dropped += loss.dropped_samples;
+    }
+
+    /// Returns the rows lost in every place together.
+    pub fn total(&self) -> u64 {
+        self.skipped + self.link + self.proxy + self.dropped
+    }
+}
+
+/// Where the rows a stream loses next were lost, as far as its parser was
+/// told since the stream's last rows. The later a place is listed, the
+/// more it explains, so the latest listed of those told is the one blamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(crate) enum LossSite {
+    /// Nothing was told, so the device sent none or a live link lost them.
+    #[default]
+    Device,
+    /// The proxy said it dropped packets of the stream for this connection.
+    Proxy,
+    /// The connection had no room for a packet.
+    Receiver,
+    /// The link was lost.
+    Link,
+}
+
+impl Loss {
+    /// Returns the loss of `samples` rows before the row `expected`, lost
+    /// at `site`.
+    pub(crate) fn at(site: LossSite, samples: u64, expected: Option<SampleNumber>) -> Loss {
+        let of = |blamed: LossSite| if site == blamed { samples } else { 0 };
+        Loss {
+            samples,
+            expected,
+            dropped_batches: 0,
+            dropped_samples: of(LossSite::Receiver),
+            link_samples: of(LossSite::Link),
+            proxy_samples: of(LossSite::Proxy),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A loss of `samples` rows, of which the other fields name some.
+    fn loss(samples: u64, dropped: u64, link: u64, proxy: u64) -> Loss {
+        Loss {
+            samples,
+            expected: None,
+            dropped_batches: 0,
+            dropped_samples: dropped,
+            link_samples: link,
+            proxy_samples: proxy,
+        }
+    }
+
+    /// Each field of a loss adds to its own place, and the rows no field
+    /// names add to `skipped`.
+    #[test]
+    fn each_place_a_loss_names_adds_to_its_own_count() {
+        let mut lost = Lost::default();
+        lost.add(&loss(5, 0, 0, 0));
+        assert_eq!(
+            lost,
+            Lost {
+                skipped: 5,
+                ..Lost::default()
+            }
+        );
+        lost.add(&loss(7, 7, 0, 0));
+        assert_eq!(lost.dropped, 7);
+        lost.add(&loss(3, 0, 3, 0));
+        assert_eq!(lost.link, 3);
+        lost.add(&loss(4, 0, 0, 4));
+        assert_eq!(lost.proxy, 4);
+        assert_eq!(
+            lost,
+            Lost {
+                skipped: 5,
+                link: 3,
+                proxy: 4,
+                dropped: 7,
+            }
+        );
+        assert_eq!(lost.total(), 19);
+    }
+
+    /// One loss that names several places splits among them, and its total
+    /// is its rows.
+    #[test]
+    fn a_loss_of_several_places_splits_among_them() {
+        let mut lost = Lost::default();
+        let both = loss(20, 6, 4, 3);
+        lost.add(&both);
+        assert_eq!(
+            lost,
+            Lost {
+                skipped: 7,
+                link: 4,
+                proxy: 3,
+                dropped: 6,
+            }
+        );
+        assert_eq!(lost.total(), both.samples);
+    }
 }

@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::f64::consts::PI;
 
-use crate::data::{ColumnArray, ColumnOp};
+use crate::{ColumnArray, ColumnOp};
 use rustfft::{num_complex::Complex, FftPlanner};
 
 const WELCH_DEFAULT_SEGMENTS: usize = 4;
@@ -37,15 +37,19 @@ pub struct Spectrum {
     pub hop_size: usize,
 }
 
-/// Why [`Welch`] has no spectrum to give.
-#[derive(Debug, Clone, PartialEq)]
+/// Why [`Welch`] has no spectrum to give. Its text says why in words a
+/// person reads.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NoSpectrum {
     /// No sample has arrived since the estimate was reset.
+    #[error("no sample has arrived")]
     WaitingForSamples,
     /// The sample rate is not a positive number.
+    #[error("the sample rate is not a positive number")]
     InvalidSampleRate,
     /// Fewer samples are held than an estimate needs.
+    #[error("it holds {have} samples and an estimate needs {need}")]
     TooFewSamples {
         /// The samples held.
         have: usize,
@@ -53,6 +57,7 @@ pub enum NoSpectrum {
         need: usize,
     },
     /// The estimate found no bin whose density is a positive number.
+    #[error("no bin of the estimate of {sample_count} samples has a positive density")]
     NoValidFrequencyBins {
         /// The samples the estimate used.
         sample_count: usize,
@@ -99,7 +104,7 @@ impl Welch {
 
     /// Sets the window and the sample rate. Reset the estimate and replay the
     /// column after a change, as
-    /// [`ColumnProcessor::invalidate`](crate::data::ColumnProcessor::invalidate)
+    /// [`ColumnProcessor::invalidate`](crate::ColumnProcessor::invalidate)
     /// arranges.
     pub fn configure(&mut self, window_samples: usize, sampling_hz: f64) {
         self.window_samples = window_samples;
@@ -328,6 +333,23 @@ pub fn estimate_white_noise_floor(points: &[(f64, f64)]) -> Option<f64> {
     median(&candidates)
         .map(f64::exp)
         .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+/// Returns the `count` largest peaks of an amplitude spectral density, given
+/// as `(frequency, density)` points rising in frequency, largest first.
+///
+/// A peak is a point whose density is greater than the point's before it
+/// and no less than the point's after it, so the first and last points are
+/// never peaks and a flat top counts once, at its first point. Peaks of the
+/// same density keep their order in frequency.
+pub fn largest_peaks(points: &[(f64, f64)], count: usize) -> Vec<(f64, f64)> {
+    let mut peaks: Vec<(f64, f64)> = (points.windows(3))
+        .filter(|w| w[1].1 > w[0].1 && w[1].1 >= w[2].1)
+        .map(|w| w[1])
+        .collect();
+    peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
+    peaks.truncate(count);
+    peaks
 }
 
 fn median(values: &[f64]) -> Option<f64> {
@@ -563,6 +585,60 @@ mod tests {
             (0.97..1.03).contains(&ratio),
             "integrated tone power drifted from A^2/2: {ratio}"
         );
+    }
+
+    /// The largest peaks come first, at most as many as asked, and an end
+    /// point or a point on a slope is none. A flat top counts once.
+    #[test]
+    fn the_largest_peaks_are_the_highest_local_maxima_first() {
+        let points = [
+            (1.0, 9.0),
+            (2.0, 1.0),
+            (3.0, 5.0),
+            (4.0, 2.0),
+            (5.0, 7.0),
+            (6.0, 7.0),
+            (7.0, 3.0),
+            (8.0, 4.0),
+            (9.0, 8.0),
+        ];
+        assert_eq!(largest_peaks(&points, 2), [(5.0, 7.0), (3.0, 5.0)]);
+        assert_eq!(largest_peaks(&points, 9), [(5.0, 7.0), (3.0, 5.0)]);
+        assert!(largest_peaks(&points, 0).is_empty());
+        assert!(largest_peaks(&points[..2], 5).is_empty());
+    }
+
+    /// Peaks of one density keep their order in frequency, however many
+    /// there are and wherever the count cuts them.
+    #[test]
+    fn peaks_of_one_density_keep_their_order_in_frequency() {
+        let points: Vec<(f64, f64)> = (0..41)
+            .map(|i| (f64::from(i), if i % 4 == 2 { 6.0 } else { 1.0 }))
+            .collect();
+        let peaks = largest_peaks(&points, 20);
+        let frequencies: Vec<f64> = peaks.iter().map(|&(f, _)| f).collect();
+        assert_eq!(
+            frequencies,
+            [2.0, 6.0, 10.0, 14.0, 18.0, 22.0, 26.0, 30.0, 34.0, 38.0]
+        );
+        assert_eq!(
+            largest_peaks(&points, 3),
+            [(2.0, 6.0), (6.0, 6.0), (10.0, 6.0)]
+        );
+    }
+
+    /// The largest peak of a sine's spectrum is at the sine's frequency.
+    #[test]
+    fn a_sines_largest_peak_is_its_frequency() {
+        let sampling_hz = 1000.0;
+        let (ts, vals) = sine_signal(4096, 50.0, sampling_hz);
+        let mut op = Welch::new(4096, sampling_hz);
+        push(&mut op, &ts, &vals);
+        let data = op.output().as_ref().expect("expected Ok result");
+        let peaks = largest_peaks(&data.points, 3);
+        let bin_hz = sampling_hz / data.segment_size as f64;
+        assert!((peaks[0].0 - 50.0).abs() <= 2.0 * bin_hz, "{peaks:?}");
+        assert!(peaks.windows(2).all(|pair| pair[0].1 >= pair[1].1));
     }
 
     #[test]

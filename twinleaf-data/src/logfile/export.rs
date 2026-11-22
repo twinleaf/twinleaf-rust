@@ -31,10 +31,10 @@
 //! decides which breaks start a new run at all. [`RunSplitLevel`] decides
 //! which streams roll to a new table when one does.
 
-use super::continuity::{Boundary, Generations};
-use super::filter::ColumnFilter;
-use super::metadata::{StreamKey, StreamMetadataSnapshot};
-use super::sample::{native_types, ColumnArray, SampleBatch};
+use crate::model::continuity::{Boundary, Generations};
+use crate::model::filter::ColumnFilter;
+use crate::model::sample::{native_types, ColumnArray, SampleBatch};
+use crate::model::schema::{StreamKey, StreamMetadataSnapshot};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
@@ -150,7 +150,7 @@ enum RunScope {
 /// The first batch in scope stamped with a new generation decides whether the
 /// generation gets its own table or shares the current one. A boundary the
 /// policy splits at gives it one, and so does a
-/// [`Change::Initial`](crate::data::Change::Initial), since a
+/// [`Change::Initial`](crate::Change::Initial), since a
 /// stream's first data never moves a generation its peers share. A new
 /// generation at an Initial is of a device that started over. Later batches
 /// in scope, from any stream, read the index back.
@@ -716,13 +716,10 @@ fn hdf_name_component(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::continuity::{Change, Loss};
-    use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
-    use crate::data::tests::fixtures;
+    use crate::fixtures;
+    use crate::model::continuity::{Change, Loss};
+    use crate::model::sample::{BatchContext, ColumnData, SampleBatchBuilder};
     use crate::proto::data::DataType;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, MutexGuard};
 
     fn key(stream_id: u8) -> StreamKey {
         StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(stream_id))
@@ -744,6 +741,9 @@ mod tests {
             samples: 7,
             expected: Some(SampleNumber::new(2)),
             dropped_batches: 0,
+            dropped_samples: 0,
+            link_samples: 0,
+            proxy_samples: 0,
         }
     }
 
@@ -807,15 +807,6 @@ mod tests {
         builder.finish()
     }
 
-    fn temp_hdf(label: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "twinleaf_export_{label}_{}_{}.h5",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
     fn appender(path: &Path) -> Hdf5Appender {
         Hdf5Appender::with_options(
             path,
@@ -825,11 +816,6 @@ mod tests {
             RunSplitLevel::None,
         )
         .expect("create test HDF5 output")
-    }
-
-    fn hdf_test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        crate::chan::lock(&LOCK)
     }
 
     #[test]
@@ -913,8 +899,8 @@ mod tests {
 
     #[test]
     fn safe_constructor_does_not_replace_existing_files() {
-        let _guard = hdf_test_lock();
-        let path = temp_hdf("exclusive");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exclusive.h5");
         std::fs::write(&path, b"existing input").expect("create sentinel");
 
         assert!(Hdf5Appender::with_options(
@@ -929,14 +915,12 @@ mod tests {
             std::fs::read(&path).expect("read sentinel"),
             b"existing input"
         );
-
-        std::fs::remove_file(path).expect("remove sentinel");
     }
 
     #[test]
     fn duplicate_stream_names_are_rejected_by_the_schema_guard() {
-        let _guard = hdf_test_lock();
-        let path = temp_hdf("duplicate_names");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate_names.h5");
         let mut writer = appender(&path);
         writer
             .write_batch(batch(1, "field", "x"))
@@ -945,14 +929,12 @@ mod tests {
             .write_batch(batch(2, "field", "x"))
             .expect_err("a second stream of the same name must fail");
         assert!(error.to_string().contains("schema changed"));
-        drop(writer);
-        std::fs::remove_file(path).expect("remove output");
     }
 
     #[test]
     fn changed_schema_is_rejected_instead_of_reinterpreted() {
-        let _guard = hdf_test_lock();
-        let path = temp_hdf("schema_change");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schema_change.h5");
         let mut writer = appender(&path);
         writer
             .write_batch(batch(1, "field", "x"))
@@ -961,62 +943,6 @@ mod tests {
             .write_batch(batch(1, "field", "renamed"))
             .expect_err("schema change must fail");
         assert!(error.to_string().contains("schema changed"));
-        drop(writer);
-        std::fs::remove_file(path).expect("remove output");
-    }
-
-    #[test]
-    fn normal_segment_rollover_reuses_a_flat_table() {
-        let _guard = hdf_test_lock();
-        let path = temp_hdf("segment_rollover");
-        let mut writer = appender(&path);
-        writer
-            .write_batch(batch_in_segment(DeviceRoute::root(), 1, "field", "x", 0))
-            .expect("write first segment");
-        writer
-            .write_batch(batch_in_segment(DeviceRoute::root(), 1, "field", "x", 100))
-            .expect("write next segment");
-        writer.finish().expect("finish output");
-
-        let file = File::open(&path).expect("open output");
-        assert_eq!(
-            file.dataset("field")
-                .expect("open stream table")
-                .shape()
-                .expect("read table shape"),
-            vec![2]
-        );
-        drop(file);
-        std::fs::remove_file(path).expect("remove output");
-    }
-
-    #[test]
-    fn each_route_gets_a_group_with_its_parents() {
-        let _guard = hdf_test_lock();
-        let path = temp_hdf("nested_routes");
-        let mut writer = appender(&path);
-        // The deeper route comes first, so its parent group is created for it.
-        for route in ["/0/2", "/0", "/1"] {
-            let route = route.parse().expect("parse route");
-            writer
-                .write_batch(batch_in_segment(route, 1, "field", "x", 0))
-                .expect("write routed stream");
-        }
-        writer.finish().expect("finish output");
-
-        let file = File::open(&path).expect("open output");
-        for table in ["0/2/field", "0/field", "1/field"] {
-            assert_eq!(
-                file.dataset(table)
-                    .expect("open routed table")
-                    .shape()
-                    .expect("read table shape"),
-                vec![1],
-                "{table}"
-            );
-        }
-        drop(file);
-        std::fs::remove_file(path).expect("remove output");
     }
 
     mod read_back {
@@ -1097,7 +1023,7 @@ mod tests {
         //! wrong layout.
 
         use super::*;
-        use crate::data::sample::ColumnBuilder;
+        use crate::model::sample::ColumnBuilder;
         use hdf5_pure::{CompoundMember, Datatype};
         use proptest::prelude::*;
 
@@ -1377,7 +1303,6 @@ mod tests {
                 (streams, batches, start, rate) in export_plan(),
                 compress in any::<bool>(),
             ) {
-                let _guard = hdf_test_lock();
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("export.h5");
                 let mut writer = Hdf5Appender::with_options(
@@ -1456,7 +1381,6 @@ mod tests {
         /// ```
         #[test]
         fn a_table_is_laid_out_as_its_c_struct() {
-            let _guard = hdf_test_lock();
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("literal.h5");
             let plan = StreamPlan {

@@ -3,8 +3,8 @@
 //! [`SampleBatch`] holds immutable columnar rows, one [`ColumnArray`] per
 //! column of its [`StreamSchema`], and [`SampleRow`] views one row.
 
-use super::continuity::{Boundary, Generations};
-use super::metadata::{SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamSchema};
+use crate::model::continuity::{Boundary, Generations};
+use crate::model::schema::{SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamSchema};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
@@ -19,20 +19,26 @@ pub(crate) struct SampleClock {
 }
 
 impl SampleClock {
+    /// Returns the clock of `segment`, which starts at its start time and
+    /// steps by its period. A segment whose sampling rate or decimation is
+    /// zero has no period, and its clock steps by zero. The parser emits no
+    /// rows from such a segment.
     pub(crate) fn of(segment: wire::SegmentView<'_>) -> Self {
         Self {
             start_time: f64::from(segment.start_time()),
-            period: f64::from(segment.decimation()) / f64::from(segment.sampling_rate()),
+            period: segment.period().unwrap_or(0.0),
         }
     }
 
-    pub(crate) fn time_at(&self, n: u32) -> f64 {
-        self.start_time + self.period * f64::from(n)
+    /// Returns the time at which sample `n` begins.
+    pub(crate) fn begin_of(&self, n: SampleNumber) -> f64 {
+        self.start_time + self.period * f64::from(n.value())
     }
-}
 
-pub(crate) fn sample_time(segment: wire::SegmentView<'_>, n: u32) -> f64 {
-    SampleClock::of(segment).time_at(n)
+    /// Returns the time at which sample `n` ends. It is the time of row `n`.
+    pub(crate) fn end_of(&self, n: SampleNumber) -> f64 {
+        self.start_time + self.period * f64::from(n.value() + 1)
+    }
 }
 
 /// A frozen `Vec<T>`, shared by [`Arc`] and narrowed to a row range. Cloning
@@ -274,11 +280,11 @@ native_types!(define_columns);
 
 /// The metadata, boundary and generations that every row of a batch shares.
 #[derive(Debug, Clone)]
-pub(super) struct BatchContext {
-    pub(super) metadata: StreamMetadataSnapshot,
+pub(crate) struct BatchContext {
+    pub(crate) metadata: StreamMetadataSnapshot,
     /// At most one boundary per batch, anchored at its first row.
-    pub(super) boundary: Option<Boundary>,
-    pub(super) generations: Generations,
+    pub(crate) boundary: Option<Boundary>,
+    pub(crate) generations: Generations,
 }
 
 /// Rows of one stream from one device, held column-major.
@@ -292,6 +298,8 @@ pub(super) struct BatchContext {
 #[derive(Debug, Clone)]
 pub struct SampleBatch {
     context: BatchContext,
+    /// The ordinal of the buffer run a read took the rows from, if any.
+    run: Option<u64>,
     sample_numbers: ScalarBuffer<SampleNumber>,
     /// Each row's end-of-sample time, materialized at construction.
     timestamps: ScalarBuffer<f64>,
@@ -370,7 +378,7 @@ impl SampleBatchBuilder {
     /// # Panics
     ///
     /// Panics if the schema has a column of a type this build cannot decode.
-    pub(super) fn new(context: BatchContext, capacity: usize) -> Self {
+    pub(crate) fn new(context: BatchContext, capacity: usize) -> Self {
         let columns = context
             .metadata
             .schema()
@@ -389,15 +397,15 @@ impl SampleBatchBuilder {
         }
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.sample_numbers.len()
     }
 
-    pub(super) fn generations(&self) -> Generations {
+    pub(crate) fn generations(&self) -> Generations {
         self.context.generations
     }
 
-    pub(super) fn accepts(&self, rows: &impl RowSource) -> bool {
+    pub(crate) fn accepts(&self, rows: &impl RowSource) -> bool {
         self.context.generations == rows.generations()
             && self.context.metadata.segment_record() == rows.segment_record()
             && self.context.metadata.schema() == rows.schema()
@@ -411,13 +419,13 @@ impl SampleBatchBuilder {
     /// Panics if `cells` yields too few values or a value its column cannot
     /// hold. Debug builds also panic if it yields too many.
     #[cfg(test)]
-    pub(super) fn push_row(
+    pub(crate) fn push_row(
         &mut self,
         n: SampleNumber,
         cells: impl IntoIterator<Item = ColumnData>,
     ) {
         self.sample_numbers.push(n);
-        self.timestamps.push(self.clock.time_at(n.value() + 1));
+        self.timestamps.push(self.clock.end_of(n));
         let mut cells = cells.into_iter();
         for values in &mut self.columns {
             values.push_data(&cells.next().expect("one cell per column"));
@@ -428,7 +436,7 @@ impl SampleBatchBuilder {
     /// Appends `rows` samples numbered from `first`, with their timestamps,
     /// and returns every column, in schema order, for the caller to append
     /// exactly `rows` values to each.
-    pub(super) fn push_samples(
+    pub(crate) fn push_samples(
         &mut self,
         first: SampleNumber,
         rows: usize,
@@ -436,7 +444,7 @@ impl SampleBatchBuilder {
         for row in 0..rows {
             let n = SampleNumber::new(first.value() + row as u32);
             self.sample_numbers.push(n);
-            self.timestamps.push(self.clock.time_at(n.value() + 1));
+            self.timestamps.push(self.clock.end_of(n));
         }
         self.columns.iter_mut()
     }
@@ -447,7 +455,7 @@ impl SampleBatchBuilder {
     /// # Panics
     ///
     /// Panics if `rows` is out of bounds.
-    pub(super) fn freeze_rows(&self, rows: Range<usize>) -> SampleBatch {
+    pub(crate) fn freeze_rows(&self, rows: Range<usize>) -> SampleBatch {
         let mut context = self.context.clone();
         if rows.start != 0 {
             context.boundary = None;
@@ -464,7 +472,7 @@ impl SampleBatchBuilder {
     }
 
     /// Freezes the accumulated rows into a shareable batch.
-    pub(super) fn finish(self) -> SampleBatch {
+    pub(crate) fn finish(self) -> SampleBatch {
         SampleBatch::new(
             self.context,
             self.sample_numbers.into(),
@@ -508,6 +516,7 @@ impl SampleBatch {
         );
         SampleBatch {
             context,
+            run: None,
             sample_numbers,
             timestamps,
             columns,
@@ -528,6 +537,7 @@ impl SampleBatch {
         }
         SampleBatch {
             context,
+            run: self.run,
             sample_numbers: self.sample_numbers.slice(rows.clone()),
             timestamps: self.timestamps.slice(rows.clone()),
             columns: self.columns.iter().map(|c| c.slice(rows.clone())).collect(),
@@ -562,6 +572,19 @@ impl SampleBatch {
     /// Returns the continuity generations this batch's rows belong to.
     pub fn generations(&self) -> Generations {
         self.context.generations
+    }
+
+    /// Returns the [ordinal](crate::Run::ordinal) of the buffer run a
+    /// read took this batch's rows from, or `None` for a batch no run gave.
+    /// Two batches of one read with the same ordinal are of one run.
+    pub fn run(&self) -> Option<u64> {
+        self.run
+    }
+
+    /// Returns this batch as read from the run of `ordinal`.
+    pub(crate) fn in_run(mut self, ordinal: u64) -> SampleBatch {
+        self.run = Some(ordinal);
+        self
     }
 
     /// Returns each row's sample number within its segment, in row order.
@@ -635,7 +658,7 @@ impl SampleBatch {
             .is_none_or(|b| b.is_monotonic())
     }
 
-    /// Returns `true` if the batch's boundary is [`Change::Initial`](crate::data::Change::Initial).
+    /// Returns `true` if the batch's boundary is [`Change::Initial`](crate::Change::Initial).
     pub fn is_initial(&self) -> bool {
         self.context
             .boundary
@@ -655,12 +678,6 @@ impl<'a> SampleRow<'a> {
     /// Returns the row's sample number within its segment.
     pub fn sample_number(&self) -> SampleNumber {
         self.batch.sample_numbers[self.row]
-    }
-    /// Returns the start of the sample's interval, in seconds after the
-    /// segment's epoch.
-    pub fn timestamp_begin(&self) -> f64 {
-        let segment = self.batch.metadata().segment();
-        sample_time(segment, self.sample_number().value())
     }
     /// Returns the end of the sample's interval, in seconds after the
     /// segment's epoch. It is the row's entry in [`SampleBatch::timestamps`].
@@ -713,8 +730,8 @@ impl std::fmt::Display for SampleRow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::continuity::Change;
-    use crate::data::tests::fixtures::{self, column, device, segment, stream};
+    use crate::fixtures::{self, column, device, segment, stream};
+    use crate::model::continuity::Change;
     use crate::proto::data::DataType;
 
     fn metadata(stream_id: u8, column_name: &str) -> StreamMetadataSnapshot {
@@ -791,12 +808,6 @@ mod tests {
             ColumnArray::F64(v) => assert_eq!(&v[..], [0.0, 10.0, 20.0, 30.0]),
             other => panic!("expected an f64 column, got {other:?}"),
         }
-        let expected: Vec<f64> = batch
-            .sample_numbers()
-            .iter()
-            .map(|&n| sample_time(batch.metadata().segment(), n.value() + 1))
-            .collect();
-        assert_eq!(batch.timestamps(), expected);
         assert_eq!(batch.timestamps(), [0.25, 0.5, 0.75, 1.0]);
         assert_eq!(batch.row(2).unwrap().timestamp_end(), 0.75);
     }

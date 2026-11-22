@@ -5,26 +5,28 @@
 //! reads a packet's samples column by column, each in one strided pass, and
 //! [`ColumnData::from_le_bytes`] reads one value.
 
-use super::metadata::StreamSchema;
-use super::sample::{native_types, ColumnBuilder, ColumnData};
+use crate::model::sample::{native_types, ColumnBuilder, ColumnData};
+use crate::model::schema::StreamSchema;
 use crate::proto::data as wire;
 
 macro_rules! define_decoders {
     ($($variant:ident $native:ty),* $(,)?) => {
-        /// Returns `true` if this build decodes columns of `data_type`.
-        pub(crate) fn decodes(data_type: wire::DataType) -> bool {
+        /// Returns `true` if this build decodes columns of `data_type` into
+        /// values of their own type. A column of any other type decodes to
+        /// [`ColumnData::Unknown`].
+        pub fn decodes(data_type: wire::DataType) -> bool {
             matches!(data_type, $(wire::DataType::$variant)|*)
         }
 
         impl ColumnData {
-            /// Decodes the value of `data_type` at the front of `data`, or
-            /// returns [`ColumnData::Unknown`] for a type this build cannot
-            /// decode.
+            /// Returns the value of `data_type` at the front of `data`, read
+            /// little endian, or [`ColumnData::Unknown`] for a type this build
+            /// cannot decode.
             ///
             /// # Panics
             ///
             /// Panics if `data` is shorter than the type's size.
-            pub(crate) fn from_le_bytes(data: &[u8], data_type: wire::DataType) -> ColumnData {
+            pub fn from_le_bytes(data: &[u8], data_type: wire::DataType) -> ColumnData {
                 match data_type {
                     $(
                         wire::DataType::$variant => Self::$variant(<$native>::from_le_bytes(
@@ -67,7 +69,7 @@ native_types!(define_decoders);
 /// # Panics
 ///
 /// Panics if `encoded` holds fewer than `rows` samples.
-pub(super) fn decode_samples<'a>(
+pub(crate) fn decode_samples<'a>(
     schema: &StreamSchema,
     encoded: &[u8],
     rows: usize,
@@ -88,7 +90,8 @@ mod tests {
     use crate::proto::data::DataType;
 
     /// No device sends 24-bit columns, so they are not decoded. Their type
-    /// codes still parse, and the parser steps over their bytes.
+    /// codes still parse, and the parser refuses a stream with such a column
+    /// whole.
     #[test]
     fn int24_values_are_not_decoded() {
         for data_type in [DataType::I24, DataType::U24] {

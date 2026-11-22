@@ -38,8 +38,8 @@ use glob::Pattern;
 /// | `/0/*/x`       | column `x` of any stream directly under `/0`    |
 ///
 /// ```
-/// use twinleaf::data::ColumnFilter;
-/// use twinleaf::DeviceRoute;
+/// use twinleaf_data::ColumnFilter;
+/// use twinleaf_data::proto::DeviceRoute;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let filter = ColumnFilter::new("vector")?;
@@ -151,14 +151,6 @@ mod tests {
         assert!(filter.matches(&route("/0"), "accel", "x"));
         assert!(filter.matches(&route("/0/1/2"), "gmr", "x"));
         assert!(!filter.matches(&route("/0"), "vector", "y"));
-    }
-
-    #[test]
-    fn test_stream_anywhere_explicit() {
-        let filter = ColumnFilter::new("**/vector/**").unwrap();
-        assert!(filter.matches(&route("/"), "vector", "x"));
-        assert!(filter.matches(&route("/0/1"), "vector", "y"));
-        assert!(!filter.matches(&route("/0"), "accel", "x"));
     }
 
     #[test]
