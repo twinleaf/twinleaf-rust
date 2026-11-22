@@ -19,7 +19,7 @@
 | Field          | Size   | Value                  |
 |----------------|--------|------------------------|
 | Type           | u8     | Packet type, see below |
-| TTL            | 4 bits | Hops remaining, 0 to 15 |
+| TTL            | 4 bits | Reserved, senders write 0 |
 | R              | 4 bits | Routing length, 0 to 8 |
 | Payload Length | u16    | 0 to 500               |
 
@@ -44,13 +44,15 @@ it removes the last routing byte and forwards the packet to that port.
 | 12      | `SETTING`    | Setting change, [`settings`]             |
 | 62      | `SYNC`       | Time reference, [`sync`]                 |
 | 63      | `TEXT`       | Console text                             |
-| 64      | `USER`       | Application defined                      |
+| 64      | `USER`       | Legacy proxy link status                 |
 | 66      | `PROXY_TX`   | Proxy control request, host only         |
 | 67      | `PROXY_RX`   | Proxy control reply or link status, host only |
 | 128 + n | `STREAM` n   | Samples of stream n, [`data`]            |
 
 Values 0, 9, 10, and 13 are invalid. Value 65 was `RPC_UPDATE` and is unused.
-Proxies still send their link status to 1.x clients as a `USER` packet.
+No application packet uses type 64. Proxies still send their link status to
+1.x clients as a `USER` packet, and a host reads every packet of this type as
+a legacy proxy link status.
 
 ## RPC Formats
 
@@ -61,7 +63,8 @@ ids they use.
 |-------------------------------------------------------|---------------------------------------------------------------------|
 | `rpc.info`, `rpc.listinfo`                            | [`rpc::RpcMeta`]                                                    |
 | `dev.metadata`                                        | [`data::MetadataSelector`] request, [`data::MetadataReply`] reply   |
-| Capture metadata                                      | [`capture::CaptureMetadata`]                                        |
+| Capture                                               | [`capture::Selector`] request, [`capture::Status`] and [`capture::CaptureMetadata`] replies |
+| `dev.firmware.upload`                                 | [`update::PackageHeader`] and the chunks [`update`] sizes           |
 | `dev.session`, `dev.revision`, `dev.serial`, `dev.firmware.serial` | [`SessionId`], [`HwRev`], [`DeviceSerial`], [`FirmwareSerial`] |
 
 ## Serial Framing

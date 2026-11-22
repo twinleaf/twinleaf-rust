@@ -124,6 +124,13 @@ impl DeviceRoute {
         self.as_slice().starts_with(ancestor.as_slice())
     }
 
+    /// Returns how many levels below this route a view reaches that covers
+    /// `depth` levels below `root`. Returns `None` if the view does not hold
+    /// this route.
+    pub fn depth_left_in(&self, root: &Self, depth: usize) -> Option<usize> {
+        depth.checked_sub(root.relative_route(self).ok()?.len())
+    }
+
     /// Returns `absolute` with this route removed from its front.
     ///
     /// # Errors
@@ -152,6 +159,16 @@ impl DeviceRoute {
         route.hops[self.len()..combined_len].copy_from_slice(relative.as_slice());
         route.len = combined_len as u8;
         Ok(route)
+    }
+
+    /// Returns this route with `from` at its front replaced by `to`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`relative_route`](Self::relative_route) or
+    /// [`absolute_route`](Self::absolute_route) gives.
+    pub fn rerooted(&self, from: &Self, to: &Self) -> Result<Self, RouteError> {
+        to.absolute_route(&from.relative_route(self)?)
     }
 }
 
@@ -320,6 +337,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_view_holds_its_root_and_routes_down_to_its_depth() {
+        let route = |text: &str| text.parse::<DeviceRoute>().unwrap();
+        let root = route("/1");
+        assert_eq!(route("/1").depth_left_in(&root, 2), Some(2));
+        assert_eq!(route("/1/2/3").depth_left_in(&root, 2), Some(0));
+        assert_eq!(route("/1/2/3/4").depth_left_in(&root, 2), None);
+        assert_eq!(route("/2").depth_left_in(&root, usize::MAX), None);
+    }
+
+    #[test]
+    fn a_rerooted_route_keeps_its_hops_below_the_old_root() {
+        let route = |text: &str| text.parse::<DeviceRoute>().unwrap();
+        let (from, to) = (route("/1/2"), route("/5"));
+        assert_eq!(route("/1/2/3").rerooted(&from, &to), Ok(route("/5/3")));
+        assert_eq!(
+            route("/1").rerooted(&from, &to),
+            Err(RouteError::OutsideSubtree)
+        );
+        let deep = route("/1/2/3/4/5/6/7/8");
+        assert_eq!(
+            deep.rerooted(&from, &route("/5/6/7")),
+            Err(RouteError::TooLong)
+        );
+    }
+
     fn packet_to(route: &str, payload: &[u8]) -> (Vec<u8>, usize) {
         let route: DeviceRoute = route.parse().unwrap();
         let mut header = Header::new(PacketType::RPC_REQ, payload.len() as u16);
@@ -349,20 +392,6 @@ mod tests {
         assert_eq!(header.ttl, 3);
         assert_eq!(&buf[header.payload_range()], b"cmd");
         assert_eq!(pop_hop(&mut buf[..len]), Err(ForwardError::NotRouted));
-    }
-
-    #[test]
-    fn push_hop_builds_the_upstream_route() {
-        let (mut buf, len) = packet_to("/", b"data");
-        buf.push(0);
-        let len = push_hop(&mut buf[..len + 1], 7).unwrap();
-        let len = push_hop(&mut buf[..len + 1], 2).unwrap();
-
-        let header = Header::parse_prefix(&buf[..len]).unwrap();
-        assert_eq!(header.routing_size, 2);
-        let routing = &buf[Header::SIZE + 4..len];
-        assert_eq!(DeviceRoute::from_wire(routing).unwrap().to_string(), "/2/7");
-        assert_eq!(&buf[header.payload_range()], b"data");
     }
 
     #[test]

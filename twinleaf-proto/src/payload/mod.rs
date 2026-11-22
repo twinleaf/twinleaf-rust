@@ -4,9 +4,11 @@ pub mod capture;
 pub mod data;
 pub mod heartbeat;
 pub mod log;
+pub mod proxy;
 pub mod rpc;
 pub mod settings;
 pub mod sync;
+pub mod update;
 
 /// Returns the `N` bytes of `bytes` from offset `at`, or `None` if they run
 /// past the end.
@@ -21,6 +23,8 @@ pub(crate) fn array_at<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N
 pub(crate) mod strategy {
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
+
+    use crate::packet::WriteError;
 
     /// A length from 0 to `max`. Four in five are 0, 1, `max - 1` or `max`.
     pub(crate) fn len_to(max: usize) -> impl Strategy<Value = usize> {
@@ -132,31 +136,6 @@ pub(crate) mod strategy {
         Ok(strings)
     }
 
-    /// The classes of a write of `strings` into `room` bytes after a head,
-    /// by where [`cut_in_turn`] cuts each string.
-    pub(crate) fn cut_classes(strings: &[&str], room: usize) -> Vec<&'static str> {
-        let mut classes = Vec::new();
-        let mut left = room;
-        for text in strings {
-            let limit = left.min(u8::MAX as usize);
-            if text.len() > limit {
-                classes.push(match (limit == left, text.is_char_boundary(limit)) {
-                    (true, true) => "a string cut by the room",
-                    (true, false) => "a string cut by the room inside a character",
-                    (false, true) => "a string cut at 255 bytes",
-                    (false, false) => "a string cut at 255 bytes inside a character",
-                });
-            }
-            left -= cut(text, limit).len();
-        }
-        if classes.is_empty() {
-            classes.push("no string cut");
-        }
-        classes.sort_unstable();
-        classes.dedup();
-        classes
-    }
-
     /// Text of up to `max` bytes. Half are ASCII of a length [`len_to`]
     /// draws. A quarter are any characters cut to `max` bytes on a character
     /// boundary. A quarter are up to three ASCII bytes and then one character
@@ -190,13 +169,13 @@ pub(crate) mod strategy {
     /// write is not checked. Returns the length and the zeroed buffer.
     pub(crate) fn write_over_any(
         len: usize,
-        write: impl Fn(&mut [u8]) -> Option<usize>,
-    ) -> Result<(Option<usize>, Vec<u8>), TestCaseError> {
+        write: impl Fn(&mut [u8]) -> Result<usize, WriteError>,
+    ) -> Result<(Result<usize, WriteError>, Vec<u8>), TestCaseError> {
         let mut zeroes = vec![0; len];
         let mut ones = vec![u8::MAX; len];
         let written = write(&mut zeroes);
         prop_assert_eq!(write(&mut ones), written);
-        let Some(end) = written else {
+        let Ok(end) = written else {
             return Ok((written, zeroes));
         };
         prop_assert_eq!(
@@ -210,42 +189,6 @@ pub(crate) mod strategy {
             "a byte past the length was written"
         );
         Ok((written, zeroes))
-    }
-
-    /// The name of the variable that turns on [`tally`].
-    const COUNTING: &str = "TWINLEAF_PAYLOAD_CLASSES";
-
-    /// Draws a run of cases from `strategy` and prints the share of cases in
-    /// each class that `classes` names, when the variable
-    /// `TWINLEAF_PAYLOAD_CLASSES` is set. Run it with `--nocapture` to see
-    /// the counts.
-    pub(crate) fn tally<S>(
-        title: &str,
-        strategy: S,
-        classes: impl Fn(&S::Value) -> Vec<&'static str>,
-    ) where
-        S: Strategy,
-        S::Value: std::fmt::Debug,
-    {
-        use std::cell::{Cell, RefCell};
-        use std::collections::BTreeMap;
-
-        if std::env::var_os(COUNTING).is_none() {
-            return;
-        }
-        let counts = RefCell::new(BTreeMap::<&'static str, usize>::new());
-        let cases = Cell::new(0usize);
-        proptest!(|(value in strategy)| {
-            cases.set(cases.get() + 1);
-            for class in classes(&value) {
-                *counts.borrow_mut().entry(class).or_default() += 1;
-            }
-        });
-        println!("{title}, {} cases", cases.get());
-        for (class, count) in counts.into_inner() {
-            let share = 100.0 * count as f64 / cases.get() as f64;
-            println!("  {class:<40} {count:>6} {share:>6.1}%");
-        }
     }
 
     /// How far a buffer is from the length a write needs, up to eight bytes

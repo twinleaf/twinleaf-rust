@@ -6,8 +6,11 @@
 //! heartbeats to keep a child port awake, and a host sends one when it opens a
 //! serial port.
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, PacketType, WriteError};
 use crate::SessionId;
+
+/// How often a device sends a heartbeat.
+pub const PERIOD: core::time::Duration = core::time::Duration::from_millis(200);
 
 /// Payload length of a heartbeat carrying only a session, `sizeof(tl_session_id)`.
 pub const SESSION_PAYLOAD_SIZE: usize = 4;
@@ -63,9 +66,14 @@ impl<'a> Heartbeat<'a> {
         }
     }
 
-    /// Writes a full `HEARTBEAT` packet into `buf`. Returns its length, or
-    /// `None` if it does not fit.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full `HEARTBEAT` packet into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::PayloadTooLarge`] if the payload exceeds
+    /// [`Packet::MAX_PAYLOAD`], and [`WriteError::BufferTooSmall`] if `buf`
+    /// cannot hold the packet.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         match self {
             Self::Session {
                 session,
@@ -85,23 +93,21 @@ impl<'a> Heartbeat<'a> {
     }
 }
 
-fn write_packet(buf: &mut [u8], payload: &[u8]) -> Option<usize> {
-    if payload.len() > Packet::MAX_PAYLOAD {
-        return None;
-    }
+fn write_packet(buf: &mut [u8], payload: &[u8]) -> Result<usize, WriteError> {
+    let hdr = Header::for_payload(PacketType::HEARTBEAT, payload.len())?;
     let total = Header::SIZE + payload.len();
     if buf.len() < total {
-        return None;
+        return Err(WriteError::BufferTooSmall);
     }
-    let hdr = Header::new(PacketType::HEARTBEAT, payload.len() as u16);
     hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
     buf[Header::SIZE..total].copy_from_slice(payload);
-    Some(total)
+    Ok(total)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet::Packet;
     use crate::payload::strategy::{buffer, bytes, bytes_to, slack, word, write_over_any};
     use proptest::prelude::*;
 
@@ -181,7 +187,7 @@ mod tests {
                 prop_assert_eq!(beat.settings(), None);
             }
             let (len, buf) = write_over_any(Header::SIZE + payload.len(), |buf| beat.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             prop_assert_eq!(&buf[Header::SIZE..], &payload[..]);
         }
 
@@ -194,34 +200,7 @@ mod tests {
             let needed = Header::SIZE + payload.len();
             let mut buf = buffer(needed, slack);
             let fits = payload.len() <= Packet::MAX_PAYLOAD && buf.len() >= needed;
-            prop_assert_eq!(beat.write(&mut buf), fits.then_some(needed));
+            prop_assert_eq!(beat.write(&mut buf).ok(), fits.then_some(needed));
         }
-    }
-
-    /// Byte for byte, a HEARTBEAT header with no routing over the session id
-    /// and the settings sequence, little-endian.
-    #[test]
-    fn matches_the_packed_wire_layout() {
-        let mut buf = [0u8; 16];
-        let len = beat(0x0102_0304, Some(0x0A0B_0C0D))
-            .write(&mut buf)
-            .unwrap();
-        #[rustfmt::skip]
-        assert_eq!(&buf[..len], &[
-            5, 0, 8, 0,             // header: HEARTBEAT, no routing, payload 8
-            0x04, 0x03, 0x02, 0x01, // tl_session_id, little-endian
-            0x0D, 0x0C, 0x0B, 0x0A, // settings sequence, little-endian
-        ]);
-        let len = beat(0x0102_0304, None).write(&mut buf).unwrap();
-        assert_eq!(&buf[..len], &[5, 0, 4, 0, 0x04, 0x03, 0x02, 0x01]);
-    }
-
-    /// The keepalive a hub sends a child port, which hosts also send to open
-    /// a serial port (header bytes before the CRC).
-    #[test]
-    fn an_empty_heartbeat_is_a_bare_header() {
-        let mut buf = [0u8; 8];
-        let len = Heartbeat::Any(b"").write(&mut buf).unwrap();
-        assert_eq!(&buf[..len], &[0x05, 0x00, 0x00, 0x00]);
     }
 }

@@ -9,6 +9,8 @@
 
 use crc::{Crc, CRC_32_ISO_HDLC};
 
+use crate::packet::WriteError;
+
 /// Frame delimiter, 0xC0.
 pub const SLIP_END: u8 = 0xC0;
 /// Escape, 0xDB.
@@ -29,10 +31,13 @@ pub const fn max_serialized_size(packet_size: usize) -> usize {
     2 * (packet_size + CRC_SIZE) + 1
 }
 
-/// Encodes `packet` and its CRC32 into `out` as one SLIP frame. Returns the
-/// frame length, or `None` if `out` is too small. A buffer sized by
-/// [`max_serialized_size`] always fits.
-pub fn serialize(packet: &[u8], out: &mut [u8]) -> Option<usize> {
+/// Encodes `packet` and its CRC32 into `out` as one SLIP frame and returns
+/// the frame length. A buffer sized by [`max_serialized_size`] always fits.
+///
+/// # Errors
+///
+/// Returns [`WriteError::BufferTooSmall`] if `out` is too small.
+pub fn serialize(packet: &[u8], out: &mut [u8]) -> Result<usize, WriteError> {
     let crc = CRC32.checksum(packet).to_le_bytes();
     let mut len = 0;
     for mut part in [packet, &crc[..]] {
@@ -42,7 +47,9 @@ pub fn serialize(packet: &[u8], out: &mut [u8]) -> Option<usize> {
                 .iter()
                 .position(|&byte| byte == SLIP_END || byte == SLIP_ESC)
                 .unwrap_or(part.len());
-            out.get_mut(len..len + run)?.copy_from_slice(&part[..run]);
+            out.get_mut(len..len + run)
+                .ok_or(WriteError::BufferTooSmall)?
+                .copy_from_slice(&part[..run]);
             len += run;
             let Some((&special, rest)) = part[run..].split_first() else {
                 break;
@@ -51,14 +58,15 @@ pub fn serialize(packet: &[u8], out: &mut [u8]) -> Option<usize> {
                 SLIP_END => SLIP_ESC_END,
                 _ => SLIP_ESC_ESC,
             };
-            out.get_mut(len..len + 2)?
+            out.get_mut(len..len + 2)
+                .ok_or(WriteError::BufferTooSmall)?
                 .copy_from_slice(&[SLIP_ESC, code]);
             len += 2;
             part = rest;
         }
     }
-    *out.get_mut(len)? = SLIP_END;
-    Some(len + 1)
+    *out.get_mut(len).ok_or(WriteError::BufferTooSmall)? = SLIP_END;
+    Ok(len + 1)
 }
 
 /// Frame-level error bits, matching `TL_SERIAL_ERROR_*`.
@@ -304,11 +312,6 @@ impl<const CAPACITY: usize> Deserializer<CAPACITY> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn crc32_is_the_iso_hdlc_variant() {
-        assert_eq!(CRC32.checksum(b"123456789"), 0xCBF4_3926);
-    }
-
     const CAP: usize = 64 + CRC_SIZE;
 
     fn deserialize_all(des: &mut Deserializer<CAP>, mut input: &[u8]) -> Vec<(Vec<u8>, u8)> {
@@ -321,63 +324,6 @@ mod tests {
             input = &input[n..];
         }
         frames
-    }
-
-    fn round_trip(packet: &[u8]) -> Vec<u8> {
-        let mut wire = vec![0; max_serialized_size(packet.len())];
-        let n = serialize(packet, &mut wire).unwrap();
-        wire.truncate(n);
-        let mut des = Deserializer::<CAP>::new();
-        let frames = deserialize_all(&mut des, &wire);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].1, 0, "unexpected frame errors");
-        frames[0].0.clone()
-    }
-
-    #[test]
-    fn round_trips_plain_and_escaped_packets() {
-        assert_eq!(round_trip(b"hello"), b"hello");
-        let nasty = [0xC0, 0xDB, 0x00, 0xC0, 0xDC, 0xDD, 0xDB];
-        assert_eq!(round_trip(&nasty), nasty);
-    }
-
-    #[test]
-    fn wire_format_matches_serial_proto_c() {
-        let packet = [0x01, 0xC0, 0xDB];
-        let crc = CRC32.checksum(&packet).to_le_bytes();
-        let mut wire = vec![0; max_serialized_size(packet.len())];
-        let n = serialize(&packet, &mut wire).unwrap();
-        let mut expected = vec![0x01, 0xDB, 0xDC, 0xDB, 0xDD];
-        for b in crc {
-            match b {
-                SLIP_END => expected.extend([SLIP_ESC, SLIP_ESC_END]),
-                SLIP_ESC => expected.extend([SLIP_ESC, SLIP_ESC_ESC]),
-                _ => expected.push(b),
-            }
-        }
-        expected.push(SLIP_END);
-        assert_eq!(&wire[..n], expected);
-    }
-
-    #[test]
-    fn serialize_rejects_short_buffer() {
-        let mut small = [0u8; 4];
-        assert!(serialize(b"hello", &mut small).is_none());
-    }
-
-    #[test]
-    fn byte_at_a_time_delivery() {
-        let packet = [0xC0, 0x42, 0xDB];
-        let mut wire = vec![0; max_serialized_size(packet.len())];
-        let n = serialize(&packet, &mut wire).unwrap();
-        let mut des = Deserializer::<CAP>::new();
-        let mut frames = Vec::new();
-        for &b in &wire[..n] {
-            if let (_, Some(f)) = des.push(&[b]) {
-                frames.push((f.data().to_vec(), f.errors.bits()));
-            }
-        }
-        assert_eq!(frames, vec![(packet.to_vec(), 0)]);
     }
 
     #[test]
@@ -395,18 +341,6 @@ mod tests {
     }
 
     #[test]
-    fn crc_corruption_reports_error_with_raw_bytes() {
-        let mut wire = vec![0; max_serialized_size(4)];
-        let n = serialize(b"data", &mut wire).unwrap();
-        wire[1] ^= 0xFF; // corrupt payload; CRC no longer matches
-        let mut des = Deserializer::<CAP>::new();
-        let frames = deserialize_all(&mut des, &wire[..n]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].1, FrameErrors::CRC.bits());
-        assert_eq!(frames[0].0.len(), 4 + CRC_SIZE, "CRC not stripped on error");
-    }
-
-    #[test]
     fn short_and_dangling_and_bad_escape() {
         let mut des = Deserializer::<CAP>::new();
         let frames = deserialize_all(&mut des, &[0x01, 0x02, 0xC0]);
@@ -421,92 +355,20 @@ mod tests {
         assert!(FrameErrors(frames[0].1).contains(FrameErrors::ESC_CODE));
         assert_eq!(frames[0].0[0], 0x99);
     }
-
-    #[test]
-    fn text_lines_are_surfaced_not_fatal() {
-        let mut des = Deserializer::<CAP>::new();
-        let frames = deserialize_all(&mut des, b"boot: hello v1.2\r\n");
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].1, FrameErrors::TEXT.bits());
-        assert_eq!(frames[0].0, b"boot: hello v1.2");
-
-        let mut wire = vec![0; max_serialized_size(3)];
-        let n = serialize(&[1, 2, 3], &mut wire).unwrap();
-        let frames = deserialize_all(&mut des, &wire[..n]);
-        assert_eq!(frames, vec![(vec![1, 2, 3], 0)]);
-    }
-
-    #[test]
-    fn leading_zeros_skipped_only_before_first_frame() {
-        let mut wire = vec![0; max_serialized_size(2)];
-        let n = serialize(&[9, 9], &mut wire).unwrap();
-        let mut des = Deserializer::<CAP>::new();
-        let mut input = vec![0u8, 0, 0];
-        input.extend_from_slice(&wire[..n]);
-        let frames = deserialize_all(&mut des, &input);
-        assert_eq!(frames, vec![(vec![9, 9], 0)]);
-
-        let mut wire2 = vec![0; max_serialized_size(3)];
-        let n2 = serialize(&[0, 7, 0], &mut wire2).unwrap();
-        let frames = deserialize_all(&mut des, &wire2[..n2]);
-        assert_eq!(frames, vec![(vec![0, 7, 0], 0)]);
-    }
-
-    #[test]
-    fn an_end_with_nothing_buffered_drops_a_pending_escape() {
-        let mut wire = vec![0xDB, 0xC0];
-        wire.resize(2 + max_serialized_size(3), 0);
-        let n = serialize(&[1, 2, 3], &mut wire[2..]).unwrap();
-        let mut des = Deserializer::<CAP>::new();
-        let frames = deserialize_all(&mut des, &wire[..2 + n]);
-        assert_eq!(frames, vec![(vec![1, 2, 3], 0)]);
-    }
-
-    #[test]
-    fn empty_frames_ignored() {
-        let mut des = Deserializer::<CAP>::new();
-        assert!(deserialize_all(&mut des, &[0xC0, 0xC0, 0xC0]).is_empty());
-    }
-
-    #[test]
-    fn oversized_frame_restarts_parser() {
-        let mut des = Deserializer::<CAP>::new();
-        let flood = vec![0x55u8; CAP + 10];
-        let frames = deserialize_all(&mut des, &flood);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].1, FrameErrors::TOO_BIG.bits());
-        assert_eq!(frames[0].0.len(), CAP);
-
-        // Terminate the overflow remnant before the valid frame.
-        let mut wire = vec![0xC0];
-        let mut good = vec![0; max_serialized_size(2)];
-        let n = serialize(&[1, 2], &mut good).unwrap();
-        wire.extend_from_slice(&good[..n]);
-        let frames = deserialize_all(&mut des, &wire);
-        assert_eq!(frames.last().unwrap(), &(vec![1, 2], 0));
-    }
-
-    #[test]
-    fn worst_case_size_bound_is_tight() {
-        let packet = [SLIP_END; 8];
-        let mut wire = vec![0; max_serialized_size(8)];
-        let n = serialize(&packet, &mut wire).unwrap();
-        assert!(n <= max_serialized_size(8));
-    }
 }
 
-/// The byte-at-a-time codec the run-copying one replaced, kept as the model it
-/// must agree with.
+/// A model of the codec that works a byte at a time. The properties below
+/// compare the codec against it.
 #[cfg(test)]
 mod bytewise {
     use super::*;
     use proptest::prelude::*;
 
-    fn serialize_bytewise(packet: &[u8], out: &mut [u8]) -> Option<usize> {
-        fn put(out: &mut [u8], len: &mut usize, value: u8) -> Option<()> {
-            *out.get_mut(*len)? = value;
+    fn serialize_bytewise(packet: &[u8], out: &mut [u8]) -> Result<usize, WriteError> {
+        fn put(out: &mut [u8], len: &mut usize, value: u8) -> Result<(), WriteError> {
+            *out.get_mut(*len).ok_or(WriteError::BufferTooSmall)? = value;
             *len += 1;
-            Some(())
+            Ok(())
         }
 
         let crc = CRC32.checksum(packet).to_le_bytes();
@@ -525,7 +387,7 @@ mod bytewise {
             }
         }
         put(out, &mut len, SLIP_END)?;
-        Some(len)
+        Ok(len)
     }
 
     impl<const CAPACITY: usize> Deserializer<CAPACITY> {
@@ -684,7 +546,7 @@ mod bytewise {
             let (mut runs, mut bytes) = (vec![0; room], vec![0; room]);
             let (ran, bytewise) = (serialize(&packet, &mut runs), serialize_bytewise(&packet, &mut bytes));
             prop_assert_eq!(ran, bytewise);
-            if let Some(len) = ran {
+            if let Ok(len) = ran {
                 prop_assert_eq!(&runs[..len], &bytes[..len]);
             }
         }

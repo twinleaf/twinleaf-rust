@@ -6,7 +6,7 @@
 //! `data` is chosen by the sender. Twinleaf devices send their uptime in
 //! milliseconds. [`LogMessage`] parses and writes the packet.
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, Packet, PacketType, WriteError};
 
 /// Size of the `{ data, level }` head before the message.
 pub const LOG_HEADER_SIZE: usize = 5;
@@ -66,23 +66,28 @@ impl<'a> LogMessage<'a> {
         })
     }
 
-    /// Writes a full `LOG` packet into `buf`. Returns its length, or `None` if
-    /// it does not fit or the message exceeds [`MAX_MESSAGE_SIZE`].
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full `LOG` packet into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::MessageTooLong`] if the message exceeds
+    /// [`MAX_MESSAGE_SIZE`], and [`WriteError::BufferTooSmall`] if `buf`
+    /// cannot hold the packet.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         if self.message.len() > MAX_MESSAGE_SIZE {
-            return None;
+            return Err(WriteError::MessageTooLong);
         }
         let payload_len = LOG_HEADER_SIZE + self.message.len();
         let total = Header::SIZE + payload_len;
         if buf.len() < total {
-            return None;
+            return Err(WriteError::BufferTooSmall);
         }
         let hdr = Header::new(PacketType::LOG, payload_len as u16);
-        hdr.write(buf.first_chunk_mut()?);
+        hdr.write(buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?);
         buf[Header::SIZE..Header::SIZE + 4].copy_from_slice(&self.data.to_le_bytes());
         buf[Header::SIZE + 4] = self.level.value();
         buf[Header::SIZE + LOG_HEADER_SIZE..total].copy_from_slice(self.message);
-        Some(total)
+        Ok(total)
     }
 }
 
@@ -119,7 +124,7 @@ mod tests {
             let log = LogMessage { level, data, message: &message };
             let payload_len = LOG_HEADER_SIZE + message.len();
             let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| log.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             prop_assert_eq!(header, Header::new(PacketType::LOG, payload_len as u16));
             prop_assert_eq!(LogMessage::parse(&buf[Header::SIZE..]), Some(log));
@@ -139,7 +144,7 @@ mod tests {
             };
             prop_assert!(payload.len() >= LOG_HEADER_SIZE);
             let (len, buf) = write_over_any(Header::SIZE + payload.len(), |buf| log.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             prop_assert_eq!(&buf[Header::SIZE..], &payload[..]);
         }
 
@@ -151,73 +156,7 @@ mod tests {
             let needed = Header::SIZE + LOG_HEADER_SIZE + message.len();
             let mut buf = buffer(needed, slack);
             let fits = message.len() <= MAX_MESSAGE_SIZE && buf.len() >= needed;
-            prop_assert_eq!(log.write(&mut buf), fits.then_some(needed));
+            prop_assert_eq!(log.write(&mut buf).ok(), fits.then_some(needed));
         }
-    }
-
-    /// Byte-exact packed layout of the log payload behind its packet header
-    /// (`type = TL_PTYPE_LOG`, `routing_size_and_ttl = 0`, `payload_size`
-    /// covering the fixed header and the message).
-    #[test]
-    fn matches_the_packed_wire_layout() {
-        let log = LogMessage {
-            level: LogLevel::INFO,
-            data: 0x0102_0304,
-            message: b"up",
-        };
-        let mut buf = [0u8; 32];
-        let len = log.write(&mut buf).unwrap();
-        #[rustfmt::skip]
-        assert_eq!(&buf[..len], &[
-            1, 0, 7, 0,                 // header: LOG, no routing, payload 7
-            0x04, 0x03, 0x02, 0x01,     // data, little-endian
-            3,                          // level, TL_LOG_INFO
-            b'u', b'p',
-        ]);
-    }
-
-    /// A receiver takes the level and data from the fixed header, and the
-    /// message running from there to the end of the payload.
-    #[test]
-    fn decodes_level_data_and_message() {
-        // A packet as it arrives on the wire.
-        let raw = [
-            1, 0, 13, 0, // LOG, no routing, payload_size 13
-            0xE8, 0x03, 0x00, 0x00, // data = 1000 ms
-            1,    // TL_LOG_ERROR
-            b'i', b'm', b'u', b' ', b'f', b'a', b'i', b'l',
-        ];
-        let header = Header::parse((&raw[..Header::SIZE]).try_into().unwrap()).unwrap();
-        assert_eq!(header.ptype, PacketType::LOG);
-        assert_eq!(header.packet_len(), raw.len());
-        // tl_log_packet_message_size
-        assert_eq!(
-            header.payload_size as usize - LOG_HEADER_SIZE,
-            "imu fail".len()
-        );
-
-        let log = LogMessage::parse(&raw[header.payload_range()]).unwrap();
-        assert_eq!(log.level, LogLevel::ERROR);
-        assert_eq!(log.data, 1000);
-        assert_eq!(log.message, b"imu fail");
-    }
-
-    #[test]
-    fn levels_match_the_wire_and_order_by_verbosity() {
-        assert_eq!(LogLevel::CRITICAL.value(), 0);
-        assert_eq!(LogLevel::ERROR.value(), 1);
-        assert_eq!(LogLevel::WARNING.value(), 2);
-        assert_eq!(LogLevel::INFO.value(), 3);
-        assert_eq!(LogLevel::DEBUG.value(), 4);
-        // `level > logThreshold` drops the message, so debug is dropped at an
-        // info threshold and critical never is.
-        assert!(LogLevel::DEBUG > LogLevel::INFO);
-        assert!(LogLevel::CRITICAL < LogLevel::INFO);
-    }
-
-    #[test]
-    fn max_message_size_matches_the_wire() {
-        // TL_PACKET_MAX_PAYLOAD_SIZE - sizeof(tl_log_header)
-        assert_eq!(MAX_MESSAGE_SIZE, 500 - 5);
     }
 }

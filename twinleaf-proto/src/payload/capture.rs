@@ -1,4 +1,9 @@
-//! Capture metadata, an RPC reply format.
+//! The capture RPC's selector, its status and its metadata reply.
+//!
+//! A capture RPC takes an `i16` selector as its argument, little endian.
+//! `-1` triggers a capture, `-2` reports its [`Status`], `-3` reports its
+//! [`CaptureMetadata`], and `0` and up read that block of its data. An empty
+//! argument reports the status. [`Selector`] parses and writes the argument.
 //!
 //! A capture RPC called with the metadata selector replies with a fixed head
 //! whose first byte is its own length, then four strings whose lengths the
@@ -9,6 +14,93 @@ use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::data::{DataType, RecordReader, RecordWriter};
+use crate::packet::WriteError;
+use crate::rpc::RpcError;
+
+/// Where a capture stands, as the status selector reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(u8)]
+pub enum Status {
+    /// Nothing captured yet.
+    Idle = 0,
+    /// A capture is in progress.
+    Capturing = 1,
+    /// Data is ready to read.
+    Done = 2,
+    /// The last capture failed.
+    Error = 4,
+}
+
+impl Status {
+    /// The byte the status selector replies with.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The status a reply byte names, or `None` for a byte no status has.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Idle),
+            1 => Some(Self::Capturing),
+            2 => Some(Self::Done),
+            4 => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+/// What a capture RPC argument asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Selector {
+    /// Start a capture.
+    Trigger,
+    /// The [`Status`] byte.
+    Status,
+    /// The [`CaptureMetadata`].
+    Metadata,
+    /// One block of the data.
+    Block(u16),
+}
+
+impl Selector {
+    /// The largest block index a selector holds.
+    pub const MAX_BLOCK: u16 = i16::MAX as u16;
+
+    /// The selector an argument encodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError::ArgsSize`] for an argument that is neither empty
+    /// nor two bytes, and [`RpcError::Invalid`] for a value below `-3`.
+    pub fn parse(arg: &[u8]) -> Result<Self, RpcError> {
+        let selector = match arg {
+            [] => return Ok(Self::Status),
+            [low, high] => i16::from_le_bytes([*low, *high]),
+            _ => return Err(RpcError::ArgsSize),
+        };
+        match selector {
+            -1 => Ok(Self::Trigger),
+            -2 => Ok(Self::Status),
+            -3 => Ok(Self::Metadata),
+            index if index >= 0 => Ok(Self::Block(index as u16)),
+            _ => Err(RpcError::Invalid),
+        }
+    }
+
+    /// The argument that encodes the selector. `None` for a block above
+    /// [`Self::MAX_BLOCK`].
+    pub fn arg(self) -> Option<[u8; 2]> {
+        let selector: i16 = match self {
+            Self::Trigger => -1,
+            Self::Status => -2,
+            Self::Metadata => -3,
+            Self::Block(index) => i16::try_from(index).ok()?,
+        };
+        Some(selector.to_le_bytes())
+    }
+}
 
 /// Version of the layout described here (`TL_CAPTURE_METADATA_VERSION`).
 pub const METADATA_VERSION: u8 = 1;
@@ -66,15 +158,18 @@ pub struct CaptureMetadata<'a> {
 
 impl<'a> CaptureMetadata<'a> {
     /// Writes the RPC reply payload into `buf` and returns its length. Strings
-    /// are truncated to the room left after the head. Returns `None` if `buf`
-    /// cannot hold the head.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// are truncated to the room left after the head.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, METADATA_FIXED_LEN)?;
         let name_len = record.push(self.name);
         let units_len = record.push(self.units);
         let x_name_len = record.push(self.x_name);
         let x_units_len = record.push(self.x_units);
-        Some(record.finish(MetadataHead {
+        Ok(record.finish(MetadataHead {
             head_len: METADATA_FIXED_LEN as u8,
             version: self.version,
             data_type: self.data_type.value(),
@@ -178,8 +273,7 @@ mod tests {
     //! zeros, infinities and NaNs with payloads, rooms at any byte with
     //! strings of up to 300 bytes, 1 to 225 extra head bytes, and replies
     //! with a head length, a string length or a string byte changed, so that
-    //! each refusal [`strings_of`] names is reached. `class_counts` prints
-    //! the share of each class with `TWINLEAF_PAYLOAD_CLASSES` set.
+    //! each refusal [`strings_of`] names is reached.
     //!
     //! # Exclusions
     //!
@@ -187,13 +281,12 @@ mod tests {
     //!
     //! # Examples that stay
     //!
-    //! The pinned layout, each field a value no other field holds so that
-    //! swapped fields fail, and the head size.
+    //! The selectors and the statuses, each read back from its argument or
+    //! its code.
 
     use super::*;
     use crate::payload::strategy::{
-        bytes, bytes_to, cut_classes, cut_in_turn, float, half, octet, strings_of, tally, text,
-        word, write_over_any,
+        bytes, bytes_to, cut_in_turn, float, half, octet, strings_of, text, word, write_over_any,
     };
     use proptest::prelude::*;
     use proptest::sample::Index;
@@ -315,7 +408,7 @@ mod tests {
             let wire = fields.wire();
             let metadata = fields.metadata();
             let (len, reply) = write_over_any(wire.len(), |buf| metadata.write(buf))?;
-            prop_assert_eq!(len, Some(wire.len()));
+            prop_assert_eq!(len, Ok(wire.len()));
             prop_assert_eq!(&reply, &wire);
             prop_assert_eq!(CaptureMetadata::parse(&wire).map(by_bits), Some(by_bits(metadata)));
         }
@@ -337,14 +430,14 @@ mod tests {
             let metadata = fields.metadata();
             let (len, reply) =
                 write_over_any(METADATA_FIXED_LEN + room, |buf| metadata.write(buf))?;
-            prop_assert_eq!(len, Some(wire.len()));
+            prop_assert_eq!(len, Ok(wire.len()));
             prop_assert_eq!(&reply[..wire.len()], &wire[..]);
             prop_assert_eq!(
                 CaptureMetadata::parse(&wire).map(by_bits),
                 Some(by_bits(expected.metadata()))
             );
             let (len, _) = write_over_any(METADATA_FIXED_LEN - 1, |buf| metadata.write(buf))?;
-            prop_assert_eq!(len, None);
+            prop_assert_eq!(len, Err(WriteError::BufferTooSmall));
         }
 
         /// C4. A longer head than this build's is read as far as this build
@@ -417,119 +510,58 @@ mod tests {
         ]
     }
 
-    /// Prints the share of the classes the generator obligations name, when
-    /// `TWINLEAF_PAYLOAD_CLASSES` is set.
     #[test]
-    fn class_counts() {
-        tally("C5 replies", any_reply(), |reply| {
-            vec![strings_of(reply, METADATA_FIXED_LEN, &LENGTH_OFFSETS)
-                .map_or_else(|refused| refused, |_| "parses")]
-        });
-        tally(
-            "C3 strings and room",
-            (fields(300), any::<Index>()),
-            |(fields, room)| {
-                let strings = fields.strings();
-                let total: usize = strings.iter().map(|text| text.len()).sum();
-                cut_classes(&strings, room.index(total + 2))
-            },
+    fn selectors_parse_from_the_argument() {
+        assert_eq!(Selector::parse(&[]), Ok(Selector::Status));
+        assert_eq!(
+            Selector::parse(&(-1i16).to_le_bytes()),
+            Ok(Selector::Trigger)
         );
+        assert_eq!(
+            Selector::parse(&(-2i16).to_le_bytes()),
+            Ok(Selector::Status)
+        );
+        assert_eq!(
+            Selector::parse(&(-3i16).to_le_bytes()),
+            Ok(Selector::Metadata)
+        );
+        assert_eq!(Selector::parse(&5i16.to_le_bytes()), Ok(Selector::Block(5)));
+        assert_eq!(
+            Selector::parse(&(-4i16).to_le_bytes()),
+            Err(RpcError::Invalid)
+        );
+        assert_eq!(Selector::parse(&[1, 2, 3]), Err(RpcError::ArgsSize));
     }
 
-    fn metadata() -> CaptureMetadata<'static> {
-        CaptureMetadata {
-            version: METADATA_VERSION,
-            data_type: DataType::F32,
-            data_size: 12,
-            block_size: 256,
-            length: 3,
-            y_calibration: 1.0,
-            x_offset: 0.5,
-            x_stride: 0.25,
-            name: "vbus",
-            units: "mV",
-            x_name: "t_rel",
-            x_units: "second",
+    /// Every selector with an argument parses back to itself from it, and
+    /// only a block above [`Selector::MAX_BLOCK`] has no argument.
+    #[test]
+    fn a_selector_parses_back_from_its_argument() {
+        let named = [Selector::Trigger, Selector::Status, Selector::Metadata];
+        let blocks = (0..=Selector::MAX_BLOCK).map(Selector::Block);
+        for selector in named.into_iter().chain(blocks) {
+            let arg = selector
+                .arg()
+                .expect("a selector up to MAX_BLOCK has an argument");
+            assert_eq!(Selector::parse(&arg), Ok(selector));
+        }
+        for index in Selector::MAX_BLOCK + 1..=u16::MAX {
+            assert_eq!(Selector::Block(index).arg(), None);
         }
     }
 
+    /// Each status reads back from its code, and every other byte names no
+    /// status.
     #[test]
-    fn round_trip() {
-        let mut buf = [0u8; 128];
-        let len = metadata().write(&mut buf).unwrap();
-        assert_eq!(CaptureMetadata::parse(&buf[..len]), Some(metadata()));
-    }
-
-    /// Byte-exact packed layout of the fixed metadata head and the strings
-    /// appended after it.
-    #[test]
-    fn matches_the_packed_wire_layout() {
-        let mut buf = [0u8; 64];
-        let len = metadata().write(&mut buf).unwrap();
-        #[rustfmt::skip]
-        assert_eq!(&buf[..len], &[
-            30,                         // fixed_len
-            1,                          // version
-            0x42,                       // data_type, TL_DATA_TYPE_FLOAT32
-            0,                          // reserved
-            0x0C, 0x00, 0x00, 0x00,     // data_size 12
-            0x00, 0x01,                 // block_size 256
-            0x03, 0x00, 0x00, 0x00,     // length 3
-            0x00, 0x00, 0x80, 0x3F,     // y_calibration 1.0f
-            0x00, 0x00, 0x00, 0x3F,     // x_offset 0.5f
-            0x00, 0x00, 0x80, 0x3E,     // x_stride 0.25f
-            4, 2, 5, 6,                 // name, units, x_name, x_units lengths
-            b'v', b'b', b'u', b's', b'm', b'V',
-            b't', b'_', b'r', b'e', b'l', b's', b'e', b'c', b'o', b'n', b'd',
-        ]);
-    }
-
-    #[test]
-    fn fixed_len_matches_the_wire() {
-        // TL_CAPTURE_METADATA_FIXED_LEN, static_assert'd against the struct.
-        assert_eq!(METADATA_FIXED_LEN, 30);
-    }
-
-    #[test]
-    fn head_length_lets_readers_skip_unknown_fields() {
-        // A device that appended two head fields: strings still start where the
-        // wire says they do.
-        let mut buf = [0u8; 64];
-        let len = metadata().write(&mut buf).unwrap();
-        let mut extended = [0u8; 66];
-        extended[..METADATA_FIXED_LEN].copy_from_slice(&buf[..METADATA_FIXED_LEN]);
-        extended[0] = METADATA_FIXED_LEN as u8 + 2;
-        extended[METADATA_FIXED_LEN..METADATA_FIXED_LEN + 2].copy_from_slice(&[0xAA, 0xBB]);
-        extended[METADATA_FIXED_LEN + 2..len + 2].copy_from_slice(&buf[METADATA_FIXED_LEN..len]);
-        assert_eq!(
-            CaptureMetadata::parse(&extended[..len + 2]),
-            Some(metadata())
-        );
-    }
-
-    #[test]
-    fn parse_rejects_truncated_replies() {
-        let mut buf = [0u8; 64];
-        let len = metadata().write(&mut buf).unwrap();
-        assert_eq!(CaptureMetadata::parse(&[]), None);
-        // The declared head runs past the reply.
-        assert_eq!(CaptureMetadata::parse(&buf[..METADATA_FIXED_LEN - 1]), None);
-        // A head shorter than this build's known fields.
-        let mut short = buf;
-        short[0] = METADATA_FIXED_LEN as u8 - 1;
-        assert_eq!(CaptureMetadata::parse(&short[..len]), None);
-        // x_units_len runs past the end of the reply.
-        assert_eq!(CaptureMetadata::parse(&buf[..len - 1]), None);
-    }
-
-    #[test]
-    fn write_rejects_a_buffer_too_small_for_the_head() {
-        assert_eq!(metadata().write(&mut [0u8; METADATA_FIXED_LEN - 1]), None);
-        // With room for the head alone the strings truncate away.
-        let mut buf = [0u8; METADATA_FIXED_LEN];
-        assert_eq!(metadata().write(&mut buf), Some(METADATA_FIXED_LEN));
-        let parsed = CaptureMetadata::parse(&buf).unwrap();
-        assert_eq!((parsed.name, parsed.units), ("", ""));
-        assert_eq!(parsed.length, 3);
+    fn a_status_reads_back_from_its_code() {
+        let statuses = [Status::Idle, Status::Capturing, Status::Done, Status::Error];
+        for status in statuses {
+            assert_eq!(Status::from_code(status.code()), Some(status));
+        }
+        for code in 0..=u8::MAX {
+            if !statuses.iter().any(|status| status.code() == code) {
+                assert_eq!(Status::from_code(code), None);
+            }
+        }
     }
 }

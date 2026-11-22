@@ -18,7 +18,7 @@
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, Packet, PacketType, WriteError};
 use crate::sync::Epoch;
 use crate::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 
@@ -27,6 +27,9 @@ pub const METADATA_HEADER_SIZE: usize = 2;
 /// Size of the `[first sample number u24le][segment id]` header before a
 /// packet's samples.
 pub const SAMPLE_HEADER_SIZE: usize = 4;
+/// Shortest sample payload, the sample header and one sample byte. A sample
+/// packet always carries at least one sample byte.
+pub(crate) const MIN_SAMPLE_PAYLOAD: usize = SAMPLE_HEADER_SIZE + 1;
 /// Largest sample number on the wire. Sample numbers wrap at 24 bits.
 pub const MAX_SAMPLE_NUMBER: u32 = crate::SampleNumber::MAX;
 
@@ -157,7 +160,8 @@ impl core::ops::BitOr for MetadataFlags {
 pub struct SegmentFlags(u8);
 
 impl SegmentFlags {
-    /// The rest of the segment record is populated. Without this, ignore it.
+    /// The rest of the segment record is populated. Without this the record
+    /// describes no segment and says only that its slot holds nothing.
     pub const VALID: Self = Self(1);
     /// New samples are still being generated for this segment.
     pub const ACTIVE: Self = Self(2);
@@ -272,15 +276,18 @@ impl<'a> Device<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
     pub const HEAD_SIZE: usize = size_of::<DeviceHead>();
 
-    /// Writes the bare record, without a `[type][flags]` header, into `buf`.
-    /// Returns its length, or `None` if `buf` cannot hold the head. Strings
-    /// are truncated to the room left.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes the bare record, without a `[type][flags]` header, into `buf`,
+    /// and returns its length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let name_len = record.push(self.name);
         let serial_len = record.push(self.serial);
         let firmware_len = record.push(self.firmware);
-        Some(record.finish(DeviceHead {
+        Ok(record.finish(DeviceHead {
             head_len: Self::HEAD_SIZE as u8,
             name_len,
             session: self.session.value().into(),
@@ -295,7 +302,12 @@ impl<'a> Device<'a> {
     /// if the record is truncated or a string is not UTF-8. Fields past a shorter
     /// head than this build's read as zero.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let (head, mut strings) = RecordReader::split_defaulting::<DeviceHead>(buf)?;
+        Self::read(buf, Text::Utf8)
+    }
+
+    /// Reads a bare record whose strings are read as `text` says.
+    fn read(buf: &'a [u8], text: Text) -> Option<Self> {
+        let (head, mut strings) = RecordReader::split_defaulting::<DeviceHead>(buf, text)?;
         Some(Self {
             session: SessionId::new(head.session.get()),
             n_streams: head.n_streams,
@@ -340,13 +352,16 @@ impl<'a> Stream<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
     pub const HEAD_SIZE: usize = size_of::<StreamHead>();
 
-    /// Writes the bare record, without a `[type][flags]` header, into `buf`.
-    /// Returns its length, or `None` if `buf` cannot hold the head. Strings
-    /// are truncated to the room left.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes the bare record, without a `[type][flags]` header, into `buf`,
+    /// and returns its length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let name_len = record.push(self.name);
-        Some(record.finish(StreamHead {
+        Ok(record.finish(StreamHead {
             head_len: Self::HEAD_SIZE as u8,
             stream_id: self.stream_id.value(),
             n_columns: self.n_columns,
@@ -362,7 +377,12 @@ impl<'a> Stream<'a> {
     /// 127, or a string is not UTF-8. Fields past a shorter head than this
     /// build's read as zero.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let (head, mut strings) = RecordReader::split_defaulting::<StreamHead>(buf)?;
+        Self::read(buf, Text::Utf8)
+    }
+
+    /// Reads a bare record whose strings are read as `text` says.
+    fn read(buf: &'a [u8], text: Text) -> Option<Self> {
+        let (head, mut strings) = RecordReader::split_defaulting::<StreamHead>(buf, text)?;
         Some(Self {
             stream_id: StreamId::try_new(head.stream_id)?,
             n_columns: head.n_columns,
@@ -423,13 +443,22 @@ impl<'a> Segment<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
     pub const HEAD_SIZE: usize = size_of::<SegmentHead>();
 
-    /// Writes the bare record, without a `[type][flags]` header, into `buf`.
-    /// Returns its length, or `None` if `buf` cannot hold the head. Strings
-    /// are truncated to the room left.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Whether the record describes a segment, which its
+    /// [`VALID`](SegmentFlags::VALID) flag says.
+    pub fn is_populated(&self) -> bool {
+        self.flags.contains(SegmentFlags::VALID)
+    }
+
+    /// Writes the bare record, without a `[type][flags]` header, into `buf`,
+    /// and returns its length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let timeref_serial_len = record.push(self.timeref_serial);
-        Some(record.finish(SegmentHead {
+        Ok(record.finish(SegmentHead {
             head_len: Self::HEAD_SIZE as u8,
             stream_id: self.stream_id.value(),
             segment_id: self.segment_id.value(),
@@ -450,7 +479,12 @@ impl<'a> Segment<'a> {
     /// 127, or a string is not UTF-8. Fields past a shorter head than this
     /// build's read as zero.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let (head, mut strings) = RecordReader::split_defaulting::<SegmentHead>(buf)?;
+        Self::read(buf, Text::Utf8)
+    }
+
+    /// Reads a bare record whose strings are read as `text` says.
+    fn read(buf: &'a [u8], text: Text) -> Option<Self> {
+        let (head, mut strings) = RecordReader::split_defaulting::<SegmentHead>(buf, text)?;
         Some(Self {
             stream_id: StreamId::try_new(head.stream_id)?,
             segment_id: SegmentId::new(head.segment_id),
@@ -465,6 +499,18 @@ impl<'a> Segment<'a> {
             timeref_serial: strings.take(head.timeref_serial_len)?,
         })
     }
+}
+
+/// The time reference a segment's times count from. Two segments are on the
+/// same time reference only if all three fields are equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TimeReference<'a> {
+    /// Timescale the times count in.
+    pub epoch: Epoch,
+    /// Session id of the timebase source.
+    pub session: SessionId,
+    /// Serial of the device that owns the timebase.
+    pub serial: &'a str,
 }
 
 /// One column of a stream's sample (`TL_METADATA_COLUMN`).
@@ -500,15 +546,18 @@ impl<'a> Column<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
     pub const HEAD_SIZE: usize = size_of::<ColumnHead>();
 
-    /// Writes the bare record, without a `[type][flags]` header, into `buf`.
-    /// Returns its length, or `None` if `buf` cannot hold the head. Strings
-    /// are truncated to the room left.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes the bare record, without a `[type][flags]` header, into `buf`,
+    /// and returns its length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let name_len = record.push(self.name);
         let units_len = record.push(self.units);
         let description_len = record.push(self.description);
-        Some(record.finish(ColumnHead {
+        Ok(record.finish(ColumnHead {
             head_len: Self::HEAD_SIZE as u8,
             stream_id: self.stream_id.value(),
             index: self.index.value(),
@@ -524,7 +573,12 @@ impl<'a> Column<'a> {
     /// 127, or a string is not UTF-8. Fields past a shorter head than this
     /// build's read as zero.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let (head, mut strings) = RecordReader::split_defaulting::<ColumnHead>(buf)?;
+        Self::read(buf, Text::Utf8)
+    }
+
+    /// Reads a bare record whose strings are read as `text` says.
+    fn read(buf: &'a [u8], text: Text) -> Option<Self> {
+        let (head, mut strings) = RecordReader::split_defaulting::<ColumnHead>(buf, text)?;
         Some(Self {
             stream_id: StreamId::try_new(head.stream_id)?,
             index: ColumnId::new(head.index),
@@ -588,7 +642,7 @@ macro_rules! record_view {
             }
 
             fn split(&self) -> ($head, RecordReader<'a>) {
-                RecordReader::split_defaulting::<$head>(self.record)
+                RecordReader::split_defaulting::<$head>(self.record, Text::Utf8)
                     .expect("a view's record was checked")
             }
         }
@@ -644,6 +698,14 @@ impl<'a> DeviceView<'a> {
     /// The protocol revision the device keeps, 0 from firmware that declares none.
     pub fn protocol(&self) -> u8 {
         self.field::<u8>(core::mem::offset_of!(DeviceHead, protocol))
+    }
+
+    /// Whether the device marks the starts and stops of its streams. A device that declares a
+    /// protocol revision marks the record of each segment a start opens with [`START`](SegmentFlags::START)
+    /// and closes each segment a stop ends with a record without [`ACTIVE`](SegmentFlags::ACTIVE),
+    /// both on the lane of its rows. A device that declares no revision marks neither.
+    pub fn marks_starts_and_stops(&self) -> bool {
+        self.protocol() > 0
     }
 
     /// Device name.
@@ -732,6 +794,12 @@ impl<'a> SegmentView<'a> {
         SegmentFlags::from_bits(self.field::<u8>(core::mem::offset_of!(SegmentHead, flags)))
     }
 
+    /// Whether the record describes a segment, which its
+    /// [`VALID`](SegmentFlags::VALID) flag says.
+    pub fn is_populated(&self) -> bool {
+        self.flags().contains(SegmentFlags::VALID)
+    }
+
     /// Timescale of `start_time`.
     pub fn epoch(&self) -> Epoch {
         Epoch::new(self.field::<u8>(core::mem::offset_of!(SegmentHead, epoch)))
@@ -751,10 +819,27 @@ impl<'a> SegmentView<'a> {
         )
     }
 
+    /// The time reference the segment's times count from.
+    pub fn time_reference(&self) -> TimeReference<'a> {
+        TimeReference {
+            epoch: self.epoch(),
+            session: self.timeref_session(),
+            serial: self.timeref_serial(),
+        }
+    }
+
     /// Time of sample zero, in seconds after `epoch`.
     pub fn start_time(&self) -> u32 {
         self.field::<U32>(core::mem::offset_of!(SegmentHead, start_time))
             .get()
+    }
+
+    /// Whether `other` names the same segment. That is the same id, start
+    /// time and time reference.
+    pub fn is_same_segment(&self, other: &SegmentView<'_>) -> bool {
+        self.segment_id() == other.segment_id()
+            && self.start_time() == other.start_time()
+            && self.time_reference() == other.time_reference()
     }
 
     /// Samples per second before decimation.
@@ -767,6 +852,22 @@ impl<'a> SegmentView<'a> {
     pub fn decimation(&self) -> u32 {
         self.field::<U32>(core::mem::offset_of!(SegmentHead, decimation))
             .get()
+    }
+
+    /// Rows per second, `sampling_rate / decimation`, or `None` if either is
+    /// zero.
+    pub fn rate_hz(&self) -> Option<f64> {
+        let (sampling_rate, decimation) = (self.sampling_rate(), self.decimation());
+        (sampling_rate != 0 && decimation != 0)
+            .then(|| f64::from(sampling_rate) / f64::from(decimation))
+    }
+
+    /// Seconds from one row to the next, `decimation / sampling_rate`, or
+    /// `None` if either is zero.
+    pub fn period(&self) -> Option<f64> {
+        let (sampling_rate, decimation) = (self.sampling_rate(), self.decimation());
+        (sampling_rate != 0 && decimation != 0)
+            .then(|| f64::from(decimation) / f64::from(sampling_rate))
     }
 
     /// Filter cutoff in hertz.
@@ -886,26 +987,37 @@ impl<'a> Metadata<'a> {
         matches!(kind, 1..=4)
     }
 
-    /// Writes the bare record into `buf`. Returns its type byte and length, or
-    /// `None` if `buf` cannot hold the head.
-    pub fn write_record(&self, buf: &mut [u8]) -> Option<(u8, usize)> {
+    /// Writes the bare record into `buf` and returns its type byte and length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub fn write_record(&self, buf: &mut [u8]) -> Result<(u8, usize), WriteError> {
         let (kind, len) = match self {
             Self::Device(record) => (MetadataType::Device, record.write(buf)?),
             Self::Stream(record) => (MetadataType::Stream, record.write(buf)?),
             Self::Segment(record) => (MetadataType::Segment, record.write(buf)?),
             Self::Column(record) => (MetadataType::Column, record.write(buf)?),
         };
-        Some((kind.into(), len))
+        Ok((kind.into(), len))
     }
 
     /// Writes one `dev.metadata` reply frame, `[type][record length u8][record]`,
-    /// into `buf`. Returns its length, or `None` if the record does not fit
-    /// `buf` or a `u8` length.
-    pub fn write_reply_frame(&self, buf: &mut [u8]) -> Option<usize> {
-        let (kind, len) = self.write_record(buf.get_mut(METADATA_REPLY_FRAME_HEADER..)?)?;
+    /// into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the frame
+    /// header and the record head, and [`WriteError::RecordTooLong`] if the
+    /// record is longer than a `u8` length holds.
+    pub fn write_reply_frame(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
+        let record = buf
+            .get_mut(METADATA_REPLY_FRAME_HEADER..)
+            .ok_or(WriteError::BufferTooSmall)?;
+        let (kind, len) = self.write_record(record)?;
         buf[0] = kind;
-        buf[1] = u8::try_from(len).ok()?;
-        Some(METADATA_REPLY_FRAME_HEADER + len)
+        buf[1] = u8::try_from(len).map_err(|_| WriteError::RecordTooLong)?;
+        Ok(METADATA_REPLY_FRAME_HEADER + len)
     }
 
     /// Returns the length of the bare record, with each string capped at 255
@@ -926,11 +1038,19 @@ impl<'a> Metadata<'a> {
         }
     }
 
-    /// Writes a full `METADATA` packet with `flags` into `buf`. Returns its
-    /// length, or `None` if the head does not fit or the payload exceeds
-    /// [`Packet::MAX_PAYLOAD`]. Strings are truncated to the room left.
-    pub fn write(&self, flags: MetadataFlags, buf: &mut [u8]) -> Option<usize> {
-        let (kind, len) = self.write_record(buf.get_mut(Header::SIZE + METADATA_HEADER_SIZE..)?)?;
+    /// Writes a full `METADATA` packet with `flags` into `buf` and returns its
+    /// length. Strings are truncated to the room left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::BufferTooSmall`] if the head does not fit, and
+    /// [`WriteError::PayloadTooLarge`] if the payload exceeds
+    /// [`Packet::MAX_PAYLOAD`].
+    pub fn write(&self, flags: MetadataFlags, buf: &mut [u8]) -> Result<usize, WriteError> {
+        let record = buf
+            .get_mut(Header::SIZE + METADATA_HEADER_SIZE..)
+            .ok_or(WriteError::BufferTooSmall)?;
+        let (kind, len) = self.write_record(record)?;
         write_metadata_headers(buf, kind, flags, len)
     }
 
@@ -944,34 +1064,38 @@ impl<'a> Metadata<'a> {
 }
 
 /// Writes the packet and metadata headers around a record already in place.
-/// Returns the packet length, or `None` if the payload is too big.
+/// Returns the packet length, or [`WriteError::PayloadTooLarge`] if the
+/// payload is too big.
 fn write_metadata_headers(
     buf: &mut [u8],
     kind: u8,
     flags: MetadataFlags,
     record_len: usize,
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     let payload_len = METADATA_HEADER_SIZE + record_len;
-    if payload_len > Packet::MAX_PAYLOAD {
-        return None;
-    }
-    Header::new(PacketType::METADATA, payload_len as u16)
+    Header::for_payload(PacketType::METADATA, payload_len)?
         .write((&mut buf[..Header::SIZE]).try_into().unwrap());
     buf[Header::SIZE] = kind;
     buf[Header::SIZE + 1] = flags.bits();
-    Some(Header::SIZE + payload_len)
+    Ok(Header::SIZE + payload_len)
 }
 
-/// Writes a full `METADATA` packet that carries the bare `record` unchanged.
-/// Returns its length, or `None` if it does not fit `buf` or a packet.
+/// Writes a full `METADATA` packet that carries the bare `record` unchanged,
+/// and returns its length.
+///
+/// # Errors
+///
+/// Returns [`WriteError::BufferTooSmall`] if it does not fit `buf`, and
+/// [`WriteError::PayloadTooLarge`] if it does not fit a packet.
 pub fn write_metadata_record(
     buf: &mut [u8],
     kind: u8,
     flags: MetadataFlags,
     record: &[u8],
-) -> Option<usize> {
+) -> Result<usize, WriteError> {
     let start = Header::SIZE + METADATA_HEADER_SIZE;
-    buf.get_mut(start..start + record.len())?
+    buf.get_mut(start..start + record.len())
+        .ok_or(WriteError::BufferTooSmall)?
         .copy_from_slice(record);
     write_metadata_headers(buf, kind, flags, record.len())
 }
@@ -1028,17 +1152,105 @@ impl ColumnHead {
 /// Parses the bare `record` as record type `kind`. Returns `None` for a type
 /// with no defined layout or a record that does not parse.
 fn parse_record(kind: u8, record: &[u8]) -> Option<Metadata<'_>> {
+    read_record(kind, record, Text::Utf8)
+}
+
+/// Reads the bare `record` as record type `kind` with its strings read as
+/// `text` says. Returns `None` for a type with no defined layout or a
+/// record that does not read.
+fn read_record(kind: u8, record: &[u8], text: Text) -> Option<Metadata<'_>> {
     Some(match MetadataType::from(kind) {
-        MetadataType::Device => Metadata::Device(Device::parse(record)?),
-        MetadataType::Stream => Metadata::Stream(Stream::parse(record)?),
-        MetadataType::Segment => Metadata::Segment(Segment::parse(record)?),
-        MetadataType::Column => Metadata::Column(Column::parse(record)?),
+        MetadataType::Device => Metadata::Device(Device::read(record, text)?),
+        MetadataType::Stream => Metadata::Stream(Stream::read(record, text)?),
+        MetadataType::Segment => Metadata::Segment(Segment::read(record, text)?),
+        MetadataType::Column => Metadata::Column(Column::read(record, text)?),
         MetadataType::Unknown(_) => return None,
     })
 }
 
+/// A bare metadata record of a defined type whose framing holds.
+///
+/// Its head and the lengths of its strings are read as [`Metadata::parse`]
+/// reads them, and its text is not read. [`read`](Self::read) reads its
+/// fields and checks its text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MetadataRecord<'a> {
+    kind: MetadataType,
+    record: &'a [u8],
+}
+
+impl<'a> MetadataRecord<'a> {
+    /// Returns the bare `record` of type `kind`, or `None` if the type has
+    /// no defined layout or the record would not parse for a reason other
+    /// than its text.
+    pub fn new(kind: u8, record: &'a [u8]) -> Option<Self> {
+        read_record(kind, record, Text::Unread)?;
+        Some(Self {
+            kind: kind.into(),
+            record,
+        })
+    }
+
+    /// Returns the record's type.
+    pub fn kind(&self) -> MetadataType {
+        self.kind
+    }
+
+    /// Returns the bare record.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.record
+    }
+
+    /// Returns the record's fields as [`Metadata::parse`] reads them, or
+    /// `None` if a string is not UTF-8.
+    pub fn read(&self) -> Option<Metadata<'a>> {
+        read_record(self.kind.into(), self.record, Text::Utf8)
+    }
+
+    /// Calls `f` with the record's fields, read with each string that is not
+    /// UTF-8 repaired by [`repair_record_text`]. Returns `None` if the record
+    /// does not repair within [`Packet::MAX_PAYLOAD`] bytes.
+    pub fn read_lossy<R>(&self, f: impl FnOnce(Metadata<'_>) -> R) -> Option<R> {
+        if let Some(fields) = self.read() {
+            return Some(f(fields));
+        }
+        let mut out = [0; Packet::MAX_PAYLOAD];
+        let room = out.get_mut(..repaired_record_room(self.record.len()))?;
+        let len = repair_record_text(self.kind.into(), self.record, room)?;
+        Some(f(read_record(self.kind.into(), &out[..len], Text::Utf8)?))
+    }
+}
+
+/// Prints the fields [`MetadataRecord::read_lossy`] reads, or the type and
+/// the bare record when they do not read.
+impl core::fmt::Debug for MetadataRecord<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.read_lossy(|fields| fields.fmt(f)) {
+            Some(result) => result,
+            None => (f.debug_struct("MetadataRecord"))
+                .field("kind", &self.kind)
+                .field("record", &self.record)
+                .finish(),
+        }
+    }
+}
+
+/// Returns the room a repair of a bare record of `record_len` bytes is given.
+/// It is `record_len` or 255 bytes, whichever is larger. A repaired string
+/// grows as each invalid sequence becomes U+FFFD, and a record of 255 bytes
+/// is the longest a `dev.metadata` reply frame holds, as its length is one
+/// byte. So a short record may grow to that length and no further.
+pub const fn repaired_record_room(record_len: usize) -> usize {
+    if record_len > u8::MAX as usize {
+        record_len
+    } else {
+        u8::MAX as usize
+    }
+}
+
 /// Writes the bare `record` of type `kind` into `out` with the text of each
-/// string repaired, and returns the length written.
+/// string repaired, and returns the length written. Callers give it the
+/// room [`repaired_record_room`] returns for the record.
 ///
 /// Each string that is not UTF-8 becomes what [`String::from_utf8_lossy`]
 /// gives for it, with U+FFFD in place of each invalid sequence. Text that is
@@ -1271,7 +1483,9 @@ impl<'a> Iterator for MetadataReply<'a> {
     }
 }
 
-/// A run of consecutive samples from one stream segment.
+/// A run of consecutive samples from one stream segment. It holds at least
+/// one sample byte, and the codec neither writes nor reads a sample packet
+/// with none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Samples<'a> {
     /// Stream id.
@@ -1288,9 +1502,12 @@ impl<'a> Samples<'a> {
     /// Byte offset of the first sample in a data packet.
     pub const DATA_OFFSET: usize = Header::SIZE + SAMPLE_HEADER_SIZE;
 
-    /// Writes a full sample packet into `buf`. Returns its length, or `None` if
-    /// the sample number or samples do not fit.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full sample packet into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`write_header`](Self::write_header).
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let total = Self::write_header(
             buf,
             self.stream_id,
@@ -1299,44 +1516,58 @@ impl<'a> Samples<'a> {
             self.data.len(),
         )?;
         buf[Self::DATA_OFFSET..total].copy_from_slice(self.data);
-        Some(total)
+        Ok(total)
     }
 
     /// Writes the headers of a packet carrying `data_len` bytes of samples
-    /// already in place at [`Self::DATA_OFFSET`]. Returns the packet length, or
-    /// `None` if the sample number or samples do not fit.
+    /// already in place at [`Self::DATA_OFFSET`], and returns the packet
+    /// length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::SampleNumberTooLarge`] if `first` does not fit
+    /// its field, [`WriteError::NoSamples`] if `data_len` is 0,
+    /// [`WriteError::PayloadTooLarge`] if the payload exceeds
+    /// [`Packet::MAX_PAYLOAD`], and [`WriteError::BufferTooSmall`] if `buf`
+    /// cannot hold the packet, in that order.
     pub fn write_header(
         buf: &mut [u8],
         stream_id: StreamId,
         segment_id: SegmentId,
         first: SampleNumber,
         data_len: usize,
-    ) -> Option<usize> {
+    ) -> Result<usize, WriteError> {
         if !first.fits_stream_packet() {
-            return None;
+            return Err(WriteError::SampleNumberTooLarge);
+        }
+        if data_len == 0 {
+            return Err(WriteError::NoSamples);
         }
         let payload_len = SAMPLE_HEADER_SIZE + data_len;
         let total = Header::SIZE + payload_len;
-        if payload_len > Packet::MAX_PAYLOAD || buf.len() < total {
-            return None;
+        let ptype = PacketType::stream(stream_id.value()).ok_or(WriteError::NotAPacket)?;
+        let header = Header::for_payload(ptype, payload_len)?;
+        if buf.len() < total {
+            return Err(WriteError::BufferTooSmall);
         }
-        Header::new(PacketType::stream(stream_id.value())?, payload_len as u16)
-            .write(buf.first_chunk_mut()?);
+        let head = buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?;
+        header.write(head);
         buf[Header::SIZE..Header::SIZE + 3].copy_from_slice(&first.to_le_bytes()[..3]);
         buf[Header::SIZE + 3] = segment_id.value();
-        Some(total)
+        Ok(total)
     }
 
     /// Parses a sample packet from its header and payload. Returns `None` if it
-    /// is not a sample packet of streams 1 to 127 or the payload is truncated.
+    /// is not a sample packet of streams 1 to 127, or if the payload is too
+    /// short to carry the sample header and one sample byte.
     pub fn parse(header: Header, payload: &'a [u8]) -> Option<Self> {
-        let stream_id = header.ptype.stream_id()?;
-        if stream_id < FIRST_STREAM_ID {
+        let stream_id = header.ptype.sample_stream()?;
+        let (head, data) = payload.split_at_checked(SAMPLE_HEADER_SIZE)?;
+        if data.is_empty() {
             return None;
         }
-        let (head, data) = payload.split_at_checked(SAMPLE_HEADER_SIZE)?;
         Some(Self {
-            stream_id: StreamId::try_new(stream_id)?,
+            stream_id,
             segment_id: SegmentId::new(head[3]),
             first: SampleNumber::new(u32::from_le_bytes([head[0], head[1], head[2], 0])),
             data,
@@ -1353,8 +1584,13 @@ pub(crate) struct RecordWriter<'a> {
 }
 
 impl<'a> RecordWriter<'a> {
-    pub(crate) fn new(buf: &'a mut [u8], head: usize) -> Option<Self> {
-        (buf.len() >= head).then_some(Self { buf, len: head })
+    /// Returns a writer of a record whose head is `head` bytes, or
+    /// [`WriteError::BufferTooSmall`] if `buf` cannot hold the head.
+    pub(crate) fn new(buf: &'a mut [u8], head: usize) -> Result<Self, WriteError> {
+        if buf.len() < head {
+            return Err(WriteError::BufferTooSmall);
+        }
+        Ok(Self { buf, len: head })
     }
 
     /// Appends `value` and returns how many of its bytes fit.
@@ -1378,11 +1614,21 @@ impl<'a> RecordWriter<'a> {
     }
 }
 
+/// How a [`RecordReader`] reads the bytes of each string.
+#[derive(Clone, Copy)]
+enum Text {
+    /// Each string is UTF-8, or the record does not read.
+    Utf8,
+    /// Each string reads as empty, and its bytes are not read.
+    Unread,
+}
+
 /// Reader of a record written by [`RecordWriter`]. Strings start at the head
 /// length found on the wire. A record with head fields this build does not know
 /// still parses.
 pub(crate) struct RecordReader<'a> {
     strings: &'a [u8],
+    text: Text,
 }
 
 impl<'a> RecordReader<'a> {
@@ -1393,21 +1639,24 @@ impl<'a> RecordReader<'a> {
     ) -> Option<(&'a H, Self)> {
         let (declared, strings) = split_record(record)?;
         let (head, _) = H::ref_from_prefix(declared).ok()?;
-        Some((head, Self { strings }))
+        let text = Text::Utf8;
+        Some((head, Self { strings, text }))
     }
 
     /// Returns the head this build reads and a reader of the strings after the
-    /// head on the wire. A head shorter than this build's leaves the fields it
-    /// does not reach zero, the default the protocol gives a field an older
-    /// device does not send. A longer one is read as far as this build knows.
-    pub(crate) fn split_defaulting<H: FromBytes + IntoBytes>(
+    /// head on the wire, read as `text` says. A head shorter than this build's
+    /// leaves the fields it does not reach zero, the default the protocol
+    /// gives a field an older device does not send. A longer one is read as
+    /// far as this build knows.
+    fn split_defaulting<H: FromBytes + IntoBytes>(
         record: &'a [u8],
+        text: Text,
     ) -> Option<(H, Self)> {
         let (declared, strings) = split_record(record)?;
         let mut head = H::new_zeroed();
         let known = declared.len().min(size_of::<H>());
         head.as_mut_bytes()[..known].copy_from_slice(&declared[..known]);
-        Some((head, Self { strings }))
+        Some((head, Self { strings, text }))
     }
 
     /// Skips the next string of `len` bytes. Returns `None` if the record ends
@@ -1420,7 +1669,10 @@ impl<'a> RecordReader<'a> {
     pub(crate) fn take(&mut self, len: u8) -> Option<&'a str> {
         let (value, rest) = self.strings.split_at_checked(len as usize)?;
         self.strings = rest;
-        core::str::from_utf8(value).ok()
+        match self.text {
+            Text::Utf8 => core::str::from_utf8(value).ok(),
+            Text::Unread => Some(""),
+        }
     }
 }
 
@@ -1561,6 +1813,15 @@ mod tests {
     //! - M13, idempotence. Repairing a repaired record changes nothing.
     //!   Source, M9 and M10 together. It rules out a repair that is not
     //!   stable under a second pass.
+    //! - M14, completeness and model based. The check of a packet accepts a
+    //!   metadata payload of a record type from 1 to 4 exactly when
+    //!   [`Metadata::parse`] accepts it with every string replaced by ASCII
+    //!   of the same length, and refuses it as an invalid payload otherwise.
+    //!   The record it keeps is the payload's bare record with its type and
+    //!   flags, and [`MetadataRecord::read`] gives what [`Metadata::parse`]
+    //!   gives for the payload. Source, the doc of [`MetadataRecord`]. It
+    //!   rules out a check that reads the text, and one that keeps a record
+    //!   broken beyond its text.
     //!
     //! # Generator obligations
     //!
@@ -1582,10 +1843,10 @@ mod tests {
     //!   records with bytes of their strings set to 0x80, 0xB0, 0xC2, 0xE2,
     //!   0xF0, 0xFF or any value, so strings grow past 255 bytes, a quarter
     //!   of them with a stream id of 0, 128, 255 or any value. The buffer is
-    //!   any length up to three times the record and two bytes more.
-    //!
-    //! `class_counts` prints the share of each class with
-    //! `TWINLEAF_PAYLOAD_CLASSES` set.
+    //!   any length up to three times the record and two bytes more. In M10
+    //!   to M12, when the repair writes a replacement character, half the
+    //!   buffers end where one ends.
+    //! - M14 on the M7 payloads.
     //!
     //! # Exclusions
     //!
@@ -1599,16 +1860,16 @@ mod tests {
     //!
     //! # Examples that stay
     //!
-    //! The pinned device, stream, column and segment records, each field a
-    //! value no other field of the record holds so that swapped fields fail,
-    //! the relayed record, the selectors, the reply frames with an unknown
-    //! type and a truncated frame, and the sample header. The sample packet
-    //! properties have their own docs.
+    //! The pinned device and stream records, each field a value no other
+    //! field of the record holds so that swapped fields fail, the view
+    //! accessors, a segment's rate and period, the metadata requests, a
+    //! truncated reply frame, the room for a repair, and the data and filter
+    //! type names. The sample packet properties have their own docs.
 
     use super::*;
     use crate::payload::strategy::{
-        buffer, bytes, bytes_to, cut_classes, cut_in_turn, float, half, len_to, octet, slack,
-        strings_of, tally, text, word, write_over_any,
+        buffer, bytes, bytes_to, cut_in_turn, float, half, len_to, octet, slack, strings_of, text,
+        word, write_over_any,
     };
     use proptest::prelude::*;
     use proptest::sample::Index;
@@ -1641,46 +1902,6 @@ mod tests {
             filter_cutoff: 0.0,
             filter_type: FilterType::NONE,
         }
-    }
-
-    fn round_trip(metadata: Metadata<'_>, flags: MetadataFlags) {
-        let mut buf = [0u8; 256];
-        let len = metadata.write(flags, &mut buf).unwrap();
-        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
-        assert_eq!(header.ptype, PacketType::METADATA);
-        assert_eq!(header.packet_len(), len);
-        assert_eq!(
-            Metadata::parse(&buf[header.payload_range()]),
-            Some((metadata, flags))
-        );
-    }
-
-    #[test]
-    fn records_round_trip() {
-        round_trip(Metadata::Device(device()), MetadataFlags::PERIODIC);
-        round_trip(
-            Metadata::Stream(Stream {
-                stream_id: StreamId::new(1),
-                n_columns: 6,
-                n_segments: 2,
-                sample_size: 24,
-                buf_samples: 128,
-                name: "imu",
-            }),
-            MetadataFlags::PERIODIC | MetadataFlags::LAST,
-        );
-        round_trip(Metadata::Segment(segment()), MetadataFlags::UPDATE);
-        round_trip(
-            Metadata::Column(Column {
-                stream_id: StreamId::new(1),
-                index: ColumnId::new(0),
-                data_type: DataType::F32,
-                name: "imu.accel.x",
-                units: "m/s^2",
-                description: "Acceleration (X)",
-            }),
-            MetadataFlags::default(),
-        );
     }
 
     /// Byte-exact packed layout of a device record, wrapped in a METADATA
@@ -1740,63 +1961,6 @@ mod tests {
         ]);
     }
 
-    /// A `tl_metadata_column` is a 7-byte head, then name, units, description.
-    #[test]
-    fn column_record_matches_the_packed_wire_layout() {
-        let record = Column {
-            stream_id: StreamId::new(6),
-            index: ColumnId::new(3),
-            data_type: DataType::F32,
-            name: "vbus",
-            units: "V",
-            description: "In",
-        };
-        let mut buf = [0u8; 64];
-        let len = record_bytes(Metadata::Column(record), MetadataFlags::PERIODIC, &mut buf);
-        #[rustfmt::skip]
-        assert_eq!(&buf[..len], &[
-            11, 0, 16, 0,
-            4, 0b001,                   // record type COLUMN, PERIODIC
-            7, 6, 3, 0x42,              // fixed_len, stream_id, index, FLOAT32
-            4, 1, 2,                    // name, units, description lengths
-            b'v', b'b', b'u', b's', b'V', b'I', b'n',
-        ]);
-    }
-
-    /// A `tl_metadata_segment` is a 27-byte head with four little-endian u32s
-    /// and an f32 cutoff, then the timeref serial.
-    #[test]
-    fn segment_record_matches_the_packed_wire_layout() {
-        let record = Segment {
-            stream_id: StreamId::new(6),
-            segment_id: SegmentId::new(9),
-            flags: SegmentFlags::VALID | SegmentFlags::HOLDOVER,
-            timeref_serial: "XY",
-            filter_cutoff: 1.0,
-            filter_type: FilterType::IIR_SP_LPF1,
-            ..segment()
-        };
-        let mut buf = [0u8; 64];
-        let len = record_bytes(Metadata::Segment(record), MetadataFlags::UPDATE, &mut buf);
-        #[rustfmt::skip]
-        assert_eq!(&buf[..len], &[
-            11, 0, 31, 0,
-            3, 0b010,                   // record type SEGMENT, UPDATE
-            27,                         // fixed_len
-            6, 9,                       // stream_id, segment_id
-            0b101,                      // VALID | HOLDOVER
-            3,                          // epoch UNIX
-            2,                          // time_ref_serial_varlen
-            0x0D, 0x0C, 0x0B, 0x0A,     // time_ref_session_id
-            0x00, 0x31, 0xBF, 0x69,     // start_time 1774137600
-            0xE8, 0x03, 0x00, 0x00,     // sampling_rate 1000
-            0x64, 0x00, 0x00, 0x00,     // decimation 100
-            0x00, 0x00, 0x80, 0x3F,     // filter_cutoff 1.0f
-            1,                          // filter_type IIR_SP_LPF1
-            b'X', b'Y',
-        ]);
-    }
-
     fn record_bytes(metadata: Metadata<'_>, flags: MetadataFlags, buf: &mut [u8]) -> usize {
         let len = metadata.write(flags, buf).unwrap();
         assert_eq!(
@@ -1804,54 +1968,6 @@ mod tests {
             Some((metadata, flags))
         );
         len
-    }
-
-    /// Relaying a record produces the same packet as writing it from fields.
-    #[test]
-    fn a_relayed_record_matches_the_packet_it_came_from() {
-        for (metadata, kind) in [
-            (Metadata::Device(device()), 1),
-            (Metadata::Segment(segment()), 3),
-        ] {
-            let flags = MetadataFlags::UPDATE;
-            let mut written = [0u8; 128];
-            let len = metadata.write(flags, &mut written).unwrap();
-            let (_, flags, record) = split_metadata(&written[Header::SIZE..len]).unwrap();
-
-            let mut relayed = [0u8; 128];
-            let relayed_len = write_metadata_record(&mut relayed, kind, flags, record).unwrap();
-            assert_eq!(&relayed[..relayed_len], &written[..len]);
-        }
-    }
-
-    #[test]
-    fn head_length_lets_readers_skip_unknown_fields() {
-        // A device that appended two fields to the column head: strings still
-        // start where the wire says they do.
-        #[rustfmt::skip]
-        let record = [
-            9, 4, 1, 0x42, 4, 1, 2,     // the head this build knows
-            0xAA, 0xBB,                 // two fields it does not
-            b'v', b'b', b'u', b's', b'V', b'I', b'n',
-        ];
-        let column = Column::parse(&record).unwrap();
-        assert_eq!(column.name, "vbus");
-        assert_eq!(column.units, "V");
-        assert_eq!(column.description, "In");
-    }
-
-    #[test]
-    fn parse_rejects_short_and_unknown_records() {
-        assert_eq!(Metadata::parse(&[]), None);
-        assert_eq!(Metadata::parse(&[1]), None);
-        // Record type 5 is not defined; its layout is unknown.
-        assert_eq!(Metadata::parse(&[5, 0, 7, 0, 0, 0, 0, 0, 0]), None);
-        // A head under two bytes holds no field.
-        assert_eq!(Column::parse(&[1, 0]), None);
-        // A head that reaches the stream id must name a valid one.
-        assert_eq!(Column::parse(&[6, 0, 0, 0, 0, 0]), None);
-        // name_varlen runs past the end of the record.
-        assert_eq!(Column::parse(&[7, 0, 0, 0, 9, 0, 0, b'x']), None);
     }
 
     fn written(metadata: Metadata<'_>) -> Vec<u8> {
@@ -1958,114 +2074,27 @@ mod tests {
         );
     }
 
-    /// An older device's shorter head leaves out its last fields, which read
-    /// as zero, and the strings start where its head ends.
+    /// A segment's rate is its sampling rate over its decimation and its
+    /// period is the decimation over the sampling rate. A zero in either
+    /// field gives neither.
     #[test]
-    fn fields_past_a_shorter_head_read_as_zero() {
-        // A column head that stops before `units_len` and `description_len`.
-        let record = [5, 1, 2, DataType::F32.value(), 1, b'x'];
-        let view = ColumnView::new_checked(&record).unwrap();
-        assert_eq!(view.data_type(), DataType::F32);
-        assert_eq!(
-            (view.name(), view.units(), view.description()),
-            ("x", "", "")
-        );
-        assert_eq!(
-            Column::parse(&record),
-            Some(Column {
-                stream_id: StreamId::new(1),
-                index: ColumnId::new(2),
-                data_type: DataType::F32,
-                name: "x",
-                units: "",
-                description: "",
-            })
-        );
-    }
-
-    /// A newer device's longer head is read as far as this build knows. Its
-    /// strings start after the whole head, and the extra bytes stay in the
-    /// record, so two records that differ only there are unequal.
-    #[test]
-    fn a_longer_head_is_skipped_and_kept() {
-        let record = written(Metadata::Column(column()));
-        let (head, strings) = split_record(&record).unwrap();
-        let mut longer = vec![head[0] + 2];
-        longer.extend_from_slice(&head[1..]);
-        longer.extend_from_slice(&[0xAB, 0xCD]);
-        longer.extend_from_slice(strings);
-
-        let view = ColumnView::new_checked(&longer).unwrap();
-        assert_eq!(view.fields(), column());
-        assert_eq!(view.description(), "Total field");
-
-        let mut changed = longer.clone();
-        changed[Column::HEAD_SIZE] = 0xEE;
-        assert_ne!(view, ColumnView::new_checked(&changed).unwrap());
-    }
-
-    #[test]
-    fn record_len_sizes_a_buffer_that_does_not_truncate() {
-        let metadata = Metadata::Device(device());
-        let mut buf = vec![0; metadata.record_len()];
-        let (kind, len) = metadata.write_record(&mut buf).unwrap();
-        assert_eq!((kind, len), (1, metadata.record_len()));
-        assert_eq!(Device::parse(&buf[..len]), Some(device()));
-        let (head, strings) = split_record(&buf[..len]).unwrap();
-        assert_eq!(head.len(), Device::HEAD_SIZE);
-        assert_eq!(strings.len(), len - Device::HEAD_SIZE);
-    }
-
-    #[test]
-    fn split_record_rejects_a_head_it_cannot_trust() {
-        assert_eq!(split_record(&[]), None);
-        // A head of one byte holds nothing but its own length.
-        assert_eq!(split_record(&[1, 0]), None);
-        // The declared head runs past the record.
-        assert_eq!(split_record(&[7, 0, 0]), None);
-        assert_eq!(split_record(&[2, 0, b'x']), Some((&[2, 0][..], &b"x"[..])));
-    }
-
-    #[test]
-    fn strings_truncate_on_a_character_boundary() {
-        let record = Column {
-            stream_id: StreamId::new(1),
-            index: ColumnId::new(0),
-            data_type: DataType::F32,
-            name: "bar.therm",
-            units: "°C",
-            description: "",
+    fn a_segment_rate_and_period_come_from_its_sampling_rate_and_decimation() {
+        let record_of = |sampling_rate, decimation| {
+            written(Metadata::Segment(Segment {
+                sampling_rate,
+                decimation,
+                ..segment()
+            }))
         };
-        // Room for the packet header, the metadata header, the 7-byte head,
-        // "bar.therm", and one byte of the two-byte degree sign.
-        let mut buf = [0u8; Header::SIZE + METADATA_HEADER_SIZE + 7 + 9 + 1];
-        let len = record
-            .write(&mut buf[Header::SIZE + METADATA_HEADER_SIZE..])
-            .unwrap();
-        let parsed = Column::parse(&buf[Header::SIZE + METADATA_HEADER_SIZE..][..len]).unwrap();
-        assert_eq!(parsed.name, "bar.therm");
-        assert_eq!(parsed.units, "", "split a multi-byte character");
-    }
-
-    #[test]
-    fn write_rejects_a_buffer_too_small_for_the_head() {
-        let mut buf = [0u8; Header::SIZE + METADATA_HEADER_SIZE + 6];
-        assert_eq!(
-            Metadata::Device(device()).write(MetadataFlags::PERIODIC, &mut buf),
-            None
-        );
-    }
-
-    #[test]
-    fn selectors_encode_as_packed_triples() {
-        assert_eq!(MetadataSelector::device().encode(), [1, 0, 0]);
-        assert_eq!(MetadataSelector::stream(7).encode(), [2, 7, 0]);
-        assert_eq!(MetadataSelector::segment(7, 3).encode(), [3, 7, 3]);
-        assert_eq!(
-            MetadataSelector::segment(7, CURRENT_SEGMENT).encode(),
-            [3, 7, 0xff]
-        );
-        assert_eq!(MetadataSelector::column(2, 5).encode(), [4, 2, 5]);
+        let record = record_of(1000, 3);
+        let view = SegmentView::new_checked(&record).unwrap();
+        assert_eq!(view.rate_hz(), Some(1000.0 / 3.0));
+        assert_eq!(view.period(), Some(3.0 / 1000.0));
+        for (sampling_rate, decimation) in [(1000, 0), (0, 3), (0, 0)] {
+            let record = record_of(sampling_rate, decimation);
+            let view = SegmentView::new_checked(&record).unwrap();
+            assert_eq!((view.rate_hz(), view.period()), (None, None));
+        }
     }
 
     #[test]
@@ -2105,58 +2134,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_frame_is_the_type_the_length_and_the_bare_record() {
-        let record = Column {
-            stream_id: StreamId::new(6),
-            index: ColumnId::new(3),
-            data_type: DataType::F32,
-            name: "vbus",
-            units: "V",
-            description: "In",
-        };
-        let mut buf = [0u8; 64];
-        let len = Metadata::Column(record)
-            .write_reply_frame(&mut buf)
-            .unwrap();
-        #[rustfmt::skip]
-        assert_eq!(&buf[..len], &[
-            4, 14,                      // record type COLUMN, record length
-            7, 6, 3, 0x42,              // fixed_len, stream_id, index, FLOAT32
-            4, 1, 2,                    // name, units, description lengths
-            b'v', b'b', b'u', b's', b'V', b'I', b'n',
-        ]);
-
-        let mut frames = MetadataReply::parse(&buf[..len]).unwrap();
-        let (kind, bare) = frames.next().unwrap();
-        assert_eq!(kind, MetadataType::Column);
-        assert_eq!(Column::parse(bare), Some(record));
-        assert_eq!(frames.next(), None);
-    }
-
-    #[test]
-    fn a_reply_iterates_every_frame_including_unknown_types() {
-        let mut reply = Vec::new();
-        let mut buf = [0u8; 256];
-        let len = Metadata::Device(device())
-            .write_reply_frame(&mut buf)
-            .unwrap();
-        reply.extend_from_slice(&buf[..len]);
-        reply.extend_from_slice(&[9, 2, 0xAA, 0xBB]); // unknown record type 9
-        let len = Metadata::Segment(segment())
-            .write_reply_frame(&mut buf)
-            .unwrap();
-        reply.extend_from_slice(&buf[..len]);
-
-        let frames: Vec<_> = MetadataReply::parse(&reply).unwrap().collect();
-        assert_eq!(frames.len(), 3);
-        assert_eq!(frames[0].0, MetadataType::Device);
-        assert_eq!(Device::parse(frames[0].1), Some(device()));
-        assert_eq!(frames[1], (MetadataType::Unknown(9), &[0xAA, 0xBB][..]));
-        assert_eq!(frames[2].0, MetadataType::Segment);
-        assert_eq!(Segment::parse(frames[2].1), Some(segment()));
-    }
-
-    #[test]
     fn a_truncated_reply_fails_validation_instead_of_yielding_a_prefix() {
         let mut reply = Vec::new();
         let mut buf = [0u8; 256];
@@ -2169,55 +2146,6 @@ mod tests {
         assert!(MetadataReply::parse(&reply).is_none());
         assert!(MetadataReply::parse(&[3]).is_none());
         assert!(MetadataReply::parse(&[]).is_some());
-    }
-
-    #[test]
-    fn a_record_too_long_for_a_frame_length_byte_is_refused() {
-        let long = "n".repeat(120);
-        let record = Metadata::Device(Device {
-            session: SESSION,
-            n_streams: 1,
-            name: &long,
-            serial: &long,
-            firmware: &long,
-            protocol: 0,
-        });
-        let mut buf = [0u8; 512];
-        assert!(record.record_len() > usize::from(u8::MAX));
-        assert_eq!(record.write_reply_frame(&mut buf), None);
-    }
-
-    #[test]
-    fn samples_round_trip_with_a_24_bit_sample_number() {
-        let samples = Samples {
-            stream_id: StreamId::new(1),
-            segment_id: SegmentId::new(7),
-            first: SampleNumber::new(0x00AB_CDEF),
-            data: &[1, 2, 3, 4, 5, 6, 7, 8],
-        };
-        let mut buf = [0u8; 64];
-        let len = samples.write(&mut buf).unwrap();
-        #[rustfmt::skip]
-        assert_eq!(&buf[..Header::SIZE + SAMPLE_HEADER_SIZE], &[
-            129, 0, 12, 0,              // header: STREAM0 + 1, payload 12
-            0xEF, 0xCD, 0xAB,           // first sample number, 24-bit LE
-            7,                          // segment_id
-        ]);
-        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
-        assert_eq!(header.packet_len(), len);
-        assert_eq!(
-            Samples::parse(header, &buf[header.payload_range()]),
-            Some(samples)
-        );
-    }
-
-    /// Stream 0 is reserved and sample packets carry streams 1 to 127.
-    #[test]
-    fn stream_ids_run_from_1_to_127() {
-        for value in 0..=u8::MAX {
-            let in_range = (1..=127).contains(&value);
-            assert_eq!(StreamId::try_new(value).is_some(), in_range, "{value}");
-        }
     }
 
     /// The largest sample payload, after the head.
@@ -2239,11 +2167,12 @@ mod tests {
     }
 
     proptest! {
-        /// Samples whose first number fits 24 bits and whose data fits a
-        /// packet write a sample packet of exactly its length for their
-        /// stream, whose payload parses back to them. Writing the headers in
-        /// front of data already in place gives the same packet. Both are the
-        /// same whatever the buffer held before.
+        /// Samples whose first number fits 24 bits and whose data holds at
+        /// least one byte and fits a packet write a sample packet of exactly
+        /// its length for their stream, whose payload parses back to them.
+        /// Writing the headers in front of data already in place gives the
+        /// same packet. Both are the same whatever the buffer held before.
+        /// Empty data is refused by both.
         #[test]
         fn samples_decode_as_they_were_encoded(
             stream_id in stream_id(),
@@ -2254,7 +2183,15 @@ mod tests {
             let samples = Samples { stream_id, segment_id, first: SampleNumber::new(first), data: &data };
             let payload_len = SAMPLE_HEADER_SIZE + data.len();
             let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| samples.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            if data.is_empty() {
+                prop_assert_eq!(len, Err(WriteError::NoSamples));
+                let (len, _) = write_over_any(buf.len(), |in_place| {
+                    Samples::write_header(in_place, stream_id, segment_id, samples.first, 0)
+                })?;
+                prop_assert_eq!(len, Err(WriteError::NoSamples));
+                return Ok(());
+            }
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             let ptype = PacketType::new(128 + stream_id.value());
             prop_assert_eq!(header, Header::new(ptype, payload_len as u16));
@@ -2264,13 +2201,14 @@ mod tests {
                 in_place[Samples::DATA_OFFSET..].copy_from_slice(&data);
                 Samples::write_header(in_place, stream_id, segment_id, samples.first, data.len())
             })?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             prop_assert_eq!(in_place, buf);
         }
 
-        /// Samples are written when the first number fits 24 bits, the
-        /// payload is at most [`Packet::MAX_PAYLOAD`] bytes, and the buffer
-        /// holds the packet, and refused otherwise.
+        /// Samples are written when the first number fits 24 bits, there is at
+        /// least one sample byte, the payload is at most
+        /// [`Packet::MAX_PAYLOAD`] bytes, and the buffer holds the packet, and
+        /// refused otherwise.
         #[test]
         fn samples_are_written_only_when_they_fit(
             first in prop_oneof![
@@ -2292,18 +2230,20 @@ mod tests {
             let needed = Samples::DATA_OFFSET + data_len;
             let mut buf = buffer(needed, slack);
             let fits = first <= MAX_SAMPLE_NUMBER
+                && data_len > 0
                 && data_len <= MAX_SAMPLE_DATA
                 && buf.len() >= needed;
-            prop_assert_eq!(samples.write(&mut buf), fits.then_some(needed));
+            prop_assert_eq!(samples.write(&mut buf).ok(), fits.then_some(needed));
             prop_assert_eq!(
-                Samples::write_header(&mut buf, samples.stream_id, samples.segment_id, samples.first, data_len),
+                Samples::write_header(&mut buf, samples.stream_id, samples.segment_id, samples.first, data_len).ok(),
                 fits.then_some(needed)
             );
         }
 
-        /// A payload parses as samples when its packet type carries a stream
-        /// from 1 to 127 and it holds the four-byte head. Writing what was
-        /// parsed gives back the same packet, whatever the buffer held before.
+        /// A payload parses as samples exactly when its packet type carries a
+        /// stream from 1 to 127 and it holds the four-byte head and at least
+        /// one more byte. Writing what was parsed gives back the same packet,
+        /// whatever the buffer held before.
         #[test]
         fn any_payload_parses_as_samples_when_it_holds_the_head(
             ptype in prop_oneof![
@@ -2319,13 +2259,14 @@ mod tests {
             ],
         ) {
             let header = Header::new(ptype, payload.len() as u16);
+            let parses = ptype.value() > 128 && payload.len() >= MIN_SAMPLE_PAYLOAD;
             let Some(samples) = Samples::parse(header, &payload) else {
-                prop_assert!(ptype.value() <= 128 || payload.len() < SAMPLE_HEADER_SIZE);
+                prop_assert!(!parses);
                 return Ok(());
             };
-            prop_assert!(ptype.value() > 128);
+            prop_assert!(parses);
             let (len, buf) = write_over_any(Header::SIZE + payload.len(), |buf| samples.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let mut head = [0u8; Header::SIZE];
             header.write(&mut head);
             prop_assert_eq!(&buf[..Header::SIZE], &head[..]);
@@ -2804,11 +2745,12 @@ mod tests {
     fn write_record_over_any(
         fields: &Fields,
         len: usize,
-    ) -> Result<(Option<usize>, Vec<u8>), TestCaseError> {
+    ) -> Result<(Result<usize, WriteError>, Vec<u8>), TestCaseError> {
         let metadata = fields.metadata();
         write_over_any(len, |buf| {
             let (kind, len) = metadata.write_record(buf)?;
-            (kind == fields.kind()).then_some(len)
+            assert_eq!(kind, fields.kind(), "the type byte is not the record's");
+            Ok(len)
         })
     }
 
@@ -3111,7 +3053,7 @@ mod tests {
         fn a_record_is_laid_out_as_its_struct(fields in fields(MAX_STRING)) {
             let wire = fields.wire();
             let (len, record) = write_record_over_any(&fields, wire.len())?;
-            prop_assert_eq!(len, Some(wire.len()));
+            prop_assert_eq!(len, Ok(wire.len()));
             prop_assert_eq!(&record, &wire);
             prop_assert_eq!(fields.metadata().record_len(), wire.len());
         }
@@ -3148,9 +3090,9 @@ mod tests {
                     &wire,
                 ]
                 .concat();
-                prop_assert_eq!(written, Some(packet_len));
+                prop_assert_eq!(written, Ok(packet_len));
                 prop_assert_eq!(&packet, &expected);
-                prop_assert_eq!(relayed, Some(packet_len));
+                prop_assert_eq!(relayed, Ok(packet_len));
                 prop_assert_eq!(&relay, &expected);
                 let parsed = Metadata::parse(&packet[Header::SIZE..]);
                 prop_assert_eq!(
@@ -3158,19 +3100,19 @@ mod tests {
                     Some((by_bits(metadata), flags))
                 );
             } else {
-                prop_assert_eq!(written, None);
-                prop_assert_eq!(relayed, None);
+                prop_assert_eq!(written, Err(WriteError::PayloadTooLarge));
+                prop_assert_eq!(relayed, Err(WriteError::PayloadTooLarge));
             }
 
             let frame_len = METADATA_REPLY_FRAME_HEADER + wire.len();
             let (framed, frame) = write_over_any(frame_len, |buf| metadata.write_reply_frame(buf))?;
             if wire.len() <= MAX_STRING {
-                prop_assert_eq!(framed, Some(frame_len));
+                prop_assert_eq!(framed, Ok(frame_len));
                 prop_assert_eq!(&frame, &[&[fields.kind(), wire.len() as u8][..], &wire].concat());
                 let frames: Option<Vec<_>> = MetadataReply::parse(&frame).map(Iterator::collect);
                 prop_assert_eq!(frames, Some(vec![(fields.mtype(), &wire[..])]));
             } else {
-                prop_assert_eq!(framed, None);
+                prop_assert_eq!(framed, Err(WriteError::RecordTooLong));
             }
         }
 
@@ -3187,7 +3129,7 @@ mod tests {
             let mut buf = [0u8; Packet::MAX_SIZE];
             let frames = vec![0u8; len];
             let fits = crate::rpc::write_reply(&mut buf, crate::RpcRequestId::new(1), &frames);
-            prop_assert_eq!(fits.is_some(), len <= MAX_METADATA_REPLY_SIZE);
+            prop_assert_eq!(fits.is_ok(), len <= MAX_METADATA_REPLY_SIZE);
         }
 
         /// M4. Into a buffer that holds the head and some room more, each
@@ -3209,10 +3151,13 @@ mod tests {
             let head = fields.head_size();
 
             let (len, record) = write_record_over_any(&fields, head + room)?;
-            prop_assert_eq!(len, Some(wire.len()));
+            prop_assert_eq!(len, Ok(wire.len()));
             prop_assert_eq!(&record[..wire.len()], &wire[..]);
             reads_as(&wire, &expected)?;
-            prop_assert_eq!(write_record_over_any(&fields, head - 1)?.0, None);
+            prop_assert_eq!(
+                write_record_over_any(&fields, head - 1)?.0,
+                Err(WriteError::BufferTooSmall)
+            );
             let whole: usize = cut_in_turn(&strings, usize::MAX).iter().map(|text| text.len()).sum();
             prop_assert!(fields.metadata().record_len() >= head + whole);
 
@@ -3221,13 +3166,13 @@ mod tests {
             let start = Header::SIZE + METADATA_HEADER_SIZE;
             let (len, packet) = write_over_any(start + head + room, |buf| metadata.write(flags, buf))?;
             if METADATA_HEADER_SIZE + wire.len() <= Packet::MAX_PAYLOAD {
-                prop_assert_eq!(len, Some(start + wire.len()));
+                prop_assert_eq!(len, Ok(start + wire.len()));
                 prop_assert_eq!(&packet[start..start + wire.len()], &wire[..]);
             } else {
-                prop_assert_eq!(len, None);
+                prop_assert_eq!(len, Err(WriteError::PayloadTooLarge));
             }
             let (len, _) = write_over_any(start + head - 1, |buf| metadata.write(flags, buf))?;
-            prop_assert_eq!(len, None);
+            prop_assert_eq!(len, Err(WriteError::BufferTooSmall));
         }
 
         /// M5. A longer head than this build's is read as far as this build
@@ -3336,7 +3281,11 @@ mod tests {
         record: &[u8],
         len: usize,
     ) -> Result<(Option<usize>, Vec<u8>), TestCaseError> {
-        write_over_any(len, |out| repair_record_text(kind, record, out))
+        let repair = |out: &mut [u8]| {
+            repair_record_text(kind, record, out).ok_or(WriteError::BufferTooSmall)
+        };
+        let (written, zeroes) = write_over_any(len, repair)?;
+        Ok((written.ok(), zeroes))
     }
 
     /// The declared head length and the byte range of each string of the
@@ -3464,78 +3413,12 @@ mod tests {
         ]
     }
 
-    /// A bare column record of stream 1, index 2 and type f32 whose strings
-    /// hold these bytes.
-    fn column_with(name: &[u8], units: &[u8], description: &[u8]) -> Vec<u8> {
-        let head = [
-            7,
-            1,
-            2,
-            DataType::F32.value(),
-            name.len() as u8,
-            units.len() as u8,
-            description.len() as u8,
-        ];
-        [&head[..], name, units, description].concat()
-    }
-
-    /// Repairs the column `record` with room for all of it three times over.
-    fn repaired_column(record: &[u8]) -> Vec<u8> {
-        let mut out = vec![0; 3 * record.len()];
-        let len = repair_record_text(4, record, &mut out).expect("a repairable record");
-        out.truncate(len);
-        out
-    }
-
     #[test]
-    fn a_lone_continuation_byte_becomes_one_replacement_character() {
-        let out = repaired_column(&column_with(b"field", &[0xB0, 0x43], b"Total"));
-        let column = Column::parse(&out).unwrap();
-        assert_eq!(column.units, "\u{FFFD}C");
-        assert_eq!((column.name, column.description), ("field", "Total"));
-        assert_eq!(
-            (column.stream_id, column.index, column.data_type),
-            (StreamId::new(1), ColumnId::new(2), DataType::F32)
-        );
-    }
-
-    #[test]
-    fn a_character_cut_short_at_the_end_becomes_one_replacement_character() {
-        let out = repaired_column(&column_with(b"x", &[0x6D, 0xB5], b""));
-        assert_eq!(Column::parse(&out).unwrap().units, "m\u{FFFD}");
-    }
-
-    #[test]
-    fn text_that_is_utf8_is_unchanged() {
-        let record = column_with(b"x", &[0xC2, 0xB0, 0x43], b"");
-        let out = repaired_column(&record);
-        assert_eq!(Column::parse(&out).unwrap().units, "°C");
-        assert_eq!(out, record);
-    }
-
-    #[test]
-    fn a_string_that_grows_past_255_bytes_is_cut_on_a_character_boundary() {
-        // One ASCII byte then 100 bytes that each become a 3-byte character.
-        let name = [&b"a"[..], &[0xFF; 100]].concat();
-        let out = repaired_column(&column_with(&name, b"V", b""));
-        let column = Column::parse(&out).unwrap();
-        assert_eq!(column.name, format!("a{}", "\u{FFFD}".repeat(84)));
-        assert_eq!(column.name.len(), 253);
-        assert_eq!(column.units, "V");
-    }
-
-    #[test]
-    fn a_buffer_too_short_for_all_the_text_cuts_the_last_strings_first() {
-        let record = column_with(b"ab", &[0xB0, b'C'], b"xyz");
-        // Room for the head, the name, the repaired units and one byte more.
-        let mut out = vec![0; Column::HEAD_SIZE + 2 + 4 + 1];
-        let len = repair_record_text(4, &record, &mut out).unwrap();
-        let column = Column::parse(&out[..len]).unwrap();
-        assert_eq!(
-            (column.name, column.units, column.description),
-            ("ab", "\u{FFFD}C", "x")
-        );
-        assert_eq!(repair_record_text(4, &record, &mut out[..6]), None);
+    fn the_room_for_a_repair_is_the_record_or_a_reply_frame_whichever_is_longer() {
+        assert_eq!(repaired_record_room(0), 255);
+        assert_eq!(repaired_record_room(10), 255);
+        assert_eq!(repaired_record_room(255), 255);
+        assert_eq!(repaired_record_room(300), 300);
     }
 
     proptest! {
@@ -3559,17 +3442,40 @@ mod tests {
 
         /// M10, M11 and M12. A repair gives the record the model builds,
         /// which parses, and refuses exactly the records whose fault is not
-        /// their text, whatever the buffer held before.
+        /// their text, whatever the buffer held before. A lenient read of a
+        /// record and its `Debug` text give the fields of its repair.
         #[test]
         fn a_repair_reads_each_string_lossily_and_cuts_it_in_turn(
             (kind, record) in damaged(),
-            room in any::<Index>(),
+            (room, filled) in (any::<Index>(), any::<bool>()),
         ) {
-            let room = room.index(3 * record.len() + 3);
+            // Half the rooms end where a replacement character ends, so the
+            // room left for it is its length exactly.
+            let full = repaired_model(kind, &record, 3 * record.len() + 3).unwrap_or_default();
+            let ends: Vec<usize> = (3..=full.len())
+                .filter(|&end| full[end - 3..end] == *"\u{FFFD}".as_bytes())
+                .collect();
+            let room = match filled && !ends.is_empty() {
+                true => ends[room.index(ends.len())],
+                false => room.index(3 * record.len() + 3),
+            };
             let (len, out) = repair_over_any(kind, &record, room)?;
             let head = record.first().map_or(0, |&head| usize::from(head));
             let ascii_parses = parse_record(kind, &with_ascii_strings(kind, &record)).is_some();
             prop_assert_eq!(len.is_some(), ascii_parses && room >= head, "{:?}", record);
+            let framed = MetadataRecord::new(kind, &record);
+            if let Some(framed) = framed.filter(|_| record.len() <= Packet::MAX_PAYLOAD) {
+                let mut fixed = vec![0; repaired_record_room(record.len())];
+                let strict = repair_record_text(kind, &record, &mut fixed)
+                    .and_then(|len| read_record(kind, &fixed[..len], Text::Utf8));
+                prop_assert_eq!(
+                    framed.read_lossy(|fields| format!("{:?}", by_bits(fields))),
+                    strict.map(|fields| format!("{:?}", by_bits(fields)))
+                );
+                if let Some(strict) = strict {
+                    prop_assert_eq!(format!("{framed:?}"), format!("{strict:?}"));
+                }
+            }
             let Some(len) = len else {
                 return Ok(());
             };
@@ -3594,29 +3500,34 @@ mod tests {
         }
     }
 
-    /// Prints the share of the classes the generator obligations name, when
-    /// `TWINLEAF_PAYLOAD_CLASSES` is set.
-    #[test]
-    fn class_counts() {
-        tally("M7 payloads", any_metadata(), |payload| {
-            let class = match payload[..] {
-                [kind @ 1..=4, _, ref record @ ..] => {
-                    record_strings(kind, record).map_or_else(|refused| refused, |_| "parses")
-                }
-                [_, _, ..] => "record type not defined",
-                _ => "under two bytes",
+    proptest! {
+        /// M14. The check frames a metadata record and does not read its
+        /// text, and the record it keeps reads as the payload parses.
+        #[test]
+        fn the_check_frames_a_record_and_leaves_its_text_unread(payload in any_metadata()) {
+            use crate::packet::{Checked, PacketError, Payload};
+            let size = (payload.len() as u16).to_le_bytes();
+            let raw = [&[11, 0, size[0], size[1]][..], &payload].concat();
+            let [kind @ 1..=4, flags, ref record @ ..] = payload[..] else {
+                return Ok(());
             };
-            vec![class]
-        });
-        tally(
-            "M4 strings and room",
-            (fields(300), any::<Index>()),
-            |(fields, room)| {
-                let strings = fields.strings();
-                let total: usize = strings.iter().map(|text| text.len()).sum();
-                cut_classes(&strings, room.index(total + 2))
-            },
-        );
+            let ascii = [&[kind, flags][..], &with_ascii_strings(kind, record)].concat();
+            let refused = Metadata::parse(&ascii).is_none();
+            let checked = Checked::exact(&raw);
+            prop_assert_eq!(checked.err(), refused.then_some(PacketError::InvalidPayload));
+            let Ok(checked) = checked else {
+                return Ok(());
+            };
+            let Payload::Metadata(kept, kept_flags) = checked.payload() else {
+                return Err(TestCaseError::fail("not a metadata payload"));
+            };
+            prop_assert_eq!((kept.kind(), kept.bytes()), (MetadataType::from(kind), record));
+            prop_assert_eq!(kept_flags, MetadataFlags::from_bits(flags));
+            prop_assert_eq!(
+                kept.read().map(by_bits),
+                Metadata::parse(&payload).map(|(record, _)| by_bits(record))
+            );
+        }
     }
 
     #[test]

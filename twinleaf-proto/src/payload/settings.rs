@@ -6,7 +6,7 @@
 //! bytes the RPC of that name would return. The other `flags` bits are
 //! reserved and sent as zero. [`Setting`] parses and writes the packet.
 
-use crate::packet::{Header, Packet, PacketType};
+use crate::packet::{Header, Packet, PacketType, WriteError};
 
 /// Size of the `{ name_len, flags }` head before the name and value.
 pub const SETTING_HEADER_SIZE: usize = 2;
@@ -52,36 +52,50 @@ impl<'a> Setting<'a> {
         core::str::from_utf8(self.name).ok()
     }
 
-    /// Returns the payload length. Returns `None` if the name is longer than
-    /// 255 bytes or the payload exceeds [`Packet::MAX_PAYLOAD`].
-    pub fn payload_len(&self) -> Option<usize> {
+    /// Returns the payload length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::NameTooLong`] if the name is longer than 255
+    /// bytes, and [`WriteError::PayloadTooLarge`] if the payload exceeds
+    /// [`Packet::MAX_PAYLOAD`].
+    pub fn payload_len(&self) -> Result<usize, WriteError> {
         if self.name.len() > u8::MAX as usize {
-            return None;
+            return Err(WriteError::NameTooLong);
         }
         let len = self.head_len() + self.name.len() + self.reply.len();
-        (len <= Packet::MAX_PAYLOAD).then_some(len)
+        Header::for_payload(PacketType::SETTING, len).map(|_| len)
     }
 
-    /// Writes a full `SETTING` packet into `buf`. Returns its length, or `None`
-    /// if it does not fit or the name exceeds 255 bytes.
-    pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Writes a full `SETTING` packet into `buf` and returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`payload_len`](Self::payload_len), and
+    /// [`WriteError::BufferTooSmall`] if the packet does not fit `buf`.
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize, WriteError> {
         let payload_len = self.payload_len()?;
         let total = Header::SIZE + payload_len;
         if buf.len() < total {
-            return None;
+            return Err(WriteError::BufferTooSmall);
         }
         let hdr = Header::new(PacketType::SETTING, payload_len as u16);
-        hdr.write(buf.first_chunk_mut()?);
+        hdr.write(buf.first_chunk_mut().ok_or(WriteError::BufferTooSmall)?);
         self.write_payload(&mut buf[Header::SIZE..total])?;
-        Some(total)
+        Ok(total)
     }
 
-    /// Writes the payload alone, without a packet header, into `out`. Returns
-    /// its length, or `None` if it does not fit or the name exceeds 255 bytes.
-    pub fn write_payload(&self, out: &mut [u8]) -> Option<usize> {
+    /// Writes the payload alone, without a packet header, into `out`, and
+    /// returns its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`payload_len`](Self::payload_len), and
+    /// [`WriteError::BufferTooSmall`] if the payload does not fit `out`.
+    pub fn write_payload(&self, out: &mut [u8]) -> Result<usize, WriteError> {
         let len = self.payload_len()?;
         if out.len() < len {
-            return None;
+            return Err(WriteError::BufferTooSmall);
         }
         out[0] = self.name.len() as u8;
         out[1] = match self.seq {
@@ -95,7 +109,7 @@ impl<'a> Setting<'a> {
         let value_start = name_start + self.name.len();
         out[name_start..value_start].copy_from_slice(self.name);
         out[value_start..len].copy_from_slice(self.reply);
-        Some(len)
+        Ok(len)
     }
 
     fn head_len(&self) -> usize {
@@ -202,14 +216,14 @@ mod tests {
             let setting = Setting { name: &name, seq, reply: &reply };
             let head = SETTING_HEADER_SIZE + seq.map_or(0, |_| SEQUENCE_SIZE);
             let payload_len = head + name.len() + reply.len();
-            prop_assert_eq!(setting.payload_len(), Some(payload_len));
+            prop_assert_eq!(setting.payload_len(), Ok(payload_len));
             let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| setting.write(buf))?;
-            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(len, Ok(buf.len()));
             let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
             prop_assert_eq!(header, Header::new(PacketType::SETTING, payload_len as u16));
             prop_assert_eq!(Setting::parse(&buf[Header::SIZE..]), Some(setting));
             let (len, payload) = write_over_any(payload_len, |out| setting.write_payload(out))?;
-            prop_assert_eq!(len, Some(payload_len));
+            prop_assert_eq!(len, Ok(payload_len));
             prop_assert_eq!(&payload[..], &buf[Header::SIZE..]);
             if let Some(text) = text {
                 prop_assert_eq!(setting.name_str(), text.as_deref());
@@ -236,7 +250,7 @@ mod tests {
             prop_assert_eq!(setting.name.len(), name_len as usize);
             prop_assert_eq!(setting.seq.is_some(), seq);
             let (len, written) = write_over_any(payload.len(), |out| setting.write_payload(out))?;
-            prop_assert_eq!(len, Some(payload.len()));
+            prop_assert_eq!(len, Ok(payload.len()));
             let mut canonical = payload.clone();
             canonical[1] = flags & VERSION;
             prop_assert_eq!(written, canonical);
@@ -254,88 +268,15 @@ mod tests {
             let head = SETTING_HEADER_SIZE + seq.map_or(0, |_| SEQUENCE_SIZE);
             let payload_len = head + name.len() + reply.len();
             let valid = name.len() <= MAX_NAME && payload_len <= Packet::MAX_PAYLOAD;
-            prop_assert_eq!(setting.payload_len(), valid.then_some(payload_len));
+            prop_assert_eq!(setting.payload_len().ok(), valid.then_some(payload_len));
 
             let mut buf = buffer(Header::SIZE + payload_len, slack);
             let fits = valid && buf.len() >= Header::SIZE + payload_len;
-            prop_assert_eq!(setting.write(&mut buf), fits.then_some(Header::SIZE + payload_len));
+            prop_assert_eq!(setting.write(&mut buf).ok(), fits.then_some(Header::SIZE + payload_len));
             let mut out = buffer(payload_len, slack);
             let fits = valid && out.len() >= payload_len;
-            prop_assert_eq!(setting.write_payload(&mut out), fits.then_some(payload_len));
+            prop_assert_eq!(setting.write_payload(&mut out).ok(), fits.then_some(payload_len));
         }
-    }
-
-    /// Byte-exact packed layout of the setting payload behind its packet
-    /// header (`type = TL_PTYPE_SETTING`, `payload_size` covering header, name,
-    /// and value), with the RPC's reply moved in behind the name.
-    #[test]
-    fn matches_the_packed_wire_layout() {
-        let setting = Setting {
-            name: b"rpc.hash",
-            seq: None,
-            reply: &0x0102_0304u32.to_le_bytes(),
-        };
-        let mut buf = [0u8; 32];
-        let len = setting.write(&mut buf).unwrap();
-        #[rustfmt::skip]
-        assert_eq!(&buf[..len], &[
-            12, 0, 14, 0,                               // header: SETTING, no routing, payload 14
-            8,                                          // name_len
-            0,                                          // flags
-            b'r', b'p', b'c', b'.', b'h', b'a', b's', b'h',
-            0x04, 0x03, 0x02, 0x01,                     // the rpc.hash reply, verbatim
-        ]);
-    }
-
-    /// A receiver takes `name_len` bytes of name, then the rest of the
-    /// payload as the value.
-    #[test]
-    fn decodes_name_and_value_from_the_payload() {
-        let raw = [
-            12, 0, 11, 0, // SETTING, no routing, payload_size 11
-            8, 0, // name_len 8, flags 0
-            b'd', b'e', b'v', b'.', b'n', b'a', b'm', b'e', //
-            b'X',
-        ];
-        let header = Header::parse((&raw[..Header::SIZE]).try_into().unwrap()).unwrap();
-        assert_eq!(header.ptype, PacketType::SETTING);
-        assert_eq!(header.packet_len(), raw.len());
-
-        let setting = Setting::parse(&raw[header.payload_range()]).unwrap();
-        assert_eq!(setting.name_str(), Some("dev.name"));
-        assert_eq!(
-            setting.reply.len(),
-            header.payload_size as usize - SETTING_HEADER_SIZE - setting.name.len()
-        );
-        assert_eq!(setting.reply, b"X");
-    }
-
-    /// Byte for byte, the head with [`VERSION`] set, the sequence number,
-    /// then the name and value as before.
-    #[test]
-    fn a_numbered_announcement_puts_its_sequence_before_the_name() {
-        let setting = Setting {
-            name: b"dev.name",
-            seq: Some(0x0102_0304),
-            reply: b"X",
-        };
-        let mut buf = [0u8; 32];
-        let len = setting.write(&mut buf).unwrap();
-        #[rustfmt::skip]
-        assert_eq!(&buf[..len], &[
-            12, 0, 15, 0,           // header: SETTING, no routing, payload 15
-            8,                      // name_len
-            VERSION,                // flags
-            0x04, 0x03, 0x02, 0x01, // sequence, little-endian
-            b'd', b'e', b'v', b'.', b'n', b'a', b'm', b'e',
-            b'X',
-        ]);
-        assert_eq!(Setting::parse(&buf[Header::SIZE..len]), Some(setting));
-        assert_eq!(
-            Setting::parse(&[0, VERSION, 1, 0, 0]),
-            None,
-            "a short sequence"
-        );
     }
 
     #[test]

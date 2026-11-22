@@ -3,7 +3,8 @@
 //!
 //! A device sends each packet on the lane [`lane_of`] names. Each lane keeps its write order and
 //! lanes keep none between them, so each law reads one lane of one route, its control or one
-//! stream's data, and takes from control only the sample size a stream's record fixes for the session.
+//! stream's data, and takes from control only what a device fixes for a session, the sample size
+//! of a stream's record and the stream count of its device record.
 //!
 //! A trace is every packet a host exchanged with a tree of devices since it
 //! first heard them, in the order it saw them. A row is a sample packet, and
@@ -15,7 +16,8 @@
 //! checked alone. Its control starts over at its first heartbeat and at each naming a new session, as what came before may be of another, and each stream's
 //! data at a [`SegmentFlags::START`] record opening another segment, as each begins its lane
 //! afresh while the other lanes may still carry what came before. A device keeps the laws of the [`Law::revision`] its record declares and those before.
-//! A packet whose payload does not parse is not checked.
+//! A packet whose payload does not parse is not checked, except against [`Law::F2`], which reads
+//! only its header and payload length.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -23,7 +25,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::num::NonZeroU16;
 
-use crate::data::{self, FilterType, Metadata, Samples, SegmentFlags};
+use crate::data::{self, FilterType, Metadata, Samples, SegmentFlags, MIN_SAMPLE_PAYLOAD};
 use crate::heartbeat::{Heartbeat, SESSION_PAYLOAD_SIZE, SETTINGS_PAYLOAD_SIZE};
 use crate::packet::{lane_of, Header, Lane, PacketType, PacketView};
 use crate::rpc::{ErrorReply, Reply, Request};
@@ -58,6 +60,8 @@ pub struct Observed<'a> {
 pub enum Law {
     /// Every packet a device sends has a TTL of 0.
     F1,
+    /// Every sample packet a device sends carries at least one sample byte.
+    F2,
     /// Every heartbeat a device sends is its session, alone in 4 bytes or with
     /// its settings sequence in 8.
     I1,
@@ -82,6 +86,10 @@ pub enum Law {
     /// A record that moves a segment id's start or reference between two of its rows, with no
     /// record of another id between them, restarts the count, so the next row numbers no higher.
     S5,
+    /// A segment's first active record without [`SegmentFlags::START`], on the time reference of
+    /// the segment its stream's last row was in, starts no earlier than that segment, whose rows
+    /// number below the whole output periods between the two starts at its rate and decimation.
+    S6,
     /// No row of a segment comes after its closing record, one without [`SegmentFlags::ACTIVE`].
     D1,
     /// A segment's closing record is its opening record with [`SegmentFlags::ACTIVE`] cleared.
@@ -89,6 +97,9 @@ pub enum Law {
     /// A record opening a segment while its stream has none open carries [`SegmentFlags::START`],
     /// and one with it while a segment is open ends that segment unclosed.
     D3,
+    /// Every stream a record or a row names is numbered at most the `n_streams` of the device's
+    /// latest device record.
+    M1,
 }
 
 impl Law {
@@ -96,14 +107,17 @@ impl Law {
     pub const fn revision(self) -> u8 {
         match self {
             Self::F1 | Self::I1 | Self::A1 | Self::A2 => 0,
-            Self::S1
+            Self::F2
+            | Self::S1
             | Self::S2
             | Self::S3
             | Self::S4
             | Self::S5
+            | Self::S6
             | Self::D1
             | Self::D2
-            | Self::D3 => 1,
+            | Self::D3
+            | Self::M1 => 1,
         }
     }
 }
@@ -130,13 +144,22 @@ pub fn check(trace: &[Observed<'_>]) -> Vec<Violation> {
             let broken = match seen.sender {
                 Sender::Host => {
                     route.control.asked(seen.packet);
-                    [None, None]
+                    [None, None, None]
                 }
                 Sender::Device => [
                     (!f1(seen.packet.header)).then(|| {
                         (
                             Law::F1,
                             format!("a packet of TTL {}", seen.packet.header.ttl),
+                        )
+                    }),
+                    (!f2(seen.packet.header)).then(|| {
+                        (
+                            Law::F2,
+                            format!(
+                                "a sample packet of {} payload bytes",
+                                seen.packet.header.payload_size
+                            ),
                         )
                     }),
                     route.heard(seen.packet),
@@ -154,6 +177,10 @@ pub fn check(trace: &[Observed<'_>]) -> Vec<Violation> {
 
 fn f1(header: Header) -> bool {
     header.ttl == 0
+}
+
+fn f2(header: Header) -> bool {
+    header.ptype.sample_stream().is_none() || usize::from(header.payload_size) >= MIN_SAMPLE_PAYLOAD
 }
 
 fn i1(payload: &[u8]) -> bool {
@@ -243,7 +270,38 @@ fn d3(stream: &Stream, record: &Record) -> bool {
     stream.latest.is_none() || !record.active() || stream.open().is_some() || record.starts()
 }
 
+/// The rows of a segment with no rate or decimation number against nothing, so only the order of
+/// the two starts is read.
+fn s6(stream: &Stream, record: &Record) -> bool {
+    let next = &record.segment;
+    let Some(before) = stream.last_row.as_ref() else {
+        return true;
+    };
+    if !record.active()
+        || record.starts()
+        || stream.runs.contains_key(next)
+        || before.time_reference() != next.time_reference()
+    {
+        return true;
+    }
+    let Some(seconds) = next.start_time.checked_sub(before.start_time) else {
+        return false;
+    };
+    let (Some(last), Some(&(rate, decimation))) = (stream.last(before), stream.periods.get(before))
+    else {
+        return true;
+    };
+    rate == 0
+        || decimation == 0
+        || u64::from(last) < u64::from(seconds) * u64::from(rate) / u64::from(decimation)
+}
+
+fn m1(n_streams: Option<u8>, stream: StreamId) -> bool {
+    n_streams.is_none_or(|n_streams| stream.value() <= n_streams)
+}
+
 /// A segment as a row names it, its id with the start and time reference of its latest record.
+/// Its fields are the ones [`data::SegmentView::is_same_segment`] compares.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Segment {
     id: SegmentId,
@@ -251,6 +309,27 @@ struct Segment {
     epoch: Epoch,
     timeref_session: SessionId,
     timeref_serial: String,
+}
+
+impl Segment {
+    /// The segment `record` names.
+    fn of(record: data::Segment<'_>) -> Self {
+        Self {
+            id: record.segment_id,
+            start_time: record.start_time,
+            epoch: record.epoch,
+            timeref_session: record.timeref_session,
+            timeref_serial: record.timeref_serial.into(),
+        }
+    }
+
+    fn time_reference(&self) -> data::TimeReference<'_> {
+        data::TimeReference {
+            epoch: self.epoch,
+            session: self.timeref_session,
+            serial: &self.timeref_serial,
+        }
+    }
 }
 
 /// A segment record, the segment it names with everything else it says.
@@ -290,6 +369,8 @@ struct Stream {
     latest: Option<Segment>,
     /// Every segment recorded, with the last sample number of its rows.
     runs: BTreeMap<Segment, Option<u32>>,
+    /// Every segment recorded, with the sampling rate and decimation of its latest record.
+    periods: BTreeMap<Segment, (u32, u32)>,
     last_row: Option<Segment>,
     /// Whether a record of another segment id came since the last row.
     crossed: bool,
@@ -313,7 +394,7 @@ impl Stream {
     }
 
     fn recorded(&mut self, record: data::Segment<'_>) -> Option<(Law, String)> {
-        if !record.flags.contains(SegmentFlags::VALID) {
+        if !record.is_populated() {
             return None;
         }
         let what = format!(
@@ -323,13 +404,7 @@ impl Stream {
             record.start_time
         );
         let record = Record {
-            segment: Segment {
-                id: record.segment_id,
-                start_time: record.start_time,
-                epoch: record.epoch,
-                timeref_session: record.timeref_session,
-                timeref_serial: record.timeref_serial.into(),
-            },
+            segment: Segment::of(record),
             flags: record.flags,
             sampling_rate: record.sampling_rate,
             decimation: record.decimation,
@@ -347,10 +422,16 @@ impl Stream {
                 ..Self::default()
             };
         }
-        let broken = [(Law::D2, d2(self, &record)), (Law::D3, d3(self, &record))]
-            .into_iter()
-            .find_map(|(law, holds)| (!holds).then_some(law));
+        let broken = [
+            (Law::D2, d2(self, &record)),
+            (Law::D3, d3(self, &record)),
+            (Law::S6, s6(self, &record)),
+        ]
+        .into_iter()
+        .find_map(|(law, holds)| (!holds).then_some(law));
         let segment = record.segment.clone();
+        self.periods
+            .insert(segment.clone(), (record.sampling_rate, record.decimation));
         self.crossed |= self
             .last_row
             .as_ref()
@@ -406,6 +487,8 @@ struct Control {
     session: Option<SessionId>,
     /// The protocol revision the device's record declares, 0 until it declares one.
     protocol: u8,
+    /// The stream count of the device's latest record, unknown until it sends one.
+    n_streams: Option<u8>,
     /// The highest settings sequence the device has shown.
     shown: Option<u32>,
     /// Requests not yet answered, with the sequence shown before each.
@@ -439,6 +522,17 @@ impl Control {
         broken.map(|law| {
             let name = String::from_utf8_lossy(setting.name);
             (law, format!("{name} announced as setting {seq}"))
+        })
+    }
+
+    /// Whether a packet naming `stream` breaks [`Law::M1`].
+    fn named(&self, stream: StreamId) -> Option<(Law, String)> {
+        (!m1(self.n_streams, stream)).then(|| {
+            let (stream, n_streams) = (stream.value(), self.n_streams.unwrap_or_default());
+            (
+                Law::M1,
+                format!("stream {stream} of a device of {n_streams} streams"),
+            )
         })
     }
 }
@@ -478,6 +572,7 @@ impl Route {
             PacketType::METADATA => match Metadata::parse(packet.payload)?.0 {
                 Metadata::Device(record) => {
                     self.control.protocol = record.protocol;
+                    self.control.n_streams = Some(record.n_streams);
                     None
                 }
                 Metadata::Stream(record) => {
@@ -485,9 +580,10 @@ impl Route {
                         .entry(record.stream_id)
                         .or_default()
                         .sample_size = NonZeroU16::new(record.sample_size);
-                    None
+                    self.control.named(record.stream_id)
                 }
-                Metadata::Segment(_) | Metadata::Column(_) => None,
+                Metadata::Column(record) => self.control.named(record.stream_id),
+                Metadata::Segment(_) => None,
             },
             PacketType::RPC_REP => {
                 let reply = Reply::parse(packet.payload)?;
@@ -507,19 +603,26 @@ impl Route {
     fn data(&mut self, packet: PacketView<'_>) -> Option<(Law, String)> {
         match packet.header.ptype {
             PacketType::METADATA => match Metadata::parse(packet.payload)?.0 {
-                Metadata::Segment(record) => self
-                    .streams
-                    .entry(record.stream_id)
-                    .or_default()
-                    .recorded(record),
+                Metadata::Segment(record) => {
+                    let named = self.control.named(record.stream_id);
+                    let broken = self
+                        .streams
+                        .entry(record.stream_id)
+                        .or_default()
+                        .recorded(record);
+                    named.or(broken)
+                }
                 Metadata::Device(_) | Metadata::Stream(_) | Metadata::Column(_) => None,
             },
             _ => {
                 let samples = Samples::parse(packet.header, packet.payload)?;
-                self.streams
+                let named = self.control.named(samples.stream_id);
+                let broken = self
+                    .streams
                     .entry(samples.stream_id)
                     .or_default()
-                    .row(samples)
+                    .row(samples);
+                named.or(broken)
             }
         }
     }
@@ -531,6 +634,7 @@ impl Route {
             None => {
                 self.control = Control {
                     protocol: self.control.protocol,
+                    n_streams: self.control.n_streams,
                     ..Control::default()
                 }
             }
@@ -544,14 +648,14 @@ impl Route {
 mod tests {
     use super::*;
     use crate::data::MetadataFlags;
-    use crate::packet::Packet;
+    use crate::packet::{Packet, WriteError};
     use crate::rpc::{self, Method};
     use crate::SampleNumber;
 
     /// A packet the device at `/` sent or was sent.
     type Step = (DeviceRoute, Sender, Vec<u8>);
 
-    fn written(write: impl FnOnce(&mut [u8]) -> Option<usize>) -> Vec<u8> {
+    fn written(write: impl FnOnce(&mut [u8]) -> Result<usize, WriteError>) -> Vec<u8> {
         let mut buf = [0; Packet::MAX_SIZE];
         let len = write(&mut buf).unwrap();
         buf[..len].to_vec()
@@ -588,11 +692,35 @@ mod tests {
 
     /// A segment's record with `flags`, on the time reference of session `reference`.
     fn segment(segment: u8, start_time: u32, reference: u32, flags: SegmentFlags) -> Step {
-        let record = Metadata::Segment(data::Segment {
+        segment_in(Epoch::UNIX, segment, start_time, reference, flags)
+    }
+
+    /// A segment's record with `flags`, on the time reference of session `reference` in `epoch`.
+    fn segment_in(
+        epoch: Epoch,
+        segment: u8,
+        start_time: u32,
+        reference: u32,
+        flags: SegmentFlags,
+    ) -> Step {
+        let record =
+            Metadata::Segment(segment_record(epoch, segment, start_time, reference, flags));
+        device(written(|buf| record.write(MetadataFlags::UPDATE, buf)))
+    }
+
+    /// The record [`segment_in`] writes.
+    fn segment_record(
+        epoch: Epoch,
+        segment: u8,
+        start_time: u32,
+        reference: u32,
+        flags: SegmentFlags,
+    ) -> data::Segment<'static> {
+        data::Segment {
             stream_id: StreamId::new(1),
             segment_id: SegmentId::new(segment),
             flags,
-            epoch: Epoch::UNIX,
+            epoch,
             timeref_serial: "S1",
             timeref_session: SessionId::new(reference),
             start_time,
@@ -600,8 +728,7 @@ mod tests {
             decimation: 1,
             filter_cutoff: 0.0,
             filter_type: FilterType::NONE,
-        });
-        device(written(|buf| record.write(MetadataFlags::UPDATE, buf)))
+        }
     }
 
     /// The record of a segment a switch opened.
@@ -631,8 +758,13 @@ mod tests {
 
     /// The record of stream 1, two bytes a sample, so that each row carries two.
     fn stream() -> Step {
+        stream_of(1)
+    }
+
+    /// The record of stream `stream`, two bytes a sample.
+    fn stream_of(stream: u8) -> Step {
         let record = Metadata::Stream(data::Stream {
-            stream_id: StreamId::new(1),
+            stream_id: StreamId::new(stream),
             n_columns: 1,
             n_segments: 4,
             sample_size: 2,
@@ -643,8 +775,13 @@ mod tests {
     }
 
     fn row(segment: u8, first: u32) -> Step {
+        row_of(1, segment, first)
+    }
+
+    /// A row of stream `stream`, two bytes for each of two samples.
+    fn row_of(stream: u8, segment: u8, first: u32) -> Step {
         let samples = Samples {
-            stream_id: StreamId::new(1),
+            stream_id: StreamId::new(stream),
             segment_id: SegmentId::new(segment),
             first: SampleNumber::new(first),
             data: &[0; 4],
@@ -697,6 +834,19 @@ mod tests {
             .into_iter()
             .map(|violation| (violation.law, violation.index))
             .collect()
+    }
+
+    /// Rows 0 to 29 of a segment at 10 rows a second from second 100, then `next`, and its row 0.
+    fn held(next: Step) -> Vec<Step> {
+        vec![
+            declare(1),
+            stream(),
+            record(0, 100),
+            row(0, 0),
+            row(0, 28),
+            next,
+            row(1, 0),
+        ]
     }
 
     /// Each law holds of a trace that keeps it and names the one packet of a
@@ -953,6 +1103,40 @@ mod tests {
                 vec![v1(), start(0, 100), close(0, 100), record(1, 101)],
                 3,
             ),
+            (Law::S6, held(record(1, 103)), held(record(1, 102)), 5),
+            (Law::S6, held(start(1, 102)), held(record(1, 102)), 5),
+            (Law::S6, held(record_on(1, 102, 4)), held(record(1, 102)), 5),
+            (
+                Law::S6,
+                held(segment_in(
+                    Epoch::SYSTIME,
+                    1,
+                    99,
+                    3,
+                    SegmentFlags::VALID | SegmentFlags::ACTIVE,
+                )),
+                held(record(1, 99)),
+                5,
+            ),
+            (
+                Law::M1,
+                vec![
+                    row_of(2, 0, 0),
+                    stream_of(2),
+                    v1(),
+                    stream(),
+                    record(0, 100),
+                    row(0, 0),
+                ],
+                vec![v1(), stream_of(2)],
+                1,
+            ),
+            (
+                Law::M1,
+                vec![row_of(2, 0, 0), v1(), record(0, 100), row(0, 0)],
+                vec![v1(), record(0, 100), row_of(2, 0, 0)],
+                2,
+            ),
         ];
         for (law, lawful, breaking, index) in cases {
             assert_eq!(
@@ -981,6 +1165,25 @@ mod tests {
             breaking(vec![declare(1)]),
             [(Law::S1, 2), (Law::F1, 3), (Law::S1, 3)]
         );
+    }
+
+    /// A sample packet with no sample bytes breaks `F2` for a device of revision 1, and a device of
+    /// revision 0 is not held to it.
+    #[test]
+    fn a_sample_packet_with_no_samples_breaks_f2_from_revision_1() {
+        let empty = device(vec![
+            PacketType::stream(1).unwrap().value(),
+            0,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        let trace = |declared: Step| broken(&[declared, stream(), record(0, 100), empty.clone()]);
+        assert_eq!(trace(declare(1)), [(Law::F2, 3)]);
+        assert_eq!(trace(declare(0)), []);
     }
 
     /// A heartbeat of the next session that overtakes the last session's rows, as a hop that keeps
@@ -1032,5 +1235,61 @@ mod tests {
             close(0, 103),
         ];
         assert_eq!(broken(&steps), []);
+    }
+
+    /// The contract's segment and the view's test of the same segment agree.
+    /// Records that differ in one of id, start time, epoch and the time
+    /// reference's session and serial name other segments to both.
+    #[test]
+    fn a_segment_is_the_one_the_view_names_the_same() {
+        let base = segment_record(
+            Epoch::UNIX,
+            0,
+            100,
+            3,
+            SegmentFlags::VALID | SegmentFlags::ACTIVE,
+        );
+        let bytes = |record: data::Segment<'_>| {
+            let metadata = Metadata::Segment(record);
+            let mut buf = alloc::vec![0; metadata.record_len()];
+            let (_, len) = metadata.write_record(&mut buf).unwrap();
+            buf.truncate(len);
+            buf
+        };
+        let others = [
+            data::Segment {
+                segment_id: SegmentId::new(1),
+                ..base
+            },
+            data::Segment {
+                start_time: 101,
+                ..base
+            },
+            data::Segment {
+                epoch: Epoch::SYSTIME,
+                ..base
+            },
+            data::Segment {
+                timeref_session: SessionId::new(4),
+                ..base
+            },
+            data::Segment {
+                timeref_serial: "S2",
+                ..base
+            },
+        ];
+        let base_bytes = bytes(base);
+        let base_view = data::SegmentView::new_checked(&base_bytes).unwrap();
+        for (index, other) in others.into_iter().chain([base]).enumerate() {
+            let other_bytes = bytes(other);
+            let other_view = data::SegmentView::new_checked(&other_bytes).unwrap();
+            let same = index == others.len();
+            assert_eq!(
+                Segment::of(base) == Segment::of(other),
+                same,
+                "pair {index}"
+            );
+            assert_eq!(base_view.is_same_segment(&other_view), same, "pair {index}");
+        }
     }
 }
