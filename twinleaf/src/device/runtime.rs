@@ -393,18 +393,10 @@ mod sandbox {
 /// Returns the proxy `TWINLEAF_PROXY` names, or else the machine's own on
 /// `127.0.0.1:7855`, which may be started.
 pub(crate) fn chosen_proxy() -> ProxyAddress {
-    proxy_named_by(proxy::named())
-}
-
-/// Returns the proxy as [`chosen_proxy`] does, with `named` as the variable's
-/// value.
-fn proxy_named_by(named: Option<String>) -> ProxyAddress {
-    match named {
-        Some(url) => ProxyAddress { url, ensure: None },
-        None => ProxyAddress {
-            url: proxy::endpoint_at(TCP_DEFAULT_PORT),
-            ensure: Some(ensure_proxy),
-        },
+    let ensure = proxy::named().is_none().then_some(ensure_proxy as _);
+    ProxyAddress {
+        url: proxy::chosen(),
+        ensure,
     }
 }
 
@@ -426,19 +418,6 @@ mod tests {
             Ok((ensured, embedded))
         };
         Supervisor::new().run("ensure", ensuring).unwrap()
-    }
-
-    /// A proxy that `TWINLEAF_PROXY` names is never started, and with none
-    /// named the machine's own proxy is.
-    #[test]
-    fn the_variable_names_the_proxy_else_the_machines_proxy() {
-        let named = proxy_named_by(Some("tcp://127.0.0.1:2".to_string()));
-        assert_eq!(named.url, "tcp://127.0.0.1:2");
-        assert!(named.ensure.is_none());
-
-        let machine = proxy_named_by(None);
-        assert_eq!(machine.url, "tcp://127.0.0.1:7855");
-        assert!(machine.ensure.is_some());
     }
 
     /// Proxies spawned together share the log, so each spawn appends rather

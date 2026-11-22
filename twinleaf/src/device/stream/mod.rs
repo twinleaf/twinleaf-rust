@@ -9,13 +9,14 @@
 //! device sent after the metadata changed. The update reaches the parser
 //! too, which decodes the samples after it with it. The proxy's other
 //! updates may overtake the device's packets, as each is the latest value of
-//! one field of the store.
+//! one field of the store. A recorder's tap takes the metadata each update
+//! completes in the update's place among the packets.
 
 #[cfg(test)]
 mod tests;
 
 use crate::chan::lock;
-use crate::data::{PacketParser, SampleBatch};
+use crate::data::{DeviceMetadataSnapshot, PacketParser, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::session::{
     encode, end_sinks, prune, pruned, BatchLane, End, Field, Handle, Inlet, Joined, Lane, Queued,
@@ -33,15 +34,26 @@ const BATCH_QUEUE_LEN: usize = 1024;
 
 /// How many packets a raw tap's queue holds, enough for a recorder's disk
 /// stall.
-const PACKET_QUEUE_LEN: usize = 8192;
+pub(super) const PACKET_QUEUE_LEN: usize = 8192;
 
 /// How many packets the inlet holds, as many as a socket's own queue.
 const INLET_LEN: usize = transport::DEFAULT_RX_CHANNEL_SIZE;
 
-/// A subscription to the pump's batches or packets, on its way to the pump.
+/// A subscription to the pump's batches, packets or recorded stream, on its
+/// way to the pump.
 enum Tap {
     Batches(Sink<BatchLane>),
     Packets(Sink<Lane<tio::Packet>>),
+    Recorded(Sink<Lane<Tapped>>),
+}
+
+/// One entry of a recorder's tap, in the order of the stream.
+#[derive(Clone)]
+pub(crate) enum Tapped {
+    /// A packet, as a raw tap carries it.
+    Packet(tio::Packet),
+    /// A device's complete metadata, where the proxy's update of it sat.
+    Described(DeviceMetadataSnapshot),
 }
 
 /// The connection's one stream, shared by every view. Its pump starts at the
@@ -73,6 +85,16 @@ impl Stream {
     pub(super) fn packets(self: &Arc<Stream>, scope: Scope) -> Receiver<tio::Packet> {
         let (sink, receiver) = Sink::new(PACKET_QUEUE_LEN, scope);
         let _ = self.pump().send(Tap::Packets(sink));
+        receiver.tied_to(self)
+    }
+
+    /// Subscribes to the packets in `scope` and to the metadata of each
+    /// device in it, in the order of the stream. The device at the root of
+    /// `scope` and each device the proxy lists in it is watched. A device
+    /// whose metadata is complete when this is called is described first.
+    pub(crate) fn recorded(self: &Arc<Stream>, scope: Scope) -> Receiver<Tapped> {
+        let (sink, receiver) = Sink::new(PACKET_QUEUE_LEN, scope);
+        let _ = self.pump().send(Tap::Recorded(sink));
         receiver.tied_to(self)
     }
 
@@ -120,6 +142,7 @@ struct Pump {
     taps: mpsc::UnboundedReceiver<Tap>,
     batches: Vec<Sink<BatchLane>>,
     packets: Vec<Sink<Lane<tio::Packet>>>,
+    recorded: Vec<Sink<Lane<Tapped>>>,
     /// Each watch the pump sent, by its id, and what has arrived of its
     /// next update.
     watches: BTreeMap<u16, (Watch, Joined)>,
@@ -141,6 +164,7 @@ impl Pump {
             taps,
             batches: Vec::new(),
             packets: Vec::new(),
+            recorded: Vec::new(),
             watches: BTreeMap::new(),
             next_id: 0,
         }
@@ -159,12 +183,19 @@ impl Pump {
                 tap = self.taps.recv() => match tap {
                     Some(Tap::Batches(sink)) => self.batches.push(sink),
                     Some(Tap::Packets(sink)) => self.packets.push(sink),
+                    Some(Tap::Recorded(mut sink)) => {
+                        for snapshot in lock(&self.store).described(sink.scope) {
+                            sink.lane.send_always(Tapped::Described(snapshot));
+                        }
+                        self.recorded.push(sink);
+                    }
                     None => return,
                 },
                 () = followed.notified() => {}
                 () = pruned(|cx| {
                     let store = lock(&self.store).prune_gone(cx);
-                    store | prune(&mut self.batches, cx) | prune(&mut self.packets, cx)
+                    let taps = prune(&mut self.packets, cx) | prune(&mut self.recorded, cx);
+                    store | prune(&mut self.batches, cx) | taps
                 }) => {}
                 received = self.inlet.recv_async() => {
                     let Ok(first) = received else { break None };
@@ -182,10 +213,12 @@ impl Pump {
         }
         end_batches(&mut self.batches, end);
         end_sinks(&mut self.packets, end);
+        end_sinks(&mut self.recorded, end);
         while let Some(tap) = self.taps.recv().await {
             match tap {
                 Tap::Batches(sink) => end_batches(&mut vec![sink], end),
                 Tap::Packets(sink) => end_sinks(&mut vec![sink], end),
+                Tap::Recorded(sink) => end_sinks(&mut vec![sink], end),
             }
         }
     }
@@ -193,17 +226,15 @@ impl Pump {
     /// Watches each device a receiver follows that is not watched yet, and
     /// stops each watch no receiver follows, dropping what it kept. A device
     /// whose batches a tap takes counts as followed, as its metadata decodes
-    /// them.
+    /// them, and so does a device a recorder's tap covers.
     fn reconcile(&mut self) {
         let session = self.root.session();
         let mut store = lock(&self.store);
         let mut wanted = store.demand();
-        for sink in &self.batches {
-            let covered = store
-                .routes()
-                .iter()
-                .filter(|route| sink.scope.covers(**route));
-            let routes = std::iter::once(sink.scope.route).chain(covered.copied());
+        let batches = self.batches.iter().map(|sink| sink.scope);
+        for scope in batches.chain(self.recorded.iter().map(|sink| sink.scope)) {
+            let covered = store.routes().iter().filter(|route| scope.covers(**route));
+            let routes = std::iter::once(scope.route).chain(covered.copied());
             wanted.extend(routes.map(|route| Watch {
                 route,
                 table: false,
@@ -236,10 +267,11 @@ impl Pump {
 
     /// Drops every watch, as the session's socket is lost, and makes every
     /// device lost. The raw taps and the parser get a disconnect status at
-    /// the root, as a link's loss gives them. The parser learns each device's
-    /// metadata again and keeps its last rows, so the samples after report
-    /// what the outage lost, or a new session, against them. The watches go
-    /// out again at once, and the session sends them once it is open again.
+    /// the root, as a link's loss gives them, whatever the batch taps cover.
+    /// The parser learns each device's metadata again and keeps its last
+    /// rows, so the samples after report what the outage lost, or a new
+    /// session, against them. The watches go out again at once, and the
+    /// session sends them once it is open again.
     fn lose(&mut self) {
         // A recording marks the outage as it marks a link's loss.
         let lost = Packet::link(LinkStatus::SensorDisconnected);
@@ -276,13 +308,31 @@ impl Pump {
                 self.watches.remove(&error.req_id.value());
                 return;
             }
-            ProxyRx::Link(_) | ProxyRx::Alive | ProxyRx::Unknown(..) => return,
+            ProxyRx::Link(_) | ProxyRx::Alive | ProxyRx::Dropped { .. } | ProxyRx::Unknown(..) => {
+                return
+            }
         };
         let Some((watch, joined)) = self.watches.get_mut(&id) else {
             return;
         };
-        if let Some(update) = joined.join(value) {
-            lock(&self.store).apply(watch.route, update, &mut self.parser);
+        let Some(update) = joined.join(value) else {
+            return;
+        };
+        let route = watch.route;
+        let described = matches!(update, Update::Metadata(Some(_)));
+        lock(&self.store).apply(route, update, &mut self.parser);
+        if !described {
+            return;
+        }
+        // A recorder takes the metadata the store now holds where the update
+        // sat among the device's packets.
+        let Some(snapshot) = self.parser.metadata(route) else {
+            return;
+        };
+        for sink in &mut self.recorded {
+            if sink.scope.covers(route) {
+                sink.lane.send_always(Tapped::Described(snapshot.clone()));
+            }
         }
     }
 
@@ -298,7 +348,10 @@ impl Pump {
 
     /// Takes one entry of the inlet, a packet, a reply to a watch or the
     /// loss of the socket, or reports the gap the session left. Returns why
-    /// the session ended, at its end. The packets of a route a tap covers
+    /// the session ended, at its end. The proxy's count of the samples it
+    /// dropped for this connection goes to the parser as a packet does, and
+    /// a gap is told to it, so the samples after say where the missing ones
+    /// went. The packets of a route a tap covers
     /// reach the parser, but for the device's own metadata records, as the
     /// parser takes metadata from the proxy's metadata updates alone. Until
     /// the first metadata update of a device, the parser waits for metadata
@@ -310,9 +363,10 @@ impl Pump {
                 self.lose();
                 return None;
             }
-            // The parser marks the gap in the samples.
+            // The parser marks the gap in the samples, as this connection's.
             Queued::Gap(lost) => {
                 log::warn!("the stream's inlet overflowed and {lost} packets were lost");
+                self.parser.note_dropped_packets();
                 return None;
             }
             Queued::Ended(end) => return Some(end),
@@ -339,6 +393,11 @@ impl Pump {
         if let Err(error) = self.parser.push_packet(packet) {
             log::warn!("dropping invalid stream packet: {error}");
         }
+        self.offer_batches();
+    }
+
+    /// Offers each batch the parser completed to the batch sinks.
+    fn offer_batches(&mut self) {
         while let Some(batch) = self.parser.pop_batch() {
             let scope = Scope::point(batch.route());
             self.batches
@@ -347,8 +406,9 @@ impl Pump {
         self.batches.retain_mut(|sink| sink.lane.report_lag());
     }
 
-    /// Offers a packet to the raw taps, unparsed and with its absolute route.
-    /// A status reaches every tap its subtree overlaps.
+    /// Offers a packet to the raw taps and the recorders' taps, unparsed and
+    /// with its absolute route. A status reaches every tap its subtree
+    /// overlaps.
     fn tap(&mut self, packet: &tio::Packet) {
         let scope = match packet.link_status() {
             Some(_) => Scope::subtree(packet.route()),
@@ -356,6 +416,8 @@ impl Pump {
         };
         self.packets
             .retain_mut(|sink| sink.offer(scope, || packet.clone()));
+        self.recorded
+            .retain_mut(|sink| sink.offer(scope, || Tapped::Packet(packet.clone())));
     }
 }
 

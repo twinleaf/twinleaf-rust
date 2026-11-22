@@ -1,16 +1,21 @@
 //! The [`Connection`] to a proxy and its [`DeviceTree`] and [`Device`] views.
 
 use super::runtime::chosen_proxy;
-use super::stream::Stream;
+use super::stream::{Stream, Tapped};
 use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
 use crate::rt::Supervisor;
-use crate::session::rpc::{CallError, PendingReply, RpcMeta, RpcRegistry, RpcRegistryError};
-use crate::session::{Field, CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
+use crate::session::rpc::{
+    plan, CallError, Outcome, PendingReply, Refusal, RpcMeta, RpcMetaExt, RpcRegistry,
+    RpcRegistryError, RpcValueType,
+};
+use crate::session::{Field, CHANGES, LINK, METADATA, PRESENCE, REGISTRY, SETTINGS};
 use crate::session::{Handle, Session};
 use crate::session::{Layout, ProxyAddress, Purpose, Receiver, RecvError, Scope};
-use crate::session::{MetadataState, Presence, RegistryState, SettingChange, Settings};
+use crate::session::{
+    LinkState, LostCause, MetadataState, Presence, RegistryState, SettingChange, Settings,
+};
 use crate::tio;
 use crate::tio::rpc::{RpcArgs, RpcReply};
 use crate::tio::transport::is_local_tcp;
@@ -24,7 +29,7 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long [`Device::rpc_registry`] and [`Device::settings`] wait for the
 /// table to load and the settings to be read.
-const TABLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const TABLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long [`Connection::open`] waits for the proxy to open a device. The
 /// proxy itself gives a device 10 s to answer.
@@ -146,8 +151,9 @@ impl Connection {
     /// [`presence`](Device::presence).
     ///
     /// A socket to the proxy that closes without a stop, as when the proxy
-    /// crashes, does not end it either. Every device is
-    /// [`Lost`](Presence::Lost) and every RPC fails with
+    /// crashes, does not end it either. Every device not lost already is
+    /// [`Lost`](Presence::Lost) as [`LostCause::ProxyLost`] and every RPC
+    /// fails with
     /// [`CallError::ResponseLost`] until the connection is open again, and
     /// the raw [`packets`](DeviceTree::packets) carry a
     /// [`SensorDisconnected`](crate::tio::packet::LinkStatus::SensorDisconnected)
@@ -513,6 +519,12 @@ impl DeviceTree {
         self.stream.packets(self.scope())
     }
 
+    /// Subscribes to the subtree's packets and to the metadata of each of
+    /// its devices, in the order of the stream, for a recorder.
+    pub(crate) fn recorded(&self) -> Receiver<Tapped> {
+        self.stream.recorded(self.scope())
+    }
+
     /// Returns the routes the proxy has heard in the subtree so far, sorted,
     /// waiting up to 10 s for its answer. Sends nothing to the devices.
     pub fn routes(&self) -> Vec<DeviceRoute> {
@@ -618,7 +630,7 @@ impl DeviceTree {
         arg: ReqT,
     ) -> Result<RepT, CallError> {
         let ret = self.raw_rpc(route, name, &arg.encode_args())?;
-        RepT::decode_reply(&ret).map_err(CallError::InvalidReply)
+        RepT::decode_reply(&ret).map_err(|error| CallError::InvalidReply(error.into()))
     }
 
     /// Calls the no-argument RPC `name` at `route` and expects no value.
@@ -662,6 +674,78 @@ impl DeviceTree {
     /// refuses with [`CallError::DeviceError`].
     pub fn rpc_meta(&self, route: DeviceRoute, name: &str) -> Result<RpcMeta, CallError> {
         self.rpc(route, "rpc.info", name).map(RpcMeta::from_bits)
+    }
+
+    /// Calls `name` with the argument `text`, or with none, on each of
+    /// `routes`, and returns what each device made of it, in the order of
+    /// `routes`.
+    ///
+    /// Each device's argument is `text` encoded by its own RPC table. With
+    /// no `text` each device is called with no argument, which reads a
+    /// value or runs an action, and each reply decodes by that device's
+    /// table. Either way the calls go to all the devices at once. The call
+    /// waits for every device's table at once, as
+    /// [`Device::rpc_registry_async`] waits for one, up to 30 s. The call is
+    /// planned for every device before anything is sent, as a write that
+    /// reaches only some devices cannot be taken back. Nothing is sent when
+    /// any route is outside this view, is named more than once, has a table
+    /// that failed to load or did not load in time, has a table that lacks
+    /// `name`, or has a type that cannot hold `text`. Each such route is
+    /// then [`Outcome::Refused`] with its [`Refusal`], and every other route
+    /// is [`Outcome::Skipped`]. Otherwise the call goes to every device at
+    /// once, and each waits for its reply up to the view's timeout. A device
+    /// lost after the plan is made is sent the call all the same, and its
+    /// outcome is an error or unknown, while the others are sent theirs.
+    pub async fn call_each(
+        &self,
+        name: &str,
+        text: Option<&str>,
+        routes: &[DeviceRoute],
+    ) -> Vec<(DeviceRoute, Outcome)> {
+        let waits = routes.iter().map(|&route| async move {
+            let named = routes.iter().filter(|&&other| other == route).count();
+            let table = match self.device(route) {
+                _ if named > 1 => Err(Refusal::NamedTwice),
+                Ok(device) => device.rpc_registry_async().await,
+                Err(error) => Err(Refusal::OutsideView(error)),
+            };
+            (route, table)
+        });
+        let tables = futures_util::future::join_all(waits).await;
+        let planned = match plan(name, text, tables) {
+            Ok(planned) => planned,
+            Err(refused) => return refused,
+        };
+        let pending: Vec<_> = planned
+            .into_iter()
+            .map(|p| (p.route, p.kind, self.submit(p.route, name, &p.arg)))
+            .collect();
+        let mut results = Vec::with_capacity(pending.len());
+        for (route, kind, reply) in pending {
+            results.push((route, Outcome::of_reply(kind, reply.await)));
+        }
+        results
+    }
+}
+
+/// Waits until `updates` yields a device's RPC table, or why it could not
+/// be loaded, or until `deadline`. Returns the table, or why there is none
+/// to call the device by.
+pub(super) async fn table_by(
+    updates: &Receiver<RegistryState>,
+    deadline: tokio::time::Instant,
+) -> Result<Arc<RpcRegistry>, Refusal> {
+    loop {
+        let received = tokio::select! {
+            received = updates.recv_async() => received,
+            () = crate::chan::sleep_until(deadline) => return Err(Refusal::TableNotLoaded),
+        };
+        return match received {
+            Ok(Ok(table)) => Ok(table),
+            Ok(Err(error)) => Err(Refusal::TableFailed(error)),
+            Err(RecvError::Lagged(_)) => continue,
+            Err(_) => Err(Refusal::TableNotLoaded),
+        };
     }
 }
 
@@ -710,13 +794,16 @@ impl Device {
     /// the link that serves it, and every client watches what it found. A
     /// device not heard from yet, or one the proxy does not answer for in
     /// time, is [`Presence::Connecting`]. A device silent for 3 s is lost.
-    /// Once the connection has ended, every device is [`Presence::Lost`].
+    /// Once the connection has ended, every device is [`Presence::Lost`]. A
+    /// device lost before keeps the moment and the cause of that loss. Any
+    /// other is lost as [`LostCause::ProxyLost`].
     pub fn presence(&self) -> Presence {
         match self.presence_updates().recv_timeout(METADATA_TIMEOUT) {
             Ok(presence) => presence,
             Err(RecvError::Timeout) => Presence::Connecting,
             Err(_) => Presence::Lost {
                 since: Instant::now(),
+                cause: Some(LostCause::ProxyLost),
             },
         }
     }
@@ -727,6 +814,13 @@ impl Device {
     /// behind skips to the newest.
     pub fn presence_updates(&self) -> Receiver<Presence> {
         self.state(PRESENCE)
+    }
+
+    /// Subscribes to what the proxy says of the link that serves this
+    /// device. The receiver yields the link's URL with each presence the
+    /// proxy says. A reader that falls behind skips to the newest.
+    pub fn link_updates(&self) -> Receiver<LinkState> {
+        self.state(LINK)
     }
 
     /// Collects this device's complete metadata, waiting up to 10 s.
@@ -867,6 +961,22 @@ impl Device {
         registry.map_err(unreceived)?
     }
 
+    /// Returns the RPCs this device offers, waiting up to 30 s until the
+    /// table is loaded, without blocking the thread. It is the table
+    /// [`rpc_registry`](Self::rpc_registry) returns, and the one
+    /// [`DeviceTree::call_each`] calls the device by.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no call can be made of the device by its table.
+    /// [`Refusal::TableNotLoaded`] is a table not loaded in time or a
+    /// connection that ended, and [`Refusal::TableFailed`] is a table that
+    /// failed to load, with why.
+    pub async fn rpc_registry_async(&self) -> Result<Arc<RpcRegistry>, Refusal> {
+        let deadline = tokio::time::Instant::now() + TABLE_TIMEOUT;
+        table_by(&self.rpc_registry_updates(), deadline).await
+    }
+
     /// Subscribes to this device's RPC table. The receiver yields the table,
     /// or why it could not be loaded, once it is known, then each new one.
     /// Subscribing starts loading it. A reader that falls behind skips to the
@@ -923,6 +1033,16 @@ impl Device {
         self.tree.rpc_meta(self.route(), name)
     }
 
+    /// Returns the type of this device's RPC `name` from its table. A name
+    /// the table lacks is asked of the device with [`rpc_meta`](Self::rpc_meta).
+    /// Returns `None` when neither knows the name.
+    pub fn rpc_type(&self, name: &str) -> Option<RpcValueType> {
+        let table = self.rpc_registry().ok();
+        let listed = table.and_then(|t| t.find(name).map(|d| d.meta));
+        let meta = listed.or_else(|| self.rpc_meta(name).ok());
+        meta.map(|m| m.text_type())
+    }
+
     /// Returns a test device at the root, over a session whose socket is a
     /// pair of channels, and the session's far end.
     #[cfg(test)]
@@ -936,10 +1056,11 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::tests::fixtures::{announcement, broadcast, metadata_records, samples};
+    use crate::data::fixtures::metadata_records;
     use crate::device::tests::fixtures::{self, open_through};
     use crate::proto::rpc as wire_rpc;
     use crate::proxy::Proxy;
+    use crate::session::tests::packets::{announcement, broadcast, samples};
     use crate::session::tests::wait_for;
     use crate::session::TestProxy;
     use crate::tio::tests::device::FakeDevice;
@@ -988,21 +1109,6 @@ mod tests {
             tree.metadata(route("/2")),
             Err(MetadataError::Route(RouteError::OutsideSubtree))
         ));
-    }
-
-    #[test]
-    fn a_blocking_rpc_waits_on_its_own_completion() {
-        let (tree, proxy) = test_tree();
-        let responder = thread::spawn(move || {
-            let (route, name, _, id) = proxy.call();
-            assert_eq!(name, "dev.name");
-            proxy.reply(id, b"ASM", route);
-            proxy
-        });
-
-        let name: String = tree.get(DeviceRoute::root(), "dev.name").unwrap();
-        assert_eq!(name, "ASM");
-        responder.join().unwrap();
     }
 
     #[test]
@@ -1086,6 +1192,50 @@ mod tests {
         responder.join().unwrap();
     }
 
+    /// An RPC's type comes from the device's table, then from `rpc.info`
+    /// for a name the table lacks. A name neither knows has no type.
+    #[test]
+    fn rpc_type_reads_the_table_then_asks_the_device() {
+        use crate::session::{parts, Update, Watch, WATCH};
+        let (device, proxy) = Device::test_pair();
+        let responder = thread::spawn(move || {
+            let mut asked = 0;
+            while asked < 2 {
+                let packet = proxy.sent.recv_timeout(WAIT).expect("the device is asked");
+                match packet.payload() {
+                    tio::packet::Payload::ProxyTx(request) => {
+                        let wire_rpc::Method::ByName(name) = request.method else {
+                            continue;
+                        };
+                        let watch = crate::session::decode::<Watch>(request.args);
+                        if name == WATCH.as_bytes() && watch.is_ok_and(|watch| watch.table) {
+                            let table = vec![("test.gain".to_string(), 0xA742)];
+                            let table = Update::Table(Ok((Some(1), None, table)));
+                            for part in parts(request.id.value(), &table) {
+                                proxy.send(part);
+                            }
+                        }
+                    }
+                    tio::packet::Payload::RpcRequest(request) => {
+                        let (id, route) = (request.id.value(), packet.route());
+                        match request.args {
+                            b"test.enable" => proxy.reply(id, &0x8b10u16.to_le_bytes(), route),
+                            _ => proxy.refuse(id, wire_rpc::RpcError::NotFound, route),
+                        }
+                        asked += 1;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let type_of = |bits: u16| Some(wire_rpc::RpcMeta::from_bits(bits).text_type());
+        assert_eq!(device.rpc_type("test.gain"), type_of(0xA742));
+        assert_eq!(device.rpc_type("test.enable"), type_of(0x8b10));
+        assert_eq!(device.rpc_type("no.such.rpc"), None);
+        responder.join().unwrap();
+    }
+
     /// The name of the root device of `connection`.
     fn root_name(connection: &Connection) -> String {
         connection
@@ -1120,13 +1270,16 @@ mod tests {
     }
 
     /// Closing one clone ends every subscription and view of the connection,
-    /// though they outlive the clone, and the proxy lets the client go.
+    /// though they outlive the clone, and the proxy lets the client go. A
+    /// device of it is lost as the proxy was lost, whether it was heard
+    /// or not.
     #[test]
     fn a_close_ends_every_handle_on_the_connection() {
         let device = FakeDevice::start();
         let proxy = fixtures::proxy();
         let connection = open_through(&proxy, &device.url).unwrap();
         let view = connection.device(DeviceRoute::root());
+        let unheard = connection.device("/9".parse().unwrap());
         let presence = view.presence_updates();
         assert_eq!(root_name(&connection), "FAKE");
 
@@ -1142,6 +1295,18 @@ mod tests {
         };
         assert_eq!(ended, RecvError::Closed);
         assert!(view.get::<String>("dev.name").is_err());
+        for gone in [view.presence(), unheard.presence()] {
+            assert!(
+                matches!(
+                    gone,
+                    Presence::Lost {
+                        cause: Some(LostCause::ProxyLost),
+                        ..
+                    }
+                ),
+                "{gone:?}"
+            );
+        }
         while !proxy.clients().is_empty() {
             assert!(
                 Instant::now() < deadline,
@@ -1149,6 +1314,69 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Once the connection ends, a device lost before keeps the moment and
+    /// the cause of that loss, and a device the client holds nothing of is
+    /// lost as the proxy was lost.
+    #[test]
+    fn a_device_lost_before_the_connection_ends_keeps_its_loss() {
+        use crate::session::{parts, Update, Watch, WATCH};
+        let (session, proxy) = Session::test_pair();
+        let connection = Connection::over(session);
+        let quiet = connection.device(DeviceRoute::root());
+        let unheard = connection.device("/9".parse().unwrap());
+        let presence = quiet.presence_updates();
+        let watched = Watch {
+            route: DeviceRoute::root(),
+            table: false,
+        };
+        let id = loop {
+            let packet = proxy.sent.recv_timeout(WAIT).expect("the client watches");
+            let tio::packet::Payload::ProxyTx(request) = packet.payload() else {
+                continue;
+            };
+            let wire_rpc::Method::ByName(name) = request.method else {
+                continue;
+            };
+            let asked = crate::session::decode::<Watch>(request.args);
+            if name == WATCH.as_bytes() && asked.is_ok_and(|asked| asked == watched) {
+                break request.id.value();
+            }
+        };
+        let code = LostCause::Quiet.code();
+        for part in parts(id, &Update::Presence(Err(Some(1000)), code, None)) {
+            proxy.send(part);
+        }
+        let before = wait_for(&presence, |now| matches!(now, Presence::Lost { .. }));
+        assert!(
+            matches!(
+                before,
+                Presence::Lost {
+                    cause: Some(LostCause::Quiet),
+                    ..
+                }
+            ),
+            "{before:?}"
+        );
+
+        // The socket closes, which ends the session for good.
+        drop(proxy);
+        let deadline = Instant::now() + WAIT;
+        while presence.recv_deadline(deadline).is_ok() {}
+
+        assert_eq!(quiet.presence(), before);
+        let gone = unheard.presence();
+        assert!(
+            matches!(
+                gone,
+                Presence::Lost {
+                    cause: Some(LostCause::ProxyLost),
+                    ..
+                }
+            ),
+            "{gone:?}"
+        );
     }
 
     /// The routes of a tree come from the proxy, each as the client sees it

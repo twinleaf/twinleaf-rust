@@ -12,10 +12,16 @@ use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{Attribute, ImplItem, Item, ItemMod, ItemUse, Meta, Token, UseTree, Visibility};
 
-/// The layers, lowest first, as the crate's doc lists them.
-const LAYERS: [&str; 8] = [
-    "seam", "rt", "tio", "data", "session", "proxy", "device", "firmware",
+/// The layers that are modules of this crate, lowest first, as the crate's
+/// doc lists them. The data layer is the crate `twinleaf-data`, which
+/// [`BELOW_DATA`] places.
+const LAYERS: [&str; 7] = [
+    "seam", "rt", "tio", "session", "proxy", "device", "firmware",
 ];
+
+/// The layers below the data layer, which may not name it, as `crate::data`
+/// or as `twinleaf_data`.
+const BELOW_DATA: [&str; 3] = ["seam", "rt", "tio"];
 
 type Module = Vec<String>;
 
@@ -434,6 +440,25 @@ impl Crate {
         let mut found = Vec::new();
         let mut edges = BTreeMap::new();
         for named in &self.named {
+            let below_data = named
+                .from
+                .first()
+                .is_some_and(|top| BELOW_DATA.contains(&top.as_str()));
+            let names_data = named
+                .path
+                .first()
+                .is_some_and(|first| first == "twinleaf_data")
+                || self
+                    .absolute(&named.from, &named.path)
+                    .is_some_and(|path| path.first().is_some_and(|top| top == "data"));
+            if below_data && names_data {
+                found.push(format!(
+                    "{}: {} names {}, which reaches up to the data layer",
+                    named.at,
+                    shown(&named.from),
+                    named.path.join("::")
+                ));
+            }
             let Some(path) = self.absolute(&named.from, &named.path) else {
                 continue;
             };
@@ -454,7 +479,6 @@ impl Crate {
             let (from, to) = (layer(&named.from), layer(&module));
             let allowed = match (LAYERS.get(from).copied(), LAYERS[to]) {
                 _ if from == to => true,
-                (Some("data"), "tio") => under(&module, &["tio", "packet"]),
                 (Some("device"), "proxy") if !named.test => {
                     under(&named.from, &["device", "runtime"])
                 }
@@ -581,6 +605,11 @@ fn each_way_of_naming_what_a_module_may_not_is_found() {
         "fn f() { println!(\"{:?}\", crate::proxy::X::f()); }",
         "#[cfg(not(all(test, feature = \"x\")))] fn f() { crate::tio::tests::X::f(); }",
         "#[cfg(any(feature = \"serial\", test))] fn f() { crate::tio::tests::X::f(); }",
+        "fn f() { crate::data::X::f(); }",
+        "use super::data::X;",
+        "fn f() { use crate::data as d; d::X::f(); }",
+        "use twinleaf_data::data::X;",
+        "fn f() { twinleaf_data::data::X::f(); }",
     ];
     for code in breaking {
         assert_ne!(breaches(code), Vec::<String>::new(), "{code}");

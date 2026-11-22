@@ -666,11 +666,14 @@ fn same_routes(a: &[NamedRoute], b: &[NamedRoute]) -> bool {
             .all(|(a, b)| a.route == b.route && a.name == b.name)
 }
 
+/// The mDNS service type of a Twinleaf device or proxy served over TCP.
+pub const TWINLEAF_MDNS_SERVICE: &str = "_twinleaf._tcp.local.";
+
 /// Service types Twinleaf network devices advertise. TCP is preferred when
 /// both appear. Firmware built before 2026-06-15 advertises `_tio`.
 #[cfg(feature = "mdns")]
 const TWINLEAF_MDNS_SERVICES: [&str; 4] = [
-    "_twinleaf._tcp.local.",
+    TWINLEAF_MDNS_SERVICE,
     "_twinleaf._udp.local.",
     "_tio._tcp.local.",
     "_tio._udp.local.",
