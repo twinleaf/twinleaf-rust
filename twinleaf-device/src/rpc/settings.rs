@@ -105,6 +105,19 @@ impl<const N: usize> Scalar for Text<N> {
     }
 }
 
+/// A reason the device names, such as a held conflict's, which a host only reads.
+impl Scalar for &'static str {
+    const KIND: rpc::Kind = rpc::Kind::String;
+
+    fn decode(_: &[u8]) -> Result<Self, RpcError> {
+        Err(RpcError::ReadOnly)
+    }
+
+    fn encode(self, out: &mut Reply) -> Result<(), RpcError> {
+        put(out, self.as_bytes())
+    }
+}
+
 /// A flag, one byte on the wire like every other libtio bool.
 impl Scalar for bool {
     const KIND: rpc::Kind = rpc::Kind::Bool;

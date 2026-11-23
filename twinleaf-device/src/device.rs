@@ -1145,10 +1145,16 @@ pub trait Group {
         Ok(())
     }
 
-    /// Put a group whose restored settings its rule refuses back at its defaults.
+    /// A combination of these settings no plan runs, which a write is kept for all the same: the
+    /// group keeps publishing the last plan that ran and reports the conflict until a write clears it.
+    fn hold(&self) -> Result<(), Refusal> {
+        Ok(())
+    }
+
+    /// Put a group whose restored settings its rule refuses or holds back at its defaults.
     /// A group of groups repairs each child, so one broken rule resets only its own.
     fn repair(&mut self, to: &mut Announcer<'_>) -> Result<(), Refusal> {
-        let refused = self.check();
+        let refused = self.check().and(self.hold());
         let mut reset = Ok(());
         if refused.is_err() {
             self.entries(&mut |entry| {
@@ -1173,6 +1179,16 @@ pub struct Refusal {
 impl From<RpcError> for Refusal {
     fn from(error: RpcError) -> Self {
         Self { error, why: "" }
+    }
+}
+
+/// A constraint the settings break, named: out of range together.
+impl From<&'static str> for Refusal {
+    fn from(why: &'static str) -> Self {
+        Self {
+            error: RpcError::Range,
+            why,
+        }
     }
 }
 
@@ -1619,6 +1635,75 @@ mod tests {
 
         fn check(&self) -> Result<(), Refusal> {
             self.counter.check()
+        }
+    }
+
+    /// A pump inside a period, which holds a pump that outlasts it: the window and what the
+    /// task runs stay at the last plan that ran, and `shot.conflict` says why.
+    struct Shot {
+        period: Setting<u32>,
+        pump: Setting<u32>,
+        window: Setting<u32>,
+        conflict: Setting<&'static str>,
+        running: &'static AtomicU32,
+    }
+
+    impl Shot {
+        fn new() -> Self {
+            Self {
+                period: Setting::new("shot.period", 10).persistent(),
+                pump: Setting::new("shot.pump", 4).persistent(),
+                window: Setting::new("shot.window", 6).read_only(),
+                conflict: Setting::new("shot.conflict", "").read_only(),
+                running: Box::leak(Box::new(AtomicU32::new(6))),
+            }
+        }
+
+        /// The window its requests leave, or the constraint they break.
+        fn plan(&self) -> Result<u32, Refusal> {
+            self.period
+                .get()
+                .checked_sub(self.pump.get())
+                .ok_or("the pump outlasts the period".into())
+        }
+
+        fn harness() -> Harness<Self> {
+            harnessed(opened(
+                identity(),
+                table(Self::new()),
+                Self::new(),
+                PASSWORD,
+            ))
+        }
+    }
+
+    impl Group for Shot {
+        fn entries(&mut self, visit: &mut dyn FnMut(Entry<'_>)) {
+            visit(Entry::Setting(&mut self.period));
+            visit(Entry::Setting(&mut self.pump));
+            visit(Entry::Setting(&mut self.window));
+            visit(Entry::Setting(&mut self.conflict));
+        }
+
+        fn publish(&self) {
+            if let Ok(window) = self.plan() {
+                self.running.store(window, Relaxed);
+            }
+        }
+
+        fn refresh(&mut self, to: &mut Announcer<'_>) {
+            let planned = self.plan();
+            if let Ok(window) = planned {
+                let _ = to.set(&mut self.window, window);
+            }
+            let _ = to.set(
+                &mut self.conflict,
+                planned.map_or_else(|refusal| refusal.why, |_| ""),
+            );
+        }
+
+        fn hold(&self) -> Result<(), Refusal> {
+            self.plan().map(drop)
         }
     }
 
@@ -2980,6 +3065,146 @@ mod tests {
             .filter(|(name, _)| name.starts_with(b"board."))
             .collect();
         assert_eq!(stored, [(&b"board.count"[..], &15u32.to_le_bytes()[..])]);
+    }
+
+    /// What a held shot reads back: its period, pump, window and conflict, and what its task runs.
+    fn shot(device: &mut Harness<Shot>) -> (Vec<Vec<u8>>, u32) {
+        let read = ["shot.period", "shot.pump", "shot.window", "shot.conflict"]
+            .map(|name| device.ask(name, &[]).value().to_vec());
+        (read.into(), device.device.settings().running.load(Relaxed))
+    }
+
+    /// A write the plan cannot run is kept and answered, announced with the conflict after it,
+    /// and the window and the task stay at the last plan that ran.
+    #[test]
+    fn a_held_write_is_kept_and_the_last_plan_keeps_running() {
+        let mut device = Shot::harness();
+        device.ask("shot.pump", &3u32.to_le_bytes());
+        let held = device.ask("shot.pump", &12u32.to_le_bytes());
+        assert_eq!(held.value(), 12u32.to_le_bytes());
+        assert_eq!(
+            held.announced(),
+            [
+                ("shot.pump".to_owned(), 12u32.to_le_bytes().to_vec()),
+                (
+                    "shot.conflict".to_owned(),
+                    b"the pump outlasts the period".to_vec()
+                ),
+            ]
+        );
+        assert_eq!(
+            shot(&mut device),
+            (
+                vec![
+                    10u32.to_le_bytes().to_vec(),
+                    12u32.to_le_bytes().to_vec(),
+                    7u32.to_le_bytes().to_vec(),
+                    b"the pump outlasts the period".to_vec(),
+                ],
+                7
+            )
+        );
+    }
+
+    /// A write that lets held requests plan again applies them: the request, the window, then
+    /// the cleared conflict, on consecutive versions, ahead of the reply.
+    #[test]
+    fn a_write_that_clears_a_held_conflict_applies_its_plan() {
+        let mut device = Shot::harness();
+        device.ask("shot.pump", &12u32.to_le_bytes());
+        let version = device.ask("settings.version", &[]).value().to_vec();
+        let cleared = device.ask("shot.period", &20u32.to_le_bytes());
+        assert_eq!(
+            cleared.announced(),
+            [
+                ("shot.period".to_owned(), 20u32.to_le_bytes().to_vec()),
+                ("shot.window".to_owned(), 8u32.to_le_bytes().to_vec()),
+                ("shot.conflict".to_owned(), Vec::new()),
+            ]
+        );
+        assert_eq!(cleared.value(), 20u32.to_le_bytes());
+        let after = u32::from_le_bytes(version.try_into().unwrap()) + 3;
+        assert_eq!(
+            device.ask("settings.version", &[]).value(),
+            after.to_le_bytes()
+        );
+        assert_eq!(device.device.settings().running.load(Relaxed), 8);
+    }
+
+    proptest::proptest! {
+        /// Whatever came before, the last period and pump decide the conflict in either order,
+        /// and the window and what runs whenever they plan.
+        #[test]
+        fn a_held_outcome_depends_only_on_the_last_requests(
+            history in proptest::collection::vec((proptest::bool::ANY, 0u32..20), 0..8),
+            period in 0u32..20,
+            pump in 0u32..20,
+            pump_first in proptest::bool::ANY,
+        ) {
+            let last = [("shot.period", period), ("shot.pump", pump)];
+            let [first, second] = match pump_first {
+                true => [last[1], last[0]],
+                false => last,
+            };
+            let mut device = Shot::harness();
+            history
+                .iter()
+                .map(|&(is_pump, value)| (last[usize::from(is_pump)].0, value))
+                .chain([first, second])
+                .for_each(|(name, value)| {
+                    device.ask(name, &value.to_le_bytes());
+                });
+            let mut fresh = Shot::harness();
+            last.iter().for_each(|(name, value)| {
+                fresh.ask(name, &value.to_le_bytes());
+            });
+            let (held, running) = shot(&mut device);
+            let (planned, ran) = shot(&mut fresh);
+            match pump <= period {
+                true => proptest::prop_assert_eq!((held, running), (planned, ran)),
+                false => {
+                    proptest::prop_assert_eq!(&held[..2], &planned[..2]);
+                    proptest::prop_assert_eq!(&held[3], &planned[3]);
+                }
+            }
+        }
+    }
+
+    /// A restored pair the plan cannot run puts the group back at its defaults and says why.
+    #[test]
+    fn a_restored_conflict_resets_the_group_and_says_why() {
+        let mut device = Shot::harness();
+        let mut image = Entries::new();
+        let mut period = Setting::new("shot.period", 3u32).persistent();
+        let mut pump = Setting::new("shot.pump", 5u32).persistent();
+        conf::encode([&mut period as &mut dyn Persisted, &mut pump], &mut image).unwrap();
+
+        device.drive(Input::Loaded(None, Ok(&image)), BOOT);
+        assert_eq!(
+            device.lanes.events.announced(),
+            [
+                ("shot.period".to_owned(), 3u32.to_le_bytes().to_vec()),
+                ("shot.pump".to_owned(), 5u32.to_le_bytes().to_vec()),
+                ("shot.period".to_owned(), 10u32.to_le_bytes().to_vec()),
+                ("shot.pump".to_owned(), 4u32.to_le_bytes().to_vec()),
+            ]
+        );
+        assert_eq!(
+            device.logged,
+            [(LogLevel::WARNING, "the pump outlasts the period")]
+        );
+        assert_eq!(
+            shot(&mut device),
+            (
+                vec![
+                    10u32.to_le_bytes().to_vec(),
+                    4u32.to_le_bytes().to_vec(),
+                    6u32.to_le_bytes().to_vec(),
+                    Vec::new(),
+                ],
+                6
+            )
+        );
     }
 
     /// A move is published to the tasks that read it, and a read is not.
