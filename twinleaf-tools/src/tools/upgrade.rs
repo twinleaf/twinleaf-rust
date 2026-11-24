@@ -392,7 +392,8 @@ fn download_with_progress(
     Ok(data)
 }
 
-/// Drives [`firmware::flash`], rendering each phase, then re-reads `dev.desc`.
+/// Drives [`firmware::flash`], rendering each phase, then says what the device
+/// runs once back.
 fn flash_with_progress(device: &Device, firmware_data: &[u8]) -> eyre::Result<()> {
     let power_cycle_hint =
         "power cycle the device before retrying and check if dev.stop exists as an rpc";
@@ -401,7 +402,7 @@ fn flash_with_progress(device: &Device, firmware_data: &[u8]) -> eyre::Result<()
 
     // Bars are created lazily so the dev.stop lines print cleanly above them.
     let mut upload: Option<ProgressBar> = None;
-    let mut finalize: Option<ProgressBar> = None;
+    let mut restart: Option<ProgressBar> = None;
 
     let result = firmware::flash(device, firmware_data, |event| match event {
         FlashEvent::Stopping => {
@@ -455,19 +456,19 @@ fn flash_with_progress(device: &Device, firmware_data: &[u8]) -> eyre::Result<()
             }
             println!(" {} committing...", label("dev.firmware.upgrade"));
         }
-        FlashEvent::Finalizing => {
+        FlashEvent::Restarting => {
             let spinner = crate::logging::multi_progress().add(ProgressBar::new_spinner());
             spinner.set_style(
                 ProgressStyle::default_spinner()
                     .template("{spinner:.green} {msg}")
                     .unwrap(),
             );
-            spinner.set_message("Finalizing upgrade...");
+            spinner.set_message("Restarting into the new firmware...");
             spinner.enable_steady_tick(Duration::from_millis(100));
-            finalize = Some(spinner);
+            restart = Some(spinner);
         }
-        FlashEvent::Complete => {
-            if let Some(spinner) = finalize.take() {
+        FlashEvent::Restarted => {
+            if let Some(spinner) = restart.take() {
                 spinner.finish_and_clear();
             }
         }
@@ -477,50 +478,35 @@ fn flash_with_progress(device: &Device, firmware_data: &[u8]) -> eyre::Result<()
     if let Some(bar) = upload.take() {
         bar.finish_and_clear();
     }
-    if let Some(spinner) = finalize.take() {
+    if let Some(spinner) = restart.take() {
         spinner.finish_and_clear();
     }
 
     // An image the device cannot take fails the same after a power cycle.
     let refused = matches!(result, Err(firmware::FirmwareError::Refused(_)));
     let result = result.wrap_err("firmware upgrade failed");
-    match refused {
+    let flashed = match refused {
         true => result?,
         false => result.suggestion(power_cycle_hint)?,
+    };
+
+    let build = |fw: &firmware::InstalledFirmware| {
+        fw.hash.clone().unwrap_or_else(|| fw.description.clone())
+    };
+    let (was, upgrade) = (build(&flashed.before), label("dev.firmware.upgrade"));
+    match flashed.after.as_ref().map(build) {
+        Some(now) if now != was => {
+            println!(
+                " {upgrade} {}",
+                style(format!("Now running {now} (was {was})")).green()
+            )
+        }
+        Some(_) => println!(" {upgrade} Restarted, still running {was}"),
+        None => {
+            let warning = "committed, but the device did not come back within a minute";
+            println!(" {upgrade} {}", style(warning).yellow());
+            println!(" {} {power_cycle_hint}", label("Suggestion:"));
+        }
     }
-
-    println!(
-        " {} {}",
-        label("dev.firmware.upgrade"),
-        style("complete").green()
-    );
-
-    verify_new_firmware(device);
     Ok(())
-}
-
-/// Re-reads `dev.desc` after a flash, retrying while the device reboots, and
-/// prints the firmware now running. Prints a warning if it cannot be read.
-fn verify_new_firmware(device: &Device) {
-    let spinner = crate::logging::multi_progress().add(ProgressBar::new_spinner());
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    spinner.set_message("Verifying new firmware (re-reading dev.desc)...");
-    spinner.enable_steady_tick(Duration::from_millis(100));
-
-    let installed = firmware::reread_installed(device);
-    spinner.finish_and_clear();
-
-    let label = |s: &str| style(format!("{:11}", s)).bold().cyan();
-    match installed {
-        Some(fw) => println!(" {} {}", label("Running:"), fw.description),
-        None => println!(
-            "{}",
-            style("Could not re-read dev.desc after upgrade (device may still be rebooting).")
-                .yellow()
-        ),
-    }
 }

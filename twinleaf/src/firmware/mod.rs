@@ -16,8 +16,9 @@ use crate::proto::update::{
     PACKAGE_OFFSET_SIZE,
 };
 use crate::session::rpc::{pipelined, CallError};
+use crate::session::{Presence, RecvError};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "firmware-update")]
 mod directory;
@@ -35,21 +36,11 @@ const MAX_CHUNKS_IN_FLIGHT: usize = 2;
 /// How many resumptions in a row may leave the device's upload cursor where
 /// it was before the upload is abandoned.
 const MAX_STALLS: u32 = 3;
-/// How long [`flash`] waits after committing while the device writes the
-/// image. The device must stay powered and linked during this time.
+/// How long [`flash`] waits after committing for the device to come back.
 #[cfg(not(test))]
-const COMMIT_SETTLE_TIME: Duration = Duration::from_secs(5);
+const RESTART_DEADLINE: Duration = Duration::from_secs(60);
 #[cfg(test)]
-const COMMIT_SETTLE_TIME: Duration = Duration::from_millis(10);
-/// How many times [`reread_installed`] reads `dev.desc` while the device
-/// reboots after an upgrade.
-pub const REREAD_ATTEMPTS: usize = 6;
-/// How long [`reread_installed`] waits between two reads.
-#[cfg(not(test))]
-pub const REREAD_INTERVAL: Duration = Duration::from_millis(1500);
-/// How long [`reread_installed`] waits between two reads.
-#[cfg(test)]
-pub const REREAD_INTERVAL: Duration = Duration::from_millis(10);
+const RESTART_DEADLINE: Duration = Duration::from_millis(500);
 
 /// A firmware build date (UTC calendar date). Ordered chronologically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -235,10 +226,19 @@ pub enum FlashEvent {
     },
     /// Upload finished. The commit RPC is being issued.
     Committing,
-    /// Commit accepted. Settling before the link can be dropped.
-    Finalizing,
-    /// Upgrade fully committed.
-    Complete,
+    /// Commit taken. The device restarts into the new image.
+    Restarting,
+    /// The device is back in a new session.
+    Restarted,
+}
+
+/// What a device ran around an upgrade [`flash`] committed.
+#[derive(Debug, Clone)]
+pub struct Flashed {
+    /// The firmware it ran before the commit.
+    pub before: InstalledFirmware,
+    /// The firmware it runs once back, or `None` if it was not back in time.
+    pub after: Option<InstalledFirmware>,
 }
 
 /// An error from a firmware operation.
@@ -374,22 +374,6 @@ fn parse_installed(desc: &str) -> InstalledFirmware {
 pub fn query_installed(device: &Device) -> Result<InstalledFirmware, FirmwareError> {
     let desc: String = device.get("dev.desc")?;
     Ok(parse_installed(&desc))
-}
-
-/// Reads the firmware `device` runs after an upgrade, while it reboots. It
-/// reads `dev.desc` up to [`REREAD_ATTEMPTS`] times, at once and then
-/// [`REREAD_INTERVAL`] apart, and returns the first answer, or `None` if
-/// the device answered none.
-pub fn reread_installed(device: &Device) -> Option<InstalledFirmware> {
-    for attempt in 0..REREAD_ATTEMPTS {
-        if attempt > 0 {
-            std::thread::sleep(REREAD_INTERVAL);
-        }
-        if let Ok(installed) = query_installed(device) {
-            return Some(installed);
-        }
-    }
-    None
 }
 
 /// Returns whether `latest` is newer than the `installed` firmware.
@@ -545,13 +529,16 @@ pub fn download(
 /// A chunk lost in either direction fails the upload window it is in. The
 /// upload then reads the device's upload cursor and resumes from that chunk.
 /// It gives up after three resumptions in a row that leave the cursor where
-/// it was. After committing, it blocks for five seconds while the device
-/// writes the image, and reports [`FlashEvent::Finalizing`] meanwhile. The
-/// device must stay powered and linked until [`FlashEvent::Complete`].
+/// it was. After committing, it waits up to a minute for the device to come
+/// back in a new session, or for one whose heartbeats carry no session to be
+/// lost and come back, and reads what it runs then. A commit the proxy
+/// answers with a timeout counts as taken once the device is lost or back,
+/// as the proxy answers so the calls a lost or restarted device left.
 ///
 /// # Errors
 ///
-/// Returns [`FirmwareError::Rpc`] if `dev.stop` or the commit fails,
+/// Returns [`FirmwareError::Rpc`] if `dev.stop`, the commit, or a read of
+/// `dev.desc` fails, or the connection ends while the device restarts,
 /// [`FirmwareError::Refused`] if the image is empty, the device takes the
 /// other kind of image or refuses a package's header, and
 /// [`FirmwareError::Upload`] if an upload stalls or the device's cursor is
@@ -560,7 +547,7 @@ pub fn flash(
     device: &Device,
     firmware_data: &[u8],
     mut on_event: impl FnMut(FlashEvent),
-) -> Result<(), FirmwareError> {
+) -> Result<Flashed, FirmwareError> {
     if firmware_data.is_empty() {
         return Err(FirmwareError::Refused("the image is empty".into()));
     }
@@ -600,13 +587,58 @@ pub fn flash(
     }
 
     on_event(FlashEvent::Committing);
-    device.action("dev.firmware.upgrade")?;
+    let presence = device.presence_updates();
+    let before = query_installed(device)?;
+    let session = match device.presence() {
+        Presence::Alive { session } => session,
+        Presence::Connecting | Presence::Lost { .. } => None,
+    };
+    let given_up = match device.action("dev.firmware.upgrade") {
+        Ok(()) => None,
+        Err(CallError::DeviceError(refusal)) if refusal.error == wire_rpc::RpcError::Timeout => {
+            Some(refusal)
+        }
+        Err(error) => return Err(error.into()),
+    };
 
-    on_event(FlashEvent::Finalizing);
-    std::thread::sleep(COMMIT_SETTLE_TIME);
-
-    on_event(FlashEvent::Complete);
-    Ok(())
+    on_event(FlashEvent::Restarting);
+    let deadline = Instant::now() + RESTART_DEADLINE;
+    let mut lost = false;
+    let back = loop {
+        let now = match presence.recv_deadline(deadline) {
+            Ok(now) => now,
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Timeout) => break false,
+            Err(RecvError::Disconnected | RecvError::Stopped | RecvError::Closed) => {
+                return Err(CallError::ResponseLost.into())
+            }
+        };
+        match now {
+            Presence::Connecting => {}
+            Presence::Lost { .. } => lost = true,
+            Presence::Alive { session: now } => {
+                let restarted = match (session, now) {
+                    (Some(old), Some(new)) => new != old,
+                    (None, None) => lost,
+                    (Some(_), None) | (None, Some(_)) => true,
+                };
+                if restarted {
+                    break true;
+                }
+            }
+        }
+    };
+    if let (false, false, Some(refusal)) = (back, lost, given_up) {
+        return Err(CallError::DeviceError(refusal).into());
+    }
+    let after = match back {
+        true => {
+            on_event(FlashEvent::Restarted);
+            Some(query_installed(device)?)
+        }
+        false => None,
+    };
+    Ok(Flashed { before, after })
 }
 
 /// Whether `data` is a signed package. Its header names the format version
@@ -813,6 +845,8 @@ fn chunk_at(cursor: u32, image: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{parts, LostCause, TestProxy, Update, WATCH};
+    use crate::tio::packet::Packet;
 
     fn installed(date: Option<&str>, hash: Option<&str>) -> InstalledFirmware {
         InstalledFirmware {
@@ -996,6 +1030,40 @@ mod tests {
         Reject,
     }
 
+    /// The watches a fake device's session made of its presence.
+    #[derive(Default)]
+    struct Watches(Vec<u16>);
+
+    impl Watches {
+        /// Takes `packet` if it is a control request, and tells a watch it
+        /// makes that the device is `alive` in a session. Returns whether it
+        /// was one.
+        fn take(&mut self, proxy: &TestProxy, packet: &Packet, alive: Option<u32>) -> bool {
+            let crate::tio::packet::Payload::ProxyTx(request) = packet.payload() else {
+                return false;
+            };
+            if matches!(request.method, wire_rpc::Method::ByName(name) if name == WATCH.as_bytes())
+            {
+                self.0.push(request.id.value());
+                self.tell(proxy, Ok(alive), None);
+            }
+            true
+        }
+
+        /// Tells every watch `presence`, lost as `cause` if it says so.
+        fn tell(
+            &self,
+            proxy: &TestProxy,
+            presence: Result<Option<u32>, Option<u64>>,
+            cause: Option<u8>,
+        ) {
+            self.0
+                .iter()
+                .flat_map(|&id| parts(id, &Update::Presence(presence, cause, None)))
+                .for_each(|part| proxy.send(part));
+        }
+    }
+
     /// A chunked image whose every chunk announces its data offset in its
     /// first four bytes, so the fake device can check it as the real one does.
     fn image(len: usize) -> Vec<u8> {
@@ -1016,14 +1084,23 @@ mod tests {
         firmware: Vec<u8>,
         cursor: u32,
         fault: impl FnMut(usize) -> Fault + Send + 'static,
-    ) -> (Result<(), FirmwareError>, Vec<FlashEvent>, Vec<usize>, u32) {
+    ) -> (
+        Result<Flashed, FirmwareError>,
+        Vec<FlashEvent>,
+        Vec<usize>,
+        u32,
+    ) {
         let (device, proxy) = crate::device::Device::test_pair();
         let responder = std::thread::spawn(move || {
             let mut cursor = cursor;
             let mut fault = fault;
             let mut sent = Vec::new();
+            let (mut watches, mut session) = (Watches::default(), 1);
             // The session's socket closes once the device is dropped.
             while let Ok(request) = proxy.sent.recv_timeout(Duration::from_secs(5)) {
+                if watches.take(&proxy, &request, Some(session)) {
+                    continue;
+                }
                 let route = request.route();
                 let crate::tio::packet::Payload::RpcRequest(request) = request.payload() else {
                     panic!("flash only makes RPC calls");
@@ -1035,6 +1112,12 @@ mod tests {
                 // A device that takes images does not answer dev.firmware.abort.
                 if name == b"dev.firmware.abort" {
                     proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
+                    continue;
+                }
+                if name == b"dev.firmware.upgrade" {
+                    proxy.reply(id, &[], route);
+                    session += 1;
+                    watches.tell(&proxy, Ok(Some(session)), None);
                     continue;
                 }
                 if name != b"dev.firmware.upload" {
@@ -1120,7 +1203,7 @@ mod tests {
         assert_eq!(sent, [0, 1, 2]);
         assert_eq!(acked(&events), [1, 2, 3]);
         assert_eq!(cursor, THREE_CHUNKS_DATA);
-        assert!(events.contains(&FlashEvent::Complete));
+        assert!(events.contains(&FlashEvent::Restarted));
     }
 
     /// Losing chunk 1 also gets chunk 2, already in flight, rejected for its
@@ -1244,23 +1327,54 @@ mod tests {
         data
     }
 
+    /// What the package fake does with the commit.
+    enum Commit {
+        /// Answers it, and restarts into a new session.
+        Restart,
+        /// Refuses it with this error, and stays.
+        Refuse(wire_rpc::RpcError),
+        /// Takes it and goes silent, so the proxy answers it with a timeout
+        /// and loses the device, which comes back if `back`. Its heartbeats
+        /// carry its session unless `sessionless`.
+        Lost { back: bool, sessionless: bool },
+    }
+
     /// Run [`flash`] against a fake device that keeps the crate's own upload
-    /// cursor for `board`, with `fault` deciding what happens to each chunk.
-    /// Returns the outcome, the events, the chunks sent in order (zero for
-    /// the header, then one more than each image chunk's index), and the
-    /// device's final cursor.
+    /// cursor for `board`, with `commit` deciding what it does with the
+    /// commit and `fault` what happens to each chunk. Its `dev.desc` names
+    /// its session. Returns the outcome, the events, the chunks sent in order
+    /// (zero for the header, then one more than each image chunk's index),
+    /// and the device's final cursor.
     fn flash_package_against(
         board: device_update::Package,
         firmware: Vec<u8>,
+        commit: Commit,
         fault: impl FnMut(usize) -> Fault + Send + 'static,
-    ) -> (Result<(), FirmwareError>, Vec<FlashEvent>, Vec<usize>, u32) {
+    ) -> (
+        Result<Flashed, FirmwareError>,
+        Vec<FlashEvent>,
+        Vec<usize>,
+        u32,
+    ) {
         let (device, proxy) = crate::device::Device::test_pair();
         let responder = std::thread::spawn(move || {
             let booted = std::time::Instant::now();
             let mut upload = device_update::Upload::new();
             let mut fault = fault;
             let mut sent = Vec::new();
+            let (mut watches, mut session) = (Watches::default(), 1);
+            let sessionless = matches!(
+                commit,
+                Commit::Lost {
+                    sessionless: true,
+                    ..
+                }
+            );
+            let alive = |session: u32| (!sessionless).then_some(session);
             while let Ok(request) = proxy.sent.recv_timeout(Duration::from_secs(5)) {
+                if watches.take(&proxy, &request, alive(session)) {
+                    continue;
+                }
                 let now = booted.elapsed().as_nanos() as u64;
                 let route = request.route();
                 let crate::tio::packet::Payload::RpcRequest(request) = request.payload() else {
@@ -1276,10 +1390,31 @@ mod tests {
                 };
                 match name {
                     b"dev.firmware.abort" => answer(upload.abort().map(|()| Vec::new())),
-                    b"dev.firmware.upgrade" => answer(upload.upgrade(now).map(|_| {
-                        upload.armed();
-                        Vec::new()
-                    })),
+                    b"dev.firmware.upgrade" => match commit {
+                        Commit::Restart => {
+                            answer(upload.upgrade(now).map(|_| {
+                                upload.armed();
+                                Vec::new()
+                            }));
+                            session += 1;
+                            watches.tell(&proxy, Ok(alive(session)), None);
+                        }
+                        Commit::Refuse(error) => answer(Err(error)),
+                        Commit::Lost { back, .. } => {
+                            upload.upgrade(now).unwrap();
+                            upload.armed();
+                            answer(Err(wire_rpc::RpcError::Timeout));
+                            watches.tell(&proxy, Err(Some(0)), LostCause::Disconnected.code());
+                            if back {
+                                session += 1;
+                                watches.tell(&proxy, Ok(alive(session)), None);
+                            }
+                        }
+                    },
+                    b"dev.desc" => answer(Ok(format!(
+                        "Twinleaf TEST R1 ((null)) [2026-11-24/{session:06}-DEV]"
+                    )
+                    .into_bytes())),
                     b"dev.firmware.upload" if request.args.is_empty() => {
                         answer(Ok(upload.cursor(now).to_le_bytes().to_vec()))
                     }
@@ -1317,7 +1452,10 @@ mod tests {
             let cursor = upload.cursor(0);
             (sent, cursor)
         });
-        let device = device.with_timeout(Duration::from_millis(500));
+        let device = {
+            let device = device;
+            device.with_timeout(Duration::from_millis(500))
+        };
         let mut events = Vec::new();
         let result = flash(&device, &firmware, |e| events.push(e));
         drop(device);
@@ -1346,13 +1484,13 @@ mod tests {
         let board = board();
         let firmware = package(&board, PACKAGE_IMAGE);
         let (result, events, sent, cursor) =
-            flash_package_against(board, firmware, |_| Fault::Deliver);
+            flash_package_against(board, firmware, Commit::Restart, |_| Fault::Deliver);
 
         result.unwrap();
         assert_eq!(sent, [0, 1, 2, 3]);
         assert_eq!(acked(&events), [1, 2, 3, 4]);
         assert_eq!(cursor, PACKAGE_IMAGE as u32);
-        assert!(events.contains(&FlashEvent::Complete));
+        assert!(events.contains(&FlashEvent::Restarted));
     }
 
     /// Losing image chunk 1 gets chunk 2, already in flight, refused for its
@@ -1362,13 +1500,14 @@ mod tests {
         let board = board();
         let firmware = package(&board, PACKAGE_IMAGE);
         let mut lost = false;
-        let (result, events, sent, cursor) = flash_package_against(board, firmware, move |chunk| {
-            if chunk == 2 && !std::mem::replace(&mut lost, true) {
-                Fault::LoseRequest
-            } else {
-                Fault::Deliver
-            }
-        });
+        let (result, events, sent, cursor) =
+            flash_package_against(board, firmware, Commit::Restart, move |chunk| {
+                if chunk == 2 && !std::mem::replace(&mut lost, true) {
+                    Fault::LoseRequest
+                } else {
+                    Fault::Deliver
+                }
+            });
 
         result.unwrap();
         assert_eq!(sent, [0, 1, 2, 3, 2, 3]);
@@ -1384,9 +1523,10 @@ mod tests {
         let board = board();
         let firmware = package(&board, PACKAGE_IMAGE);
         let mut faults = vec![Fault::LoseAck, Fault::LoseRequest].into_iter();
-        let (result, _, sent, cursor) = flash_package_against(board, firmware, move |_| {
-            faults.next().unwrap_or(Fault::Deliver)
-        });
+        let (result, _, sent, cursor) =
+            flash_package_against(board, firmware, Commit::Restart, move |_| {
+                faults.next().unwrap_or(Fault::Deliver)
+            });
 
         result.unwrap();
         assert_eq!(sent, [0, 1, 0, 1, 2, 3]);
@@ -1401,7 +1541,8 @@ mod tests {
             ..board()
         };
         let firmware = package(&board(), PACKAGE_IMAGE);
-        let (result, _, sent, _) = flash_package_against(other, firmware, |_| Fault::Deliver);
+        let (result, _, sent, _) =
+            flash_package_against(other, firmware, Commit::Restart, |_| Fault::Deliver);
 
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1417,7 +1558,9 @@ mod tests {
     #[test]
     fn a_device_refuses_the_other_kind_of_image() {
         let (result, events, sent, _) =
-            flash_package_against(board(), image(THREE_CHUNKS), |_| Fault::Deliver);
+            flash_package_against(board(), image(THREE_CHUNKS), Commit::Restart, |_| {
+                Fault::Deliver
+            });
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("takes signed packages"),
@@ -1432,45 +1575,77 @@ mod tests {
         assert!(events.is_empty() && sent.is_empty());
     }
 
-    /// Runs [`reread_installed`] against a fake device that refuses the
-    /// first `refusals` reads of `dev.desc` and answers every one after.
-    /// Returns what it read and how many reads the device saw.
-    fn reread_against(refusals: usize) -> (Option<InstalledFirmware>, usize) {
-        let (device, proxy) = crate::device::Device::test_pair();
-        let responder = std::thread::spawn(move || {
-            let mut reads = 0;
-            while let Ok(request) = proxy.sent.recv_timeout(Duration::from_secs(5)) {
-                let route = request.route();
-                let crate::tio::packet::Payload::RpcRequest(request) = request.payload() else {
-                    panic!("a reread only makes RPC calls");
-                };
-                let id = request.id.value();
-                reads += 1;
-                match reads <= refusals {
-                    true => proxy.refuse(id, wire_rpc::RpcError::State, route),
-                    false => {
-                        proxy.reply(id, b"Twinleaf ASM R6 ((null)) [2026-06-04/022547]", route)
-                    }
-                }
-            }
-            reads
-        });
-        let installed = reread_installed(&device);
-        drop(device);
-        (installed, responder.join().unwrap())
+    /// The build a package fake runs in `session`.
+    fn build(session: u32) -> Option<String> {
+        Some(format!("{session:06}-DEV"))
     }
 
-    /// A reread answers with the first read that succeeds, after reads that
-    /// fail while the device reboots, and gives up after the last attempt.
+    /// A commit answered, or one the device went silent on and the proxy
+    /// answered with a timeout, is followed to the device back in a new
+    /// session, and what it ran before and runs after are read.
     #[test]
-    fn a_reread_retries_while_the_device_reboots() {
-        let (installed, reads) = reread_against(REREAD_ATTEMPTS - 1);
-        assert_eq!(installed.unwrap().hash.as_deref(), Some("022547"));
-        assert_eq!(reads, REREAD_ATTEMPTS);
+    fn a_commit_is_followed_to_the_device_back_in_a_new_session() {
+        let commits = [
+            Commit::Restart,
+            Commit::Lost {
+                back: true,
+                sessionless: false,
+            },
+            Commit::Lost {
+                back: true,
+                sessionless: true,
+            },
+        ];
+        for commit in commits {
+            let board = board();
+            let firmware = package(&board, PACKAGE_IMAGE);
+            let (result, events, _, _) =
+                flash_package_against(board, firmware, commit, |_| Fault::Deliver);
 
-        let (installed, reads) = reread_against(REREAD_ATTEMPTS);
-        assert!(installed.is_none());
-        assert_eq!(reads, REREAD_ATTEMPTS);
+            let flashed = result.unwrap();
+            assert_eq!(flashed.before.hash, build(1));
+            assert_eq!(flashed.after.unwrap().hash, build(2));
+            assert!(events.ends_with(&[FlashEvent::Restarting, FlashEvent::Restarted]));
+        }
+    }
+
+    /// A device that refuses the commit and stays reports its refusal, a
+    /// timeout among them.
+    #[test]
+    fn a_commit_refused_by_a_device_that_stays_fails_as_itself() {
+        let refusals = [wire_rpc::RpcError::Invalid, wire_rpc::RpcError::Timeout];
+        for refusal in refusals {
+            let board = board();
+            let firmware = package(&board, PACKAGE_IMAGE);
+            let (result, events, _, _) =
+                flash_package_against(board, firmware, Commit::Refuse(refusal), |_| Fault::Deliver);
+
+            let refused = matches!(
+                result,
+                Err(FirmwareError::Rpc(CallError::DeviceError(ref payload))) if payload.error == refusal
+            );
+            assert!(refused, "{result:?}");
+            assert!(!events.contains(&FlashEvent::Restarted));
+        }
+    }
+
+    /// A device lost after its commit that never comes back leaves the
+    /// upgrade committed, with nothing read after it.
+    #[test]
+    fn a_device_that_never_comes_back_leaves_nothing_read_after() {
+        let board = board();
+        let firmware = package(&board, PACKAGE_IMAGE);
+        let lost = Commit::Lost {
+            back: false,
+            sessionless: false,
+        };
+        let (result, events, _, _) =
+            flash_package_against(board, firmware, lost, |_| Fault::Deliver);
+
+        let flashed = result.unwrap();
+        assert_eq!(flashed.before.hash, build(1));
+        assert!(flashed.after.is_none());
+        assert_eq!(events.last(), Some(&FlashEvent::Restarting));
     }
 
     #[test]

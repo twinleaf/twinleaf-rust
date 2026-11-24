@@ -776,31 +776,25 @@ impl Firmware {
                     };
                     firmware.tell(device, job, state);
                 }
+                FlashEvent::Restarting => {
+                    log::info!("{device} restarts into {flashing}");
+                    let state = UpgradeState::Restarting {
+                        source,
+                        target: flashing.clone(),
+                    };
+                    firmware.tell(device, job, state);
+                }
                 _ => {}
             });
             (result, reached)
         })
         .await;
-        match flashed {
-            Ok((Ok(()), _)) => {}
+        let installed = match flashed {
+            Ok((Ok(flashed), _)) => flashed.after,
             Ok((Err(error), reached)) => {
                 return failed(step_of(reached, &error), error.to_string())
             }
             Err(error) => return failed(Step::Upload, error.to_string()),
-        }
-
-        log::info!("{device} restarts into {target}");
-        let restarting = UpgradeState::Restarting {
-            source,
-            target: target.clone(),
-        };
-        self.tell(device, job, restarting);
-        let installed = match self.tree.device(device) {
-            Ok(reread) => tokio::task::spawn_blocking(move || fw::reread_installed(&reread))
-                .await
-                .ok()
-                .flatten(),
-            Err(_) => None,
         };
         match &installed {
             Some(installed) => log::info!(
@@ -845,8 +839,6 @@ pub(crate) mod tests {
     use twinleaf::Connection;
 
     /// How long a test waits for what must come, on a machine however busy.
-    /// An upgrade of the simulated device takes over five seconds, as the
-    /// device settles for five after its commit.
     const WAIT: Duration = Duration::from_secs(90);
     /// How long a test waits to see that nothing comes.
     const QUIET: Duration = Duration::from_millis(1500);

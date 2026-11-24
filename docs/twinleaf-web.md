@@ -407,8 +407,8 @@ at most one capture call in flight per capture RPC.
 
 The hub reads what each device runs, and installs firmware the page asks
 for, as `tio upgrade` does: it calls `twinleaf::firmware`
-(`query_installed`, `check_for_update`, `download_cached`, `flash`,
-`reread_installed`) and copies none of it. Each call blocks, so each runs
+(`query_installed`, `check_for_update`, `download_cached`, `flash`) and
+copies none of it. Each call blocks, so each runs
 on tokio's blocking threads, on the device `DeviceTree::device` gives.
 
 **What a device runs.** The hub reads a device's `dev.desc` once each
@@ -501,9 +501,9 @@ Every state but `idle` carries `source` (`latest`, `release`, `file`) and
 | `queued` | waits for the upgrades asked before it |
 | `downloading` | the release is being downloaded (`download_cached`, or the catalog's `download` with no cache) |
 | `uploading` | the image is on its way: `sent` of `size` bytes (`size × chunk / chunks`), from 0 as `flash` starts, at most every 100 ms and the last |
-| `finalizing` | from `FlashEvent::Committing`, through the 5 s settle |
-| `restarting` | `flash` returned; the hub re-reads `dev.desc` (`reread_installed`, 6 reads 1.5 s apart) |
-| `done` | with `installed`, as in `firmware`, or `null` if the device did not answer in time, which is no failure |
+| `finalizing` | from `FlashEvent::Committing`, until the commit is taken |
+| `restarting` | from `FlashEvent::Restarting`, until `flash` sees the device back in a new session, or a minute passes |
+| `done` | with `installed`, as `flash` read it once the device was back, or `null` if it was not back in time, which is no failure |
 | `failed` | with `step` and `error`, the error's text |
 
 `step` is `check` for an image the device cannot take (`FirmwareError::Refused`,
