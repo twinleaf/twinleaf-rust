@@ -36,6 +36,12 @@ const MAX_CHUNKS_IN_FLIGHT: usize = 2;
 /// How many resumptions in a row may leave the device's upload cursor where
 /// it was before the upload is abandoned.
 const MAX_STALLS: u32 = 3;
+/// How much longer each stalled resumption waits than the last, so a device
+/// that refuses uploads while it starts up is ready before the upload gives up.
+#[cfg(not(test))]
+const STALL_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const STALL_BACKOFF: Duration = Duration::from_millis(20);
 /// How long [`flash`] waits after committing for the device to come back.
 #[cfg(not(test))]
 const RESTART_DEADLINE: Duration = Duration::from_secs(60);
@@ -529,11 +535,12 @@ pub fn download(
 /// A chunk lost in either direction fails the upload window it is in. The
 /// upload then reads the device's upload cursor and resumes from that chunk.
 /// It gives up after three resumptions in a row that leave the cursor where
-/// it was. After committing, it waits up to a minute for the device to come
-/// back in a new session, or for one whose heartbeats carry no session to be
-/// lost and come back, and reads what it runs then. A commit the proxy
-/// answers with a timeout counts as taken once the device is lost or back,
-/// as the proxy answers so the calls a lost or restarted device left.
+/// it was, each waiting longer than the last. After committing, it waits up
+/// to a minute for the device to come back in a new session, or for one
+/// whose heartbeats carry no session to be lost and come back, and reads what
+/// it runs then. A commit the proxy answers with a timeout counts as taken
+/// once the device is lost or back, as the proxy answers so the calls a lost
+/// or restarted device left.
 ///
 /// # Errors
 ///
@@ -726,6 +733,7 @@ fn upload_image(
             total: total_chunks,
             error: error.to_string(),
         });
+        std::thread::sleep(STALL_BACKOFF * stalls);
         resume_at = next;
     }
 }
@@ -819,6 +827,7 @@ fn upload_package(
             total: total_chunks,
             error: error.to_string(),
         });
+        std::thread::sleep(STALL_BACKOFF * stalls);
         resume_at = next;
     }
 }
@@ -1027,7 +1036,7 @@ mod tests {
         Deliver,
         LoseRequest,
         LoseAck,
-        Reject,
+        Reject(wire_rpc::RpcError),
     }
 
     /// The watches a fake device's session made of its presence.
@@ -1144,7 +1153,7 @@ mod tests {
                     }
                     Fault::LoseRequest => {}
                     Fault::LoseAck => cursor += data,
-                    Fault::Reject => proxy.refuse(id, wire_rpc::RpcError::Invalid, route),
+                    Fault::Reject(error) => proxy.refuse(id, error, route),
                 }
             }
             (sent, cursor)
@@ -1259,7 +1268,9 @@ mod tests {
 
     #[test]
     fn an_upload_the_device_keeps_rejecting_fails_without_progress() {
-        let (result, _, sent, _) = flash_against(image(100), 0, |_| Fault::Reject);
+        let (result, _, sent, _) = flash_against(image(100), 0, |_| {
+            Fault::Reject(wire_rpc::RpcError::Invalid)
+        });
 
         let err = result.unwrap_err().to_string();
         assert_eq!(sent.len(), MAX_STALLS as usize);
@@ -1267,6 +1278,23 @@ mod tests {
             err.contains("failed 3 times without progress") && err.contains("invalid arguments"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A device that refuses uploads for a while after it starts takes one
+    /// that waits it out.
+    #[test]
+    fn an_upload_waits_out_a_device_still_starting_up() {
+        let ready = Instant::now() + 2 * STALL_BACKOFF;
+        let (result, events, sent, cursor) = flash_against(image(THREE_CHUNKS), 0, move |_| {
+            match Instant::now() < ready {
+                true => Fault::Reject(wire_rpc::RpcError::State),
+                false => Fault::Deliver,
+            }
+        });
+
+        result.unwrap();
+        assert!(!resumed(&events).is_empty() && sent.ends_with(&[0, 1, 2]));
+        assert_eq!(cursor, THREE_CHUNKS_DATA);
     }
 
     #[test]
@@ -1443,7 +1471,7 @@ mod tests {
                             Fault::Deliver => answer(take()),
                             Fault::LoseRequest => {}
                             Fault::LoseAck => drop(take()),
-                            Fault::Reject => answer(Err(wire_rpc::RpcError::Invalid)),
+                            Fault::Reject(error) => answer(Err(error)),
                         }
                     }
                     _ => answer(Ok(Vec::new())),
